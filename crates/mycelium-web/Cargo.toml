@@ -1,0 +1,41 @@
+[package]
+name = "mycelium-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycelium-core = { path = "../mycelium-core" }
+mycelium-store = { path = "../mycelium-store" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+mycelium-auth = { path = "../mycelium-auth" }
+mycelium-mcp = { path = "../mycelium-mcp" }
+axum.workspace = true
+axum-server.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+leptos.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.2"
+hkdf.workspace = true
+sha2.workspace = true
+hex = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", features = ["json"] }

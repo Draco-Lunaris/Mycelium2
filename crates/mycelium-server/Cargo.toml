@@ -1,0 +1,34 @@
+[package]
+name = "mycelium-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mycelium2"
+path = "src/main.rs"
+
+[dependencies]
+mycelium-core = { path = "../mycelium-core" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+mycelium-store = { path = "../mycelium-store" }
+mycelium-auth = { path = "../mycelium-auth" }
+mycelium-web = { path = "../mycelium-web" }
+mycelium-mcp = { path = "../mycelium-mcp" }
+mycelium-librarian = { path = "../mycelium-librarian" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

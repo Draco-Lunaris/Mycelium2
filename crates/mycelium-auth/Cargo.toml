@@ -1,0 +1,43 @@
+[package]
+name = "mycelium-auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycelium-store = { path = "../mycelium-store" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+argon2.workspace = true
+jsonwebtoken.workspace = true
+totp-rs.workspace = true
+webauthn-rs.workspace = true
+webauthn-rs-core = "0.5"
+openidconnect.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+axum.workspace = true
+sha2.workspace = true
+hex = "0.4"
+base64 = "0.22"
+base64-url = "3.0"
+url = "2.5"
+rand = "0.9"
+# ed25519-dalek needs rand_core 0.6 (rand 0.8) for key generation.
+rand_08 = { package = "rand", version = "0.8" }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }
+pkcs8 = "0.10"
+# Must match oauth2 5.0's reqwest (0.12) so the AsyncHttpClient impl applies.
+reqwest = "0.12"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+tower.workspace = true

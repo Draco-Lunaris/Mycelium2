@@ -1,0 +1,27 @@
+[package]
+name = "mycelium-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mycelium2-cli"
+path = "src/main.rs"
+
+[dependencies]
+mycelium-core = { path = "../mycelium-core" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+mycelium-store = { path = "../mycelium-store" }
+mycelium-auth = { path = "../mycelium-auth" }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

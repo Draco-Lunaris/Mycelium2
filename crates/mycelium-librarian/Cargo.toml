@@ -1,0 +1,27 @@
+[package]
+name = "mycelium-librarian"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycelium-core = { path = "../mycelium-core" }
+mycelium-store = { path = "../mycelium-store" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

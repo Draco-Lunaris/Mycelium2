@@ -1,0 +1,36 @@
+[package]
+name = "mycelium-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mycelium-core = { path = "../mycelium-core" }
+mycelium-store = { path = "../mycelium-store" }
+mycelium-auth = { path = "../mycelium-auth" }
+mycelium-crypto = { path = "../mycelium-crypto" }
+rmcp.workspace = true
+axum.workspace = true
+http = "1.5"
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars = "1.0"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+hex = "0.4"
+hkdf.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+mycelium-web = { path = "../mycelium-web" }
+mycelium-crypto = { path = "../mycelium-crypto" }
