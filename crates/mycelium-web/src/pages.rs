@@ -457,6 +457,7 @@ pub fn admin_page(
     llm_url: &str,
     llm_model: &str,
     max_book_mib: u64,
+    security: &crate::state::SecurityConfig,
     bookshelves: &[(String, bool)],
     ingest_jobs: &[(String, String, String, String, String)],
     ok: Option<&str>,
@@ -561,6 +562,16 @@ pub fn admin_page(
   <label>Max book size (MiB, 1–255)</label><input name="max_book_mib" type="number" min="1" max="255" value="{max_book_mib}" required>
   <button type="submit">Save limit</button>
 </form>
+<h2>Security settings</h2>
+<p class="muted">Tunable within guardrails — values outside the ranges below are clamped. Session TTL applies to new logins; existing sessions keep their expiry.</p>
+<form method="post" action="/admin/security">
+  <label>Session TTL (minutes, 15–10080; 720 = 12h)</label><input name="session_ttl_minutes" type="number" min="15" max="10080" value="{}" required>
+  <label>Login failures before lockout (3–10)</label><input name="login_max_failures" type="number" min="3" max="10" value="{}" required>
+  <label>Lockout backoff cap (seconds, 30–3600)</label><input name="login_lockout_seconds" type="number" min="30" max="3600" value="{}" required>
+  <label>Minimum password length (12–128)</label><input name="min_password_length" type="number" min="12" max="128" value="{}" required>
+  <label>Passage cap (chars, 16384–1048576; 131072 = 128k)</label><input name="passage_max_chars" type="number" min="16384" max="1048576" value="{}" required>
+  <button type="submit">Save security settings</button>
+</form>
 <h2>Ingest jobs</h2>
 <table><tr><th>Book</th><th>Status</th><th>Detail</th><th>Created</th><th>Shelf</th></tr>{job_rows}</table>
 <h2>Global skills</h2>
@@ -569,7 +580,12 @@ pub fn admin_page(
 <form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>"#,
         flash(ok, err),
         html_escape(llm_url),
-        html_escape(llm_model)
+        html_escape(llm_model),
+        security.session_ttl_minutes,
+        security.login_max_failures,
+        security.login_lockout_seconds,
+        security.min_password_length,
+        security.passage_max_chars
     );
     layout("Admin", Some(user), csrf, body)
 }

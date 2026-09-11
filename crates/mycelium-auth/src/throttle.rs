@@ -15,20 +15,26 @@ pub enum ThrottleDecision {
 /// Exponential backoff throttle: delay doubles per consecutive failure,
 /// capped, and decays after a success.
 ///
-/// Backoff schedule (seconds): 1, 2, 4, 8, 16, 30 (cap).
+/// Backoff schedule (seconds): 1, 2, 4, 8, 16, cap.
 #[derive(Debug, Clone)]
 pub struct AuthThrottle {
     failures: HashMap<String, u32>,
     last_failure: HashMap<String, Instant>,
+    /// Failures before the first deny (default 3).
+    max_failures: u32,
+    /// Backoff cap (default 30s).
     cap: Duration,
 }
 
-const MAX_FAILURES_BEFORE_DENY: u32 = 3;
+/// Default failures before deny.
+const DEFAULT_MAX_FAILURES: u32 = 3;
+/// Default backoff cap.
+const DEFAULT_CAP: Duration = Duration::from_secs(30);
 
 /// Exponential backoff delay for a failure count (free function so record
 /// paths can compute it without borrowing self).
-fn delay_for(failures: u32, cap: Duration) -> Duration {
-    let exp = failures.saturating_sub(MAX_FAILURES_BEFORE_DENY).min(5);
+fn delay_for(failures: u32, max_failures: u32, cap: Duration) -> Duration {
+    let exp = failures.saturating_sub(max_failures).min(5);
     let secs = 1u64 << exp; // 1, 2, 4, 8, 16
     Duration::from_secs(secs).min(cap)
 }
@@ -44,8 +50,24 @@ impl AuthThrottle {
         Self {
             failures: HashMap::new(),
             last_failure: HashMap::new(),
-            cap: Duration::from_secs(30),
+            max_failures: DEFAULT_MAX_FAILURES,
+            cap: DEFAULT_CAP,
         }
+    }
+
+    /// Configure the deny threshold and backoff cap (admin-configurable
+    /// security settings; callers clamp to sane bounds).
+    pub fn with_limits(mut self, max_failures: u32, cap: Duration) -> Self {
+        self.max_failures = max_failures.max(1);
+        self.cap = cap;
+        self
+    }
+
+    /// Update the deny threshold and backoff cap in place (runtime
+    /// reconfiguration; callers clamp to sane bounds).
+    pub fn set_limits(&mut self, max_failures: u32, cap: Duration) {
+        self.max_failures = max_failures.max(1);
+        self.cap = cap;
     }
 
     /// Check whether an attempt is allowed WITHOUT recording anything.
@@ -53,13 +75,13 @@ impl AuthThrottle {
         let Some(&n) = self.failures.get(key) else {
             return ThrottleDecision::Allow;
         };
-        if n < MAX_FAILURES_BEFORE_DENY {
+        if n < self.max_failures {
             return ThrottleDecision::Allow;
         }
         let Some(last) = self.last_failure.get(key) else {
             return ThrottleDecision::Allow;
         };
-        let delay = delay_for(n, self.cap);
+        let delay = delay_for(n, self.max_failures, self.cap);
         let elapsed = last.elapsed();
         if elapsed >= delay {
             // The backoff window has passed: allow (failure count persists
@@ -76,10 +98,10 @@ impl AuthThrottle {
         let n = self.failures.entry(key.to_string()).or_insert(0);
         *n += 1;
         self.last_failure.insert(key.to_string(), Instant::now());
-        if *n < MAX_FAILURES_BEFORE_DENY {
+        if *n < self.max_failures {
             return ThrottleDecision::Allow;
         }
-        let delay = delay_for(*n, self.cap);
+        let delay = delay_for(*n, self.max_failures, self.cap);
         ThrottleDecision::Deny { retry_after: delay }
     }
 

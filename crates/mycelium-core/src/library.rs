@@ -104,8 +104,20 @@ pub enum PassageError {
 /// - No anchor (empty string): whole text (discovery mode handled by callers).
 /// - Other anchors: `AnchorNotFound`.
 ///
-/// The result is truncated to `READ_PASSAGE_MAX_CHARS` (mirrors original).
+/// The result is truncated to `max_chars` (callers pass their configured
+/// limit; `READ_PASSAGE_MAX_CHARS` is the default).
 pub fn extract_passage(slug: &str, anchor: &str, full_text: &str) -> Result<Passage, PassageError> {
+    extract_passage_capped(slug, anchor, full_text, READ_PASSAGE_MAX_CHARS)
+}
+
+/// `extract_passage` with an explicit cap (admin-configurable passage
+/// limit; the caller clamps it to sane bounds).
+pub fn extract_passage_capped(
+    slug: &str,
+    anchor: &str,
+    full_text: &str,
+    max_chars: usize,
+) -> Result<Passage, PassageError> {
     if full_text.trim().is_empty() {
         return Err(PassageError::EmptyBook);
     }
@@ -117,7 +129,7 @@ pub fn extract_passage(slug: &str, anchor: &str, full_text: &str) -> Result<Pass
         Anchor::Other(a) if a.is_empty() => full_text.to_string(),
         Anchor::Other(a) => return Err(PassageError::AnchorNotFound(a)),
     };
-    let text: String = text.chars().take(READ_PASSAGE_MAX_CHARS).collect();
+    let text: String = text.chars().take(max_chars).collect();
     Ok(Passage {
         slug: slug.to_string(),
         anchor: anchor.to_string(),

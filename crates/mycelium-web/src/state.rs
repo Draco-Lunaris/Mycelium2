@@ -53,6 +53,75 @@ impl Default for UploadConfig {
     }
 }
 
+/// Security settings, stored in ConfigStore (key `"security"`).
+/// Admin-editable within guardrails — every field is clamped to sane
+/// bounds on read AND on save, so a compromised admin cannot turn a
+/// guardrail off, only tune it within safe limits. Defaults are the
+/// project's original values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecurityConfig {
+    /// Web session TTL in minutes (default 720 = 12h; min 15, max 10080).
+    pub session_ttl_minutes: u64,
+    /// Login failures before the first throttle deny (default 3; min 3, max 10).
+    pub login_max_failures: u32,
+    /// Login backoff cap in seconds (default 30; min 30, max 3600).
+    pub login_lockout_seconds: u64,
+    /// Minimum password length (default 20; min 12, max 128).
+    pub min_password_length: usize,
+    /// Passage extraction cap in chars (default 131072 = 128k; min 16384, max 1048576).
+    pub passage_max_chars: usize,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_minutes: 720,
+            login_max_failures: 3,
+            login_lockout_seconds: 30,
+            min_password_length: 20,
+            passage_max_chars: 128 * 1024,
+        }
+    }
+}
+
+/// Guardrail bounds for SecurityConfig (enforced on read and on save).
+pub mod security_bounds {
+    pub const SESSION_TTL_MIN: u64 = 15;
+    pub const SESSION_TTL_MAX: u64 = 10080;
+    pub const LOGIN_FAILURES_MIN: u32 = 3;
+    pub const LOGIN_FAILURES_MAX: u32 = 10;
+    pub const LOCKOUT_SECS_MIN: u64 = 30;
+    pub const LOCKOUT_SECS_MAX: u64 = 3600;
+    pub const PASSWORD_LEN_MIN: usize = 12;
+    pub const PASSWORD_LEN_MAX: usize = 128;
+    pub const PASSAGE_CHARS_MIN: usize = 16 * 1024;
+    pub const PASSAGE_CHARS_MAX: usize = 1024 * 1024;
+}
+
+impl SecurityConfig {
+    /// Clamp every field into its guardrail bounds (used on read AND
+    /// on save — defense in depth against out-of-range DB values).
+    pub fn clamped(mut self) -> Self {
+        use security_bounds::*;
+        self.session_ttl_minutes = self
+            .session_ttl_minutes
+            .clamp(SESSION_TTL_MIN, SESSION_TTL_MAX);
+        self.login_max_failures = self
+            .login_max_failures
+            .clamp(LOGIN_FAILURES_MIN, LOGIN_FAILURES_MAX);
+        self.login_lockout_seconds = self
+            .login_lockout_seconds
+            .clamp(LOCKOUT_SECS_MIN, LOCKOUT_SECS_MAX);
+        self.min_password_length = self
+            .min_password_length
+            .clamp(PASSWORD_LEN_MIN, PASSWORD_LEN_MAX);
+        self.passage_max_chars = self
+            .passage_max_chars
+            .clamp(PASSAGE_CHARS_MIN, PASSAGE_CHARS_MAX);
+        self
+    }
+}
+
 impl AppState {
     /// The effective upload config: ConfigStore value or the default.
     pub async fn upload_config(&self) -> UploadConfig {
@@ -62,6 +131,19 @@ impl AppState {
             .ok()
             .flatten()
             .unwrap_or_default()
+    }
+
+    /// The effective security config: ConfigStore value (clamped) or
+    /// the default. Clamping on read means even a hand-edited DB row
+    /// cannot produce an unsafe value.
+    pub async fn security_config(&self) -> SecurityConfig {
+        self.config
+            .get::<SecurityConfig>("security")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .clamped()
     }
 }
 

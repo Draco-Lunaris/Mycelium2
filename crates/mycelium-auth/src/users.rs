@@ -193,14 +193,28 @@ impl UserStore {
     }
 
     /// Change a user's password: verifies the old password, re-wraps the
-    /// master key (file ciphertext untouched), updates the hash.
+    /// master key (file ciphertext untouched), updates the hash. Uses the
+    /// default password policy.
     pub async fn change_password(
         &self,
         user_id: Uuid,
         old_password: &str,
         new_password: &str,
     ) -> Result<(), UsersError> {
-        crate::password::check_password_policy(new_password)?;
+        self.change_password_min(user_id, old_password, new_password, crate::MIN_PASSWORD_LEN)
+            .await
+    }
+
+    /// Change a user's password with an explicit minimum length
+    /// (admin-configurable policy; callers clamp to sane bounds).
+    pub async fn change_password_min(
+        &self,
+        user_id: Uuid,
+        old_password: &str,
+        new_password: &str,
+        min_len: usize,
+    ) -> Result<(), UsersError> {
+        crate::password::check_password_policy_min(new_password, min_len)?;
         let record = self.get_by_id(user_id).await?;
         let Some(stored_hash) = &record.password_hash else {
             return Err(UsersError::InvalidCredentials);
@@ -365,7 +379,7 @@ mod tests {
                 .create_local("alice", "alice@example.com", "short", Role::User)
                 .await,
             Err(UsersError::Password(
-                crate::password::PasswordError::TooShort
+                crate::password::PasswordError::TooShort(crate::MIN_PASSWORD_LEN)
             ))
         ));
     }

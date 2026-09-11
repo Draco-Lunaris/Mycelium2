@@ -42,6 +42,21 @@ pub struct LoginService {
     throttle: std::sync::Arc<std::sync::Mutex<AuthThrottle>>,
 }
 
+/// Per-call runtime security settings (admin-configurable via the web
+/// layer's ConfigStore). `None` fields keep the built-in defaults.
+/// All values are expected pre-clamped by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct LoginOptions {
+    /// Session TTL override.
+    pub session_ttl: Option<chrono::Duration>,
+    /// Throttle: failures before the first deny.
+    pub login_max_failures: Option<u32>,
+    /// Throttle: backoff cap.
+    pub login_lockout: Option<std::time::Duration>,
+    /// Password policy: minimum length (applies to password change).
+    pub min_password_length: Option<usize>,
+}
+
 impl LoginService {
     pub fn new(pool: sqlx::SqlitePool) -> Self {
         Self {
@@ -51,7 +66,8 @@ impl LoginService {
         }
     }
 
-    /// Log a user in with username + password (+ optional TOTP code).
+    /// Log a user in with username + password (+ optional TOTP code),
+    /// with the built-in security defaults.
     ///
     /// - Throttled per username with exponential backoff (recorded on
     ///   failure, reset on success).
@@ -64,6 +80,31 @@ impl LoginService {
         password: &str,
         totp_code: Option<&str>,
     ) -> Result<LoginSuccess, LoginError> {
+        self.login_with_options(username, password, totp_code, &LoginOptions::default())
+            .await
+    }
+
+    /// Log a user in with runtime security settings (admin-configurable;
+    /// the web layer passes its ConfigStore values, pre-clamped).
+    pub async fn login_with_options(
+        &self,
+        username: &str,
+        password: &str,
+        totp_code: Option<&str>,
+        options: &LoginOptions,
+    ) -> Result<LoginSuccess, LoginError> {
+        // Apply the runtime throttle limits (if configured) before the
+        // check — the throttle is shared state, so this affects all
+        // concurrent logins too. Idempotent: setting the same limits
+        // repeatedly is a no-op.
+        {
+            let mut throttle = self.throttle.lock().unwrap();
+            if let (Some(max_f), Some(lockout)) =
+                (options.login_max_failures, options.login_lockout)
+            {
+                throttle.set_limits(max_f, lockout);
+            }
+        }
         // Throttle check (per username; Phase 5 should also key by IP).
         let decision = self.throttle.lock().unwrap().check(username);
         if let ThrottleDecision::Deny { retry_after } = decision {
@@ -92,7 +133,10 @@ impl LoginService {
         }
         // Success: reset throttle, mint a fresh session.
         self.throttle.lock().unwrap().record_success(username);
-        let session = self.sessions.create(auth.record.id).await?;
+        let session = match options.session_ttl {
+            Some(ttl) => self.sessions.create_with_ttl(auth.record.id, ttl).await?,
+            None => self.sessions.create(auth.record.id).await?,
+        };
         Ok(LoginSuccess {
             must_change_password: auth.record.must_change_password,
             user: auth,
@@ -101,15 +145,29 @@ impl LoginService {
     }
 
     /// Change password AND invalidate all existing sessions (the stolen-
-    /// session defense). Requires the old password.
+    /// session defense). Requires the old password. Uses the default
+    /// password policy.
     pub async fn change_password(
         &self,
         user_id: Uuid,
         old_password: &str,
         new_password: &str,
     ) -> Result<(), LoginError> {
+        self.change_password_min(user_id, old_password, new_password, crate::MIN_PASSWORD_LEN)
+            .await
+    }
+
+    /// Change password with an explicit minimum length (admin-configurable
+    /// policy; callers clamp to sane bounds) AND invalidate all sessions.
+    pub async fn change_password_min(
+        &self,
+        user_id: Uuid,
+        old_password: &str,
+        new_password: &str,
+        min_len: usize,
+    ) -> Result<(), LoginError> {
         self.users
-            .change_password(user_id, old_password, new_password)
+            .change_password_min(user_id, old_password, new_password, min_len)
             .await?;
         // Invalidate every session for this user.
         self.sessions.delete_all_for_user(user_id).await?;

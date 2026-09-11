@@ -29,6 +29,14 @@ variables for runtime settings:
   heuristic catalog (ingest never fails on LLM errors).
 - **Upload limits** — maximum book upload size (MiB, 1–255; default
   32, the original Mycelium's default). Takes effect immediately.
+- **Security settings** — tunable within guardrails (out-of-range
+  values are clamped, on save and on read):
+  - Session TTL: 15–10080 minutes (default 720 = 12h; applies to new
+    logins)
+  - Login failures before lockout: 3–10 (default 3)
+  - Lockout backoff cap: 30–3600 seconds (default 30)
+  - Minimum password length: 12–128 (default 20)
+  - Passage cap: 16384–1048576 chars (default 131072 = 128k)
 - **OIDC SSO** — issuer URL, client ID/secret (encrypted at rest with
   the service key), redirect URI. Disabled until configured.
 
@@ -46,10 +54,11 @@ variables for runtime settings:
 
 ## Security-relevant defaults
 
-- Sessions: 12h TTL, server-side, cookie `HttpOnly; Secure;
-  SameSite=Strict`.
-- Login throttling with lockout; TOTP/WebAuthn optional second
-  factors.
+- Sessions: server-side, cookie `HttpOnly; Secure; SameSite=Strict`;
+  TTL admin-configurable (default 12h, floor 15min).
+- Login throttling with exponential backoff (threshold and cap
+  admin-configurable within guardrails); TOTP/WebAuthn optional
+  second factors.
 - Forced password change for the bootstrapped admin and any
   admin-reset account.
 - Password policy: minimum 20 characters.

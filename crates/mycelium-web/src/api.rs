@@ -412,8 +412,22 @@ pub async fn login_submit(
 ) -> Response {
     // Clone the service out of the mutex so no guard is held across await.
     let login = state.login.clone();
+    // Runtime security settings (admin-configurable, pre-clamped).
+    let sec = state.security_config().await;
+    let options = mycelium_auth::login::LoginOptions {
+        session_ttl: Some(chrono::Duration::minutes(sec.session_ttl_minutes as i64)),
+        login_max_failures: Some(sec.login_max_failures),
+        login_lockout: Some(std::time::Duration::from_secs(sec.login_lockout_seconds)),
+        min_password_length: Some(sec.min_password_length),
+    };
+    let cookie_max_age = sec.session_ttl_minutes * 60;
     match login
-        .login(&form.username, &form.password, form.totp.as_deref())
+        .login_with_options(
+            &form.username,
+            &form.password,
+            form.totp.as_deref(),
+            &options,
+        )
         .await
     {
         Ok(success) => {
@@ -435,7 +449,7 @@ pub async fn login_submit(
                 .master_keys
                 .insert(success.user.record.id, success.user.master_key);
             let cookie = format!(
-                "myc2_session={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200",
+                "myc2_session={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={cookie_max_age}",
                 success.session.id
             );
             let mut response = if success.must_change_password {
@@ -892,8 +906,10 @@ pub async fn password_submit(
         Err(_) => return Redirect::to("/login").into_response(),
     };
     let login = state.login.clone();
+    // Admin-configurable minimum length (pre-clamped).
+    let min_len = state.security_config().await.min_password_length;
     match login
-        .change_password(sess.user_id, &form.old, &form.new)
+        .change_password_min(sess.user_id, &form.old, &form.new, min_len)
         .await
     {
         Ok(()) => {
@@ -1065,6 +1081,7 @@ pub async fn admin_view(
     let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
     let llm = llm.unwrap_or_default();
     let upload = state.upload_config().await;
+    let security = state.security_config().await;
     let shelves = state.store.list_bookshelves().await.unwrap_or_default();
     let shelf_tuples: Vec<(String, bool)> = shelves.into_iter().collect();
     // Ingest jobs (slug, status, detail, created, shelf name).
@@ -1095,6 +1112,7 @@ pub async fn admin_view(
         &llm.url,
         &llm.model,
         upload.max_book_mib,
+        &security,
         &shelf_tuples,
         &job_rows,
         params.created.as_deref(),
@@ -1232,6 +1250,36 @@ pub async fn admin_save_upload_limits(
         .config
         .set("upload", &crate::state::UploadConfig { max_book_mib })
         .await;
+    Redirect::to("/admin").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SecuritySettingsForm {
+    pub session_ttl_minutes: u64,
+    pub login_max_failures: u32,
+    pub login_lockout_seconds: u64,
+    pub min_password_length: usize,
+    pub passage_max_chars: usize,
+}
+
+/// POST /admin/security — save the security settings (admin only).
+/// Stored in ConfigStore (key "security"), clamped to guardrail bounds
+/// on save AND on read — settings can be tuned within safe limits but
+/// never disabled.
+pub async fn admin_save_security(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<SecuritySettingsForm>,
+) -> Response {
+    let cfg = crate::state::SecurityConfig {
+        session_ttl_minutes: form.session_ttl_minutes,
+        login_max_failures: form.login_max_failures,
+        login_lockout_seconds: form.login_lockout_seconds,
+        min_password_length: form.min_password_length,
+        passage_max_chars: form.passage_max_chars,
+    }
+    .clamped();
+    let _ = state.config.set("security", &cfg).await;
     Redirect::to("/admin").into_response()
 }
 
@@ -1491,7 +1539,8 @@ pub async fn api_passage(
     if is_global == 0 && user.role != Role::Admin {
         return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
     }
-    // Read the stack text and extract the passage.
+    // Read the stack text and extract the passage (admin-configurable
+    // cap, pre-clamped).
     let text =
         match mycelium_librarian::read_stack_text(&state.store, &state.service_key, &book_ref.slug)
             .await
@@ -1499,7 +1548,13 @@ pub async fn api_passage(
             Ok(t) => t,
             Err(_) => return error_response(StatusCode::NOT_FOUND, "book text unavailable"),
         };
-    match mycelium_core::library::extract_passage(&book_ref.slug, &book_ref.anchor, &text) {
+    let cap = state.security_config().await.passage_max_chars;
+    match mycelium_core::library::extract_passage_capped(
+        &book_ref.slug,
+        &book_ref.anchor,
+        &text,
+        cap,
+    ) {
         Ok(passage) => Json(serde_json::json!({
             "slug": passage.slug,
             "anchor": passage.anchor,

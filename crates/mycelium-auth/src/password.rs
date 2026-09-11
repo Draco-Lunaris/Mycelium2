@@ -8,8 +8,8 @@ use crate::MIN_PASSWORD_LEN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PasswordError {
-    #[error("password must be at least {MIN_PASSWORD_LEN} characters")]
-    TooShort,
+    #[error("password must be at least {0} characters")]
+    TooShort(usize),
     #[error("password hashing failed")]
     HashFailed,
     #[error("invalid password hash stored")]
@@ -17,9 +17,16 @@ pub enum PasswordError {
 }
 
 /// Enforce the password policy: minimum length only (DESIGN decision).
+/// Uses the default minimum (`MIN_PASSWORD_LEN`).
 pub fn check_password_policy(password: &str) -> Result<(), PasswordError> {
-    if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(PasswordError::TooShort);
+    check_password_policy_min(password, MIN_PASSWORD_LEN)
+}
+
+/// Enforce the password policy with an explicit minimum
+/// (admin-configurable; callers clamp to sane bounds).
+pub fn check_password_policy_min(password: &str, min_len: usize) -> Result<(), PasswordError> {
+    if password.chars().count() < min_len {
+        return Err(PasswordError::TooShort(min_len));
     }
     Ok(())
 }

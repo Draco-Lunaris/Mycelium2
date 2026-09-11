@@ -43,12 +43,22 @@ impl SessionManager {
 
     /// Create a session for a user. Returns the record; the caller sets the
     /// httpOnly cookie with the session id and keeps the CSRF token for the
-    /// double-submit pattern.
+    /// double-submit pattern. Uses the manager's default TTL.
     pub async fn create(&self, user_id: Uuid) -> Result<SessionRecord, SessionError> {
+        self.create_with_ttl(user_id, self.ttl).await
+    }
+
+    /// Create a session with an explicit TTL (admin-configurable session
+    /// lifetime; the caller clamps it to sane bounds).
+    pub async fn create_with_ttl(
+        &self,
+        user_id: Uuid,
+        ttl: Duration,
+    ) -> Result<SessionRecord, SessionError> {
         let id = Uuid::new_v4();
         let csrf = format!("myc2-csrf-{}", Uuid::new_v4());
         let now = Utc::now();
-        let expires = now + self.ttl;
+        let expires = now + ttl;
         sqlx::query(
             "INSERT INTO sessions (id, user_id, csrf_token, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
         )

@@ -65,6 +65,7 @@ pub fn build_router_with_shutdown(
         .route("/admin/oidc", post(api::admin_save_oidc))
         .route("/admin/llm", post(api::admin_save_llm))
         .route("/admin/upload-limits", post(api::admin_save_upload_limits))
+        .route("/admin/security", post(api::admin_save_security))
         .route("/admin/bookshelves", post(api::admin_create_bookshelf))
         .route("/admin/backup", post(api::admin_backup))
         // API + health + metrics.
