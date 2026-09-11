@@ -46,6 +46,50 @@ button.danger { background: var(--danger); color: #fff; }
 .muted { color: var(--muted); }
 pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: auto; }
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
+
+/* Librarian chat */
+.chat-log {
+  display: flex; flex-direction: column; gap: 0.8rem;
+  padding: 1rem; margin-bottom: 1rem; min-height: 16rem; max-height: 60vh;
+  overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.chat-msg {
+  max-width: 80%; padding: 0.6rem 0.9rem; border-radius: 10px;
+  white-space: pre-wrap; word-wrap: break-word; line-height: 1.45;
+}
+.chat-msg.user {
+  align-self: flex-end; background: var(--accent); color: #10131a;
+  border-bottom-right-radius: 2px;
+}
+.chat-msg.librarian {
+  align-self: flex-start; background: var(--bg);
+  border: 1px solid var(--border); border-bottom-left-radius: 2px;
+}
+.chat-msg.pending { color: var(--muted); font-style: italic; }
+.chat-msg.librarian > *:first-child { margin-top: 0; }
+.chat-msg.librarian > *:last-child { margin-bottom: 0; }
+.chat-msg.librarian p { margin: 0.4rem 0; }
+.chat-msg.librarian pre {
+  background: var(--panel); padding: 0.6rem; margin: 0.4rem 0;
+  font-size: 0.85rem; white-space: pre-wrap;
+}
+.chat-msg.librarian code {
+  background: var(--panel); padding: 0.1rem 0.3rem; border-radius: 3px;
+  font-size: 0.9em;
+}
+.chat-msg.librarian pre code { background: none; padding: 0; }
+.chat-msg.librarian ul, .chat-msg.librarian ol { margin: 0.4rem 0; padding-left: 1.4rem; }
+.chat-msg.librarian h3, .chat-msg.librarian h4, .chat-msg.librarian h5, .chat-msg.librarian h6 {
+  margin: 0.6rem 0 0.2rem; font-size: 1rem;
+}
+.chat-msg.error {
+  align-self: flex-start; background: rgba(247,118,142,.12);
+  border: 1px solid var(--danger); color: var(--danger);
+}
+#chat-form textarea { min-height: 3.5rem; font-family: inherit; resize: vertical; }
+#chat-form button { margin-top: 0.5rem; }
+#chat-form { display: flex; flex-direction: column; gap: 0.2rem; }
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.
@@ -163,55 +207,219 @@ pub const GRAPH_JS: &str = r##"// Dependency-free force-directed graph renderer 
 /// The chat page's client logic (external asset — CSP-safe: the site
 /// policy is script-src 'self' + nonce, so inline scripts are blocked;
 /// /assets/chat.js loads under 'self').
-pub const CHAT_JS: &str = r#"// Librarian chat: post messages to /api/v1/chat and render replies.
+pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/chat/stream (SSE).
 (function () {
   var log = document.getElementById("chat-log");
   var form = document.getElementById("chat-form");
   var input = document.getElementById("chat-input");
+  var sendBtn = form ? form.querySelector("button[type=submit]") : null;
+  var busy = false;
   function addMsg(text, who) {
     var div = document.createElement("div");
     div.className = "chat-msg " + who;
-    div.textContent = text;
+    if (who.indexOf("librarian") === 0) {
+      renderMarkdown(div, text);
+    } else {
+      div.textContent = text;
+    }
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
+    return div;
+  }
+  // Minimal XSS-safe markdown renderer: builds DOM nodes only (never
+  // innerHTML with model text). Supports: fenced code blocks, headings,
+  // bullet lists, inline code, bold, and [text](/path) links (relative
+  // or same-origin only — no javascript:, no external hrefs).
+  function renderMarkdown(container, text) {
+    var lines = text.split("\n");
+    var i = 0;
+    var list = null;
+    function flushList() { if (list) { list = null; } }
+    function inline(parent, str) {
+      // Split on `code`, **bold**, and [text](url) — build nodes.
+      var re = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))/g;
+      var last = 0, m;
+      while ((m = re.exec(str)) !== null) {
+        if (m.index > last) parent.appendChild(document.createTextNode(str.slice(last, m.index)));
+        var tok = m[0];
+        if (tok.charAt(0) === "`") {
+          var code = document.createElement("code");
+          code.textContent = tok.slice(1, -1);
+          parent.appendChild(code);
+        } else if (tok.charAt(0) === "*") {
+          var b = document.createElement("strong");
+          b.textContent = tok.slice(2, -2);
+          parent.appendChild(b);
+        } else {
+          var lm = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
+          if (lm) {
+            var url = lm[2];
+            var ok = url.charAt(0) === "/" || url.indexOf("https://") === 0;
+            if (ok) {
+              var a = document.createElement("a");
+              a.textContent = lm[1];
+              a.href = url;
+              if (url.indexOf("http") === 0) a.rel = "noopener noreferrer";
+              parent.appendChild(a);
+            } else {
+              parent.appendChild(document.createTextNode(lm[1] + " (" + url + ")"));
+            }
+          } else {
+            parent.appendChild(document.createTextNode(tok));
+          }
+        }
+        last = m.index + tok.length;
+      }
+      if (last < str.length) parent.appendChild(document.createTextNode(str.slice(last)));
+    }
+    while (i < lines.length) {
+      var line = lines[i];
+      if (line.indexOf("```") === 0) {
+        flushList();
+        var pre = document.createElement("pre");
+        var codeEl = document.createElement("code");
+        i++;
+        var codeLines = [];
+        while (i < lines.length && lines[i].indexOf("```") !== 0) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++; // skip closing fence
+        codeEl.textContent = codeLines.join("\n");
+        pre.appendChild(codeEl);
+        container.appendChild(pre);
+        continue;
+      }
+      var h = /^(#{1,4}) (.*)$/.exec(line);
+      if (h) {
+        flushList();
+        var heading = document.createElement("h" + (h[1].length + 2 > 6 ? 6 : h[1].length + 2));
+        inline(heading, h[2]);
+        container.appendChild(heading);
+      } else if (/^[-*] /.test(line)) {
+        if (!list) { list = document.createElement("ul"); container.appendChild(list); }
+        var li = document.createElement("li");
+        inline(li, line.slice(2));
+        list.appendChild(li);
+      } else if (/^(\d+)\. /.test(line)) {
+        if (!list) { list = document.createElement("ol"); container.appendChild(list); }
+        var oli = document.createElement("li");
+        inline(oli, line.replace(/^\d+\. /, ""));
+        list.appendChild(oli);
+      } else if (line.trim() === "") {
+        flushList();
+      } else {
+        flushList();
+        var p = document.createElement("p");
+        inline(p, line);
+        container.appendChild(p);
+      }
+      i++;
+    }
+  }
+  function setBusy(state) {
+    busy = state;
+    if (sendBtn) sendBtn.disabled = state;
   }
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
+    if (busy) return;
     var msg = input.value.trim();
     if (!msg) return;
     addMsg(msg, "user");
     input.value = "";
+    setBusy(true);
+    var pending = addMsg("The librarian is thinking…", "librarian pending");
+    var steps = [];
+    function renderPending() {
+      var text = "The librarian is thinking…";
+      if (steps.length) text += "\n\n" + steps.join("\n");
+      pending.textContent = text;
+      log.scrollTop = log.scrollHeight;
+    }
     var csrfMeta = document.querySelector('meta[name="csrf-token"]');
     var body = new URLSearchParams();
     body.set("message", msg);
     body.set("csrf_token", csrfMeta ? csrfMeta.content : "");
-    addMsg("…", "librarian pending");
-    fetch("/api/v1/chat", {
+    fetch("/api/v1/chat/stream", {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
-        "x-csrf-token": csrfMeta ? csrfMeta.content : ""
+        "x-csrf-token": csrfMeta ? csrfMeta.content : "",
+        "accept": "text/event-stream"
       },
       body: body.toString()
     }).then(function (r) {
-      return r.json().then(function (j) { return { status: r.status, j: j }; });
-    }).then(function (res) {
-      var pending = log.querySelector(".pending");
-      if (pending) pending.remove();
-      if (res.status === 200) addMsg(res.j.reply, "librarian");
-      else addMsg(res.j.error || "the librarian is unavailable", "librarian error");
-    }).catch(function () {
-      var pending = log.querySelector(".pending");
-      if (pending) pending.remove();
-      addMsg("request failed", "librarian error");
+      if (!r.ok || !r.body) {
+        return r.json().then(function (j) {
+          throw new Error(j.error || ("HTTP " + r.status));
+        });
+      }
+      var reader = r.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = "";
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) { finish(); return; }
+          buf += decoder.decode(chunk.value, { stream: true });
+          var parts = buf.split("\n\n");
+          buf = parts.pop();
+          parts.forEach(function (part) {
+            var line = part.replace(/^data: /, "");
+            if (!line) return;
+            var ev;
+            try { ev = JSON.parse(line); } catch (e) { return; }
+            if (ev.type === "tool") {
+              steps.push("· " + ev.name + (ev.detail ? " (" + ev.detail + ")" : ""));
+              renderPending();
+            } else if (ev.type === "done") {
+              pending.remove();
+              addMsg(ev.reply, "librarian");
+              setBusy(false);
+            } else if (ev.type === "error") {
+              pending.remove();
+              addMsg(ev.error, "error");
+              setBusy(false);
+            }
+          });
+          return pump();
+        });
+      }
+      function finish() {
+        // Stream ended without a done/error event (e.g. connection
+        // drop): clear the pending state.
+        if (busy) {
+          pending.remove();
+          addMsg("connection closed", "error");
+          setBusy(false);
+        }
+      }
+      return pump();
+    }).catch(function (err) {
+      pending.remove();
+      setBusy(false);
+      addMsg(err.message || "request failed", "error");
     });
   });
 })();
 "#;
 
-/// Write the default assets to `assets_dir` if not present (first boot).
+/// The default assets' content version. Bumped when the built-in
+/// defaults change; a mismatching (or missing) marker file triggers a
+/// refresh, so upgrades deliver new defaults while admins can still
+/// customize (delete the marker to opt out of refreshes, or restore it
+/// to re-opt-in on the next boot).
+pub const ASSETS_VERSION: &str = "2";
+
+/// Write the default assets to `assets_dir`. First boot writes
+/// everything; later boots refresh the defaults when the version
+/// marker is stale (upgrade path) — a present, matching marker means
+/// leave the files alone (admin customization preserved).
 pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(assets_dir)?;
+    let marker = assets_dir.join(".defaults-version");
+    let current = std::fs::read_to_string(&marker).unwrap_or_default();
+    let refresh = current.trim() != ASSETS_VERSION;
     let files = [
         ("style.css", STYLE_CSS),
         ("app.js", APP_JS),
@@ -220,9 +428,12 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
     ];
     for (name, contents) in files {
         let path = assets_dir.join(name);
-        if !path.exists() {
+        if !path.exists() || refresh {
             std::fs::write(path, contents)?;
         }
+    }
+    if refresh {
+        std::fs::write(&marker, ASSETS_VERSION)?;
     }
     Ok(())
 }
@@ -238,12 +449,40 @@ mod tests {
         assert!(dir.path().join("style.css").exists());
         assert!(dir.path().join("app.js").exists());
         assert!(dir.path().join("graph.js").exists());
-        // Idempotent: does not overwrite.
+        assert!(dir.path().join("chat.js").exists());
+        // Same version: does not overwrite (admin customization safe).
         std::fs::write(dir.path().join("style.css"), "custom").unwrap();
         scaffold_defaults(dir.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("style.css")).unwrap(),
             "custom"
+        );
+    }
+
+    #[test]
+    fn version_bump_refreshes_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_defaults(dir.path()).unwrap();
+        // Simulate an old-version deployment with customized assets.
+        std::fs::write(dir.path().join("style.css"), "old custom").unwrap();
+        std::fs::write(dir.path().join(".defaults-version"), "1").unwrap();
+        scaffold_defaults(dir.path()).unwrap();
+        // Refreshed to the current defaults + marker updated.
+        assert!(
+            std::fs::read_to_string(dir.path().join("style.css"))
+                .unwrap()
+                .contains("--bg:")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".defaults-version")).unwrap(),
+            ASSETS_VERSION
+        );
+        // And idempotent again.
+        std::fs::write(dir.path().join("style.css"), "new custom").unwrap();
+        scaffold_defaults(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("style.css")).unwrap(),
+            "new custom"
         );
     }
 }

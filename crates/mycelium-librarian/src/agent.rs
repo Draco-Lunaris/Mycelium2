@@ -89,6 +89,17 @@ pub async fn run_mutation(
     })
 }
 
+/// A progress event emitted during a streaming agent run.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// The agent is invoking a tool (name + short argument summary).
+    Tool { name: String, detail: String },
+    /// The final answer.
+    Done(String),
+    /// The run failed.
+    Failed(String),
+}
+
 /// Run the agent in chat mode (write tools enabled, full history).
 /// Returns the assistant's reply.
 pub async fn run_chat(
@@ -96,6 +107,23 @@ pub async fn run_chat(
     store: &ConceptStore<'_>,
     history: &[ConversationTurn],
 ) -> Result<String, AgentError> {
+    run_chat_streaming(client, store, history, None).await
+}
+
+/// Streaming chat: same loop as run_chat, but emits progress events to
+/// the caller's channel (the web layer streams them as SSE). The
+/// final reply is still returned.
+pub async fn run_chat_streaming(
+    client: &LlmClient,
+    store: &ConceptStore<'_>,
+    history: &[ConversationTurn],
+    events: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+) -> Result<String, AgentError> {
+    let emit = |event: AgentEvent| {
+        if let Some(tx) = &events {
+            let _ = tx.send(event);
+        }
+    };
     let system = build_system_prompt(store, AgentMode::Chat).await?;
     let tools = all_tool_specs();
     // Seed the loop with the provided history (the last turn is the
@@ -106,11 +134,18 @@ pub async fn run_chat(
             .chat_with_tools(&system, &conversation, &tools, 0.2)
             .await?;
         match output {
-            StepOutput::Text(answer) => return Ok(answer),
+            StepOutput::Text(answer) => {
+                emit(AgentEvent::Done(answer.clone()));
+                return Ok(answer);
+            }
             StepOutput::ToolCalls(calls) => {
                 // OpenAI protocol: echo the assistant tool_calls turn.
                 conversation.push(ConversationTurn::AssistantToolCalls(calls.clone()));
                 for call in calls {
+                    emit(AgentEvent::Tool {
+                        name: call.function.name.clone(),
+                        detail: call.function.arguments.chars().take(120).collect(),
+                    });
                     // Tool errors go back to the model (recovery), same
                     // as the query/mutation loops.
                     let result = match execute_tool_tracked(store, &call, true).await {
@@ -125,6 +160,8 @@ pub async fn run_chat(
             }
         }
     }
+    let err = AgentError::StepCapExceeded.to_string();
+    emit(AgentEvent::Failed(err.clone()));
     Err(AgentError::StepCapExceeded)
 }
 

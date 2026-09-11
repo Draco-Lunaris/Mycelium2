@@ -48,6 +48,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/ingest/{id}", get(api_ingest_job))
         .route("/passages", get(api_passage))
         .route("/chat", post(api_chat))
+        .route("/chat/stream", post(api_chat_stream))
 }
 
 // ---------- JSON API ----------
@@ -373,6 +374,30 @@ impl IntoResponseWithBody
     }
 }
 
+/// Helper trait for a streaming (SSE) body response with two headers.
+trait IntoResponseWithBytesStream: Sized {
+    fn into_response_with_bytes_stream(self, body: axum::body::Body) -> Response;
+}
+
+impl IntoResponseWithBytesStream
+    for (
+        StatusCode,
+        [(axum::http::header::HeaderName, &'static str); 2],
+    )
+{
+    fn into_response_with_bytes_stream(self, body: axum::body::Body) -> Response {
+        let (status, headers) = self;
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        for (name, value) in headers {
+            response
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_static(value));
+        }
+        response
+    }
+}
+
 /// Helper trait for a binary (bytes) body response with three headers.
 trait IntoResponseWithBytes3: Sized {
     fn into_response_with_bytes(self, body: Vec<u8>) -> Response;
@@ -487,6 +512,8 @@ pub async fn login_page(State(_state): State<AppState>) -> Response {
 pub async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     if let Some(session_id) = crate::middleware::session_id_from_headers(&headers) {
         let _ = state.sessions.delete(session_id).await;
+        // Chat history is session-scoped ephemeral state — drop it.
+        state.chat_history.clear(session_id);
     }
     let mut response = Redirect::to("/login").into_response();
     response.headers_mut().insert(
@@ -1582,6 +1609,7 @@ pub struct ChatMessageForm {
 pub async fn api_chat(
     State(state): State<AppState>,
     user: SessionUser,
+    session: SessionId,
     axum::Form(form): axum::Form<ChatMessageForm>,
 ) -> Response {
     if form.message.trim().is_empty() {
@@ -1595,11 +1623,23 @@ pub async fn api_chat(
     let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
     let llm = llm.unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
-    let history = vec![mycelium_librarian::llm::ConversationTurn::User(
+    // Multi-turn memory: the session's prior turns + this message.
+    let mut history = state.chat_history.get(session.0);
+    history.push(mycelium_librarian::llm::ConversationTurn::User(
         form.message.clone(),
-    )];
+    ));
     match mycelium_librarian::agent::run_chat(&client, &cs, &history).await {
-        Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
+        Ok(reply) => {
+            state.chat_history.push(
+                session.0,
+                mycelium_librarian::llm::ConversationTurn::User(form.message.clone()),
+            );
+            state.chat_history.push(
+                session.0,
+                mycelium_librarian::llm::ConversationTurn::Assistant(reply.clone()),
+            );
+            Json(serde_json::json!({ "reply": reply })).into_response()
+        }
         Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
             tracing::warn!(error = %e, "librarian chat LLM failure");
             error_response(
@@ -1612,6 +1652,103 @@ pub async fn api_chat(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
+}
+
+/// POST /api/v1/chat/stream — the streaming variant: server-sent
+/// events with the agent's progress (tool invocations) and the final
+/// reply. Event format (one JSON object per SSE `data:` line):
+///   {"type":"tool","name":"search_knowledge","detail":"..."}
+///   {"type":"done","reply":"..."}
+///   {"type":"error","error":"..."}
+pub async fn api_chat_stream(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    axum::Form(form): axum::Form<ChatMessageForm>,
+) -> Response {
+    if form.message.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty message");
+    }
+    let master = match state.master_key_for(user.user_id).await {
+        Ok(m) => m,
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+    };
+    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
+    let llm = llm.unwrap_or_default();
+    let client = mycelium_librarian::llm::LlmClient::new(&llm);
+    // Multi-turn memory: the session's prior turns + this message.
+    let mut history = state.chat_history.get(session.0);
+    history.push(mycelium_librarian::llm::ConversationTurn::User(
+        form.message.clone(),
+    ));
+    state.chat_history.push(
+        session.0,
+        mycelium_librarian::llm::ConversationTurn::User(form.message.clone()),
+    );
+
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<mycelium_librarian::agent::AgentEvent>();
+    let run_tx = tx.clone();
+    // The agent runs in a task owning its own Store clone (Store is
+    // cheap-clone: pool handle + path) so the ConceptStore's borrow
+    // lives inside the task. The handler streams events as they
+    // arrive; transport errors that abort before any event surface as
+    // a Failed event.
+    let task_store = (*state.store).clone();
+    tokio::spawn(async move {
+        let cs = ConceptStore::for_user(&task_store, user.user_id, master);
+        let result = mycelium_librarian::agent::run_chat_streaming(
+            &client,
+            &cs,
+            &history,
+            Some(run_tx.clone()),
+        )
+        .await;
+        if let Err(e) = result {
+            let msg = if matches!(e, mycelium_librarian::agent::AgentError::Llm(_)) {
+                "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal"
+            } else {
+                "internal error"
+            };
+            let _ = run_tx.send(mycelium_librarian::agent::AgentEvent::Failed(
+                msg.to_string(),
+            ));
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            let payload = match &event {
+                mycelium_librarian::agent::AgentEvent::Tool { name, detail } => {
+                    serde_json::json!({ "type": "tool", "name": name, "detail": detail })
+                }
+                mycelium_librarian::agent::AgentEvent::Done(reply) => {
+                    // Multi-turn memory: record the assistant reply.
+                    state.chat_history.push(
+                        session.0,
+                        mycelium_librarian::llm::ConversationTurn::Assistant(reply.clone()),
+                    );
+                    serde_json::json!({ "type": "done", "reply": reply })
+                }
+                mycelium_librarian::agent::AgentEvent::Failed(error) => {
+                    serde_json::json!({ "type": "error", "error": error })
+                }
+            };
+            yield Ok::<String, std::convert::Infallible>(format!("data: {payload}\n\n"));
+            if matches!(event, mycelium_librarian::agent::AgentEvent::Done(_) | mycelium_librarian::agent::AgentEvent::Failed(_)) {
+                break;
+            }
+        }
+    };
+    let body = axum::body::Body::from_stream(stream);
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+    )
+        .into_response_with_bytes_stream(body)
 }
 
 /// GET /chat — the chat page (librarian agent over the user's bundle).

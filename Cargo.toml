@@ -24,6 +24,7 @@ rust-version = "1.88"
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
+async-stream = "0.3"
 
 # HTTP / web
 axum = { version = "0.8", features = ["macros", "multipart"] }
