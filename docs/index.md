@@ -63,5 +63,8 @@ cat data/config/initial-admin-password
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0 — see [LICENSE](../LICENSE),
-[LICENSE-MIT](../LICENSE-MIT), and [LICENSE-APACHE](../LICENSE-APACHE).
+Dual-licensed under MIT OR Apache-2.0 — see
+[LICENSE](https://github.com/Draco-Lunaris/Mycelium2/blob/master/LICENSE),
+[LICENSE-MIT](https://github.com/Draco-Lunaris/Mycelium2/blob/master/LICENSE-MIT),
+and
+[LICENSE-APACHE](https://github.com/Draco-Lunaris/Mycelium2/blob/master/LICENSE-APACHE).
