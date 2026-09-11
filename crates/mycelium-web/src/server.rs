@@ -179,13 +179,33 @@ pub async fn serve(
     let router = build_router_with_shutdown(state, shutdown.clone());
     let tls = cert::load_or_create_tls_config(data_dir, cert_path, key_path).await?;
 
-    // HTTP:80 → HTTPS redirect.
+    // HTTP:80 → HTTPS redirect. Preserves the request Host (so the
+    // redirect targets the hostname the client actually used) and the
+    // path + query.
     let redirect_addr = http_addr;
     let https_port = https_addr.port();
     let http_redirect = tokio::spawn(async move {
-        let app = Router::new().fallback(move || async move {
-            Redirect::to(&format!("https://localhost:{https_port}/"))
-        });
+        let app = Router::new().fallback(
+            move |headers: axum::http::HeaderMap, uri: axum::http::Uri| async move {
+                // Host header (strip any client-supplied port — the
+                // redirect port is the server's https_port).
+                let host = headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|h| {
+                        h.rsplit_once(':')
+                            .map(|(name, _)| name)
+                            .unwrap_or(h)
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "localhost".to_string());
+                let path_and_query = uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                Redirect::to(&format!("https://{host}:{https_port}{path_and_query}"))
+            },
+        );
         match tokio::net::TcpListener::bind(redirect_addr).await {
             Ok(listener) => {
                 let _ = axum::serve(listener, app).await;
