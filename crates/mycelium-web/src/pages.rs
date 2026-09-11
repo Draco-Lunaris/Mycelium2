@@ -314,6 +314,7 @@ pub fn admin_page(
     llm_url: &str,
     llm_model: &str,
     bookshelves: &[(String, bool)],
+    ingest_jobs: &[(String, String, String, String, String)],
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
@@ -336,6 +337,29 @@ pub fn admin_page(
                 r#"<tr><td>{}</td><td>{}</td></tr>"#,
                 html_escape(name),
                 if *global { "global-read" } else { "private" }
+            )
+        })
+        .collect::<String>();
+    let shelf_options = bookshelves
+        .iter()
+        .map(|(name, _)| {
+            format!(
+                r#"<option value="{}">{}</option>"#,
+                html_escape(name),
+                html_escape(name)
+            )
+        })
+        .collect::<String>();
+    let job_rows = ingest_jobs
+        .iter()
+        .map(|(slug, status, detail, created, shelf)| {
+            format!(
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                html_escape(slug),
+                html_escape(status),
+                html_escape(detail),
+                html_escape(created),
+                html_escape(shelf)
             )
         })
         .collect::<String>();
@@ -379,6 +403,17 @@ pub fn admin_page(
   <label>Global read</label><select name="global"><option value="0">private</option><option value="1">global-read</option></select>
   <button type="submit">Create bookshelf</button>
 </form>
+<h2>Upload book</h2>
+<p class="muted">Markdown (.md) up to 32 MiB. The librarian catalogs it onto the bookshelf (LLM-assisted when the configured backend is reachable; heuristic otherwise).</p>
+<form method="post" action="/api/v1/ingest" enctype="multipart/form-data">
+  <label>Bookshelf</label><select name="bookshelf" required>{shelf_options}</select>
+  <label>Slug</label><input name="slug" required pattern="[a-zA-Z0-9-]+" placeholder="my-book">
+  <label>Title</label><input name="title" required>
+  <label>Book file (.md)</label><input name="file" type="file" accept=".md,text/markdown" required>
+  <button type="submit">Upload and ingest</button>
+</form>
+<h2>Ingest jobs</h2>
+<table><tr><th>Book</th><th>Status</th><th>Detail</th><th>Created</th><th>Shelf</th></tr>{job_rows}</table>
 <h2>Maintenance</h2>
 <form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>"#,
         flash(ok, err),

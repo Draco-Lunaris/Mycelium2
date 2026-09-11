@@ -70,6 +70,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let login = mycelium_auth::login::LoginService::new(store.pool().clone());
     let state = mycelium_web::AppState::new(store, service_key, login, assets_dir);
 
+    // Librarian boot sweep: fail jobs interrupted by a previous
+    // shutdown, requeue pending ones.
+    match state.librarian.recover_on_boot().await {
+        Ok(requeued) if !requeued.is_empty() => {
+            tracing::info!(count = requeued.len(), "requeued pending ingest jobs");
+            // Run them now (best-effort; failures are recorded per job).
+            if let Err(e) = state.librarian.run_pending().await {
+                tracing::error!(error = %e, "ingest requeue run failed");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "librarian boot sweep failed"),
+    }
+
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

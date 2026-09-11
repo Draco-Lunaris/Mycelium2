@@ -34,6 +34,16 @@ pub fn api_routes() -> Router<AppState> {
                 .delete(api_delete_concept),
         )
         .route("/health", get(health_detail))
+        // Phase 7: book ingest + passages. The upload route accepts
+        // multipart bodies up to 33 MiB (32 MiB book + overhead).
+        .route(
+            "/ingest",
+            get(api_ingest_jobs)
+                .post(api_upload_book)
+                .layer(axum::extract::DefaultBodyLimit::max(33 * 1024 * 1024)),
+        )
+        .route("/ingest/{id}", get(api_ingest_job))
+        .route("/passages", get(api_passage))
 }
 
 // ---------- JSON API ----------
@@ -755,6 +765,24 @@ pub async fn admin_view(
     let llm = llm.unwrap_or_default();
     let shelves = state.store.list_bookshelves().await.unwrap_or_default();
     let shelf_tuples: Vec<(String, bool)> = shelves.into_iter().collect();
+    // Ingest jobs (slug, status, detail, created, shelf name).
+    let jobs = state.store.list_ingest_jobs(20).await.unwrap_or_default();
+    let mut job_rows: Vec<(String, String, String, String, String)> = Vec::new();
+    for j in &jobs {
+        let shelf_name = state
+            .store
+            .bookshelf_name(j.bookshelf_id)
+            .await
+            .unwrap_or_default();
+        let slug = state.store.book_slug(j.book_id).await.unwrap_or_default();
+        job_rows.push((
+            slug,
+            j.status.as_str().to_string(),
+            j.detail.clone(),
+            j.created_at.to_rfc3339(),
+            shelf_name,
+        ));
+    }
     // RequireAdmin guarantees the session user is an admin; fetch for render.
     let admin = request_admin_user(&state, &session).await;
     pages::admin_page(
@@ -765,6 +793,7 @@ pub async fn admin_view(
         &llm.url,
         &llm.model,
         &shelf_tuples,
+        &job_rows,
         params.created.as_deref(),
         params.error.as_deref(),
     )
@@ -905,4 +934,215 @@ pub async fn admin_backup(
         "note": "full tar backup ships in Phase 9",
     });
     (StatusCode::OK, Json(manifest)).into_response()
+}
+
+// ---------- Phase 7: book ingest + passages ----------
+
+/// Maximum accepted book upload (matches the middleware's multipart
+/// CSRF buffer cap; the original Mycelium used 32 MiB).
+pub const MAX_BOOK_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+pub struct UploadForm {
+    pub bookshelf: String,
+    pub slug: String,
+    pub title: String,
+}
+
+/// POST /api/v1/ingest — multipart book upload (admin only).
+///
+/// Fields: `bookshelf` (name), `slug`, `title`, `file` (the .md text),
+/// plus the CSRF token (verified by the middleware's multipart path).
+/// Creates the book + job rows and runs the ingest inline (the job
+/// status is visible via GET /api/v1/ingest/{id}).
+pub async fn api_upload_book(
+    State(state): State<AppState>,
+    user: SessionUser,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    let mut bookshelf = String::new();
+    let mut slug = String::new();
+    let mut title = String::new();
+    let mut file: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "bookshelf" => bookshelf = field.text().await.unwrap_or_default(),
+            "slug" => slug = field.text().await.unwrap_or_default(),
+            "title" => title = field.text().await.unwrap_or_default(),
+            "file" => match field.bytes().await {
+                Ok(bytes) => file = Some(bytes.to_vec()),
+                Err(e) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("file read failed: {e}"),
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+    let Some(file) = file else {
+        return error_response(StatusCode::BAD_REQUEST, "missing file field");
+    };
+    if file.len() > MAX_BOOK_BYTES {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "book exceeds 32 MiB");
+    }
+    let Some(text) = String::from_utf8(file).ok() else {
+        return error_response(StatusCode::BAD_REQUEST, "book must be UTF-8 markdown");
+    };
+    if text.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "book text is empty");
+    }
+    // Resolve the bookshelf by name.
+    let shelf_id = match state.store.bookshelf_id_by_name(&bookshelf).await {
+        Ok(Some(id)) => id,
+        _ => return error_response(StatusCode::BAD_REQUEST, "unknown bookshelf"),
+    };
+    let user_id = user.user_id;
+    let slug = mycelium_librarian::slugify(&slug);
+    if slug.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid slug");
+    }
+    match state
+        .librarian
+        .submit(shelf_id, user_id, &slug, &title, &text)
+        .await
+    {
+        Ok(job) => {
+            // Run only the submitted job inline (one job per user; the
+            // request blocks until THIS catalog is written — never the
+            // whole queue, which could stall for minutes).
+            let _ = state.librarian.run_job(job.job_id).await;
+            let status = state.librarian.job_status(job.job_id).await;
+            let status = status.ok().flatten();
+            let (status_str, detail) = status
+                .map(|s| (s.status.as_str(), s.detail))
+                .unwrap_or(("unknown", String::new()));
+            if status_str == "done" {
+                crate::state::Metrics::inc(&state.metrics.books_ingested);
+            } else if status_str == "failed" {
+                crate::state::Metrics::inc(&state.metrics.ingest_failures);
+            }
+            let body = serde_json::json!({
+                "job_id": job.job_id,
+                "book_id": job.book_id,
+                "slug": job.slug,
+                "status": status_str,
+                "detail": detail,
+            });
+            (StatusCode::ACCEPTED, Json(body)).into_response()
+        }
+        Err(mycelium_librarian::WorkerError::UserBusy) => error_response(
+            StatusCode::CONFLICT,
+            "user already has an ingest job running",
+        ),
+        Err(mycelium_librarian::WorkerError::Store(mycelium_store::BooksError::DuplicateSlug(
+            s,
+        ))) => error_response(StatusCode::CONFLICT, &format!("duplicate book slug: {s}")),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// GET /api/v1/ingest — list recent ingest jobs (admin only).
+pub async fn api_ingest_jobs(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    let jobs = state.store.list_ingest_jobs(50).await.unwrap_or_default();
+    let body: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "bookshelf_id": j.bookshelf_id,
+                "book_id": j.book_id,
+                "status": j.status.as_str(),
+                "detail": j.detail,
+                "created_at": j.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Json(body).into_response()
+}
+
+/// GET /api/v1/ingest/{id} — one job's status (admin only).
+pub async fn api_ingest_job(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Ok(id) = uuid::Uuid::parse_str(&id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid job id");
+    };
+    match state.librarian.job_status(id).await {
+        Ok(Some(status)) => Json(serde_json::json!({
+            "id": status.id,
+            "status": status.status.as_str(),
+            "detail": status.detail,
+        }))
+        .into_response(),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "job not found"),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PassageParams {
+    /// A `book://<slug>#<anchor>` resource string.
+    pub resource: String,
+}
+
+/// GET /api/v1/passages?resource=book://slug#anchor — read a passage
+/// from the shared library stacks. Global-read bookshelves are
+/// readable by all users; admin-private ones by admins only.
+pub async fn api_passage(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(params): Query<PassageParams>,
+) -> Response {
+    let Some(book_ref) = mycelium_core::library::parse_book_ref(&params.resource) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid book:// resource");
+    };
+    // The book must exist and its shelf must be global-read (or the
+    // requester is an admin).
+    let Some(book) = state
+        .store
+        .book_by_slug(&book_ref.slug)
+        .await
+        .unwrap_or(None)
+    else {
+        return error_response(StatusCode::NOT_FOUND, "book not found");
+    };
+    let shelf_row: Option<(i64,)> =
+        sqlx::query_as("SELECT is_global_read FROM bookshelves WHERE id = ?")
+            .bind(book.bookshelf_id.to_string())
+            .fetch_optional(state.store.pool())
+            .await
+            .ok()
+            .flatten();
+    let Some((is_global,)) = shelf_row else {
+        return error_response(StatusCode::NOT_FOUND, "bookshelf not found");
+    };
+    if is_global == 0 && user.role != Role::Admin {
+        return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
+    }
+    // Read the stack text and extract the passage.
+    let text =
+        match mycelium_librarian::read_stack_text(&state.store, &state.service_key, &book_ref.slug)
+            .await
+        {
+            Ok(t) => t,
+            Err(_) => return error_response(StatusCode::NOT_FOUND, "book text unavailable"),
+        };
+    match mycelium_core::library::extract_passage(&book_ref.slug, &book_ref.anchor, &text) {
+        Ok(passage) => Json(serde_json::json!({
+            "slug": passage.slug,
+            "anchor": passage.anchor,
+            "text": passage.text,
+        }))
+        .into_response(),
+        Err(e) => error_response(StatusCode::NOT_FOUND, &e.to_string()),
+    }
 }

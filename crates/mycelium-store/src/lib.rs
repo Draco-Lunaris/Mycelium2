@@ -1,5 +1,6 @@
 //! Embedded storage: SQLite metadata + encrypted file repository.
 
+pub mod books;
 pub mod concept_store;
 pub mod config;
 pub mod file_repo;
@@ -7,6 +8,7 @@ pub mod migrations;
 pub mod models;
 pub mod search_index;
 
+pub use books::{BookRow, BooksError};
 pub use concept_store::{ConceptEntry, ConceptScope, ConceptStore, ConceptStoreError};
 pub use config::ConfigError;
 pub use config::ConfigStore;
@@ -117,6 +119,37 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(|(n, g)| (n, g != 0)).collect())
+    }
+
+    /// Look up a bookshelf id by name.
+    pub async fn bookshelf_id_by_name(&self, name: &str) -> Result<Option<uuid::Uuid>, StoreError> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM bookshelves WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|(id,)| uuid::Uuid::parse_str(&id).ok()))
+    }
+
+    /// Look up a bookshelf name by id.
+    pub async fn bookshelf_name(&self, id: uuid::Uuid) -> Option<String> {
+        sqlx::query_as::<_, (String,)>("SELECT name FROM bookshelves WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|(n,)| n)
+    }
+
+    /// Look up a book slug by book id.
+    pub async fn book_slug(&self, book_id: uuid::Uuid) -> Option<String> {
+        sqlx::query_as::<_, (String,)>("SELECT slug FROM books WHERE id = ?")
+            .bind(book_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|(s,)| s)
     }
 
     /// Run a closure inside a transaction; rolls back on error.

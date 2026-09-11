@@ -74,6 +74,16 @@ async fn metrics(State(state): State<AppState>) -> Response {
         "# TYPE mycelium2_searches_total counter\nmycelium2_searches_total {}",
         m.searches_total.load(std::sync::atomic::Ordering::Relaxed)
     );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_books_ingested_total counter\nmycelium2_books_ingested_total {}",
+        m.books_ingested.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_ingest_failures_total counter\nmycelium2_ingest_failures_total {}",
+        m.ingest_failures.load(std::sync::atomic::Ordering::Relaxed)
+    );
     (
         axum::http::StatusCode::OK,
         [(

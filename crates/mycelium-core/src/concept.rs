@@ -6,20 +6,27 @@ use crate::reserved_names;
 
 /// Frontmatter of an OKF concept. `type` is the only required field;
 /// all others are optional and unknown fields are ignored (lenient parsing).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Frontmatter {
     #[serde(rename = "type", default)]
     pub concept_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Book catalog concepts: the hub path this concept belongs to
+    /// (`/<slug>/book.md` on chapter concepts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub book: Option<String>,
+    /// Chapter concepts: 1-based chapter index within the book.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter_index: Option<u32>,
 }
 
 /// A parsed OKF concept: frontmatter + markdown body + canonical path.
@@ -202,5 +209,28 @@ mod tests {
         assert!(is_reserved_filename("log.md"));
         assert!(is_reserved_filename("info.md"));
         assert!(!is_reserved_filename("users.md"));
+    }
+
+    #[test]
+    fn book_catalog_fields_round_trip() {
+        let src = "---\ntype: Chapter\ntitle: Chapter One\nbook: /my-book/book.md\nchapter_index: 1\n---\n\nBody.\n";
+        let c = Concept::parse("/my-book/ch-1-one.md", src).unwrap();
+        assert_eq!(c.frontmatter.book.as_deref(), Some("/my-book/book.md"));
+        assert_eq!(c.frontmatter.chapter_index, Some(1));
+        let md = c.to_markdown().unwrap();
+        assert!(md.contains("book: /my-book/book.md"));
+        assert!(md.contains("chapter_index: 1"));
+        let c2 = Concept::parse("/my-book/ch-1-one.md", &md).unwrap();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn optional_fields_omitted_when_absent() {
+        let c = Concept::parse("/x.md", "---\ntype: Note\n---\n\nhi\n").unwrap();
+        let md = c.to_markdown().unwrap();
+        assert!(!md.contains("title:"));
+        assert!(!md.contains("tags:"));
+        assert!(!md.contains("book:"));
+        assert!(!md.contains("chapter_index:"));
     }
 }

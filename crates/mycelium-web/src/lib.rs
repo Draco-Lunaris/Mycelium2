@@ -14,17 +14,6 @@ pub use state::{AppState, MasterKeyCache};
 
 /// Admin-managed LLM backend config (stored in ConfigStore under "llm").
 /// Ollama default per DESIGN; any OpenAI-compatible endpoint works.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LlmConfig {
-    pub url: String,
-    pub model: String,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            url: "http://localhost:11434/v1".into(),
-            model: "default".into(),
-        }
-    }
-}
+/// The canonical definition lives in mycelium-librarian (the consumer);
+/// re-exported here for existing callers.
+pub use mycelium_librarian::llm::LlmConfig;

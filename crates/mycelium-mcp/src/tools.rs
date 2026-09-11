@@ -172,10 +172,8 @@ pub async fn memory_add(
         Frontmatter {
             concept_type: concept_type.to_string(),
             title: Some(title),
-            description: None,
-            resource: None,
-            tags: vec![],
             timestamp: Some(now_rfc3339()),
+            ..Default::default()
         },
         args.content.clone(),
         path,

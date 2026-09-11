@@ -153,10 +153,7 @@ mod tests {
             Frontmatter {
                 concept_type: "Note".into(),
                 title: Some(path.to_string()),
-                description: None,
-                resource: None,
-                tags: vec![],
-                timestamp: None,
+                ..Default::default()
             },
             body.to_string(),
             path.into(),

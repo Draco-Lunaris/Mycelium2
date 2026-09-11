@@ -149,11 +149,13 @@ pub async fn csrf_protect(
     };
 
     let (mut parts, body) = request.into_parts();
-    let is_form = parts
+    let content_type = parts
         .headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+        .unwrap_or("");
+    let is_form = content_type.starts_with("application/x-www-form-urlencoded");
+    let is_multipart = content_type.starts_with("multipart/form-data");
 
     let presented = parts
         .headers
@@ -192,6 +194,33 @@ pub async fn csrf_protect(
                 }
             }
         }
+        None if is_multipart => {
+            // Multipart upload (book ingest): buffer the body (uploads are
+            // legitimately large — 33 MiB cap), extract the csrf_token
+            // field with a boundary-aware parse, verify, restore.
+            match axum::body::to_bytes(body, 33 * 1024 * 1024).await {
+                Ok(bytes) => {
+                    let token = multipart_field(&bytes, content_type, "csrf_token");
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    let restored = axum::http::Request::from_parts(
+                        parts.clone(),
+                        axum::body::Body::from(bytes.clone()),
+                    );
+                    match token {
+                        Some(token) => {
+                            return verify_and_continue(state, session, token, restored, next)
+                                .await;
+                        }
+                        None => {
+                            return (StatusCode::FORBIDDEN, "missing CSRF token").into_response();
+                        }
+                    }
+                }
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "body read failed").into_response();
+                }
+            }
+        }
         None => None,
     };
 
@@ -202,6 +231,55 @@ pub async fn csrf_protect(
         }
         None => (StatusCode::FORBIDDEN, "missing CSRF token").into_response(),
     }
+}
+
+/// Extract a field's value from a buffered multipart/form-data body.
+/// Boundary-aware but minimal: finds the named part and returns its
+/// body bytes decoded as UTF-8 (lossy). Returns None when the field is
+/// absent or the body is malformed.
+fn multipart_field(body: &[u8], content_type: &str, field: &str) -> Option<String> {
+    // boundary="..." or boundary=...
+    let idx = content_type.find("boundary=")?;
+    let raw = &content_type[idx + "boundary=".len()..];
+    let boundary = raw
+        .strip_prefix('"')
+        .and_then(|r| r.split_once('"').map(|(b, _)| b))
+        .unwrap_or_else(|| raw.split(';').next().unwrap_or(raw));
+    if boundary.is_empty() {
+        return None;
+    }
+    let delim = format!("--{boundary}");
+    let text = body;
+    let mut pos = 0usize;
+    while let Some(start) = find_subsequence(&text[pos..], delim.as_bytes()) {
+        let abs = pos + start + delim.len();
+        // Part header runs to a blank line; body runs to the next delimiter.
+        let header_end_rel = find_subsequence(&text[abs..], b"\r\n\r\n")?;
+        let headers = String::from_utf8_lossy(&text[abs..abs + header_end_rel]).to_string();
+        let body_start = abs + header_end_rel + 4;
+        let next_delim = find_subsequence(&text[body_start..], delim.as_bytes())?;
+        // Trim the trailing CRLF before the boundary.
+        let mut body_end = body_start + next_delim;
+        if body_end >= 2 && &text[body_end - 2..body_end] == b"\r\n" {
+            body_end -= 2;
+        }
+        if headers
+            .to_lowercase()
+            .contains(&format!("name=\"{field}\"").to_lowercase())
+        {
+            return Some(String::from_utf8_lossy(&text[body_start..body_end]).to_string());
+        }
+        pos = body_start;
+    }
+    None
+}
+
+/// Find a subsequence in a byte slice.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Verify the presented token against the session and continue.

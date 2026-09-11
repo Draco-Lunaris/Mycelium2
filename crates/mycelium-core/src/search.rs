@@ -160,10 +160,7 @@ mod tests {
             Frontmatter {
                 concept_type: "Note".into(),
                 title: Some(title.into()),
-                description: None,
-                resource: None,
-                tags: vec![],
-                timestamp: None,
+                ..Default::default()
             },
             body.into(),
             path.into(),
@@ -218,9 +215,8 @@ mod tests {
                 concept_type: "Skill".into(),
                 title: Some("Deploy Rust Service".into()),
                 description: Some("Skill for deploying rust services".into()),
-                resource: None,
                 tags: vec!["skill".into(), "rust".into()],
-                timestamp: None,
+                ..Default::default()
             },
             "# Instructions\n\nRun cargo build --release.".into(),
             "/skills/deploy-rust-service.md".into(),

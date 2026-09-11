@@ -27,6 +27,8 @@ pub struct Metrics {
     pub concepts_read: AtomicU64,
     pub searches_total: AtomicU64,
     pub requests_total: AtomicU64,
+    pub books_ingested: AtomicU64,
+    pub ingest_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -46,6 +48,8 @@ pub struct AppState {
     pub service_key: Arc<ServiceKey>,
     pub master_keys: Arc<MasterKeyCache>,
     pub metrics: Arc<Metrics>,
+    /// The in-process librarian (book ingest worker).
+    pub librarian: Arc<mycelium_librarian::LibrarianWorker>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
 }
@@ -58,15 +62,23 @@ impl AppState {
         assets_dir: std::path::PathBuf,
     ) -> Self {
         let pool = store.pool().clone();
+        let store = Arc::new(store);
+        let config = Arc::new(ConfigStore::new(pool.clone()));
+        let librarian = Arc::new(mycelium_librarian::LibrarianWorker::new(
+            Arc::clone(&store),
+            Arc::new(service_key.clone()),
+            Arc::clone(&config),
+        ));
         Self {
-            store: Arc::new(store),
+            store,
             users: Arc::new(UserStore::new(pool.clone())),
             sessions: Arc::new(SessionManager::new(pool.clone())),
-            config: Arc::new(ConfigStore::new(pool)),
+            config,
             login: Arc::new(login),
             service_key: Arc::new(service_key),
             master_keys: Arc::new(MasterKeyCache::default()),
             metrics: Arc::new(Metrics::default()),
+            librarian,
             assets_dir,
         }
     }

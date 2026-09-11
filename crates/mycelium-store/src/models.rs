@@ -90,6 +90,7 @@ impl IngestStatus {
 pub struct IngestJob {
     pub id: Uuid,
     pub bookshelf_id: Uuid,
+    pub book_id: Uuid,
     pub requested_by_user_id: Uuid,
     pub status: IngestStatus,
     pub detail: String,

@@ -125,14 +125,20 @@ pub fn extract_passage(slug: &str, anchor: &str, full_text: &str) -> Result<Pass
     })
 }
 
-/// Extract the n-th chapter (1-based): from its `# ` heading to the next `# ` heading.
+/// Extract the n-th chapter (1-based): from its `# ` heading to the next
+/// `# ` heading. Headings inside fenced code blocks are ignored (mirrors
+/// the librarian's `parse_outline`, so anchors line up with the catalog).
 fn extract_chapter(text: &str, index: u32) -> Result<String, PassageError> {
     let mut seen = 0u32;
     let mut start = None;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut offset = 0usize;
+    let mut in_fence = false;
     for line in &lines {
-        if line.starts_with("# ") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && trimmed.starts_with("# ") {
             seen += 1;
             if seen == index {
                 start = Some(offset);
@@ -152,14 +158,19 @@ fn extract_chapter(text: &str, index: u32) -> Result<String, PassageError> {
 }
 
 /// Extract the m-th section (1-based) of the n-th chapter (1-based).
+/// Headings inside fenced code blocks are ignored (mirrors `parse_outline`).
 fn extract_section(text: &str, chapter: u32, section: u32) -> Result<String, PassageError> {
     // Find the chapter's start offset first.
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut seen_ch = 0u32;
     let mut ch_start_offset = None;
     let mut offset = 0usize;
+    let mut in_fence = false;
     for line in &lines {
-        if line.starts_with("# ") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && trimmed.starts_with("# ") {
             seen_ch += 1;
             if seen_ch == chapter {
                 ch_start_offset = Some(offset);
@@ -178,14 +189,17 @@ fn extract_section(text: &str, chapter: u32, section: u32) -> Result<String, Pas
     let mut seen_sec = 0u32;
     let mut sec_start = None;
     let mut offset = 0usize;
+    let mut in_fence = false;
     for line in &ch_lines {
-        if offset > 0 && line.starts_with("# ") {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && offset > 0 && trimmed.starts_with("# ") {
             // Next chapter begins — return up to here (or not found).
             return sec_start
                 .map(|s| chapter_text[s..offset].to_string())
                 .ok_or_else(|| PassageError::AnchorNotFound(format!("sec-{chapter}-{section}")));
-        }
-        if line.starts_with("## ") {
+        } else if !in_fence && trimmed.starts_with("## ") {
             seen_sec += 1;
             if seen_sec == section {
                 sec_start = Some(offset);
@@ -322,5 +336,55 @@ More details.
     fn empty_anchor_returns_whole_text() {
         let p = extract_passage("b", "", BOOK).unwrap();
         assert_eq!(p.text, BOOK);
+    }
+
+    #[test]
+    fn fenced_headings_are_ignored() {
+        // A `# ` line inside a fenced code block must not count as a
+        // chapter boundary — mirrors the librarian's parse_outline so
+        // book:// anchors line up with the catalog.
+        let book = "\
+# Chapter One
+
+Intro.
+
+```
+# not a chapter
+## not a section
+```
+
+## Section 1.1
+
+Details.
+
+# Chapter Two
+
+Second.
+";
+        // Chapter 2 is the SECOND real heading, not the fenced one.
+        let p = extract_passage("b", "ch-2-chapter-two", book).unwrap();
+        assert!(p.text.starts_with("# Chapter Two"));
+        assert!(!p.text.contains("not a chapter"));
+        // Section 1.1 is the first real section of chapter 1.
+        let s = extract_passage("b", "sec-1-1-section-1-1", book).unwrap();
+        assert!(s.text.starts_with("## Section 1.1"));
+        // The fenced fake section must not shift section numbering.
+        assert!(extract_passage("b", "sec-1-2-x", book).is_err());
+    }
+
+    #[test]
+    fn tilde_fences_are_ignored() {
+        let book = "\
+# Chapter One
+
+~~~
+# fake
+~~~
+
+Real text.
+";
+        let p = extract_passage("b", "ch-1-chapter-one", book).unwrap();
+        assert!(p.text.contains("Real text."));
+        assert!(extract_passage("b", "ch-2-fake", book).is_err());
     }
 }

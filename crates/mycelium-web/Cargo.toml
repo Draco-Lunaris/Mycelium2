@@ -13,6 +13,7 @@ mycelium-store = { path = "../mycelium-store" }
 mycelium-crypto = { path = "../mycelium-crypto" }
 mycelium-auth = { path = "../mycelium-auth" }
 mycelium-mcp = { path = "../mycelium-mcp" }
+mycelium-librarian = { path = "../mycelium-librarian" }
 axum.workspace = true
 axum-server.workspace = true
 tower.workspace = true
