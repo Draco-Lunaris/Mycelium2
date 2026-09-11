@@ -164,6 +164,13 @@ async fn serve_asset(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static(mime),
             );
+            // Cache aggressively: the page references assets with a
+            // ?v=<ASSETS_VERSION> query, so a version bump changes the
+            // URL and busts the cache on upgrade.
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=604800"),
+            );
             response
         }
         Err(_) => (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),

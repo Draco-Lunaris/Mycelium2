@@ -1,0 +1,4 @@
+- main [ref=f2e2]:
+  - generic [ref=f2e5]:
+    - textbox [ref=f2e6]
+    - button "Send" [ref=f2e7]

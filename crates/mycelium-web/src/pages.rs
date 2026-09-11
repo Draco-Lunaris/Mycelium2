@@ -59,7 +59,12 @@ pub fn layout_full(
     };
     let scripts = extra_scripts
         .iter()
-        .map(|s| format!(r#"<script src="{s}"></script>"#))
+        .map(|s| {
+            format!(
+                r#"<script src="{s}?v={}"></script>"#,
+                crate::assets::ASSETS_VERSION
+            )
+        })
         .collect::<String>();
     let html = format!(
         r#"<!DOCTYPE html>
@@ -69,18 +74,20 @@ pub fn layout_full(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="{}">
 <title>{} — Mycelium2</title>
-<link rel="stylesheet" href="/assets/style.css">
+<link rel="stylesheet" href="/assets/style.css?v={}">
 </head>
 <body class="{}">
 <header><a href="/">Mycelium2</a>{}</header>
 <main>{}</main>
-<script src="/assets/app.js"></script>{scripts}
+<script src="/assets/app.js?v={}"></script>{scripts}
 </body>
 </html>"#,
         html_escape(csrf),
         html_escape(title),
+        crate::assets::ASSETS_VERSION,
         body_class,
         nav,
+        crate::assets::ASSETS_VERSION,
         body
     );
     Html(html)

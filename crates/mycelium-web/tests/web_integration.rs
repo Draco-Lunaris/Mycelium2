@@ -420,7 +420,7 @@ async fn full_web_flow() {
         .await
         .unwrap();
     let graph_html = graph_page.text().await.unwrap();
-    assert!(graph_html.contains(r#"<script src="/assets/graph.js">"#));
+    assert!(graph_html.contains(r#"<script src="/assets/graph.js?v="#));
 
     // 21. Non-admin cannot access /admin. Create a regular user via the
     //     admin portal, then log in as them.

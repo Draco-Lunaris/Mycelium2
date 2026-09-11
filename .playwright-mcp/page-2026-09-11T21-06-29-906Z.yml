@@ -1,0 +1,10 @@
+- generic [active] [ref=f4e1]:
+  - banner [ref=f4e2]:
+    - link "Mycelium2" [ref=f4e3] [cursor=pointer]:
+      - /url: /
+  - main [ref=f4e4]:
+    - generic [ref=f4e5]:
+      - heading "Librarian" [level=1] [ref=f4e7]
+      - generic [ref=f4e9]:
+        - textbox "test" [ref=f4e10]
+        - button "Send" [ref=f4e11] [cursor=pointer]
