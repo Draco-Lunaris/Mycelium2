@@ -160,6 +160,55 @@ pub const GRAPH_JS: &str = r##"// Dependency-free force-directed graph renderer 
 })();
 "##;
 
+/// The chat page's client logic (external asset — CSP-safe: the site
+/// policy is script-src 'self' + nonce, so inline scripts are blocked;
+/// /assets/chat.js loads under 'self').
+pub const CHAT_JS: &str = r#"// Librarian chat: post messages to /api/v1/chat and render replies.
+(function () {
+  var log = document.getElementById("chat-log");
+  var form = document.getElementById("chat-form");
+  var input = document.getElementById("chat-input");
+  function addMsg(text, who) {
+    var div = document.createElement("div");
+    div.className = "chat-msg " + who;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var msg = input.value.trim();
+    if (!msg) return;
+    addMsg(msg, "user");
+    input.value = "";
+    var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+    var body = new URLSearchParams();
+    body.set("message", msg);
+    body.set("csrf_token", csrfMeta ? csrfMeta.content : "");
+    addMsg("…", "librarian pending");
+    fetch("/api/v1/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "x-csrf-token": csrfMeta ? csrfMeta.content : ""
+      },
+      body: body.toString()
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, j: j }; });
+    }).then(function (res) {
+      var pending = log.querySelector(".pending");
+      if (pending) pending.remove();
+      if (res.status === 200) addMsg(res.j.reply, "librarian");
+      else addMsg(res.j.error || "the librarian is unavailable", "librarian error");
+    }).catch(function () {
+      var pending = log.querySelector(".pending");
+      if (pending) pending.remove();
+      addMsg("request failed", "librarian error");
+    });
+  });
+})();
+"#;
+
 /// Write the default assets to `assets_dir` if not present (first boot).
 pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(assets_dir)?;
@@ -167,6 +216,7 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("style.css", STYLE_CSS),
         ("app.js", APP_JS),
         ("graph.js", GRAPH_JS),
+        ("chat.js", CHAT_JS),
     ];
     for (name, contents) in files {
         let path = assets_dir.join(name);

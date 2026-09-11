@@ -46,6 +46,7 @@ pub fn mcp_service(
         store: Arc::clone(&state.store),
         service_key: Arc::clone(&state.service_key),
         master_keys: Arc::clone(&state.master_keys),
+        config: Arc::clone(&state.config),
     };
     let service_key = (*state.service_key).clone();
     StreamableHttpService::new(
@@ -54,6 +55,7 @@ pub fn mcp_service(
                 store: Arc::clone(&inner_state.store),
                 service_key: Arc::new(service_key.clone()),
                 master_keys: Arc::clone(&inner_state.master_keys),
+                config: Arc::clone(&inner_state.config),
             }))
         },
         Default::default(),

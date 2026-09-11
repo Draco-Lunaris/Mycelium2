@@ -34,11 +34,13 @@ impl MyceliumMcpServer {
 
 #[tool_router]
 impl MyceliumMcpServer {
-    /// Search the calling user's private knowledge base for concepts
-    /// relevant to a natural-language question.
+    /// Answer a question from the calling user's private knowledge
+    /// base. The librarian agent synthesizes a grounded answer (with
+    /// sources); without an LLM backend the tool returns ranked
+    /// keyword-search hits instead.
     #[tool(
         name = "mycelium2_memory_query",
-        description = "Search the user's private knowledge base for concepts relevant to a natural-language question."
+        description = "Answer a natural-language question from the user's private knowledge base. The librarian agent searches, reads the relevant concepts, and synthesizes a grounded answer citing bundle paths. (Without an LLM backend configured, returns ranked keyword-search hits instead.)"
     )]
     async fn memory_query(
         &self,
@@ -46,28 +48,35 @@ impl MyceliumMcpServer {
         args: Parameters<tools::MemoryQueryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
-        let results = tools::memory_query(&self.state, &user, &args.0)
+        let output = tools::memory_query(&self.state, &user, &args.0)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "memory tool internal error");
                 ErrorData::internal_error("internal storage error", None)
             })?;
-        if results.is_empty() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "no concepts matched the question",
-            )]));
+        match output {
+            tools::QueryOutput::Answer(a) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(a.answer)]))
+            }
+            tools::QueryOutput::Hits(results) => {
+                if results.is_empty() {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "no concepts matched the question",
+                    )]));
+                }
+                let text = results
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "## {}\npath: {}\nscore: {:.2}\n{}\n",
+                            r.title, r.concept_path, r.score, r.snippet
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
         }
-        let text = results
-            .iter()
-            .map(|r| {
-                format!(
-                    "## {}\npath: {}\nscore: {:.2}\n{}\n",
-                    r.title, r.concept_path, r.score, r.snippet
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     /// Record new knowledge in the calling user's private bundle.

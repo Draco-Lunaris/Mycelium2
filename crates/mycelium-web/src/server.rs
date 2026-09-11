@@ -36,6 +36,7 @@ pub fn build_router_with_shutdown(
         store: Arc::clone(&state.store),
         service_key: Arc::clone(&state.service_key),
         master_keys: Arc::clone(&state.master_keys),
+        config: Arc::clone(&state.config),
     };
 
     Router::new()
@@ -53,6 +54,7 @@ pub fn build_router_with_shutdown(
         .route("/graph", get(api::graph_view))
         .route("/skills", get(api::skills_view))
         .route("/books", get(api::books_view))
+        .route("/chat", get(api::chat_view))
         .route(
             "/password",
             get(api::password_view).post(api::password_submit),

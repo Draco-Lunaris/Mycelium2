@@ -41,6 +41,15 @@ fn global_skills<'a>(state: &'a McpState) -> ConceptStore<'a> {
     )
 }
 
+/// The librarian agent's LLM client from the runtime config (admin-
+/// managed via ConfigStore key "llm"; Ollama default).
+async fn agent_client(state: &McpState) -> Option<mycelium_librarian::llm::LlmClient> {
+    let cfg: Option<mycelium_librarian::llm::LlmConfig> =
+        state.config.get("llm").await.ok().flatten();
+    let cfg = cfg.unwrap_or_default();
+    Some(mycelium_librarian::llm::LlmClient::new(&cfg))
+}
+
 /// Render a store error for the caller: expected failures (not found,
 /// invalid input) become caller-visible messages; internal failures
 /// (database, crypto) are logged and reduced to a generic message so no
@@ -84,24 +93,61 @@ fn search_terms(question: &str) -> Vec<String> {
         .collect()
 }
 
-/// Search the caller's private bundle for concepts matching the question.
+/// The agent's answer to a query: grounded text (the agent embeds a
+/// "Sources:" line per the system prompt).
+#[derive(serde::Serialize)]
+pub struct AgentAnswer {
+    pub answer: String,
+}
+
+/// Answer a question from the caller's private bundle. The librarian
+/// agent (LLM tool-call loop: search → read → synthesize, citing
+/// paths) handles the query; when no LLM backend is reachable the
+/// deterministic keyword search is the fallback (ranked hits, no
+/// synthesis) — the tool never hard-fails on a missing LLM.
 pub async fn memory_query(
     state: &McpState,
     user: &McpUser,
     args: &MemoryQueryArgs,
-) -> Result<Vec<mycelium_core::search::SearchResult>, ConceptStoreError> {
+) -> Result<QueryOutput, ConceptStoreError> {
     let master = state
         .master_key_for(user.user_id)
         .await
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
+
+    // Agent path: the v1 architecture — all queries flow through the
+    // librarian. Unreachable LLM → deterministic fallback below.
+    if let Some(client) = agent_client(state).await {
+        match mycelium_librarian::agent::run_query(&client, &cs, &args.question).await {
+            Ok(result) => {
+                return Ok(QueryOutput::Answer(AgentAnswer {
+                    answer: result.answer,
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "librarian agent query failed — falling back to search");
+            }
+        }
+    }
+
+    // Deterministic fallback: ranked keyword hits (pre-agent behavior).
     let query = SearchQuery::new(search_terms(&args.question));
     // MCP query stays private by default (DESIGN: web search spans
     // user + global; MCP queries the user bundle only).
     let mut results = cs.search(&query).await?;
     let limit = args.limit.unwrap_or(10).min(100);
     results.truncate(limit);
-    Ok(results)
+    Ok(QueryOutput::Hits(results))
+}
+
+/// The query tool's output: either the agent's grounded answer or the
+/// deterministic search fallback.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum QueryOutput {
+    Answer(AgentAnswer),
+    Hits(Vec<mycelium_core::search::SearchResult>),
 }
 
 // ---------------------------------------------------------------------------
@@ -126,9 +172,11 @@ pub struct MemoryAddArgs {
     pub concept_type: Option<String>,
 }
 
-/// Store new knowledge as a concept in the caller's private bundle.
-/// A path collision with different content disambiguates with a numeric
-/// suffix rather than silently overwriting existing knowledge.
+/// Store new knowledge in the caller's private bundle. The librarian
+/// agent (v1 architecture) searches for overlap, then enriches an
+/// existing concept or creates a deliberately-placed, two-way-linked
+/// new one. Deterministic fallback (no LLM): slugified concept at a
+/// derived path with collision disambiguation.
 pub async fn memory_add(
     state: &McpState,
     user: &McpUser,
@@ -140,6 +188,52 @@ pub async fn memory_add(
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
 
+    // Agent path: wrap the payload as an explicit persist directive
+    // (v1 rule — bare content reads as chat and gets answered, not
+    // stored).
+    if let Some(client) = agent_client(state).await {
+        let mut instruction = format!(
+            "Persist the following knowledge into the knowledge base. First search for \
+             related or owning concepts. If this is an attribute or detail of an \
+             existing concept, patch it into that concept rather than creating a new \
+             one. Only a distinct stand-alone entity or substantial topic gets its own \
+             concept — and then you must also patch the related existing concepts to \
+             link back to it. This is content to store, not a message to answer — you \
+             must use the write tools.\n\nKNOWLEDGE TO RECORD:\n{}",
+            args.content
+        );
+        if let Some(path) = &args.path {
+            instruction.push_str(&format!("\n\nIf it fits, place new content at {path}."));
+        }
+        if let Some(kind) = &args.concept_type {
+            instruction.push_str(&format!(
+                "\n\nThe knowledge is of kind/type \"{kind}\" — use it as the concept `type`."
+            ));
+        }
+        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+            Ok(result) => {
+                return Ok(if result.files_changed.is_empty() {
+                    result.summary
+                } else {
+                    format!(
+                        "{}\n\nFiles changed:\n{}",
+                        result.summary,
+                        result
+                            .files_changed
+                            .iter()
+                            .map(|f| format!("- {f}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "librarian agent add failed — falling back to direct write");
+            }
+        }
+    }
+
+    // Deterministic fallback: direct concept write (pre-agent behavior).
     let base_path = derive_path(&args.path, &args.shelf, &args.content);
     let title = derive_title(&args.content);
     let concept_type = args
@@ -257,6 +351,9 @@ pub struct MemoryUpdateArgs {
 }
 
 /// Apply a change to existing knowledge in the caller's private bundle.
+/// The librarian agent locates the concepts and applies targeted edits
+/// (v1 architecture); deterministic fallback (no LLM): resolve the
+/// target by path or best search match and append a dated addendum.
 pub async fn memory_update(
     state: &McpState,
     user: &McpUser,
@@ -268,6 +365,42 @@ pub async fn memory_update(
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
 
+    // Agent path: the instruction is a change directive.
+    if let Some(client) = agent_client(state).await {
+        let mut instruction = format!(
+            "Apply the following change to the knowledge base. Locate the concept(s) \
+             the change concerns (search first, read them), then apply targeted edits \
+             with the write tools. This is a change to apply, not a message to answer.\n\n\
+             CHANGE TO APPLY:\n{}",
+            args.instruction
+        );
+        if let Some(path) = &args.path {
+            instruction.push_str(&format!("\n\nThe target concept is at {path}."));
+        }
+        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+            Ok(result) => {
+                return Ok(if result.files_changed.is_empty() {
+                    result.summary
+                } else {
+                    format!(
+                        "{}\n\nFiles changed:\n{}",
+                        result.summary,
+                        result
+                            .files_changed
+                            .iter()
+                            .map(|f| format!("- {f}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "librarian agent update failed — falling back to addendum");
+            }
+        }
+    }
+
+    // Deterministic fallback: dated addendum (pre-agent behavior).
     // Resolve the target concept: explicit path, or best search match.
     let path = match &args.path {
         Some(p) => canonical(p),
@@ -347,8 +480,10 @@ pub async fn memory_status(
 pub struct MemoryMaintainArgs {}
 
 /// Health-check and repair the caller's bundle graph: wire orphaned
-/// concepts into related concepts and fix broken links. Returns a
-/// summary of repairs made.
+/// concepts into related concepts and fix broken links. The librarian
+/// agent performs the repairs (v1 architecture — it reads the orphans
+/// and wires them into genuinely related concepts); deterministic
+/// fallback (no LLM): title-overlap wiring + broken-link flagging.
 pub async fn memory_maintain(
     state: &McpState,
     user: &McpUser,
@@ -367,6 +502,76 @@ pub async fn memory_maintain(
     }
     let g = graph::build_graph_from_concepts(&concepts);
     let health = g.health();
+    if health.orphan_count == 0 && health.broken_link_count == 0 {
+        return Ok(format!(
+            "Memory is healthy — {} concepts, {} links, no orphans, no broken links. Nothing to repair.",
+            health.concept_count, health.edge_count
+        ));
+    }
+
+    // Agent path: hand the orphans + broken links to the librarian
+    // (v1's maintain instruction).
+    if let Some(client) = agent_client(state).await {
+        let orphan_list = g
+            .orphans
+            .iter()
+            .map(|o| format!("- {o}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let broken_list = g
+            .broken_links
+            .iter()
+            .map(|b| format!("- {} → {} (missing)", b.from, b.to))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let instruction = format!(
+            "Repair the knowledge graph. This is a maintenance task — use the write tools.\n\n\
+             ORPHANED CONCEPTS (no other concept links to them). For each, read it and the \
+             concepts it relates to, then wire it in: patch a genuinely related concept to \
+             reference it, and/or add outbound links from it to related concepts. Do NOT \
+             invent relationships that don't exist — if an orphan genuinely relates to \
+             nothing, leave it.\n{}\n\n\
+             BROKEN LINKS (target does not exist). Fix the path if the target was renamed/moved, \
+             or remove the link if the target is gone.\n{}\n\n\
+             Follow the enrich / link-both-ways rules. Read concepts before editing.",
+            if orphan_list.is_empty() {
+                "(none)".to_string()
+            } else {
+                orphan_list
+            },
+            if broken_list.is_empty() {
+                "(none)".to_string()
+            } else {
+                broken_list
+            },
+        );
+        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+            Ok(result) => {
+                // Re-measure after the agent's repairs.
+                let entries2 = cs.list().await?;
+                let mut concepts2 = Vec::with_capacity(entries2.len());
+                for entry in &entries2 {
+                    if let Ok(c) = cs.get(&entry.path).await {
+                        concepts2.push(c);
+                    }
+                }
+                let after = graph::build_graph_from_concepts(&concepts2).health();
+                return Ok(format!(
+                    "{}\n\nGraph health: orphans {} → {}, broken links {} → {}.",
+                    result.summary,
+                    health.orphan_count,
+                    after.orphan_count,
+                    health.broken_link_count,
+                    after.broken_link_count,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "librarian agent maintain failed — falling back to deterministic repair");
+            }
+        }
+    }
+
+    // Deterministic fallback: title-overlap wiring + link flagging.
     // Repair 1: wire orphans into the most-related concept (title
     // overlap) so the graph stays connected. Link text strips bracket
     // characters so a hostile title cannot break out of the markdown.

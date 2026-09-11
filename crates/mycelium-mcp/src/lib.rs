@@ -40,12 +40,14 @@ impl MasterKeyCache {
 }
 
 /// Shared state for the MCP server (a lean sibling of the web AppState —
-/// no web/frontend concerns, just store + keys).
+/// no web/frontend concerns, just store + keys + config).
 #[derive(Clone)]
 pub struct McpState {
     pub store: Arc<Store>,
     pub service_key: Arc<ServiceKey>,
     pub master_keys: Arc<MasterKeyCache>,
+    /// Runtime config source (LLM backend for the librarian agent).
+    pub config: Arc<mycelium_store::ConfigStore>,
 }
 
 impl McpState {

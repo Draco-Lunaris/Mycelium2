@@ -31,12 +31,61 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ToolSpec<'a>]>,
 }
 
+/// One message in the conversation. `content` is None for pure
+/// tool-call assistant turns; `tool_calls` is None for user/assistant
+/// text turns and for the tool RESULT messages (which carry
+/// `tool_call_id` instead).
 #[derive(Serialize)]
 struct ChatMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+/// A tool definition advertised to the model (OpenAI function shape).
+#[derive(Serialize, Clone, Copy)]
+pub struct ToolSpec<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str, // always "function"
+    function: FunctionSpec<'a>,
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct FunctionSpec<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+}
+
+/// A tool invocation the model requested.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolCall {
+    /// The model's call id (echoed back in the tool result message).
+    #[serde(default)]
+    pub id: String,
+    /// Always "function" (OpenAI wire shape).
+    #[serde(rename = "type", default = "default_call_type")]
+    kind: String,
+    pub function: FunctionCall,
+}
+
+fn default_call_type() -> String {
+    "function".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    /// Raw JSON arguments string from the model.
+    pub arguments: String,
 }
 
 /// Response shape (only the fields we need).
@@ -52,7 +101,10 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +145,12 @@ impl LlmClient {
             model: &self.model,
             messages: vec![ChatMessage {
                 role: "user",
-                content: prompt,
+                content: Some(prompt),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             temperature: 0.2,
+            tools: None,
         };
         let response = self.http.post(&url).json(&body).send().await?;
         let status = response.status();
@@ -111,8 +166,122 @@ impl LlmClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .and_then(|c| c.message.content)
             .ok_or(LlmError::EmptyResponse)
+    }
+
+    /// One agentic step: send the conversation (with tool specs) and
+    /// get back either the assistant's final text or its requested
+    /// tool calls. The caller executes the tools, appends the results
+    /// as `role: "tool"` messages, and loops until a text answer or
+    /// the step cap.
+    pub async fn chat_with_tools(
+        &self,
+        system: &str,
+        conversation: &[ConversationTurn],
+        tools: &[ToolSpec<'_>],
+        temperature: f32,
+    ) -> Result<StepOutput, LlmError> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(conversation.len() + 1);
+        messages.push(ChatMessage {
+            role: "system",
+            content: Some(system),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        for turn in conversation {
+            messages.push(match turn {
+                ConversationTurn::User(text) => ChatMessage {
+                    role: "user",
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ConversationTurn::Assistant(text) => ChatMessage {
+                    role: "assistant",
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ConversationTurn::AssistantToolCalls(calls) => ChatMessage {
+                    role: "assistant",
+                    content: None,
+                    tool_calls: Some(calls.as_slice().to_vec()),
+                    tool_call_id: None,
+                },
+                ConversationTurn::ToolResult { call_id, result } => ChatMessage {
+                    role: "tool",
+                    content: Some(result),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                },
+            });
+        }
+        let body = ChatRequest {
+            model: &self.model,
+            messages,
+            temperature,
+            tools: Some(tools),
+        };
+        let response = self.http.post(&url).json(&body).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(LlmError::Status {
+                status: status.as_u16(),
+                body: text.chars().take(500).collect(),
+            });
+        }
+        let parsed: ChatResponse = response.json().await?;
+        let Some(choice) = parsed.choices.into_iter().next() else {
+            return Err(LlmError::EmptyResponse);
+        };
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        if !tool_calls.is_empty() {
+            Ok(StepOutput::ToolCalls(tool_calls))
+        } else {
+            Ok(StepOutput::Text(choice.message.content.unwrap_or_default()))
+        }
+    }
+}
+
+/// One turn of the agent conversation (the caller builds the history).
+#[derive(Debug, Clone)]
+pub enum ConversationTurn {
+    User(String),
+    Assistant(String),
+    /// The assistant's tool-call request — MUST precede the matching
+    /// ToolResult turns (OpenAI protocol: each role:"tool" message
+    /// responds to a preceding assistant message with tool_calls).
+    AssistantToolCalls(Vec<ToolCall>),
+    ToolResult {
+        call_id: String,
+        result: String,
+    },
+}
+
+/// The model's output for one step.
+pub enum StepOutput {
+    /// The model wants tools executed (loop continues).
+    ToolCalls(Vec<ToolCall>),
+    /// The model produced a final text answer (loop ends).
+    Text(String),
+}
+
+/// Build a tool spec from name + description + JSON-schema parameters.
+pub fn tool_spec<'a>(
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+) -> ToolSpec<'a> {
+    ToolSpec {
+        kind: "function",
+        function: FunctionSpec {
+            name,
+            description,
+            parameters,
+        },
     }
 }
 

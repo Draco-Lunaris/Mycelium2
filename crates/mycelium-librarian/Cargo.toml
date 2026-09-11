@@ -24,5 +24,6 @@ chrono.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -23,6 +23,8 @@ pub enum ConceptStoreError {
     Parse(#[from] mycelium_core::ConceptError),
     #[error("concept not found: {0}")]
     NotFound(String),
+    #[error("{0} is a reserved filename (index.md, log.md, info.md) — system-maintained")]
+    Reserved(String),
 }
 
 /// A listed concept (from the registry, no decryption needed).
@@ -112,12 +114,21 @@ impl<'a> ConceptStore<'a> {
         }
     }
 
-    /// Store a concept: encrypt the file, register it, then index it.
-    /// Ordering: file → registry → index. The registry is the source of
-    /// truth for listing; the index lags it, never leads. A crash between
-    /// steps leaves an orphaned encrypted file or a listed-but-unsearchable
-    /// concept (visible, self-heals on next put) — never a search ghost.
+    /// Store a concept: encrypt the file, register it, index it, then
+    /// regenerate the scope's index.md. Ordering: file → registry →
+    /// index. The registry is the source of truth for listing; the
+    /// index lags it, never leads. A crash between steps leaves an
+    /// orphaned encrypted file or a listed-but-unsearchable concept
+    /// (visible, self-heals on next put) — never a search ghost.
+    ///
+    /// Reserved filenames (`index.md`, `log.md`, `info.md`) are
+    /// rejected — they are system-maintained (index.md is regenerated
+    /// on every write) and a concept there would be silently clobbered.
     pub async fn put(&self, concept: &Concept) -> Result<(), ConceptStoreError> {
+        let basename = concept.source_path.rsplit('/').next().unwrap_or_default();
+        if matches!(basename, "index.md" | "log.md" | "info.md") {
+            return Err(ConceptStoreError::Reserved(concept.source_path.clone()));
+        }
         let markdown = concept.to_markdown()?;
         self.repo
             .write(
@@ -148,6 +159,28 @@ impl<'a> ConceptStore<'a> {
         .execute(self.store.pool())
         .await?;
         self.index.add_async(concept).await?;
+        self.regen_index_md().await?;
+        Ok(())
+    }
+
+    /// Regenerate the scope's `index.md` (v1 parity: the auto-
+    /// maintained directory index). It is a RAW FileRepo payload —
+    /// never a concept, never in the registry or search index — so it
+    /// never appears in listings or graph scans. Content: one bullet
+    /// per concept (title + path + type), sorted by path.
+    async fn regen_index_md(&self) -> Result<(), ConceptStoreError> {
+        let entries = self.list().await?;
+        let mut lines = vec!["# Knowledge Base".to_string()];
+        for entry in entries {
+            lines.push(format!(
+                "* [{}]({}) [{}]",
+                entry.title, entry.path, entry.concept_type
+            ));
+        }
+        let content = lines.join("\n") + "\n";
+        self.repo
+            .write("/index.md", content.as_bytes(), &self.scope.repo_scope())
+            .await?;
         Ok(())
     }
 
@@ -170,7 +203,7 @@ impl<'a> ConceptStore<'a> {
 
     /// Delete a concept: registry + index first, then the file (a crash
     /// leaves an orphaned encrypted file — harmless, cleaned by
-    /// maintenance; never a stale listing).
+    /// maintenance; never a stale listing). Regenerates index.md.
     pub async fn delete(&self, path: &str) -> Result<(), ConceptStoreError> {
         let scope_id = self.scope.scope_id();
         sqlx::query("DELETE FROM scope_files WHERE scope = ? AND path = ?")
@@ -180,6 +213,7 @@ impl<'a> ConceptStore<'a> {
             .await?;
         self.index.remove(path).await?;
         self.repo.delete(path, &self.scope.repo_scope()).await?;
+        self.regen_index_md().await?;
         Ok(())
     }
 

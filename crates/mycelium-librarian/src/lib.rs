@@ -1,5 +1,6 @@
 //! In-process librarian agent for book ingest and cataloging.
 
+pub mod agent;
 pub mod extract;
 pub mod ingest;
 pub mod llm;

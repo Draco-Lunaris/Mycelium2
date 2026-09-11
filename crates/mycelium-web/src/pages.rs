@@ -29,6 +29,7 @@ pub fn layout_with_scripts(
                 <a href="/graph">Graph</a>
                 <a href="/skills">Skills</a>
                 <a href="/books">Books</a>
+                <a href="/chat">Librarian</a>
                 <a href="/keys">API Keys</a>
                 <a href="/password">Password</a>
                 {}
@@ -389,6 +390,22 @@ pub fn books_page(
 {sections}"#
     );
     layout("Books", Some(user), csrf, body)
+}
+
+/// Chat page: talk to the librarian agent (the same agent behind the
+/// MCP tools). Messages post to /api/v1/chat; the reply renders inline.
+/// The client logic is an external asset (/assets/chat.js) — the site
+/// CSP (script-src 'self' + nonce) blocks inline scripts.
+pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
+    let body = r#"<h1>Librarian</h1>
+<p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
+<div id="chat-log" class="chat-log" aria-live="polite"></div>
+<form id="chat-form">
+  <textarea id="chat-input" rows="3" placeholder="Ask about your knowledge base, or say 'record that ...'" required></textarea>
+  <button type="submit">Send</button>
+</form>"#
+        .to_string();
+    layout_with_scripts("Librarian", Some(user), csrf, body, &["/assets/chat.js"])
 }
 
 /// Change-password page.

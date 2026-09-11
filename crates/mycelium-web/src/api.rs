@@ -3,7 +3,7 @@
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -47,6 +47,7 @@ pub fn api_routes() -> Router<AppState> {
         )
         .route("/ingest/{id}", get(api_ingest_job))
         .route("/passages", get(api_passage))
+        .route("/chat", post(api_chat))
 }
 
 // ---------- JSON API ----------
@@ -1563,4 +1564,62 @@ pub async fn api_passage(
         .into_response(),
         Err(e) => error_response(StatusCode::NOT_FOUND, &e.to_string()),
     }
+}
+
+// ---------- Librarian chat (v1 parity: the agent behind the UI) ----------
+
+#[derive(Deserialize)]
+pub struct ChatMessageForm {
+    /// The user's message.
+    pub message: String,
+}
+
+/// POST /api/v1/chat — send a message to the librarian agent. The agent
+/// (same one the MCP tools use) answers over the caller's private
+/// bundle; chat mode also allows write tools, so "record that ..."
+/// messages persist knowledge. Returns the reply as JSON (the page
+/// renders it); streaming arrives with a streaming LLM client later.
+pub async fn api_chat(
+    State(state): State<AppState>,
+    user: SessionUser,
+    axum::Form(form): axum::Form<ChatMessageForm>,
+) -> Response {
+    if form.message.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty message");
+    }
+    let master = match state.master_key_for(user.user_id).await {
+        Ok(m) => m,
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+    };
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
+    let llm = llm.unwrap_or_default();
+    let client = mycelium_librarian::llm::LlmClient::new(&llm);
+    let history = vec![mycelium_librarian::llm::ConversationTurn::User(
+        form.message.clone(),
+    )];
+    match mycelium_librarian::agent::run_chat(&client, &cs, &history).await {
+        Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
+        Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
+            tracing::warn!(error = %e, "librarian chat LLM failure");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal",
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "librarian chat failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// GET /chat — the chat page (librarian agent over the user's bundle).
+pub async fn chat_view(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    pages::chat_page(&user, &csrf).into_response()
 }

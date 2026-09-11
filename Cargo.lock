@@ -2458,6 +2458,7 @@ dependencies = [
 name = "mycelium-librarian"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "mycelium-core",
  "mycelium-crypto",
@@ -2487,6 +2488,7 @@ dependencies = [
  "mycelium-auth",
  "mycelium-core",
  "mycelium-crypto",
+ "mycelium-librarian",
  "mycelium-store",
  "mycelium-web",
  "reqwest 0.12.28",
