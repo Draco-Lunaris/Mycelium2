@@ -1,0 +1,21 @@
+# Never enter the build context (protects against leaking local
+# secrets into intermediate image layers):
+.git
+.github
+.gitignore
+target
+data
+*.env
+.env*
+*.log
+*.pem
+*.key
+*.tar.gz
+docs
+node_modules
+dist
+.DS_Store
+# Local editor state:
+.idea
+.vscode
+*.swp

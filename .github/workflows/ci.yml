@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_ATTEMPTS: 10
+
+jobs:
+  test:
+    name: fmt + clippy + test (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV 1.88)
+        uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  build:
+    name: build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV 1.88)
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin mycelium2 --bin mycelium2-cli
+
+      - name: Smoke test the binary
+        run: |
+          mkdir -p /tmp/myc2-data
+          MYCELIUM2_DATA_DIR=/tmp/myc2-data \
+          MYCELIUM2_HTTPS_ADDR=127.0.0.1:8443 \
+          MYCELIUM2_HTTP_ADDR=127.0.0.1:8080 \
+          timeout 10 ./target/release/mycelium2 || test $? -eq 124
+          test -f /tmp/myc2-data/config/initial-admin-password
+          test -f /tmp/myc2-data/db/mycelium2.sqlite3

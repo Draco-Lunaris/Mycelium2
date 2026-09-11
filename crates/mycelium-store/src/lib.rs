@@ -1,5 +1,6 @@
 //! Embedded storage: SQLite metadata + encrypted file repository.
 
+pub mod backup;
 pub mod books;
 pub mod concept_store;
 pub mod config;

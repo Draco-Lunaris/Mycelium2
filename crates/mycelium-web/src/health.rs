@@ -84,6 +84,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
         "# TYPE mycelium2_ingest_failures_total counter\nmycelium2_ingest_failures_total {}",
         m.ingest_failures.load(std::sync::atomic::Ordering::Relaxed)
     );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_backups_total counter\nmycelium2_backups_total {}",
+        m.backups_taken.load(std::sync::atomic::Ordering::Relaxed)
+    );
     (
         axum::http::StatusCode::OK,
         [(

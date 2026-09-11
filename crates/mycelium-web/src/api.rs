@@ -254,7 +254,10 @@ async fn api_put_concept(
             crate::state::Metrics::inc(&state.metrics.concepts_written);
             (StatusCode::CREATED, "created").into_response()
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "concept put failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 
@@ -279,13 +282,19 @@ async fn api_get_concept(
                     [(axum::http::header::CONTENT_TYPE, "text/markdown")],
                 )
                     .into_response_with_body(md),
-                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                Err(e) => {
+                    tracing::error!(error = %e, "concept markdown render failed");
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                }
             }
         }
         Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
             error_response(StatusCode::NOT_FOUND, "not found")
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "concept get failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 
@@ -303,7 +312,10 @@ async fn api_delete_concept(
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.delete(&canonical).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "concept delete failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 
@@ -345,6 +357,30 @@ impl IntoResponseWithBody
     )
 {
     fn into_response_with_body(self, body: String) -> Response {
+        let (status, headers) = self;
+        let mut response = Response::new(axum::body::Body::from(body));
+        *response.status_mut() = status;
+        for (name, value) in headers {
+            response
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_static(value));
+        }
+        response
+    }
+}
+
+/// Helper trait for a binary (bytes) body response with three headers.
+trait IntoResponseWithBytes3: Sized {
+    fn into_response_with_bytes(self, body: Vec<u8>) -> Response;
+}
+
+impl IntoResponseWithBytes3
+    for (
+        StatusCode,
+        [(axum::http::header::HeaderName, &'static str); 3],
+    )
+{
+    fn into_response_with_bytes(self, body: Vec<u8>) -> Response {
         let (status, headers) = self;
         let mut response = Response::new(axum::body::Body::from(body));
         *response.status_mut() = status;
@@ -1184,18 +1220,47 @@ pub async fn admin_create_bookshelf(
 }
 
 /// POST /admin/backup — full data-directory backup (admin only).
+/// Streams a tar.gz of the data directory. Best-effort snapshot of a
+/// live database; the CLI `backup` documents the stop-server path for
+/// guaranteed consistency.
 pub async fn admin_backup(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
 ) -> Response {
-    // Stream a tar of the data directory. For Phase 5 we return a simple
-    // manifest; the full tar lands with the backup feature in Phase 9.
-    let manifest = serde_json::json!({
-        "backup": "requested",
-        "data_dir": state.store.data_dir().display().to_string(),
-        "note": "full tar backup ships in Phase 9",
-    });
-    (StatusCode::OK, Json(manifest)).into_response()
+    let data_dir = state.store.data_dir().to_path_buf();
+    // Build the archive on the blocking pool (file I/O + compression).
+    let build =
+        tokio::task::spawn_blocking(move || mycelium_store::backup::backup_tar_gz(&data_dir)).await;
+    match build {
+        Ok(Ok(bytes)) => {
+            crate::state::Metrics::inc(&state.metrics.backups_taken);
+            // no-store: the archive contains the service key + sealed
+            // master keys — it must never sit in a shared/CDN cache.
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/gzip"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"mycelium2-backup.tar.gz\"",
+                    ),
+                    (
+                        axum::http::header::CACHE_CONTROL,
+                        "no-store, no-cache, must-revalidate",
+                    ),
+                ],
+            )
+                .into_response_with_bytes(bytes)
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "backup build failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "backup failed")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "backup task join failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "backup failed")
+        }
+    }
 }
 
 // ---------- Phase 7: book ingest + passages ----------
@@ -1303,7 +1368,10 @@ pub async fn api_upload_book(
         Err(mycelium_librarian::WorkerError::Store(mycelium_store::BooksError::DuplicateSlug(
             s,
         ))) => error_response(StatusCode::CONFLICT, &format!("duplicate book slug: {s}")),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "book submit failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 
@@ -1346,7 +1414,10 @@ pub async fn api_ingest_job(
         }))
         .into_response(),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "job not found"),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "job status lookup failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 

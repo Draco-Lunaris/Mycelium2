@@ -1,0 +1,124 @@
+name: Docs (GitHub Pages)
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build docs site
+        run: |
+          mkdir -p _site
+          # Index the docs directory into a single-page-friendly site:
+          # each markdown file becomes an HTML page with a nav sidebar.
+          python3 - <<'EOF'
+          import os, html, re, pathlib
+
+          docs = pathlib.Path("docs")
+          site = pathlib.Path("_site")
+          site.mkdir(exist_ok=True)
+
+          files = sorted(docs.glob("*.md"))
+          titles = {}
+          for f in files:
+              text = f.read_text()
+              m = re.search(r"^# (.+)$", text, re.M)
+              titles[f.name] = m.group(1) if m else f.name
+
+          nav = "\n".join(
+              f'<a href="{f.stem}.html">{html.escape(titles[f.name])}</a>'
+              for f in files
+          )
+
+          def md_to_html(text: str) -> str:
+              # Minimal markdown: headings, code fences, links,
+              # paragraphs. Good enough for a docs index; swap in
+              # mkdocs later if wanted.
+              out, in_code = [], False
+              for line in text.splitlines():
+                  if line.strip().startswith("```"):
+                      in_code = not in_code
+                      out.append("</pre>" if not in_code else "<pre>")
+                      continue
+                  if in_code:
+                      out.append(html.escape(line))
+                      continue
+                  m = re.match(r"^(#{1,6}) (.*)$", line)
+                  if m:
+                      level = len(m.group(1))
+                      out.append(f"<h{level}>{html.escape(m.group(2))}</h{level}>")
+                  elif line.strip():
+                      # Inline links: [text](url) — url-escape nothing
+                      # (docs use relative .md links; keep them as-is
+                      # so they resolve within the Pages site).
+                      def link_repl(mo):
+                          text_part, url_part = mo.group(1), mo.group(2)
+                          # Docs link to sibling .md files; the site
+                          # serves .html — rewrite the extension.
+                          if url_part.endswith(".md"):
+                              url_part = url_part[:-3] + ".html"
+                          return (
+                              f'<a href="{html.escape(url_part, quote=True)}">'
+                              f"{html.escape(text_part)}</a>"
+                          )
+                      escaped = html.escape(line, quote=False)
+                      # Escape first, then linkify on the escaped text
+                      # (link syntax survives escaping).
+                      linked = re.sub(
+                          r"\[([^\]]+)\]\(([^)\s]+)\)", link_repl, escaped
+                      )
+                      out.append(f"<p>{linked}</p>")
+                  else:
+                      out.append("")
+              return "\n".join(out)
+
+          for f in files:
+              body = md_to_html(f.read_text())
+              page = f"""<!doctype html>
+          <html><head><meta charset="utf-8">
+          <title>{html.escape(titles[f.name])} — Mycelium2</title>
+          <style>
+            body {{ font-family: system-ui, sans-serif; margin: 0; display: flex; }}
+            nav {{ width: 220px; padding: 1.5rem; background: #1a1a2e; }}
+            nav a {{ display: block; color: #ccc; text-decoration: none; padding: 4px 0; }}
+            nav a:hover {{ color: #fff; }}
+            main {{ padding: 2rem; max-width: 60ch; line-height: 1.6; }}
+            pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; }}
+          </style></head>
+          <body><nav><strong>Mycelium2</strong><br><br>{nav}</nav>
+          <main>{body}</main></body></html>"""
+              (site / (f.stem + ".html")).write_text(page)
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

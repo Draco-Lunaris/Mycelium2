@@ -29,6 +29,7 @@ pub struct Metrics {
     pub requests_total: AtomicU64,
     pub books_ingested: AtomicU64,
     pub ingest_failures: AtomicU64,
+    pub backups_taken: AtomicU64,
 }
 
 impl Metrics {

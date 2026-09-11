@@ -88,10 +88,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Graceful shutdown on SIGTERM/SIGINT.
+    // Graceful shutdown on SIGTERM (docker stop) and SIGINT (ctrl-c).
     let token = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
         tracing::info!("shutdown signal received");
         token.cancel();
     });

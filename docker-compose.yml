@@ -1,0 +1,28 @@
+services:
+  mycelium2:
+    image: ghcr.io/draco-lunaris/mycelium2:latest
+    build: .
+    container_name: mycelium2
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - mycelium2-data:/opt/mycelium2/data
+    # Optional: supply real TLS certs (auto self-signed when absent).
+    # - ./certs/fullchain.pem:/opt/mycelium2/tls/fullchain.pem:ro
+    # - ./certs/privkey.pem:/opt/mycelium2/tls/privkey.pem:ro
+    environment:
+      MYCELIUM2_DATA_DIR: /opt/mycelium2/data
+      # MYCELIUM2_TLS_CERT: /opt/mycelium2/tls/fullchain.pem
+      # MYCELIUM2_TLS_KEY: /opt/mycelium2/tls/privkey.pem
+      # RUST_LOG: mycelium_web=debug,info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  mycelium2-data:
