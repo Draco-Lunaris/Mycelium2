@@ -641,5 +641,76 @@ async fn upload_validation_errors() {
     assert_eq!(no_ch_json["status"], "failed");
     assert!(no_ch_json["detail"].as_str().unwrap().contains("chapters"));
 
+    // 16. Upload limit is admin-configurable (ConfigStore, not env):
+    //     raise it, upload a >32 MiB book (accepted), then verify the
+    //     admin page shows the new value.
+    let raise = client
+        .post(format!("{base}/admin/upload-limits"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("max_book_mib", "64")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raise.status(), 303, "admin can raise the upload limit");
+    // A 33 MiB book: rejected under the default 32, accepted at 64.
+    // (Sparse headings keep the catalog small; the payload is what's big.)
+    let mut big_book = String::with_capacity(33 * 1024 * 1024);
+    big_book.push_str("# Chapter One\n\n");
+    big_book.push_str(&"x".repeat(33 * 1024 * 1024));
+    let boundary = "bigbook";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "S"),
+            ("slug", "big-book"),
+            ("title", "Big Book"),
+        ],
+        Some(("file", "big.md", &big_book)),
+    );
+    let big = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        big.status(),
+        202,
+        "33 MiB book must be accepted at a 64 MiB limit"
+    );
+    let big_json: serde_json::Value = big.json().await.unwrap();
+    assert_eq!(big_json["status"], "done", "big book ingested: {big_json}");
+    // The admin page reflects the configured limit.
+    let admin_html = client
+        .get(format!("{base}/admin"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        admin_html.contains("up to 64 MiB"),
+        "admin page shows the configured limit"
+    );
+    // Reset to the default for cleanliness.
+    let reset = client
+        .post(format!("{base}/admin/upload-limits"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("max_book_mib", "32")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 303);
+
     shutdown.cancel();
 }

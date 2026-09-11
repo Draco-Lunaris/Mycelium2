@@ -50,7 +50,7 @@ on disk, no external services (the LLM backend is optional).
 | `global:skills` | service key | global skills shelf (admin-write, all-read) |
 | `global:library` | service key | book catalog concepts (hub + chapters) |
 
-Book **stack texts** (the full 32 MiB-capable book bodies) are raw
+Book **stack texts** (the full book bodies, up to the configured upload limit) are raw
 encrypted FileRepo payloads — deliberately outside the registry and
 search index; they are read via `book://<slug>#<anchor>` passage
 extraction, never listed or searched.
@@ -65,7 +65,7 @@ and `info.md` are reserved. Skills are concepts with `type: Skill`.
 
 ## Book ingest flow
 
-1. Admin uploads a markdown book (multipart, ≤32 MiB, CSRF-checked).
+1. Admin uploads a markdown book (multipart, ≤ the configured limit, CSRF-checked).
 2. The librarian worker stages the text, creates book + job rows
    (one job per user at a time; atomic claim prevents double-runs).
 3. The LLM (optional) enriches a catalog; the heuristic outline is the

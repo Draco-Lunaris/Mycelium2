@@ -38,6 +38,33 @@ impl Metrics {
     }
 }
 
+/// Upload limits, stored in ConfigStore (key `"upload"`) so they are
+/// admin-editable at runtime — no env config (DESIGN: SQLite-stored
+/// runtime config). Defaults match the original Mycelium (32 MiB).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadConfig {
+    /// Maximum accepted book upload, in MiB.
+    pub max_book_mib: u64,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self { max_book_mib: 32 }
+    }
+}
+
+impl AppState {
+    /// The effective upload config: ConfigStore value or the default.
+    pub async fn upload_config(&self) -> UploadConfig {
+        self.config
+            .get::<UploadConfig>("upload")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
 /// The axum router state.
 #[derive(Clone)]
 pub struct AppState {

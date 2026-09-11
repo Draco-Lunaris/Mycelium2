@@ -40,7 +40,7 @@ admin-private bookshelves are filtered out for non-admin callers.
 
 ### `POST /api/v1/ingest` *(admin)*
 Multipart book upload: fields `bookshelf` (name), `slug`, `title`,
-`file` (markdown, ≤32 MiB), plus the CSRF token. Runs the ingest
+`file` (markdown, ≤ the configured limit — default 32 MiB, admin-adjustable), plus the CSRF token. Runs the ingest
 inline and returns `202`:
 
 ```json

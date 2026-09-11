@@ -34,13 +34,16 @@ pub fn api_routes() -> Router<AppState> {
                 .delete(api_delete_concept),
         )
         .route("/health", get(health_detail))
-        // Phase 7: book ingest + passages. The upload route accepts
-        // multipart bodies up to 33 MiB (32 MiB book + overhead).
+        // Book ingest + passages. The route-level body limit is a
+        // generous DoS ceiling (256 MiB); the EFFECTIVE book limit is
+        // the admin-configured UploadConfig (ConfigStore, default
+        // 32 MiB) enforced by the CSRF middleware's multipart buffer
+        // and the handler's size check.
         .route(
             "/ingest",
             get(api_ingest_jobs)
                 .post(api_upload_book)
-                .layer(axum::extract::DefaultBodyLimit::max(33 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route("/ingest/{id}", get(api_ingest_job))
         .route("/passages", get(api_passage))
@@ -1061,6 +1064,7 @@ pub async fn admin_view(
     .is_some();
     let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
     let llm = llm.unwrap_or_default();
+    let upload = state.upload_config().await;
     let shelves = state.store.list_bookshelves().await.unwrap_or_default();
     let shelf_tuples: Vec<(String, bool)> = shelves.into_iter().collect();
     // Ingest jobs (slug, status, detail, created, shelf name).
@@ -1090,6 +1094,7 @@ pub async fn admin_view(
         oidc,
         &llm.url,
         &llm.model,
+        upload.max_book_mib,
         &shelf_tuples,
         &job_rows,
         params.created.as_deref(),
@@ -1208,6 +1213,28 @@ pub struct BookshelfForm {
     pub global: String,
 }
 
+#[derive(Deserialize)]
+pub struct UploadLimitsForm {
+    /// Maximum book upload in MiB. Clamped to 1..=255 (the route-level
+    /// DoS ceiling is 256 MiB; a value above it would be unreachable).
+    pub max_book_mib: u64,
+}
+
+/// POST /admin/upload-limits — save the upload limits (admin only).
+/// Stored in ConfigStore (key "upload") — runtime-editable, no env.
+pub async fn admin_save_upload_limits(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<UploadLimitsForm>,
+) -> Response {
+    let max_book_mib = form.max_book_mib.clamp(1, 255);
+    let _ = state
+        .config
+        .set("upload", &crate::state::UploadConfig { max_book_mib })
+        .await;
+    Redirect::to("/admin").into_response()
+}
+
 /// POST /admin/bookshelves — create a bookshelf (admin only).
 pub async fn admin_create_bookshelf(
     State(state): State<AppState>,
@@ -1265,10 +1292,6 @@ pub async fn admin_backup(
 
 // ---------- Phase 7: book ingest + passages ----------
 
-/// Maximum accepted book upload (matches the middleware's multipart
-/// CSRF buffer cap; the original Mycelium used 32 MiB).
-pub const MAX_BOOK_BYTES: usize = 32 * 1024 * 1024;
-
 #[derive(Deserialize)]
 pub struct UploadForm {
     pub bookshelf: String,
@@ -1313,8 +1336,15 @@ pub async fn api_upload_book(
     let Some(file) = file else {
         return error_response(StatusCode::BAD_REQUEST, "missing file field");
     };
-    if file.len() > MAX_BOOK_BYTES {
-        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "book exceeds 32 MiB");
+    // The effective limit is admin-configured (ConfigStore key
+    // "upload", default 32 MiB — the original Mycelium's default).
+    let upload_cfg = state.upload_config().await;
+    let max_bytes = upload_cfg.max_book_mib * 1024 * 1024;
+    if file.len() as u64 > max_bytes {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("book exceeds {} MiB", upload_cfg.max_book_mib),
+        );
     }
     let Some(text) = String::from_utf8(file).ok() else {
         return error_response(StatusCode::BAD_REQUEST, "book must be UTF-8 markdown");

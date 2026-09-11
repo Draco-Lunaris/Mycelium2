@@ -195,10 +195,13 @@ pub async fn csrf_protect(
             }
         }
         None if is_multipart => {
-            // Multipart upload (book ingest): buffer the body (uploads are
-            // legitimately large — 33 MiB cap), extract the csrf_token
-            // field with a boundary-aware parse, verify, restore.
-            match axum::body::to_bytes(body, 33 * 1024 * 1024).await {
+            // Multipart upload (book ingest): buffer the body (uploads
+            // are legitimately large), extract the csrf_token field
+            // with a boundary-aware parse, verify, restore. The cap is
+            // the admin-configured book limit + 1 MiB of multipart
+            // framing overhead (ConfigStore, not env).
+            let cap = (state.upload_config().await.max_book_mib + 1) * 1024 * 1024;
+            match axum::body::to_bytes(body, cap as usize).await {
                 Ok(bytes) => {
                     let token = multipart_field(&bytes, content_type, "csrf_token");
                     parts.headers.remove(axum::http::header::CONTENT_LENGTH);

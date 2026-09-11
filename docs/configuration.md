@@ -20,12 +20,15 @@ data directory — without it, global data is unrecoverable.
 
 ## Runtime config (admin portal)
 
-Stored in SQLite, edited via the admin portal:
+Stored in SQLite, edited via the admin portal — no environment
+variables for runtime settings:
 
 - **LLM backend** — OpenAI-compatible base URL + model. Default
   `http://localhost:11434/v1` (Ollama). Used by the librarian for
   chapter/section extraction; unreachable backends fall back to a
   heuristic catalog (ingest never fails on LLM errors).
+- **Upload limits** — maximum book upload size (MiB, 1–255; default
+  32, the original Mycelium's default). Takes effect immediately.
 - **OIDC SSO** — issuer URL, client ID/secret (encrypted at rest with
   the service key), redirect URI. Disabled until configured.
 
@@ -50,7 +53,7 @@ Stored in SQLite, edited via the admin portal:
 - Forced password change for the bootstrapped admin and any
   admin-reset account.
 - Password policy: minimum 20 characters.
-- Uploads: books capped at 32 MiB; multipart CSRF enforced.
+- Uploads: books capped at the admin-configured limit (default 32 MiB); multipart CSRF enforced.
 - MCP: per-user API keys (SHA-256 hashed at rest) as bearer tokens;
   the MCP endpoint enforces its own auth and is exempt from the
   session/CSRF gates.

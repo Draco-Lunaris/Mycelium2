@@ -456,6 +456,7 @@ pub fn admin_page(
     oidc_configured: bool,
     llm_url: &str,
     llm_model: &str,
+    max_book_mib: u64,
     bookshelves: &[(String, bool)],
     ingest_jobs: &[(String, String, String, String, String)],
     ok: Option<&str>,
@@ -547,13 +548,18 @@ pub fn admin_page(
   <button type="submit">Create bookshelf</button>
 </form>
 <h2>Upload book</h2>
-<p class="muted">Markdown (.md) up to 32 MiB. The librarian catalogs it onto the bookshelf (LLM-assisted when the configured backend is reachable; heuristic otherwise).</p>
+<p class="muted">Markdown (.md) up to {max_book_mib} MiB (adjustable below). The librarian catalogs it onto the bookshelf (LLM-assisted when the configured backend is reachable; heuristic otherwise).</p>
 <form method="post" action="/api/v1/ingest" enctype="multipart/form-data">
   <label>Bookshelf</label><select name="bookshelf" required>{shelf_options}</select>
   <label>Slug</label><input name="slug" required pattern="[a-zA-Z0-9-]+" placeholder="my-book">
   <label>Title</label><input name="title" required>
   <label>Book file (.md)</label><input name="file" type="file" accept=".md,text/markdown" required>
   <button type="submit">Upload and ingest</button>
+</form>
+<h3>Upload limits</h3>
+<form method="post" action="/admin/upload-limits">
+  <label>Max book size (MiB, 1–255)</label><input name="max_book_mib" type="number" min="1" max="255" value="{max_book_mib}" required>
+  <button type="submit">Save limit</button>
 </form>
 <h2>Ingest jobs</h2>
 <table><tr><th>Book</th><th>Status</th><th>Detail</th><th>Created</th><th>Shelf</th></tr>{job_rows}</table>
