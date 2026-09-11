@@ -47,13 +47,38 @@ button.danger { background: var(--danger); color: #fff; }
 pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: auto; }
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
 
-/* Librarian chat */
+/* Librarian chat — full-viewport layout (body.chat-page) */
+body.chat-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body.chat-page main {
+  display: flex; flex-direction: column; flex: 1;
+  max-width: none; width: 100%; margin: 0; padding: 0;
+  min-height: 0; /* allow children to shrink */
+}
+.chat-shell {
+  display: flex; flex-direction: column; flex: 1;
+  min-height: 0; width: 100%; max-width: 60rem; margin: 0 auto;
+  padding: 0 1.2rem 1rem;
+}
+.chat-intro { padding-top: 0.8rem; }
+.chat-intro h1 { margin: 0 0 0.2rem; font-size: 1.3rem; }
+.chat-intro p { margin: 0 0 0.6rem; font-size: 0.85rem; }
 .chat-log {
   display: flex; flex-direction: column; gap: 0.8rem;
-  padding: 1rem; margin-bottom: 1rem; min-height: 16rem; max-height: 60vh;
-  overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
-  border-radius: 6px;
+  padding: 1rem; margin-bottom: 0.8rem;
+  flex: 1 1 auto; min-height: 4rem; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; overscroll-behavior: contain;
 }
+.chat-input-bar {
+  position: sticky; bottom: 0; flex: 0 0 auto;
+  display: flex; gap: 0.6rem; align-items: flex-end;
+  padding: 0.6rem 0 0; background: var(--bg);
+}
+.chat-input-bar textarea {
+  flex: 1; min-height: 2.6rem; max-height: 10rem; resize: none;
+  font-family: inherit; line-height: 1.4;
+}
+.chat-input-bar button { margin: 0; flex: 0 0 auto; height: 2.6rem; }
 .chat-msg {
   max-width: 80%; padding: 0.6rem 0.9rem; border-radius: 10px;
   white-space: pre-wrap; word-wrap: break-word; line-height: 1.45;
@@ -87,9 +112,6 @@ pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: a
   align-self: flex-start; background: rgba(247,118,142,.12);
   border: 1px solid var(--danger); color: var(--danger);
 }
-#chat-form textarea { min-height: 3.5rem; font-family: inherit; resize: vertical; }
-#chat-form button { margin-top: 0.5rem; }
-#chat-form { display: flex; flex-direction: column; gap: 0.2rem; }
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.
@@ -321,6 +343,19 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
     busy = state;
     if (sendBtn) sendBtn.disabled = state;
   }
+  // Auto-grow the textarea to its content (capped by CSS max-height).
+  function autoGrow() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+  input.addEventListener("input", autoGrow);
+  // Enter sends; Shift+Enter inserts a newline.
+  input.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      form.requestSubmit();
+    }
+  });
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
     if (busy) return;
@@ -409,7 +444,7 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "2";
+pub const ASSETS_VERSION: &str = "3";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

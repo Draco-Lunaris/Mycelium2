@@ -21,6 +21,20 @@ pub fn layout_with_scripts(
     body: String,
     extra_scripts: &[&str],
 ) -> Html<String> {
+    layout_full(title, user, csrf, body, extra_scripts, "")
+}
+
+/// Full-control layout: extra scripts + a body class (e.g. the chat
+/// page's full-viewport mode).
+#[allow(clippy::too_many_arguments)]
+pub fn layout_full(
+    title: &str,
+    user: Option<&SessionUser>,
+    csrf: &str,
+    body: String,
+    extra_scripts: &[&str],
+    body_class: &str,
+) -> Html<String> {
     let nav = match user {
         Some(u) => format!(
             r#"<nav>
@@ -57,7 +71,7 @@ pub fn layout_with_scripts(
 <title>{} — Mycelium2</title>
 <link rel="stylesheet" href="/assets/style.css">
 </head>
-<body>
+<body class="{}">
 <header><a href="/">Mycelium2</a>{}</header>
 <main>{}</main>
 <script src="/assets/app.js"></script>{scripts}
@@ -65,6 +79,7 @@ pub fn layout_with_scripts(
 </html>"#,
         html_escape(csrf),
         html_escape(title),
+        body_class,
         nav,
         body
     );
@@ -393,19 +408,29 @@ pub fn books_page(
 }
 
 /// Chat page: talk to the librarian agent (the same agent behind the
-/// MCP tools). Messages post to /api/v1/chat; the reply renders inline.
-/// The client logic is an external asset (/assets/chat.js) — the site
-/// CSP (script-src 'self' + nonce) blocks inline scripts.
+/// MCP tools). Full-viewport layout: the conversation log fills the
+/// screen and scrolls; the input is pinned to the bottom.
 pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<h1>Librarian</h1>
-<p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
-<div id="chat-log" class="chat-log" aria-live="polite"></div>
-<form id="chat-form">
-  <textarea id="chat-input" rows="3" placeholder="Ask about your knowledge base, or say 'record that ...'" required></textarea>
-  <button type="submit">Send</button>
-</form>"#
+    let body = r#"<div class="chat-shell">
+  <div class="chat-intro">
+    <h1>Librarian</h1>
+    <p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
+  </div>
+  <div id="chat-log" class="chat-log" aria-live="polite"></div>
+  <form id="chat-form" class="chat-input-bar">
+    <textarea id="chat-input" rows="1" placeholder="Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)" required></textarea>
+    <button type="submit">Send</button>
+  </form>
+</div>"#
         .to_string();
-    layout_with_scripts("Librarian", Some(user), csrf, body, &["/assets/chat.js"])
+    layout_full(
+        "Librarian",
+        Some(user),
+        csrf,
+        body,
+        &["/assets/chat.js"],
+        "chat-page",
+    )
 }
 
 /// Change-password page.
