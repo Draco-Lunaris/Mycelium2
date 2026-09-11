@@ -48,11 +48,15 @@ impl EncryptedIndex {
         }
     }
 
-    /// Open the index for the global (service-key) scope.
-    pub fn for_service(pool: SqlitePool, service_key: &ServiceKey) -> Self {
+    /// Open the index for a global (service-key) scope.
+    ///
+    /// `namespace` separates the two service-key scopes so their tokens
+    /// and docs never collide: `"skills"` (global skills shelf) and
+    /// `"library"` (book catalogs). The scope id is `global:<namespace>`.
+    pub fn for_service(pool: SqlitePool, service_key: &ServiceKey, namespace: &str) -> Self {
         Self {
             pool,
-            scope_id: "global".to_string(),
+            scope_id: format!("global:{namespace}"),
             keys: IndexKeys::from_service_key(service_key),
         }
     }
@@ -390,7 +394,7 @@ mod tests {
     async fn service_scope_index_works() {
         let (_dir, store) = test_store().await;
         let service = mycelium_crypto::ServiceKey::from_bytes(&[3u8; 32]).unwrap();
-        let index = EncryptedIndex::for_service(store.pool().clone(), &service);
+        let index = EncryptedIndex::for_service(store.pool().clone(), &service, "skills");
         index
             .add_async(&concept(
                 "/skills/deploy.md",
@@ -413,7 +417,7 @@ mod tests {
         let master = mycelium_crypto::generate_master_key();
         let service = mycelium_crypto::ServiceKey::from_bytes(&[4u8; 32]).unwrap();
         let user_index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
-        let global_index = EncryptedIndex::for_service(store.pool().clone(), &service);
+        let global_index = EncryptedIndex::for_service(store.pool().clone(), &service, "skills");
         user_index
             .add_async(&concept("/private.md", "Private Note", "private zebra"))
             .await
@@ -436,6 +440,37 @@ mod tests {
             .unwrap();
         assert_eq!(global_hits.len(), 1);
         assert_eq!(global_hits[0].concept_path, "/global.md");
+    }
+
+    #[tokio::test]
+    async fn service_namespaces_are_isolated() {
+        // The two service-key scopes (skills shelf, library catalogs)
+        // share the service key but must never collide in the token/doc
+        // tables — even on identical concept paths.
+        let (_dir, store) = test_store().await;
+        let service = mycelium_crypto::ServiceKey::from_bytes(&[8u8; 32]).unwrap();
+        let skills = EncryptedIndex::for_service(store.pool().clone(), &service, "skills");
+        let library = EncryptedIndex::for_service(store.pool().clone(), &service, "library");
+        skills
+            .add_async(&concept("/shared.md", "Skill Doc", "skill zebra"))
+            .await
+            .unwrap();
+        library
+            .add_async(&concept("/shared.md", "Library Doc", "library zebra"))
+            .await
+            .unwrap();
+        let skill_hits = skills
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(skill_hits.len(), 1);
+        assert_eq!(skill_hits[0].title, "Skill Doc");
+        let library_hits = library
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(library_hits.len(), 1);
+        assert_eq!(library_hits[0].title, "Library Doc");
     }
 
     #[tokio::test]

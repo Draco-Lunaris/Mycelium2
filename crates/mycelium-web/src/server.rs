@@ -52,6 +52,7 @@ pub fn build_router_with_shutdown(
         .route("/search", get(api::search_view))
         .route("/graph", get(api::graph_view))
         .route("/skills", get(api::skills_view))
+        .route("/books", get(api::books_view))
         .route(
             "/password",
             get(api::password_view).post(api::password_submit),

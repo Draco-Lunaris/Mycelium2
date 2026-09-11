@@ -1,10 +1,9 @@
 //! Book ingest orchestration: write the full text to the shared
 //! encrypted library stacks, then write the catalog (hub + chapters)
-//! to the target bookshelf scope.
+//! to the library namespace of the service-key scope.
 
-use mycelium_core::concept::Concept;
 use mycelium_crypto::keys::ServiceKey;
-use mycelium_store::{ConceptStore, ConceptStoreError, Store};
+use mycelium_store::{ConceptStore, ConceptStoreError, FileRepo, Scope, Store};
 
 use crate::extract::{BookCatalog, BookOutline, build_chapter_concept, build_hub_concept};
 
@@ -12,6 +11,8 @@ use crate::extract::{BookCatalog, BookOutline, build_chapter_concept, build_hub_
 pub enum IngestError {
     #[error("store error: {0}")]
     Store(#[from] ConceptStoreError),
+    #[error("file repo error: {0}")]
+    Repo(#[from] mycelium_store::FileRepoError),
     #[error("book text is empty")]
     EmptyBook,
     #[error("book has no chapters (no `# ` headings)")]
@@ -25,6 +26,11 @@ pub fn stack_path_for(slug: &str) -> String {
 
 /// Write the full book text to the shared library stacks (service-key
 /// scope). The stored copy is the single source for `book://` passages.
+///
+/// The stack text is a raw FileRepo payload — deliberately NOT a
+/// concept: it never enters the scope_files registry or the search
+/// index (a 32 MiB book body would poison both; passages are read via
+/// `book://` anchors, not search).
 pub async fn write_stack_text(
     store: &Store,
     service_key: &ServiceKey,
@@ -34,9 +40,13 @@ pub async fn write_stack_text(
     if text.trim().is_empty() {
         return Err(IngestError::EmptyBook);
     }
-    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir());
-    let stack = stack_concept(slug, text)?;
-    cs.put(&stack).await?;
+    let repo = FileRepo::new(store.library_dir());
+    repo.write(
+        &stack_path_for(slug),
+        text.as_bytes(),
+        &Scope::Service(service_key.clone()),
+    )
+    .await?;
     Ok(())
 }
 
@@ -46,14 +56,17 @@ pub async fn read_stack_text(
     service_key: &ServiceKey,
     slug: &str,
 ) -> Result<String, IngestError> {
-    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir());
-    let stack = cs.get(&stack_path_for(slug)).await?;
-    Ok(stack.body)
+    let repo = FileRepo::new(store.library_dir());
+    let bytes = repo
+        .read(&stack_path_for(slug), &Scope::Service(service_key.clone()))
+        .await?;
+    String::from_utf8(bytes)
+        .map_err(|_| IngestError::Store(ConceptStoreError::NotFound(stack_path_for(slug))))
 }
 
-/// Write the catalog (hub + chapter concepts) to the bookshelf scope.
-/// The bookshelf scope is the service-key library directory — catalogs
-/// for all books live there under `/<slug>/`.
+/// Write the catalog (hub + chapter concepts) to the library namespace
+/// of the service-key scope. Catalogs for all books live there under
+/// `/<slug>/`.
 pub async fn write_catalog(
     store: &Store,
     service_key: &ServiceKey,
@@ -63,7 +76,7 @@ pub async fn write_catalog(
     if outline.chapters.is_empty() {
         return Err(IngestError::NoChapters);
     }
-    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir());
+    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir(), "library");
     let mut written = Vec::new();
     let hub = build_hub_concept(catalog, outline);
     cs.put(&hub).await?;
@@ -74,21 +87,6 @@ pub async fn write_catalog(
         written.push(concept.source_path.clone());
     }
     Ok(written)
-}
-
-/// The stack concept: full book text under `/library/<slug>.md`. The
-/// frontmatter is minimal (the text is the payload, not a graph node).
-fn stack_concept(slug: &str, text: &str) -> Result<Concept, IngestError> {
-    Ok(Concept::new(
-        mycelium_core::concept::Frontmatter {
-            concept_type: "BookText".into(),
-            title: Some(format!("Full text: {slug}")),
-            resource: Some(format!("book://{slug}")),
-            ..Default::default()
-        },
-        text.to_string(),
-        stack_path_for(slug),
-    ))
 }
 
 /// Convenience: full ingest for one book (stack text + catalog).
@@ -152,8 +150,23 @@ Second chapter text.
         let text = read_stack_text(&store, &service, "my-book").await.unwrap();
         assert!(text.starts_with("# Chapter One"));
 
+        // The stack text is NOT a concept: absent from the registry and
+        // the search index (passages are read via book:// anchors).
+        let cs =
+            ConceptStore::for_service(&store, service.clone(), &store.library_dir(), "library");
+        let listing = cs.list().await.unwrap();
+        assert!(
+            !listing.iter().any(|e| e.path == "/library/my-book.md"),
+            "stack text must not appear in the registry"
+        );
+        let q = mycelium_core::search::SearchQuery::new(vec!["intro".into()]);
+        let hits = cs.search(&q).await.unwrap();
+        assert!(
+            !hits.iter().any(|h| h.concept_path == "/library/my-book.md"),
+            "stack text must not be searchable"
+        );
+
         // Catalog concepts are retrievable and well-formed.
-        let cs = ConceptStore::for_service(&store, service.clone(), &store.library_dir());
         let hub = cs.get("/my-book/book.md").await.unwrap();
         assert_eq!(hub.frontmatter.concept_type, "Book");
         let ch1 = cs.get("/my-book/ch-1-chapter-one.md").await.unwrap();

@@ -3,7 +3,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use mycelium_auth::rbac::SessionUser;
+use mycelium_auth::rbac::{Role, SessionUser};
 
 use crate::middleware::SessionId;
 
@@ -28,6 +28,7 @@ pub fn layout_with_scripts(
                 <a href="/search">Search</a>
                 <a href="/graph">Graph</a>
                 <a href="/skills">Skills</a>
+                <a href="/books">Books</a>
                 <a href="/keys">API Keys</a>
                 <a href="/password">Password</a>
                 {}
@@ -161,20 +162,88 @@ pub fn concept_page(
     layout("Concept", Some(user), csrf, body)
 }
 
+/// Concept view page for a scoped store (library catalogs, global
+/// skills). `editable` controls whether the save/delete form renders
+/// (library: never; global skills: admins only).
+pub fn concept_page_scoped(
+    user: &SessionUser,
+    csrf: &str,
+    path: &str,
+    markdown: &str,
+    editable: bool,
+    scope: &str,
+) -> Html<String> {
+    let scope_note = match scope {
+        "library" => " <span class=\"muted\">(library — read-only)</span>",
+        "skills" => " <span class=\"muted\">(global skills)</span>",
+        _ => "",
+    };
+    let form = if editable {
+        format!(
+            r#"<form method="post" action="/concept">
+  <input type="hidden" name="path" value="{}">
+  <input type="hidden" name="scope" value="{scope}">
+  <label>Markdown (frontmatter + body)</label>
+  <textarea name="markdown" spellcheck="false">{}</textarea>
+  <button type="submit">Save</button>
+  <button type="submit" name="delete" value="1" class="danger" formaction="/concept/delete">Delete</button>
+</form>"#,
+            html_escape(path),
+            textarea_escape(markdown)
+        )
+    } else {
+        format!(
+            r#"<label>Markdown (read-only)</label>
+<textarea readonly spellcheck="false">{}</textarea>"#,
+            textarea_escape(markdown)
+        )
+    };
+    let body = format!(
+        r#"<h1>{}{scope_note}</h1>
+{form}"#,
+        html_escape(path)
+    );
+    layout("Concept", Some(user), csrf, body)
+}
+
 /// New-concept page.
 pub fn new_concept_page(user: &SessionUser, csrf: &str, err: Option<&str>) -> Html<String> {
-    let template = "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n";
+    let _ = err; // parse errors surface on submit instead
+    new_concept_page_with(
+        user,
+        csrf,
+        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
+        None,
+    )
+}
+
+/// New-concept page with a custom template and target scope. The form
+/// posts back with the scope so the write lands in the right store.
+pub fn new_concept_page_with(
+    user: &SessionUser,
+    csrf: &str,
+    template: &str,
+    scope: Option<&str>,
+) -> Html<String> {
+    let scope_input = scope
+        .map(|s| {
+            format!(
+                r#"<input type="hidden" name="scope" value="{}">"#,
+                html_escape(s)
+            )
+        })
+        .unwrap_or_default();
     let body = format!(
         r#"<h1>New concept</h1>
-{}
 <form method="post" action="/concept">
+  {scope_input}
   <label>Path (e.g. /notes/my-note.md)</label>
   <input name="path" required pattern="/.*\.md" placeholder="/notes/my-note.md">
   <label>Markdown</label>
-  <textarea name="markdown" spellcheck="false">{template}</textarea>
+  <textarea name="markdown" spellcheck="false">{}</textarea>
   <button type="submit">Create</button>
 </form>"#,
-        flash(None, err)
+        html_escape(template)
     );
     layout("New concept", Some(user), csrf, body)
 }
@@ -184,14 +253,35 @@ pub fn search_page(
     user: &SessionUser,
     csrf: &str,
     query: &str,
-    results: &[mycelium_core::search::SearchResult],
+    results: &[crate::api::ScopedResult],
 ) -> Html<String> {
     let rows = results
         .iter()
         .map(|r| {
+            // Scope-aware links: user bundle and library/skills concepts
+            // open in the right viewer.
+            let (href, label) = match r.scope {
+                "library" => (
+                    format!(
+                        "/concept?path={}&scope=library",
+                        urlencoding_encode(&r.concept_path)
+                    ),
+                    "library",
+                ),
+                "skills" => (
+                    format!(
+                        "/concept?path={}&scope=skills",
+                        urlencoding_encode(&r.concept_path)
+                    ),
+                    "global skills",
+                ),
+                _ => (
+                    format!("/concept?path={}", urlencoding_encode(&r.concept_path)),
+                    "your bundle",
+                ),
+            };
             format!(
-                r#"<li><a href="/concept?path={}">{}</a> <span class="muted">(score {:.1})</span><br><span class="muted">{}</span></li>"#,
-                urlencoding_encode(&r.concept_path),
+                r#"<li><a href="{href}">{}</a> <span class="muted">({label}, score {:.1})</span><br><span class="muted">{}</span></li>"#,
                 html_escape(&r.title),
                 r.score,
                 html_escape(&r.snippet)
@@ -216,36 +306,89 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
     layout_with_scripts("Graph", Some(user), csrf, body, &["/assets/graph.js"])
 }
 
-/// Skills page: private skills + global skills (read-only for users).
+/// Skills page: private skills + global skills (read-only for users,
+/// editable by admins).
 pub fn skills_page(
     user: &SessionUser,
     csrf: &str,
     private: &[mycelium_store::ConceptEntry],
     global: &[mycelium_store::ConceptEntry],
 ) -> Html<String> {
-    let list = |entries: &[mycelium_store::ConceptEntry]| {
+    let list = |entries: &[mycelium_store::ConceptEntry], scope: &str| {
         entries
             .iter()
             .map(|e| {
                 format!(
-                    r#"<li><a href="/concept?path={}&scope=skills">{}</a></li>"#,
+                    r#"<li><a href="/concept?path={}&scope={scope}">{}</a></li>"#,
                     urlencoding_encode(&e.path),
                     html_escape(&e.title)
                 )
             })
             .collect::<String>()
     };
+    let global_section = if user.role == Role::Admin {
+        format!(
+            r#"<h2>Global skills</h2>
+<ul>{}</ul>
+<p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#,
+            list(global, "skills")
+        )
+    } else {
+        format!(
+            r#"<h2>Global skills</h2>
+<ul>{}</ul>"#,
+            list(global, "skills")
+        )
+    };
     let body = format!(
         r#"<h1>Skills</h1>
 <h2>Your private skills</h2>
 <ul>{}</ul>
-<p><a href="/concept?new=1&scope=skills">New private skill</a></p>
-<h2>Global skills</h2>
-<ul>{}</ul>"#,
-        list(private),
-        list(global)
+<p><a href="/concept?new=1&scope=skills-private">New private skill</a></p>
+{global_section}"#,
+        list(private, "user"),
     );
     layout("Skills", Some(user), csrf, body)
+}
+
+/// Books browse page: shelves with their books. Each book links to its
+/// catalog hub (library scope concept viewer).
+pub fn books_page(
+    user: &SessionUser,
+    csrf: &str,
+    shelves: &[crate::api::ShelfBrowse],
+) -> Html<String> {
+    let sections = shelves
+        .iter()
+        .map(|(name, is_global, books)| {
+            let visibility = if *is_global { "global-read" } else { "admin-private" };
+            let rows = if books.is_empty() {
+                r#"<p class="muted">No books yet.</p>"#.to_string()
+            } else {
+                let items = books
+                    .iter()
+                    .map(|(slug, title)| {
+                        format!(
+                            r#"<li><a href="/concept?path=/{slug}/book.md&scope=library">{}</a> <span class="muted">({slug})</span></li>"#,
+                            html_escape(title)
+                        )
+                    })
+                    .collect::<String>();
+                format!("<ul>{items}</ul>")
+            };
+            format!(
+                r#"<h2>{}</h2>
+<p class="muted">{visibility}</p>
+{rows}"#,
+                html_escape(name)
+            )
+        })
+        .collect::<String>();
+    let body = format!(
+        r#"<h1>Bookshelves</h1>
+{sections}"#
+    );
+    layout("Books", Some(user), csrf, body)
 }
 
 /// Change-password page.
@@ -414,6 +557,8 @@ pub fn admin_page(
 </form>
 <h2>Ingest jobs</h2>
 <table><tr><th>Book</th><th>Status</th><th>Detail</th><th>Created</th><th>Shelf</th></tr>{job_rows}</table>
+<h2>Global skills</h2>
+<p class="muted">The global skills shelf is readable by all users; only admins can edit. Manage skills on the <a href="/skills">Skills page</a> (edit links appear there for admins).</p>
 <h2>Maintenance</h2>
 <form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>"#,
         flash(ok, err),

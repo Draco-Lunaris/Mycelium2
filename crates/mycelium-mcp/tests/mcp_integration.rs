@@ -537,6 +537,7 @@ async fn mcp_full_flow() {
             &store,
             service_key,
             &store.skills_dir(),
+            "skills",
         );
         let skill = mycelium_core::concept::Concept::parse(
             "/deploy-rust-service.md",

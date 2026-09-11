@@ -121,6 +121,35 @@ impl Store {
         Ok(rows.into_iter().map(|(n, g)| (n, g != 0)).collect())
     }
 
+    /// List bookshelves with ids: (id, name, is_global_read), ordered by
+    /// name — the browse page's data source.
+    pub async fn list_bookshelves_detailed(
+        &self,
+    ) -> Result<Vec<(uuid::Uuid, String, bool)>, StoreError> {
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT id, name, is_global_read FROM bookshelves ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name, g)| {
+                uuid::Uuid::parse_str(&id).ok().map(|id| (id, name, g != 0))
+            })
+            .collect())
+    }
+
+    /// Whether a bookshelf is global-read (visibility gate for passages
+    /// and browse). None when the shelf does not exist.
+    pub async fn bookshelf_is_global_read(&self, id: uuid::Uuid) -> Option<bool> {
+        sqlx::query_as::<_, (i64,)>("SELECT is_global_read FROM bookshelves WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|(g,)| g != 0)
+    }
+
     /// Look up a bookshelf id by name.
     pub async fn bookshelf_id_by_name(&self, name: &str) -> Result<Option<uuid::Uuid>, StoreError> {
         let row: Option<(String,)> = sqlx::query_as("SELECT id FROM bookshelves WHERE name = ?")

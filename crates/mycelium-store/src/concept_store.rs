@@ -43,6 +43,8 @@ pub enum ConceptScope {
     },
     Service {
         service_key: ServiceKey,
+        /// Registry/index namespace: "skills" or "library".
+        namespace: String,
     },
 }
 
@@ -50,14 +52,14 @@ impl ConceptScope {
     fn scope_id(&self) -> String {
         match self {
             ConceptScope::User { user_id, .. } => format!("user:{user_id}"),
-            ConceptScope::Service { .. } => "global".to_string(),
+            ConceptScope::Service { namespace, .. } => format!("global:{namespace}"),
         }
     }
 
     fn repo_scope(&self) -> Scope {
         match self {
             ConceptScope::User { master_key, .. } => Scope::User(master_key.clone()),
-            ConceptScope::Service { service_key } => Scope::Service(service_key.clone()),
+            ConceptScope::Service { service_key, .. } => Scope::Service(service_key.clone()),
         }
     }
 }
@@ -87,14 +89,24 @@ impl<'a> ConceptStore<'a> {
         }
     }
 
-    /// Open the concept store for a service-key scope (global skills shelf,
-    /// shared library stacks).
-    pub fn for_service(store: &'a Store, service_key: ServiceKey, dir: &std::path::Path) -> Self {
+    /// Open the concept store for a service-key scope (global skills
+    /// shelf, shared library stacks). `namespace` separates the two
+    /// service scopes in the registry and index: `"skills"` and
+    /// `"library"` — their listings and search results never mix.
+    pub fn for_service(
+        store: &'a Store,
+        service_key: ServiceKey,
+        dir: &std::path::Path,
+        namespace: &str,
+    ) -> Self {
         let repo = FileRepo::new(dir);
-        let index = EncryptedIndex::for_service(store.pool().clone(), &service_key);
+        let index = EncryptedIndex::for_service(store.pool().clone(), &service_key, namespace);
         Self {
             store,
-            scope: ConceptScope::Service { service_key },
+            scope: ConceptScope::Service {
+                service_key,
+                namespace: namespace.to_string(),
+            },
             repo,
             index,
         }
@@ -191,6 +203,28 @@ impl<'a> ConceptStore<'a> {
             .collect())
     }
 
+    /// List a scope's concepts whose path starts with `prefix` (e.g. a
+    /// book's `/<slug>/` chapter tree), registry order: path asc.
+    pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<ConceptEntry>, ConceptStoreError> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT path, title, concept_type, updated_at FROM scope_files
+             WHERE scope = ? AND path LIKE ? ESCAPE '\\' ORDER BY path",
+        )
+        .bind(self.scope.scope_id())
+        .bind(like_escape(prefix))
+        .fetch_all(self.store.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, title, concept_type, updated_at)| ConceptEntry {
+                path,
+                title,
+                concept_type,
+                updated_at,
+            })
+            .collect())
+    }
+
     /// Search this scope (delegates to the encrypted index).
     pub async fn search(
         &self,
@@ -198,6 +232,21 @@ impl<'a> ConceptStore<'a> {
     ) -> Result<Vec<mycelium_core::search::SearchResult>, ConceptStoreError> {
         Ok(self.index.search(query).await?)
     }
+}
+
+/// Escape a LIKE pattern's wildcards so `list_prefix` matches a literal
+/// prefix (`%`/`_` in paths — e.g. slugs — must not act as wildcards),
+/// then append the trailing `%` wildcard for the prefix match.
+fn like_escape(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + 4);
+    for c in prefix.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 #[cfg(test)]
@@ -292,7 +341,8 @@ mod tests {
         let master = mycelium_crypto::generate_master_key();
         let service = ServiceKey::from_bytes(&[5u8; 32]).unwrap();
         let user_cs = ConceptStore::for_user(&store, user, master);
-        let service_cs = ConceptStore::for_service(&store, service, &dir.path().join("skills"));
+        let service_cs =
+            ConceptStore::for_service(&store, service, &dir.path().join("skills"), "skills");
 
         user_cs
             .put(&concept("/skills/private.md", "Private", "private skill"))
@@ -309,5 +359,78 @@ mod tests {
         // Cross-scope get fails.
         assert!(service_cs.get("/skills/private.md").await.is_err());
         assert!(user_cs.get("/skills/global.md").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn service_namespaces_are_isolated() {
+        // The skills shelf and the library catalogs share the service
+        // key but use different registry namespaces — listings and
+        // search must never mix.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let service = ServiceKey::from_bytes(&[6u8; 32]).unwrap();
+        let skills = ConceptStore::for_service(
+            &store,
+            service.clone(),
+            &dir.path().join("skills"),
+            "skills",
+        );
+        let library = ConceptStore::for_service(
+            &store,
+            service.clone(),
+            &dir.path().join("library"),
+            "library",
+        );
+
+        skills
+            .put(&concept("/deploy.md", "Deploy Skill", "deploy zebra"))
+            .await
+            .unwrap();
+        library
+            .put(&concept("/my-book/book.md", "My Book", "book zebra"))
+            .await
+            .unwrap();
+
+        // Listings are per-namespace.
+        let skill_list = skills.list().await.unwrap();
+        assert_eq!(skill_list.len(), 1);
+        assert_eq!(skill_list[0].path, "/deploy.md");
+        let library_list = library.list().await.unwrap();
+        assert_eq!(library_list.len(), 1);
+        assert_eq!(library_list[0].path, "/my-book/book.md");
+
+        // Search is per-namespace (both hit "zebra", each sees only its own).
+        let q = mycelium_core::search::SearchQuery::new(vec!["zebra".into()]);
+        assert_eq!(skills.search(&q).await.unwrap().len(), 1);
+        assert_eq!(library.search(&q).await.unwrap().len(), 1);
+        assert_eq!(
+            skills.search(&q).await.unwrap()[0].concept_path,
+            "/deploy.md"
+        );
+        assert_eq!(
+            library.search(&q).await.unwrap()[0].concept_path,
+            "/my-book/book.md"
+        );
+
+        // list_prefix returns only the book's chapter tree.
+        library
+            .put(&concept(
+                "/my-book/ch-1-intro.md",
+                "Chapter 1",
+                "intro zebra",
+            ))
+            .await
+            .unwrap();
+        library
+            .put(&concept("/other-book/book.md", "Other Book", "other zebra"))
+            .await
+            .unwrap();
+        let chapters = library.list_prefix("/my-book/").await.unwrap();
+        assert_eq!(chapters.len(), 2);
+        assert!(chapters.iter().all(|c| c.path.starts_with("/my-book/")));
+
+        // LIKE wildcards in the prefix are literal, not wildcards.
+        let pct = library.list_prefix("/my-%/").await.unwrap();
+        assert!(pct.is_empty());
     }
 }

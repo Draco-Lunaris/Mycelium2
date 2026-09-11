@@ -31,12 +31,13 @@ fn user_store<'a>(
     ConceptStore::for_user(&state.store, user_id, master)
 }
 
-/// Open the global skills shelf (service-key scope).
+/// Open the global skills shelf (service-key scope, "skills" namespace).
 fn global_skills<'a>(state: &'a McpState) -> ConceptStore<'a> {
     ConceptStore::for_service(
         &state.store,
         (*state.service_key).clone(),
         &state.store.skills_dir(),
+        "skills",
     )
 }
 

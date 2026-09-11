@@ -109,6 +109,105 @@ pub struct SearchParams {
     global: Option<String>,
 }
 
+/// One merged search result, tagged with the scope it came from so the
+/// UI can route to the right viewer (user bundle, library, skills).
+#[derive(serde::Serialize)]
+pub struct ScopedResult {
+    pub concept_path: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f32,
+    pub scope: &'static str,
+}
+
+/// Run a cross-scope search: the user's private bundle plus (by
+/// default on the web) the global skills shelf and the library
+/// catalogs. Library hits from admin-private bookshelves are filtered
+/// out for non-admins (visibility post-filter — the index has no
+/// shelf metadata, so the DB decides).
+async fn search_all_scopes(
+    state: &AppState,
+    user: &SessionUser,
+    query: &SearchQuery,
+    include_global: bool,
+) -> Vec<ScopedResult> {
+    let mut results: Vec<ScopedResult> = Vec::new();
+    if let Ok(master) = state.master_key_for(user.user_id).await {
+        let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+        for r in cs.search(query).await.unwrap_or_default() {
+            results.push(ScopedResult {
+                concept_path: r.concept_path,
+                title: r.title,
+                snippet: r.snippet,
+                score: r.score,
+                scope: "user",
+            });
+        }
+    }
+    if include_global {
+        let skills = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.skills_dir(),
+            "skills",
+        );
+        for r in skills.search(query).await.unwrap_or_default() {
+            results.push(ScopedResult {
+                concept_path: r.concept_path,
+                title: r.title,
+                snippet: r.snippet,
+                score: r.score,
+                scope: "skills",
+            });
+        }
+        let library = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        );
+        for r in library.search(query).await.unwrap_or_default() {
+            // Visibility post-filter: a library hit belongs to a book;
+            // only global-read shelves (or admins) may see it.
+            let slug = r
+                .concept_path
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(".md")
+                .to_string();
+            let visible = match state.store.book_by_slug(&slug).await {
+                Ok(Some(book)) => {
+                    let global_read = state
+                        .store
+                        .bookshelf_is_global_read(book.bookshelf_id)
+                        .await
+                        .unwrap_or(false);
+                    global_read || user.role == Role::Admin
+                }
+                _ => false, // no DB row → not a book catalog → hide
+            };
+            if visible {
+                results.push(ScopedResult {
+                    concept_path: r.concept_path,
+                    title: r.title,
+                    snippet: r.snippet,
+                    score: r.score,
+                    scope: "library",
+                });
+            }
+        }
+    }
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.concept_path.cmp(&b.concept_path))
+    });
+    results
+}
+
 /// GET /api/v1/search?q=...&global=1 — user bundle (+ global shelves when
 /// global=1, the web default per DESIGN).
 async fn api_search(
@@ -123,27 +222,7 @@ async fn api_search(
         .collect::<Vec<_>>();
     let mut query = SearchQuery::new(terms);
     query.include_global = params.global.as_deref() == Some("1");
-    let master = match state.master_key_for(user.user_id).await {
-        Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
-    };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let mut results = cs.search(&query).await.unwrap_or_default();
-    if query.include_global {
-        let global_cs = ConceptStore::for_service(
-            &state.store,
-            (*state.service_key).clone(),
-            &state.store.skills_dir(),
-        );
-        let mut global_hits = global_cs.search(&query).await.unwrap_or_default();
-        results.append(&mut global_hits);
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.concept_path.cmp(&b.concept_path))
-        });
-    }
+    let results = search_all_scopes(&state, &user, &query, query.include_global).await;
     crate::state::Metrics::inc(&state.metrics.searches_total);
     Json(results).into_response()
 }
@@ -369,6 +448,10 @@ pub async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMa
 pub struct ConceptForm {
     pub path: Option<String>,
     pub markdown: String,
+    /// Which store to write to: "user" (default), "skills" (global
+    /// skills shelf — admin only), "library" (read-only).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// POST /concept — create or save a concept (form).
@@ -397,28 +480,66 @@ pub async fn concept_submit(
             .into_response();
         }
     };
-    let master = match state.master_key_for(user.user_id).await {
-        Ok(m) => m,
-        Err(_) => return pages::not_found().into_response(),
-    };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    match cs.put(&concept).await {
-        Ok(()) => Redirect::to(&format!(
-            "/concept?path={}",
-            pages::urlencoding_encode(&canonical)
-        ))
-        .into_response(),
-        Err(e) => {
-            let csrf = pages::current_csrf(&state, &session).await;
-            pages::concept_page(
-                &user,
-                &csrf,
-                &canonical,
-                &form.markdown,
-                None,
-                Some(&e.to_string()),
-            )
-            .into_response()
+    match form.scope.as_deref() {
+        // Global skills shelf: admin-only writes.
+        Some("skills") => {
+            if user.role != Role::Admin {
+                return error_response(StatusCode::FORBIDDEN, "admins only");
+            }
+            let cs = ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            );
+            match cs.put(&concept).await {
+                Ok(()) => Redirect::to(&format!(
+                    "/concept?path={}&scope=skills",
+                    pages::urlencoding_encode(&canonical)
+                ))
+                .into_response(),
+                Err(e) => {
+                    let csrf = pages::current_csrf(&state, &session).await;
+                    pages::concept_page(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &form.markdown,
+                        None,
+                        Some(&e.to_string()),
+                    )
+                    .into_response()
+                }
+            }
+        }
+        // The library is read-only (ingest is the only writer).
+        Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
+        // Default: the user's private bundle.
+        _ => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => return pages::not_found().into_response(),
+            };
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+            match cs.put(&concept).await {
+                Ok(()) => Redirect::to(&format!(
+                    "/concept?path={}",
+                    pages::urlencoding_encode(&canonical)
+                ))
+                .into_response(),
+                Err(e) => {
+                    let csrf = pages::current_csrf(&state, &session).await;
+                    pages::concept_page(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &form.markdown,
+                        None,
+                        Some(&e.to_string()),
+                    )
+                    .into_response()
+                }
+            }
         }
     }
 }
@@ -427,6 +548,11 @@ pub async fn concept_submit(
 pub struct ConceptQuery {
     pub path: Option<String>,
     pub new: Option<String>,
+    /// Which store to read from: "user" (default), "skills" (global
+    /// skills shelf), "library" (book catalogs), "skills-private"
+    /// (new private skill in the user bundle).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// GET /concept — view/edit (path given) or new (new=1).
@@ -438,32 +564,118 @@ pub async fn concept_view(
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     if query.new.is_some() {
-        return pages::new_concept_page(&user, &csrf, None).into_response();
+        let template = match query.scope.as_deref() {
+            Some("skills") if user.role == Role::Admin => {
+                "---\ntype: Skill\ntitle: New global skill\ndescription: \ntags: []\n---\n\n"
+            }
+            Some("skills") => {
+                return error_response(StatusCode::FORBIDDEN, "admins only");
+            }
+            Some("skills-private") | None => {
+                "---\ntype: Skill\ntitle: New private skill\ndescription: \ntags: []\n---\n\n"
+            }
+            Some("library") => {
+                return error_response(StatusCode::FORBIDDEN, "library is read-only");
+            }
+            _ => "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
+        };
+        return pages::new_concept_page_with(&user, &csrf, template, query.scope.as_deref())
+            .into_response();
     }
     let Some(path) = query.path else {
         return Redirect::to("/").into_response();
     };
     let canonical = format!("/{}", path.trim_start_matches('/'));
-    let master = match state.master_key_for(user.user_id).await {
-        Ok(m) => m,
-        Err(_) => return pages::not_found().into_response(),
-    };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    match cs.get(&canonical).await {
-        Ok(concept) => {
-            let markdown = concept.to_markdown().unwrap_or_default();
-            pages::concept_page(&user, &csrf, &canonical, &markdown, None, None).into_response()
+    match query.scope.as_deref() {
+        // Global skills shelf: readable by all, editable by admins.
+        Some("skills") => {
+            let cs = ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            );
+            match cs.get(&canonical).await {
+                Ok(concept) => {
+                    let markdown = concept.to_markdown().unwrap_or_default();
+                    let editable = user.role == Role::Admin;
+                    pages::concept_page_scoped(
+                        &user, &csrf, &canonical, &markdown, editable, "skills",
+                    )
+                    .into_response()
+                }
+                Err(_) => pages::not_found().into_response(),
+            }
         }
-        Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
-            pages::new_concept_page(&user, &csrf, None).into_response()
+        // Library catalogs: read-only, shelf-visibility gated.
+        Some("library") => {
+            // Visibility: the concept's book slug must be on a
+            // global-read shelf (or the reader is an admin).
+            let slug = canonical
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(".md")
+                .to_string();
+            let visible = match state.store.book_by_slug(&slug).await {
+                Ok(Some(book)) => {
+                    let global_read = state
+                        .store
+                        .bookshelf_is_global_read(book.bookshelf_id)
+                        .await
+                        .unwrap_or(false);
+                    global_read || user.role == Role::Admin
+                }
+                _ => false,
+            };
+            if !visible {
+                return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
+            }
+            let cs = ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.library_dir(),
+                "library",
+            );
+            match cs.get(&canonical).await {
+                Ok(concept) => {
+                    let markdown = concept.to_markdown().unwrap_or_default();
+                    pages::concept_page_scoped(
+                        &user, &csrf, &canonical, &markdown, false, "library",
+                    )
+                    .into_response()
+                }
+                Err(_) => pages::not_found().into_response(),
+            }
         }
-        Err(_) => pages::not_found().into_response(),
+        // Default: the user's private bundle.
+        _ => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => return pages::not_found().into_response(),
+            };
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+            match cs.get(&canonical).await {
+                Ok(concept) => {
+                    let markdown = concept.to_markdown().unwrap_or_default();
+                    pages::concept_page(&user, &csrf, &canonical, &markdown, None, None)
+                        .into_response()
+                }
+                Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+                    pages::new_concept_page(&user, &csrf, None).into_response()
+                }
+                Err(_) => pages::not_found().into_response(),
+            }
+        }
     }
 }
 
 #[derive(Deserialize)]
 pub struct DeleteForm {
     pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// POST /concept/delete — delete a concept (form).
@@ -473,13 +685,63 @@ pub async fn concept_delete(
     axum::Form(form): axum::Form<DeleteForm>,
 ) -> Response {
     let canonical = format!("/{}", form.path.trim_start_matches('/'));
-    let master = match state.master_key_for(user.user_id).await {
-        Ok(m) => m,
-        Err(_) => return pages::not_found().into_response(),
-    };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let _ = cs.delete(&canonical).await;
-    Redirect::to("/").into_response()
+    match form.scope.as_deref() {
+        // Global skills shelf: admin-only deletes.
+        Some("skills") => {
+            if user.role != Role::Admin {
+                return error_response(StatusCode::FORBIDDEN, "admins only");
+            }
+            let cs = ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            );
+            let _ = cs.delete(&canonical).await;
+            Redirect::to("/skills").into_response()
+        }
+        // The library is read-only (ingest is the only writer).
+        Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
+        // Default: the user's private bundle.
+        _ => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => return pages::not_found().into_response(),
+            };
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+            let _ = cs.delete(&canonical).await;
+            Redirect::to("/").into_response()
+        }
+    }
+}
+
+/// One shelf's browse data: (name, is_global_read, books as (slug, title)).
+pub type ShelfBrowse = (String, bool, Vec<(String, String)>);
+
+/// GET /books — browse global bookshelves. Users see global-read
+/// shelves; admins see all. Each shelf lists its books (from the DB),
+/// each book linking to its catalog hub.
+pub async fn books_view(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let shelves = state
+        .store
+        .list_bookshelves_detailed()
+        .await
+        .unwrap_or_default();
+    let mut shelf_data: Vec<ShelfBrowse> = Vec::new();
+    for (id, name, is_global) in shelves {
+        // Visibility: users see global-read shelves only; admins all.
+        if !is_global && user.role != Role::Admin {
+            continue;
+        }
+        let books = state.store.books_on_shelf(id).await.unwrap_or_default();
+        shelf_data.push((name, is_global, books));
+    }
+    pages::books_page(&user, &csrf, &shelf_data).into_response()
 }
 
 /// GET / — home: the user's bundle listing.
@@ -516,24 +778,7 @@ pub async fn search_view(
         .collect::<Vec<_>>();
     let mut query = SearchQuery::new(terms);
     query.include_global = true; // web default: bundle + global shelves
-    let master = match state.master_key_for(user.user_id).await {
-        Ok(m) => m,
-        Err(_) => return pages::not_found().into_response(),
-    };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let mut results = cs.search(&query).await.unwrap_or_default();
-    let global_cs = ConceptStore::for_service(
-        &state.store,
-        (*state.service_key).clone(),
-        &state.store.skills_dir(),
-    );
-    results.extend(global_cs.search(&query).await.unwrap_or_default());
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.concept_path.cmp(&b.concept_path))
-    });
+    let results = search_all_scopes(&state, &user, &query, true).await;
     crate::state::Metrics::inc(&state.metrics.searches_total);
     pages::search_page(&user, &csrf, &params.q, &results).into_response()
 }
@@ -560,13 +805,30 @@ pub async fn skills_view(
         Err(_) => return pages::not_found().into_response(),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let private = cs.list().await.unwrap_or_default();
+    // Private skills: only `type: Skill` concepts from the user bundle.
+    let private: Vec<mycelium_store::ConceptEntry> = cs
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.concept_type == "Skill")
+        .collect();
     let global_cs = ConceptStore::for_service(
         &state.store,
         (*state.service_key).clone(),
         &state.store.skills_dir(),
+        "skills",
     );
-    let global = global_cs.list().await.unwrap_or_default();
+    // Global skills: same `type: Skill` filter as the private section
+    // (the shelf is admin-managed, but a stray non-Skill concept
+    // should not surface on the Skills page).
+    let global: Vec<mycelium_store::ConceptEntry> = global_cs
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.concept_type == "Skill")
+        .collect();
     pages::skills_page(&user, &csrf, &private, &global).into_response()
 }
 
