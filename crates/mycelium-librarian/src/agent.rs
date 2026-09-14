@@ -15,11 +15,114 @@ use mycelium_store::{ConceptStore, ConceptStoreError};
 
 use crate::llm::{ConversationTurn, LlmClient, StepOutput, ToolCall, tool_spec};
 
-/// Maximum agentic steps per run (v1: MAX_STEPS = 12).
-pub const MAX_STEPS: u32 = 12;
+/// Maximum agentic steps per run (v1: MAX_STEPS = 12; raised for
+/// cross-scope search over large libraries — the model needs room to
+/// search, read, and synthesize across user + skills + library scopes).
+pub const MAX_STEPS: u32 = 30;
 /// Bundles larger than this get a compact tree summary in the prompt
 /// (v1: LARGE_BUNDLE_THRESHOLD = 300).
 const LARGE_BUNDLE_THRESHOLD: usize = 300;
+
+/// Parse `book://<slug>#<anchor>` (anchor optional). Returns
+/// `(slug, anchor)`; `None` when the string isn't a book URI or the
+/// slug tries to escape (v1's parseBookUri rules).
+fn parse_book_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("book://")?;
+    let (slug, anchor) = match rest.split_once('#') {
+        Some((s, a)) => (s, a),
+        None => (rest, ""),
+    };
+    if slug.is_empty()
+        || slug == "."
+        || slug == ".."
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains('\0')
+    {
+        return None;
+    }
+    Some((slug.to_string(), anchor.to_string()))
+}
+
+/// List a book's chapter anchors (`ch-<n>-<slug> — Title` lines) from
+/// its stack text, fence-aware, capped at 120 (v1 parity).
+fn list_chapter_anchors(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // A heading with a GFM explicit ID: `#... Title {#anchor}`.
+        if let Some(heading) = t.strip_prefix('#') {
+            let heading = heading.trim_start();
+            if let Some(brace) = heading.find("{#")
+                && let Some(end) = heading[brace..].find('}')
+            {
+                let anchor = &heading[brace + 2..brace + end];
+                let title = &heading[..brace];
+                let title = title.trim();
+                // Chapter anchors only: ch-<n>-<slug> (3 parts,
+                // 3rd non-numeric) or ch-<n>-<m>-<slug> (section).
+                let parts: Vec<&str> = anchor.split('-').collect();
+                let is_chapter = parts.len() >= 3
+                    && parts[0] == "ch"
+                    && parts[1].chars().all(|c| c.is_ascii_digit())
+                    && !parts[1].is_empty()
+                    && (parts.len() == 3 && !parts[2].chars().all(|c| c.is_ascii_digit())
+                        || parts.len() > 3);
+                if is_chapter {
+                    out.push(format!("- {anchor} — {title}"));
+                }
+            }
+        }
+        if out.len() >= 120 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        "(none found)".to_string()
+    } else {
+        out.join("\n")
+    }
+}
+
+/// Additional stores and capabilities available to the librarian agent
+/// beyond its primary user-scoped ConceptStore.  Enables cross-scope
+/// search (global books/skills) and full-text book search.
+pub struct AgentScopes<'a> {
+    /// Global skills shelf (optional — None when not configured).
+    pub skills: Option<ConceptStore<'a>>,
+    /// Global library catalog (optional — None when not configured).
+    pub library: Option<ConceptStore<'a>>,
+    /// Full-text book stack reader (optional — enables the `read_passage` tool).
+    pub read_stack_text: Option<Box<StackTextReader>>,
+    /// Book slugs the caller may see (None = no restriction). The web/MCP
+    /// layer computes this from bookshelf visibility: a library hit belongs
+    /// to a book; only global-read shelves (or admins) may see it.
+    pub visible_slugs: Option<std::collections::HashSet<String>>,
+    /// Trace persistence (optional — None disables recording). The pool
+    /// + scope id identify the caller's trace rows (`user:<uuid>`).
+    pub trace: Option<TraceSink>,
+}
+
+/// Where agent-run traces are persisted (DB-backed; v1 .traces/ parity).
+#[derive(Clone)]
+pub struct TraceSink {
+    pub pool: sqlx::SqlitePool,
+    pub scope_id: String,
+}
+
+/// Read the full text of a book's stack file by slug (async).  Returns an
+/// error string on failure so the agent can report it cleanly to the model.
+pub type StackTextReader = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+    + Send
+    + Sync;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -60,12 +163,13 @@ pub enum AgentMode {
 pub async fn run_query(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     question: &str,
 ) -> Result<QueryResult, AgentError> {
     let system = build_system_prompt(store, AgentMode::Query).await?;
     let tools = read_tool_specs();
     let answer = agent_loop(
-        client, store, &system, question, &tools, false, // read-only
+        client, store, scopes, &system, question, &tools, false, // read-only
         0.2,
     )
     .await?;
@@ -76,12 +180,22 @@ pub async fn run_query(
 pub async fn run_mutation(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     instruction: &str,
 ) -> Result<MutationResult, AgentError> {
     let system = build_system_prompt(store, AgentMode::Mutate).await?;
     let tools = all_tool_specs();
-    let (summary, files) =
-        agent_loop_tracked(client, store, &system, instruction, &tools, true, 0.2).await?;
+    let (summary, files) = agent_loop_tracked(
+        client,
+        store,
+        scopes,
+        &system,
+        instruction,
+        &tools,
+        true,
+        0.2,
+    )
+    .await?;
     Ok(MutationResult {
         summary,
         files_changed: files,
@@ -105,9 +219,10 @@ pub enum AgentEvent {
 pub async fn run_chat(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     history: &[ConversationTurn],
 ) -> Result<String, AgentError> {
-    run_chat_streaming(client, store, history, None).await
+    run_chat_streaming(client, store, scopes, history, None).await
 }
 
 /// Streaming chat: same loop as run_chat, but emits progress events to
@@ -116,6 +231,7 @@ pub async fn run_chat(
 pub async fn run_chat_streaming(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     history: &[ConversationTurn],
     events: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<String, AgentError> {
@@ -126,6 +242,16 @@ pub async fn run_chat_streaming(
     };
     let system = build_system_prompt(store, AgentMode::Chat).await?;
     let tools = all_tool_specs();
+    let mut recorder = crate::trace::TraceRecorder::new();
+    // The user turn that started this run, for the trace record.
+    let input = history
+        .iter()
+        .rev()
+        .find_map(|t| match t {
+            ConversationTurn::User(u) => Some(u.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     // Seed the loop with the provided history (the last turn is the
     // new user message).
     let mut conversation: Vec<ConversationTurn> = history.to_vec();
@@ -135,6 +261,15 @@ pub async fn run_chat_streaming(
             .await?;
         match output {
             StepOutput::Text(answer) => {
+                let trace = recorder.finalize(
+                    crate::trace::TraceKind::Chat,
+                    &input,
+                    &answer,
+                    crate::trace::TraceOutcome::Success,
+                );
+                if let Some(sink) = &scopes.trace {
+                    crate::trace::save_trace(&sink.pool, &sink.scope_id, &trace).await;
+                }
                 emit(AgentEvent::Done(answer.clone()));
                 return Ok(answer);
             }
@@ -148,10 +283,12 @@ pub async fn run_chat_streaming(
                     });
                     // Tool errors go back to the model (recovery), same
                     // as the query/mutation loops.
-                    let result = match execute_tool_tracked(store, &call, true).await {
-                        Ok((result, _)) => result,
-                        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
-                    };
+                    let result =
+                        match execute_tool_tracked(store, scopes, &call, true, &mut recorder).await
+                        {
+                            Ok((result, _)) => result,
+                            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+                        };
                     conversation.push(ConversationTurn::ToolResult {
                         call_id: call.id.clone(),
                         result,
@@ -161,15 +298,26 @@ pub async fn run_chat_streaming(
         }
     }
     let err = AgentError::StepCapExceeded.to_string();
+    let trace = recorder.finalize(
+        crate::trace::TraceKind::Chat,
+        &input,
+        &err,
+        crate::trace::TraceOutcome::Failed,
+    );
+    if let Some(sink) = &scopes.trace {
+        crate::trace::save_trace(&sink.pool, &sink.scope_id, &trace).await;
+    }
     emit(AgentEvent::Failed(err.clone()));
     Err(AgentError::StepCapExceeded)
 }
 
 /// The core loop shared by query and mutation runs. Returns the final
 /// text. `allow_writes` gates the write tools (query mode is read-only).
+#[allow(clippy::too_many_arguments)]
 async fn agent_loop(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     system: &str,
     prompt: &str,
     tools: &[crate::llm::ToolSpec<'_>],
@@ -179,6 +327,7 @@ async fn agent_loop(
     let (text, _) = agent_loop_tracked(
         client,
         store,
+        scopes,
         system,
         prompt,
         tools,
@@ -191,15 +340,23 @@ async fn agent_loop(
 
 /// The core loop, also returning the set of files written (mutation
 /// mode). Tool results are appended as conversation turns.
+#[allow(clippy::too_many_arguments)]
 async fn agent_loop_tracked(
     client: &LlmClient,
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     system: &str,
     prompt: &str,
     tools: &[crate::llm::ToolSpec<'_>],
     allow_writes: bool,
     temperature: f32,
 ) -> Result<(String, Vec<String>), AgentError> {
+    let kind = if allow_writes {
+        crate::trace::TraceKind::Mutation
+    } else {
+        crate::trace::TraceKind::Query
+    };
+    let mut recorder = crate::trace::TraceRecorder::new();
     let mut conversation = vec![ConversationTurn::User(prompt.to_string())];
     let mut files_changed: Vec<String> = Vec::new();
     for _ in 0..MAX_STEPS {
@@ -207,7 +364,14 @@ async fn agent_loop_tracked(
             .chat_with_tools(system, &conversation, tools, temperature)
             .await?;
         match output {
-            StepOutput::Text(answer) => return Ok((answer, files_changed)),
+            StepOutput::Text(answer) => {
+                let trace =
+                    recorder.finalize(kind, prompt, &answer, crate::trace::TraceOutcome::Success);
+                if let Some(sink) = &scopes.trace {
+                    crate::trace::save_trace(&sink.pool, &sink.scope_id, &trace).await;
+                }
+                return Ok((answer, files_changed));
+            }
             StepOutput::ToolCalls(calls) => {
                 // OpenAI protocol: the assistant's tool_calls turn MUST
                 // precede the tool results in the conversation.
@@ -218,14 +382,21 @@ async fn agent_loop_tracked(
                     // error results — the agent can recover and try a
                     // different approach. Only LLM transport errors
                     // abort the run (propagated by chat_with_tools).
-                    let (result, written) =
-                        match execute_tool_tracked(store, &call, allow_writes).await {
-                            Ok((result, written)) => (result, written),
-                            Err(e) => (
-                                serde_json::json!({ "error": e.to_string() }).to_string(),
-                                None,
-                            ),
-                        };
+                    let (result, written) = match execute_tool_tracked(
+                        store,
+                        scopes,
+                        &call,
+                        allow_writes,
+                        &mut recorder,
+                    )
+                    .await
+                    {
+                        Ok((result, written)) => (result, written),
+                        Err(e) => (
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                            None,
+                        ),
+                    };
                     if let Some(path) = written {
                         files_changed.push(path);
                     }
@@ -237,15 +408,27 @@ async fn agent_loop_tracked(
             }
         }
     }
+    let trace = recorder.finalize(
+        kind,
+        prompt,
+        "agent exceeded step cap",
+        crate::trace::TraceOutcome::Failed,
+    );
+    if let Some(sink) = &scopes.trace {
+        crate::trace::save_trace(&sink.pool, &sink.scope_id, &trace).await;
+    }
     Err(AgentError::StepCapExceeded)
 }
 
 /// Execute one tool call; returns (JSON result for the model, path
-/// written when the tool mutated a concept).
+/// written when the tool mutated a concept). Records the step on the
+/// run's trace recorder.
 async fn execute_tool_tracked(
     store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
     call: &ToolCall,
     allow_writes: bool,
+    recorder: &mut crate::trace::TraceRecorder,
 ) -> Result<(String, Option<String>), AgentError> {
     let name = call.function.name.as_str();
     let args: serde_json::Value =
@@ -253,7 +436,7 @@ async fn execute_tool_tracked(
             name: name.to_string(),
             reason: e.to_string(),
         })?;
-    match name {
+    let outcome = match name {
         "search_knowledge" => {
             let query = args["query"].as_str().unwrap_or_default();
             // Term cap mirrors the MCP layer's MAX_SEARCH_TERMS: the
@@ -266,20 +449,67 @@ async fn execute_tool_tracked(
                 .take(MAX_SEARCH_TERMS)
                 .map(|t| t.to_string())
                 .collect();
-            let mut q = SearchQuery::new(terms);
-            q.include_global = false;
-            let hits = store.search(&q).await?;
-            let hits_json: Vec<serde_json::Value> = hits
+            let q = SearchQuery::new(terms);
+
+            // Collect hits from all available scopes, tagging each with its scope.
+            let mut all_hits: Vec<(String, mycelium_core::search::SearchResult)> = Vec::new();
+
+            // 1. User's private bundle (always searched).
+            for h in store.search(&q).await.unwrap_or_default() {
+                all_hits.push(("user".to_string(), h));
+            }
+
+            // 2. Global skills shelf (if available).
+            if let Some(ref skills) = scopes.skills {
+                for h in skills.search(&q).await.unwrap_or_default() {
+                    all_hits.push(("skills".to_string(), h));
+                }
+            }
+
+            // 3. Global library catalog (if available), filtered by the
+            // caller's bookshelf visibility.
+            if let Some(ref library) = scopes.library {
+                for h in library.search(&q).await.unwrap_or_default() {
+                    if let Some(vis) = &scopes.visible_slugs {
+                        let slug = h
+                            .concept_path
+                            .trim_start_matches('/')
+                            .split('/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        if !vis.contains(&slug) {
+                            continue;
+                        }
+                    }
+                    all_hits.push(("library".to_string(), h));
+                }
+            }
+
+            // Sort by score descending, then path ascending for determinism.
+            // Cap the result set: hundreds of catalog concepts would drown
+            // the model and burn its step budget reading them one by one.
+            all_hits.sort_by(|a, b| {
+                b.1.score
+                    .partial_cmp(&a.1.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.concept_path.cmp(&b.1.concept_path))
+            });
+            all_hits.truncate(10);
+
+            let hits_json: Vec<serde_json::Value> = all_hits
                 .iter()
-                .map(|h| {
+                .map(|(scope, h)| {
                     serde_json::json!({
                         "path": h.concept_path,
                         "title": h.title,
                         "snippet": h.snippet,
                         "score": h.score,
+                        "scope": scope,
                     })
                 })
                 .collect();
+
             if !hits_json.is_empty() {
                 Ok((serde_json::json!({ "hits": hits_json }).to_string(), None))
             } else {
@@ -300,7 +530,36 @@ async fn execute_tool_tracked(
         }
         "read_concept" => {
             let path = args["path"].as_str().unwrap_or_default();
-            let concept = store.get(path).await?;
+            // Scope-aware: the path may live in the user's bundle, the
+            // global skills shelf, or the global library catalog (search
+            // results are scope-tagged). Try the user's bundle first,
+            // then the other scopes in order.
+            let result = store.get(path).await;
+            let concept = match result {
+                Ok(c) => c,
+                Err(_) => {
+                    let mut found = None;
+                    if let Some(ref skills) = scopes.skills
+                        && let Ok(c) = skills.get(path).await
+                    {
+                        found = Some(c);
+                    }
+                    if found.is_none()
+                        && let Some(ref library) = scopes.library
+                        && let Ok(c) = library.get(path).await
+                    {
+                        found = Some(c);
+                    }
+                    match found {
+                        Some(c) => c,
+                        None => {
+                            return Err(AgentError::Store(ConceptStoreError::NotFound(
+                                path.to_string(),
+                            )));
+                        }
+                    }
+                }
+            };
             let markdown = concept
                 .to_markdown()
                 .map_err(|e| AgentError::Store(ConceptStoreError::Parse(e)))?;
@@ -343,6 +602,111 @@ async fn execute_tool_tracked(
                 .to_string(),
                 None,
             ))
+        }
+        "read_passage" => {
+            // v1 card-catalog semantics: fetch a chapter/section's full
+            // text from the library stacks by its `book://<slug>#<anchor>`
+            // resource. On a missing anchor, return the book's chapter
+            // list so the model can pick a valid one.
+            let resource = args
+                .get("resource")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if resource.is_empty() {
+                return Err(AgentError::BadToolArgs {
+                    name: name.into(),
+                    reason: "resource is required".into(),
+                });
+            }
+            let Some((slug, anchor)) = parse_book_uri(&resource) else {
+                return Ok((
+                    serde_json::json!({
+                        "resource": resource,
+                        "error": "Not a book:// URI — expected book://<slug>#<anchor>, taken from a concept's `resource` field.",
+                    })
+                    .to_string(),
+                    None,
+                ));
+            };
+            let reader = match &scopes.read_stack_text {
+                Some(r) => r,
+                None => {
+                    return Ok((
+                        serde_json::json!({
+                            "resource": resource,
+                            "error": "No library configured on this instance; cannot read passages.",
+                        })
+                        .to_string(),
+                        None,
+                    ));
+                }
+            };
+            // Bookshelf visibility: a non-admin caller may only read
+            // passages of books on global-read shelves.
+            if let Some(vis) = &scopes.visible_slugs
+                && !vis.contains(&slug)
+            {
+                return Ok((
+                    serde_json::json!({
+                        "resource": resource,
+                        "error": "Book not found in library.",
+                    })
+                    .to_string(),
+                    None,
+                ));
+            }
+            match reader(&slug).await {
+                Ok(text) => {
+                    if anchor.is_empty() {
+                        // No anchor: list the book's chapter anchors.
+                        let anchors = list_chapter_anchors(&text);
+                        return Ok((
+                            serde_json::json!({
+                                "resource": resource,
+                                "passage": format!(
+                                    "No anchor given. Chapter anchors in this book:\n{}",
+                                    anchors
+                                ),
+                            })
+                            .to_string(),
+                            None,
+                        ));
+                    }
+                    match mycelium_core::library::extract_passage(&slug, &anchor, &text) {
+                        Ok(p) => Ok((
+                            serde_json::json!({
+                                "resource": resource,
+                                "passage": p.text,
+                            })
+                            .to_string(),
+                            None,
+                        )),
+                        Err(_) => {
+                            let anchors = list_chapter_anchors(&text);
+                            Ok((
+                                serde_json::json!({
+                                    "resource": resource,
+                                    "passage": format!(
+                                        "No passage for anchor \"{anchor}\" in book \"{slug}\". Chapter anchors in this book:\n{anchors}"
+                                    ),
+                                })
+                                .to_string(),
+                                None,
+                            ))
+                        }
+                    }
+                }
+                Err(e) => Ok((
+                    serde_json::json!({
+                        "resource": resource,
+                        "error": e,
+                    })
+                    .to_string(),
+                    None,
+                )),
+            }
         }
         "write_concept" => {
             if !allow_writes {
@@ -456,7 +820,56 @@ async fn execute_tool_tracked(
             name: other.to_string(),
             reason: "unknown tool".into(),
         }),
+    };
+    // Trace the step (telemetry — never fails the call).
+    match &outcome {
+        Ok((result, written)) => {
+            let summary = match name {
+                "search_knowledge" | "read_passage" => args
+                    .get(if name == "search_knowledge" {
+                        "query"
+                    } else {
+                        "resource"
+                    })
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            let mut paths = Vec::new();
+            if let Some(p) = written {
+                paths.push(p.clone());
+            }
+            if name == "search_knowledge"
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(result)
+                && let Some(hits) = v.get("hits").and_then(|h| h.as_array())
+            {
+                paths = hits
+                    .iter()
+                    .filter_map(|h| h.get("path").and_then(|p| p.as_str()).map(String::from))
+                    .collect();
+            }
+            recorder.record(name, &summary, paths, written.is_some());
+            // Hot memory (v1 parity): a write moves the concept to the
+            // front of the hot set and purges recent Q&As (the write
+            // may contradict them); a delete removes it.
+            if let Some(p) = written {
+                if name == "delete_concept" {
+                    crate::hot_memory::record_hot_delete(&store.scope_id(), p);
+                } else {
+                    crate::hot_memory::record_hot_write(&store.scope_id(), p);
+                }
+            }
+        }
+        Err(_) => {
+            recorder.record(name, "(error)", vec![], false);
+        }
     }
+    outcome
 }
 
 /// Replace one top-level `# Section` in a markdown body (v1
@@ -578,6 +991,7 @@ You are conversing with the user about their knowledge base. Answer questions (s
 - The only REQUIRED frontmatter field is `type` (free-form, e.g. \"Decision\", \"How-To\", \"Playbook\"). Recommended: `title`, `description` (one line), `resource`, `tags` (list).
 - `index.md` and `log.md` are RESERVED — never create concepts with those names.
 - Cross-link related concepts with bundle-relative markdown links: `[Customers table](/tables/customers.md)`. Link liberally; broken links are tolerated.
+- **Book library (card catalog)**: some shelves catalog books. A `Book` or `Chapter` concept has a small summary body and a `resource: book://<slug>#<anchor>` field — the FULL text lives in the library stacks, NOT in the concept body. To read a chapter's full text, call the `read_passage` tool with that `resource`. Never assume a chapter concept's body is the whole chapter.
 
 ## Operating rules
 
@@ -642,6 +1056,17 @@ pub fn read_tool_specs() -> Vec<crate::llm::ToolSpec<'static>> {
                             "query": { "type": "string", "description": "Keywords to search for" }
                         },
                         "required": ["query"]
+                    })),
+                ),
+                tool_spec(
+                    "read_passage",
+                    "Read a full passage from a book in the library stacks. A catalog `Book`/`Chapter` concept has a small summary body and a `resource` field like `book://<slug>#<anchor>` — call this with that resource to fetch the full chapter/section text on demand. Do NOT assume a chapter concept's body is the whole chapter; it is only a summary — use read_passage for the full text.",
+                    static_schema(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "resource": { "type": "string", "description": "A book://<slug>#<anchor> URI, taken from a concept's `resource` field" }
+                        },
+                        "required": ["resource"]
                     })),
                 ),
                 tool_spec(

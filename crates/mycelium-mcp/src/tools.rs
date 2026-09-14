@@ -41,6 +41,62 @@ fn global_skills<'a>(state: &'a McpState) -> ConceptStore<'a> {
     )
 }
 
+/// Construct the agent's cross-scope capabilities (global skills, library,
+/// and full-text book search), filtered by the caller's bookshelf
+/// visibility: admins are unrestricted, others see only global-read
+/// shelves' books.
+async fn agent_scopes<'a>(
+    state: &'a McpState,
+    user: &McpUser,
+) -> mycelium_librarian::agent::AgentScopes<'a> {
+    let store = state.store.clone();
+    let service_key = (*state.service_key).clone();
+    let read_stack_text: Option<Box<mycelium_librarian::agent::StackTextReader>> =
+        Some(Box::new(move |slug| {
+            let store = store.clone();
+            let service_key = service_key.clone();
+            let slug = slug.to_string();
+            Box::pin(async move {
+                mycelium_librarian::read_stack_text(&store, &service_key, &slug)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }));
+    let visible_slugs = if user.role == mycelium_auth::rbac::Role::Admin {
+        None
+    } else {
+        let mut out = std::collections::HashSet::new();
+        if let Ok(shelves) = state.store.list_bookshelves_detailed().await {
+            for (id, _name, global_read) in shelves {
+                if !global_read {
+                    continue;
+                }
+                if let Ok(books) = state.store.books_on_shelf(id).await {
+                    for (slug, _title) in books {
+                        out.insert(slug);
+                    }
+                }
+            }
+        }
+        Some(out)
+    };
+    mycelium_librarian::agent::AgentScopes {
+        skills: Some(global_skills(state)),
+        library: Some(ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        )),
+        read_stack_text,
+        visible_slugs,
+        trace: Some(mycelium_librarian::agent::TraceSink {
+            pool: state.store.pool().clone(),
+            scope_id: format!("user:{}", user.user_id),
+        }),
+    }
+}
+
 /// The librarian agent's LLM client from the runtime config (admin-
 /// managed via ConfigStore key "llm"; Ollama default).
 async fn agent_client(state: &McpState) -> Option<mycelium_librarian::llm::LlmClient> {
@@ -118,8 +174,17 @@ pub async fn memory_query(
 
     // Agent path: the v1 architecture — all queries flow through the
     // librarian. Unreachable LLM → deterministic fallback below.
+    // The cached wrapper (v1 parity) answers identical repeats from
+    // the fingerprint-invalidated cache — no agent run, no tokens.
     if let Some(client) = agent_client(state).await {
-        match mycelium_librarian::agent::run_query(&client, &cs, &args.question).await {
+        match mycelium_librarian::query_cache::run_query_cached(
+            &client,
+            &cs,
+            &agent_scopes(state, user).await,
+            &args.question,
+        )
+        .await
+        {
             Ok(result) => {
                 return Ok(QueryOutput::Answer(AgentAnswer {
                     answer: result.answer,
@@ -210,8 +275,17 @@ pub async fn memory_add(
                 "\n\nThe knowledge is of kind/type \"{kind}\" — use it as the concept `type`."
             ));
         }
-        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+        match mycelium_librarian::agent::run_mutation(
+            &client,
+            &cs,
+            &agent_scopes(state, user).await,
+            &instruction,
+        )
+        .await
+        {
             Ok(result) => {
+                // Seed refresh (v1 parity): the overview changed.
+                crate::seed::refresh_seed(&state.store, &state.service_key).await;
                 return Ok(if result.files_changed.is_empty() {
                     result.summary
                 } else {
@@ -274,6 +348,8 @@ pub async fn memory_add(
         path,
     );
     cs.put(&concept).await?;
+    // Hot memory (v1 parity): the direct write joins the hot set.
+    mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), &concept.source_path);
     Ok(concept.source_path)
 }
 
@@ -377,8 +453,17 @@ pub async fn memory_update(
         if let Some(path) = &args.path {
             instruction.push_str(&format!("\n\nThe target concept is at {path}."));
         }
-        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+        match mycelium_librarian::agent::run_mutation(
+            &client,
+            &cs,
+            &agent_scopes(state, user).await,
+            &instruction,
+        )
+        .await
+        {
             Ok(result) => {
+                // Seed refresh (v1 parity): the overview changed.
+                crate::seed::refresh_seed(&state.store, &state.service_key).await;
                 return Ok(if result.files_changed.is_empty() {
                     result.summary
                 } else {
@@ -428,6 +513,8 @@ pub async fn memory_update(
         concept.frontmatter.timestamp = Some(stamp);
     }
     cs.put(&concept).await?;
+    // Hot memory (v1 parity): the direct write joins the hot set.
+    mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), &path);
     Ok(path)
 }
 
@@ -545,8 +632,17 @@ pub async fn memory_maintain(
                 broken_list
             },
         );
-        match mycelium_librarian::agent::run_mutation(&client, &cs, &instruction).await {
+        match mycelium_librarian::agent::run_mutation(
+            &client,
+            &cs,
+            &agent_scopes(state, user).await,
+            &instruction,
+        )
+        .await
+        {
             Ok(result) => {
+                // Seed refresh (v1 parity): the overview changed.
+                crate::seed::refresh_seed(&state.store, &state.service_key).await;
                 // Re-measure after the agent's repairs.
                 let entries2 = cs.list().await?;
                 let mut concepts2 = Vec::with_capacity(entries2.len());

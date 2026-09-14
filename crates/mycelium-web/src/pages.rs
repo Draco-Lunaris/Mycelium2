@@ -87,8 +87,8 @@ pub fn layout_full(
         crate::assets::ASSETS_VERSION,
         body_class,
         nav,
-        crate::assets::ASSETS_VERSION,
-        body
+        body,
+        crate::assets::ASSETS_VERSION
     );
     Html(html)
 }
@@ -681,4 +681,42 @@ pub async fn current_csrf(state: &crate::state::AppState, session: &SessionId) -
 /// 404 page.
 pub fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "not found")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the page body must render inside `<main>`, and the
+    /// app.js `<script>` tag must carry a clean `?v=` version — not the body.
+    /// (A swapped `format!` argument once put the whole body into the script
+    /// tag and left `<main>` holding the bare asset version.)
+    #[test]
+    fn layout_renders_body_into_main_not_script() {
+        let html = login_page("", None).0;
+        assert!(
+            html.contains("<main><h1>Login</h1>"),
+            "body should open inside <main>: {html}"
+        );
+        assert!(
+            html.contains("</form></main>"),
+            "form should close before </main>: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<script src="/assets/app.js?v={}"></script>"#,
+                crate::assets::ASSETS_VERSION
+            )),
+            "app.js script tag should be well-formed: {html}"
+        );
+        // The body must not leak into the script src attribute.
+        assert!(
+            !html.contains("app.js?v=<h1"),
+            "body leaked into the app.js script tag: {html}"
+        );
+        assert!(
+            !html.contains(&format!("<main>{}</main>", crate::assets::ASSETS_VERSION)),
+            "<main> should not hold the bare asset version: {html}"
+        );
+    }
 }

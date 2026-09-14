@@ -231,6 +231,42 @@ impl ServerHandler for MyceliumMcpServer {
         use rmcp::model::{Implementation, ServerCapabilities};
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mycelium2", env!("CARGO_PKG_VERSION")))
+            .with_instructions(crate::seed::seed_instructions())
+    }
+
+    /// Custom list_tools (the #[tool_handler] macro skips its generated
+    /// version when this exists): injects the live seed overview into
+    /// the memory_query description (v1's universal-fallback channel —
+    /// some clients never surface initialize instructions).
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut tools = self.tool_router.list_all();
+        let seed = crate::seed::current_seed();
+        if !seed.is_empty() {
+            for tool in tools.iter_mut() {
+                if tool.name == "mycelium2_memory_query"
+                    && let Some(desc) = tool.description.as_mut()
+                {
+                    *desc = std::borrow::Cow::Owned(format!(
+                        "{desc}\n\nCURRENT MEMORY OVERVIEW:\n{seed}"
+                    ));
+                }
+            }
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
     }
 
     /// Advertise ONLY 2026-07-28: this server implements the stateless

@@ -223,7 +223,7 @@ impl LibrarianWorker {
         let outline = extract::parse_outline(text);
         let client = LlmClient::new(&self.llm_config().await);
         let catalog: BookCatalog =
-            extract::build_catalog(Some(&client), slug, title, &outline).await;
+            extract::build_catalog(Some(&client), slug, title, &outline, text).await;
         let written =
             ingest::ingest_book(&self.store, &self.service_key, slug, title, text, &catalog)
                 .await?;

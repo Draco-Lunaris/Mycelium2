@@ -64,6 +64,28 @@ pub async fn read_stack_text(
         .map_err(|_| IngestError::Store(ConceptStoreError::NotFound(stack_path_for(slug))))
 }
 
+/// Remove an existing book's catalog (all concepts under `/<slug>/`)
+/// and stack text — re-ingest support. Idempotent: a missing book is
+/// not an error.
+pub async fn delete_book(
+    store: &Store,
+    service_key: &ServiceKey,
+    slug: &str,
+) -> Result<(), IngestError> {
+    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir(), "library");
+    let prefix = format!("/{}/", slug);
+    let entries = cs.list_prefix(&prefix).await.unwrap_or_default();
+    for entry in entries {
+        // Best-effort: a missing file just means it's already gone.
+        let _ = cs.delete(&entry.path).await;
+    }
+    let repo = FileRepo::new(store.library_dir());
+    let _ = repo
+        .delete(&stack_path_for(slug), &Scope::Service(service_key.clone()))
+        .await;
+    Ok(())
+}
+
 /// Write the catalog (hub + chapter concepts) to the library namespace
 /// of the service-key scope. Catalogs for all books live there under
 /// `/<slug>/`.
@@ -78,14 +100,19 @@ pub async fn write_catalog(
     }
     let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir(), "library");
     let mut written = Vec::new();
+    let mut concepts = Vec::new();
     let hub = build_hub_concept(catalog, outline);
-    cs.put(&hub).await?;
     written.push(hub.source_path.clone());
+    concepts.push(hub);
     for chapter in &outline.chapters {
         let concept = build_chapter_concept(catalog, outline, chapter);
-        cs.put(&concept).await?;
         written.push(concept.source_path.clone());
+        concepts.push(concept);
     }
+    // One batched write: file → registry → index per concept, ONE
+    // index.md regen at the end (per-concept regen is O(n²) on a
+    // 300-chapter catalog).
+    cs.put_batch(&concepts).await?;
     Ok(written)
 }
 

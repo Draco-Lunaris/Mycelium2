@@ -88,26 +88,55 @@ impl EncryptedIndex {
             return Ok(vec![]);
         }
         // Score = sum of tf over all query terms (AND not required —
-        // matches the in-memory oracle's OR semantics).
+        // matches the in-memory oracle's OR semantics). One grouped
+        // query per DISTINCT term instead of one round-trip per term:
+        // a 32-term query on a large library is 32 index seeks either
+        // way, but the grouping happens in SQLite, not in N fetches.
+        let mut distinct: Vec<String> = query.terms.iter().map(|t| t.to_lowercase()).collect();
+        distinct.sort();
+        distinct.dedup();
+        let tokens: Vec<String> = distinct.iter().map(|t| self.keys.token(t)).collect();
         let mut scores: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for term in &query.terms {
-            let token = self.keys.token(&term.to_lowercase());
-            let rows: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT concept_path, tf FROM search_tokens WHERE scope = ? AND token = ?",
-            )
-            .bind(&self.scope_id)
-            .bind(&token)
-            .fetch_all(&self.pool)
-            .await?;
-            for (path, tf) in rows {
+        for chunk in tokens.chunks(16) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT concept_path, SUM(tf) FROM search_tokens \
+                 WHERE scope = ? AND token IN ({placeholders}) \
+                 GROUP BY concept_path"
+            );
+            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(&self.scope_id);
+            for token in chunk {
+                q = q.bind(token);
+            }
+            for (path, tf) in q.fetch_all(&self.pool).await? {
                 *scores.entry(path).or_insert(0) += tf;
             }
         }
+        // Batch doc load: one query for all scored paths instead of a
+        // round-trip per path (a broad term on a big library scores
+        // hundreds of paths).
         let mut results = Vec::with_capacity(scores.len());
-        for (path, score) in scores {
-            // Skip paths whose doc row vanished mid-search (concurrent
-            // remove/re-add) instead of failing the whole query.
-            if let Some(payload) = self.load_doc(&path).await? {
+        for chunk in scores.keys().collect::<Vec<_>>().chunks(64) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT concept_path, payload FROM search_docs \
+                 WHERE scope = ? AND concept_path IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql).bind(&self.scope_id);
+            for path in chunk {
+                q = q.bind(path);
+            }
+            for (path, payload_bytes) in q.fetch_all(&self.pool).await? {
+                let plain = match aead_open(&payload_bytes, path.as_bytes(), self.keys.index_dek())
+                {
+                    Ok(p) => p,
+                    Err(_) => continue, // corrupt row: skip, don't fail search
+                };
+                let payload: DocPayload = match serde_json::from_slice(&plain) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let score = scores.get(&path).copied().unwrap_or(0);
                 results.push(SearchResult {
                     concept_path: path,
                     title: payload.title,
@@ -123,25 +152,6 @@ impl EncryptedIndex {
                 .then_with(|| a.concept_path.cmp(&b.concept_path))
         });
         Ok(results)
-    }
-
-    async fn load_doc(&self, path: &str) -> Result<Option<DocPayload>, IndexError> {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as("SELECT payload FROM search_docs WHERE scope = ? AND concept_path = ?")
-                .bind(&self.scope_id)
-                .bind(path)
-                .fetch_optional(&self.pool)
-                .await?;
-        let Some((payload_bytes,)) = row else {
-            return Ok(None);
-        };
-        let plain = aead_open(&payload_bytes, path.as_bytes(), self.keys.index_dek())?;
-        let payload: DocPayload =
-            serde_json::from_slice(&plain).map_err(|e| IndexError::Corrupt {
-                path: path.to_string(),
-                reason: e.to_string(),
-            })?;
-        Ok(Some(payload))
     }
 }
 

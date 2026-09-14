@@ -17,6 +17,79 @@ use crate::middleware::SessionId;
 use crate::pages;
 use crate::state::AppState;
 
+/// Construct the librarian agent's cross-scope capabilities from a store
+/// and service key (global skills + library + full-text book search).
+/// Construct the librarian agent's cross-scope capabilities from a store
+/// and service key (global skills + library + full-text book search).
+/// `visible_slugs` filters library access by bookshelf visibility
+/// (None = unrestricted, i.e. admin).
+fn build_agent_scopes<'a>(
+    store: &'a mycelium_store::Store,
+    service_key: &'a mycelium_crypto::keys::ServiceKey,
+    visible_slugs: Option<std::collections::HashSet<String>>,
+    user_id: uuid::Uuid,
+) -> mycelium_librarian::agent::AgentScopes<'a> {
+    let store_arc = store.clone();
+    let sk = service_key.clone();
+    let read_stack_text: Option<Box<mycelium_librarian::agent::StackTextReader>> =
+        Some(Box::new(move |slug| {
+            let s = store_arc.clone();
+            let k = sk.clone();
+            let slug = slug.to_string();
+            Box::pin(async move {
+                mycelium_librarian::read_stack_text(&s, &k, &slug)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }));
+    mycelium_librarian::agent::AgentScopes {
+        skills: Some(ConceptStore::for_service(
+            store,
+            service_key.clone(),
+            &store.skills_dir(),
+            "skills",
+        )),
+        library: Some(ConceptStore::for_service(
+            store,
+            service_key.clone(),
+            &store.library_dir(),
+            "library",
+        )),
+        read_stack_text,
+        visible_slugs,
+        trace: Some(mycelium_librarian::agent::TraceSink {
+            pool: store.pool().clone(),
+            scope_id: format!("user:{user_id}"),
+        }),
+    }
+}
+
+/// The set of book slugs the user may see in the library: books on
+/// global-read shelves. Admins get None (unrestricted).
+async fn visible_library_slugs(
+    state: &AppState,
+    user: &SessionUser,
+) -> Option<std::collections::HashSet<String>> {
+    if user.role == Role::Admin {
+        return None;
+    }
+    let shelves = state
+        .store
+        .list_bookshelves_detailed()
+        .await
+        .unwrap_or_default();
+    let mut out = std::collections::HashSet::new();
+    for (id, _name, global_read) in shelves {
+        if !global_read {
+            continue;
+        }
+        for (slug, _title) in state.store.books_on_shelf(id).await.unwrap_or_default() {
+            out.insert(slug);
+        }
+    }
+    Some(out)
+}
+
 /// API error shape.
 #[derive(Serialize)]
 pub struct ApiError {
@@ -47,6 +120,7 @@ pub fn api_routes() -> Router<AppState> {
         )
         .route("/ingest/{id}", get(api_ingest_job))
         .route("/passages", get(api_passage))
+        .route("/dream", post(api_dream))
         .route("/chat", post(api_chat))
         .route("/chat/stream", post(api_chat_stream))
 }
@@ -82,7 +156,6 @@ async fn graph_data(State(state): State<AppState>, user: SessionUser) -> Respons
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     let mut nodes = Vec::new();
-    let mut edges = Vec::new();
     let mut known = std::collections::HashSet::new();
     for entry in cs.list().await.unwrap_or_default() {
         known.insert(entry.path.clone());
@@ -92,18 +165,24 @@ async fn graph_data(State(state): State<AppState>, user: SessionUser) -> Respons
             concept_type: entry.concept_type.clone(),
         });
     }
+    // Deduplicate edges (a concept linking to the same target twice is one
+    // relationship) and sort for deterministic output — matching the core
+    // graph builder.
+    let mut edge_set = std::collections::HashSet::new();
     for entry_path in known.iter() {
         if let Ok(concept) = cs.get(entry_path).await {
             for target in mycelium_core::links::scan_links(&concept.body) {
                 if known.contains(&target) {
-                    edges.push(GraphEdge {
-                        from: concept.source_path.clone(),
-                        to: target,
-                    });
+                    edge_set.insert((concept.source_path.clone(), target));
                 }
             }
         }
     }
+    let mut edges: Vec<GraphEdge> = edge_set
+        .into_iter()
+        .map(|(from, to)| GraphEdge { from, to })
+        .collect();
+    edges.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.to.cmp(&b.to)));
     Json(GraphResponse { nodes, edges }).into_response()
 }
 
@@ -226,7 +305,7 @@ async fn api_search(
         .map(|t| t.to_string())
         .collect::<Vec<_>>();
     let mut query = SearchQuery::new(terms);
-    query.include_global = params.global.as_deref() == Some("1");
+    query.include_global = params.global.as_deref() != Some("0");
     let results = search_all_scopes(&state, &user, &query, query.include_global).await;
     crate::state::Metrics::inc(&state.metrics.searches_total);
     Json(results).into_response()
@@ -1390,6 +1469,7 @@ pub async fn api_upload_book(
     let mut bookshelf = String::new();
     let mut slug = String::new();
     let mut title = String::new();
+    let mut replace = false;
     let mut file: Option<Vec<u8>> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -1397,6 +1477,7 @@ pub async fn api_upload_book(
             "bookshelf" => bookshelf = field.text().await.unwrap_or_default(),
             "slug" => slug = field.text().await.unwrap_or_default(),
             "title" => title = field.text().await.unwrap_or_default(),
+            "replace" => replace = field.text().await.unwrap_or_default() == "1",
             "file" => match field.bytes().await {
                 Ok(bytes) => file = Some(bytes.to_vec()),
                 Err(e) => {
@@ -1438,6 +1519,12 @@ pub async fn api_upload_book(
     if slug.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "invalid slug");
     }
+    // Re-ingest: remove the existing DB row, catalog concepts, and
+    // stack text first, then submit creates everything fresh.
+    if replace {
+        let _ = state.store.delete_book_row(&slug).await;
+        let _ = mycelium_librarian::delete_book(&state.store, &state.service_key, &slug).await;
+    }
     match state
         .librarian
         .submit(shelf_id, user_id, &slug, &title, &text)
@@ -1455,6 +1542,8 @@ pub async fn api_upload_book(
                 .unwrap_or(("unknown", String::new()));
             if status_str == "done" {
                 crate::state::Metrics::inc(&state.metrics.books_ingested);
+                // Seed refresh (v1 parity): the library overview changed.
+                mycelium_mcp::seed::refresh_seed(&state.store, &state.service_key).await;
             } else if status_str == "failed" {
                 crate::state::Metrics::inc(&state.metrics.ingest_failures);
             }
@@ -1606,6 +1695,35 @@ pub struct ChatMessageForm {
 /// bundle; chat mode also allows write tools, so "record that ..."
 /// messages persist knowledge. Returns the reply as JSON (the page
 /// renders it); streaming arrives with a streaming LLM client later.
+/// POST /api/v1/dream — run a maintenance/consolidation pass over the
+/// caller's private bundle (v1 parity: orphans, broken links, likely
+/// duplicates, oversized concepts). Deterministic signals decide
+/// whether the agent runs at all; no signals → no tokens. CSRF is
+/// enforced by the /api/v1 middleware layer.
+pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Response {
+    let master = match state.master_key_for(user.user_id).await {
+        Ok(m) => m,
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+    };
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
+    let llm = llm.unwrap_or_default();
+    let client = mycelium_librarian::llm::LlmClient::new(&llm);
+    let scopes = build_agent_scopes(
+        &state.store,
+        &state.service_key,
+        visible_library_slugs(&state, &user).await,
+        user.user_id,
+    );
+    match mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "dream failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
 pub async fn api_chat(
     State(state): State<AppState>,
     user: SessionUser,
@@ -1628,7 +1746,13 @@ pub async fn api_chat(
     history.push(mycelium_librarian::llm::ConversationTurn::User(
         form.message.clone(),
     ));
-    match mycelium_librarian::agent::run_chat(&client, &cs, &history).await {
+    let scopes = build_agent_scopes(
+        &state.store,
+        &state.service_key,
+        visible_library_slugs(&state, &user).await,
+        user.user_id,
+    );
+    match mycelium_librarian::agent::run_chat(&client, &cs, &scopes, &history).await {
         Ok(reply) => {
             state.chat_history.push(
                 session.0,
@@ -1695,11 +1819,16 @@ pub async fn api_chat_stream(
     // arrive; transport errors that abort before any event surface as
     // a Failed event.
     let task_store = (*state.store).clone();
+    let task_sk = (*state.service_key).clone();
+    let task_vis = visible_library_slugs(&state, &user).await;
+    let task_user = user.user_id;
     tokio::spawn(async move {
         let cs = ConceptStore::for_user(&task_store, user.user_id, master);
+        let scopes = build_agent_scopes(&task_store, &task_sk, task_vis, task_user);
         let result = mycelium_librarian::agent::run_chat_streaming(
             &client,
             &cs,
+            &scopes,
             &history,
             Some(run_tx.clone()),
         )

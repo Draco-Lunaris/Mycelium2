@@ -51,7 +51,8 @@ pub enum ConceptScope {
 }
 
 impl ConceptScope {
-    fn scope_id(&self) -> String {
+    /// The registry/index namespace id (`user:<uuid>` / `global:<ns>`).
+    pub fn scope_id(&self) -> String {
         match self {
             ConceptScope::User { user_id, .. } => format!("user:{user_id}"),
             ConceptScope::Service { namespace, .. } => format!("global:{namespace}"),
@@ -75,6 +76,12 @@ pub struct ConceptStore<'a> {
 }
 
 impl<'a> ConceptStore<'a> {
+    /// The scope's registry id (`user:<uuid>` / `global:<ns>`) — used by
+    /// cache fingerprints and trace sinks.
+    pub fn scope_id(&self) -> String {
+        self.scope.scope_id()
+    }
+
     /// Open the concept store for a user's private bundle.
     pub fn for_user(store: &'a Store, user_id: Uuid, master_key: MasterKey) -> Self {
         let repo = FileRepo::new(store.user_dir(user_id));
@@ -125,40 +132,53 @@ impl<'a> ConceptStore<'a> {
     /// rejected — they are system-maintained (index.md is regenerated
     /// on every write) and a concept there would be silently clobbered.
     pub async fn put(&self, concept: &Concept) -> Result<(), ConceptStoreError> {
-        let basename = concept.source_path.rsplit('/').next().unwrap_or_default();
-        if matches!(basename, "index.md" | "log.md" | "info.md") {
-            return Err(ConceptStoreError::Reserved(concept.source_path.clone()));
+        self.put_batch(std::slice::from_ref(concept)).await
+    }
+
+    /// Batched put: writes many concepts with ONE index.md regeneration
+    /// at the end (put() regenerates per concept — O(n²) on a
+    /// 300-chapter catalog ingest). Same ordering guarantees as put():
+    /// file → registry → index per concept, then the single regen.
+    pub async fn put_batch(&self, concepts: &[Concept]) -> Result<(), ConceptStoreError> {
+        if concepts.is_empty() {
+            return Ok(());
         }
-        let markdown = concept.to_markdown()?;
-        self.repo
-            .write(
-                &concept.source_path,
-                markdown.as_bytes(),
-                &self.scope.repo_scope(),
+        for concept in concepts {
+            let basename = concept.source_path.rsplit('/').next().unwrap_or_default();
+            if matches!(basename, "index.md" | "log.md" | "info.md") {
+                return Err(ConceptStoreError::Reserved(concept.source_path.clone()));
+            }
+            let markdown = concept.to_markdown()?;
+            self.repo
+                .write(
+                    &concept.source_path,
+                    markdown.as_bytes(),
+                    &self.scope.repo_scope(),
+                )
+                .await?;
+            let now = Utc::now().to_rfc3339();
+            let title = concept
+                .frontmatter
+                .title
+                .clone()
+                .unwrap_or_else(|| concept.source_path.clone());
+            sqlx::query(
+                "INSERT INTO scope_files (scope, path, title, concept_type, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(scope, path) DO UPDATE SET
+                   title = excluded.title,
+                   concept_type = excluded.concept_type,
+                   updated_at = excluded.updated_at",
             )
+            .bind(self.scope.scope_id())
+            .bind(&concept.source_path)
+            .bind(&title)
+            .bind(&concept.frontmatter.concept_type)
+            .bind(&now)
+            .execute(self.store.pool())
             .await?;
-        let now = Utc::now().to_rfc3339();
-        let title = concept
-            .frontmatter
-            .title
-            .clone()
-            .unwrap_or_else(|| concept.source_path.clone());
-        sqlx::query(
-            "INSERT INTO scope_files (scope, path, title, concept_type, updated_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(scope, path) DO UPDATE SET
-               title = excluded.title,
-               concept_type = excluded.concept_type,
-               updated_at = excluded.updated_at",
-        )
-        .bind(self.scope.scope_id())
-        .bind(&concept.source_path)
-        .bind(&title)
-        .bind(&concept.frontmatter.concept_type)
-        .bind(&now)
-        .execute(self.store.pool())
-        .await?;
-        self.index.add_async(concept).await?;
+            self.index.add_async(concept).await?;
+        }
         self.regen_index_md().await?;
         Ok(())
     }
@@ -166,21 +186,94 @@ impl<'a> ConceptStore<'a> {
     /// Regenerate the scope's `index.md` (v1 parity: the auto-
     /// maintained directory index). It is a RAW FileRepo payload —
     /// never a concept, never in the registry or search index — so it
-    /// never appears in listings or graph scans. Content: one bullet
-    /// per concept (title + path + type), sorted by path.
+    /// never appears in listings or graph scans.
+    ///
+    /// v1 structure: per-directory indexes with one bullet per concept
+    /// (`[Title](relative-url) - description`) and a Subdirectories
+    /// section (each subdir summarized: count, types, first titles).
+    /// The registry rows carry title/type but not description, so the
+    /// bullets use title + type (deterministic, no decrypt cost).
     async fn regen_index_md(&self) -> Result<(), ConceptStoreError> {
         let entries = self.list().await?;
-        let mut lines = vec!["# Knowledge Base".to_string()];
-        for entry in entries {
-            lines.push(format!(
-                "* [{}]({}) [{}]",
-                entry.title, entry.path, entry.concept_type
-            ));
+        // Group entries by directory.
+        let mut dirs: std::collections::BTreeMap<String, Vec<&ConceptEntry>> =
+            std::collections::BTreeMap::new();
+        for e in &entries {
+            let dir = match e.path.rsplit_once('/') {
+                Some((d, _)) => d.to_string(),
+                None => String::new(),
+            };
+            dirs.entry(dir).or_default().push(e);
         }
-        let content = lines.join("\n") + "\n";
-        self.repo
-            .write("/index.md", content.as_bytes(), &self.scope.repo_scope())
-            .await?;
+        // The root index always exists (v1 parity), even when every
+        // concept lives in a subdirectory.
+        dirs.entry(String::new()).or_default();
+        // Write one index.md per directory that has concepts.
+        for (dir, ents) in &dirs {
+            let mut lines = Vec::new();
+            let name = if dir.is_empty() {
+                "Knowledge Base".to_string()
+            } else {
+                dir.rsplit('/').next().unwrap_or(dir).to_string()
+            };
+            lines.push(format!("# {name}\n"));
+            for e in ents {
+                let basename = e.path.rsplit('/').next().unwrap_or(&e.path);
+                lines.push(format!(
+                    "* [{}]({}) [{}]",
+                    e.title, basename, e.concept_type
+                ));
+            }
+            // Subdirectories of this directory (immediate children).
+            let prefix = if dir.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{dir}/")
+            };
+            let mut subdirs: std::collections::BTreeMap<String, Vec<&ConceptEntry>> =
+                std::collections::BTreeMap::new();
+            for (other_dir, other_ents) in &dirs {
+                if let Some(rest) = other_dir.strip_prefix(&prefix)
+                    && *other_dir != *dir
+                    && !rest.is_empty()
+                {
+                    let child = rest.split('/').next().unwrap_or(rest);
+                    subdirs
+                        .entry(format!("{prefix}{child}"))
+                        .or_default()
+                        .extend(other_ents.iter().copied());
+                }
+            }
+            if !subdirs.is_empty() {
+                lines.push("\n## Subdirectories\n".to_string());
+                for (sub, sub_ents) in &subdirs {
+                    let types: Vec<String> = {
+                        let mut t: Vec<String> = sub_ents
+                            .iter()
+                            .map(|e| e.concept_type.clone())
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                        t.sort();
+                        t.dedup();
+                        t
+                    };
+                    let type_list = if types.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", types.join(", "))
+                    };
+                    lines.push(format!(
+                        "* [{sub}]({sub}/) — {} concept(s){type_list}",
+                        sub_ents.len()
+                    ));
+                }
+            }
+            let content = lines.join("\n") + "\n";
+            let path = format!("{dir}/index.md");
+            self.repo
+                .write(&path, content.as_bytes(), &self.scope.repo_scope())
+                .await?;
+        }
         Ok(())
     }
 

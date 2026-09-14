@@ -187,35 +187,36 @@ pub fn build_chapter_concept(
     )
 }
 
-/// The structured catalog the LLM is asked to produce.
+/// The structured catalog the LLM is asked to produce: book-level only.
 #[derive(Debug, Clone, Deserialize)]
 struct LlmCatalog {
     title: String,
     #[serde(default)]
     description: String,
-    #[serde(default)]
-    chapters: Vec<LlmChapter>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LlmChapter {
-    index: u32,
-    #[serde(default)]
-    summary: String,
-}
-
-/// Build a catalog with LLM assistance, falling back to the heuristic
-/// outline on any LLM failure (unreachable endpoint, bad JSON, missing
-/// fields). The fallback is total: the heuristic catalog is complete
-/// and correct on its own; the LLM only enriches title/description/
-/// summaries.
+/// Build a catalog with LLM assistance for the BOOK-LEVEL title and
+/// description only, falling back to the heuristic outline on any LLM
+/// failure (unreachable endpoint, bad JSON, missing fields). The
+/// fallback is total: the heuristic catalog is complete and correct on
+/// its own.
+///
+/// Chapter descriptions are DETERMINISTIC — extracted from each
+/// chapter's actual opening prose in the book text (v1's card-catalog
+/// approach). The LLM is never asked to summarize chapters: asking for
+/// hundreds of summaries from titles alone is a hallucination lottery
+/// that poisons the catalog (observed: one generic summary smeared
+/// across 697 concepts).
 pub async fn build_catalog(
     client: Option<&LlmClient>,
     slug: &str,
     title_hint: &str,
     outline: &BookOutline,
+    text: &str,
 ) -> BookCatalog {
     let mut catalog = heuristic_catalog(slug, title_hint, outline);
+    // Deterministic per-chapter descriptions from the real text.
+    catalog.chapter_summaries = chapter_descriptions(outline, text);
     let Some(client) = client else {
         return catalog;
     };
@@ -227,22 +228,70 @@ pub async fn build_catalog(
             if !llm.description.trim().is_empty() {
                 catalog.description = llm.description.trim().to_string();
             }
-            // Merge summaries by chapter index (1-based); ignore
-            // out-of-range entries.
-            for ch in llm.chapters {
-                if ch.index >= 1
-                    && !ch.summary.trim().is_empty()
-                    && let Some(slot) = catalog.chapter_summaries.get_mut(ch.index as usize - 1)
-                {
-                    *slot = ch.summary.trim().to_string();
-                }
-            }
         }
         Err(e) => {
             tracing::warn!(slug, error = %e, "LLM cataloging failed — using heuristic catalog");
         }
     }
     catalog
+}
+
+/// Extract a deterministic description for each chapter: the first
+/// ~200 chars of the chapter's own prose (skipping the heading line and
+/// any sub-headings), whitespace-collapsed. Mirrors v1's pdf-to-markdown
+/// sidecar descriptions — real text, never invented.
+///
+/// Positional: slices the text between chapter N's `# ` heading and
+/// chapter N+1's heading (the same fence-aware walk parse_outline uses),
+/// so it works whether or not the book carries `{#anchor}` IDs.
+fn chapter_descriptions(outline: &BookOutline, text: &str) -> Vec<String> {
+    // Collect the line ranges of each chapter (fence-aware).
+    let mut chapter_starts: Vec<usize> = Vec::new(); // line index of each `# ` heading
+    let mut in_fence = false;
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence && t.starts_with("# ") {
+            chapter_starts.push(i);
+        }
+    }
+    let total_lines = text.lines().count();
+    outline
+        .chapters
+        .iter()
+        .map(|ch| {
+            let start = chapter_starts.get(ch.index as usize - 1).copied();
+            let Some(start) = start else {
+                return String::new();
+            };
+            let end = chapter_starts
+                .get(ch.index as usize)
+                .copied()
+                .unwrap_or(total_lines);
+            let body = text
+                .lines()
+                .skip(start + 1) // the chapter heading line
+                .take(end.saturating_sub(start + 1))
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut out = String::new();
+            for word in body.split_whitespace() {
+                if out.len() + word.len() + 1 > 200 {
+                    break;
+                }
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+            out
+        })
+        .collect()
 }
 
 /// The heuristic catalog: title hint + first-paragraph description +
@@ -288,10 +337,8 @@ async fn llm_catalog(
          Chapter outline:\n{chapter_list}\n\n\
          Produce a JSON object with exactly these fields:\n\
          - \"title\": the book's title\n\
-         - \"description\": 2-3 sentences describing the book\n\
-         - \"chapters\": an array of objects {{\"index\": <1-based chapter number>, \"title\": \"<chapter title>\", \"summary\": \"<2-3 sentence summary>\"}}\n\n\
-         Respond with ONLY the JSON object, no markdown fences, no commentary.\n\
-         All links in any output must be absolute leading-slash paths like /{slug}/book.md — never relative ./ paths."
+         - \"description\": 2-3 sentences describing the book\n\n\
+         Respond with ONLY the JSON object, no markdown fences, no commentary."
     );
     let raw = client.chat(&prompt).await?;
     let json = strip_code_fence(&raw);
@@ -423,8 +470,17 @@ More details.
             url: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
         });
-        let catalog = build_catalog(Some(&client), "my-book", "My Book", &outline).await;
+        let catalog = build_catalog(Some(&client), "my-book", "My Book", &outline, BOOK).await;
         assert_eq!(catalog.title, "My Book");
-        assert!(catalog.chapter_summaries.iter().all(|s| s.is_empty()));
+        // Deterministic descriptions extracted from the real text
+        // (the chapter's own prose, not an LLM's guess).
+        assert_eq!(
+            catalog.chapter_summaries[0],
+            "Intro text. Details one. Details two."
+        );
+        assert_eq!(
+            catalog.chapter_summaries[1],
+            "Second chapter text. More details."
+        );
     }
 }

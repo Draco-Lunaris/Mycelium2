@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub struct McpUser {
     pub user_id: Uuid,
     pub username: String,
+    pub role: mycelium_auth::rbac::Role,
 }
 
 /// Axum middleware: require a valid bearer API key on every /mcp request.
@@ -61,6 +62,7 @@ async fn resolve_user(parts: &Parts, pool: &sqlx::SqlitePool) -> Option<McpUser>
     Some(McpUser {
         user_id: user.id,
         username: user.username,
+        role: user.role,
     })
 }
 

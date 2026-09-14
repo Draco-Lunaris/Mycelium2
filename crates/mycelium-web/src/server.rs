@@ -38,6 +38,17 @@ pub fn build_router_with_shutdown(
         master_keys: Arc::clone(&state.master_keys),
         config: Arc::clone(&state.config),
     };
+    // Seed memory (v1 parity): build the global overview once at boot
+    // so the first initialize/tools/list already carries it. Refreshed
+    // after mutations and ingests. Spawned — the router builder is
+    // sync and the seed is best-effort.
+    {
+        let seed_store = Arc::clone(&state.store);
+        let seed_key = Arc::clone(&state.service_key);
+        tokio::spawn(async move {
+            mycelium_mcp::seed::refresh_seed(&seed_store, &seed_key).await;
+        });
+    }
 
     Router::new()
         // Public.

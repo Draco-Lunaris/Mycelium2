@@ -6,9 +6,19 @@
 use axum::response::IntoResponse;
 use mycelium_core::concept::Concept;
 use mycelium_crypto::keys::ServiceKey;
-use mycelium_librarian::agent::{self, AgentMode};
+use mycelium_librarian::agent::{self, AgentMode, AgentScopes};
 use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig};
 use mycelium_store::{ConceptStore, Store};
+
+fn no_scopes<'a>() -> AgentScopes<'a> {
+    AgentScopes {
+        skills: None,
+        library: None,
+        read_stack_text: None,
+        visible_slugs: None,
+        trace: None,
+    }
+}
 
 /// A minimal OpenAI-compatible mock: serves scripted responses in
 /// order, keyed by the request's tool expectations. Each POST to
@@ -129,7 +139,7 @@ async fn query_agent_searches_reads_and_answers() {
     ])
     .await;
 
-    let result = agent::run_query(&client, &cs, "What do you know about zebras?")
+    let result = agent::run_query(&client, &cs, &no_scopes(), "What do you know about zebras?")
         .await
         .unwrap();
     assert!(result.answer.contains("striped"));
@@ -165,6 +175,7 @@ async fn mutation_agent_writes_concept() {
     let result = agent::run_mutation(
         &client,
         &cs,
+        &no_scopes(),
         "Record that the billing API charges customers.",
     )
     .await
@@ -202,7 +213,7 @@ async fn query_agent_rejects_write_tools_in_readonly_mode() {
     ])
     .await;
 
-    let result = agent::run_query(&client, &cs, "write something")
+    let result = agent::run_query(&client, &cs, &no_scopes(), "write something")
         .await
         .unwrap();
     assert!(result.answer.contains("read-only"));
@@ -220,7 +231,11 @@ async fn unreachable_llm_errors_cleanly() {
         url: "http://127.0.0.1:1/v1".into(),
         model: "m".into(),
     });
-    assert!(agent::run_query(&client, &cs, "anything").await.is_err());
+    assert!(
+        agent::run_query(&client, &cs, &no_scopes(), "anything")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -260,7 +275,9 @@ async fn chat_mode_answers_with_history() {
     )])
     .await;
     let history = vec![ConversationTurn::User("hi".into())];
-    let reply = agent::run_chat(&client, &cs, &history).await.unwrap();
+    let reply = agent::run_chat(&client, &cs, &no_scopes(), &history)
+        .await
+        .unwrap();
     assert!(reply.contains("Hello"));
 }
 
@@ -278,7 +295,8 @@ async fn index_md_regenerated_on_writes() {
         .unwrap();
 
     // index.md is a raw FileRepo payload: readable via the repo, absent
-    // from the registry.
+    // from the registry. Per-directory (v1 parity): the root index
+    // lists subdirectories; /notes/index.md lists the concepts.
     let repo = mycelium_store::FileRepo::new(store.user_dir(user));
     let bytes = repo
         .read("/index.md", &mycelium_store::Scope::User(master.clone()))
@@ -286,8 +304,18 @@ async fn index_md_regenerated_on_writes() {
         .unwrap();
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.contains("# Knowledge Base"));
-    assert!(text.contains("[Alpha](/notes/a.md)"));
-    assert!(text.contains("[Beta](/notes/b.md)"));
+    assert!(text.contains("## Subdirectories"));
+    assert!(text.contains("[/notes](/notes/)"));
+    let bytes = repo
+        .read(
+            "/notes/index.md",
+            &mycelium_store::Scope::User(master.clone()),
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("[Alpha](a.md)"));
+    assert!(text.contains("[Beta](b.md)"));
     let listing = cs.list().await.unwrap();
     assert!(
         !listing.iter().any(|e| e.path == "/index.md"),
@@ -297,7 +325,7 @@ async fn index_md_regenerated_on_writes() {
     // Delete removes the entry from the index.
     cs.delete("/notes/a.md").await.unwrap();
     let bytes = repo
-        .read("/index.md", &mycelium_store::Scope::User(master))
+        .read("/notes/index.md", &mycelium_store::Scope::User(master))
         .await
         .unwrap();
     let text = String::from_utf8(bytes).unwrap();
@@ -346,7 +374,9 @@ async fn conversation_protocol_tool_calls_precede_tool_results() {
         ),
     ])
     .await;
-    agent::run_query(&client, &cs, "find x").await.unwrap();
+    agent::run_query(&client, &cs, &no_scopes(), "find x")
+        .await
+        .unwrap();
 
     let guard = mock.lock().await;
     assert_eq!(guard.requests.len(), 2, "two round-trips");
@@ -385,4 +415,150 @@ async fn reserved_filenames_rejected_on_put() {
     cs.put(&concept("/notes/ok.md", "OK", "fine"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn hot_memory_answers_from_recent_writes() {
+    // v1 hot-memory semantics: a write joins the hot set; a query is
+    // answered from the hot excerpts by ONE tool-free LLM call (the
+    // mock's scripted response) without any agent loop.
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let cs = ConceptStore::for_user(&store, user, master);
+
+    // A write joins the hot set (as if the agent's write tool did it).
+    mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), "/notes/hot.md");
+    cs.put(&concept(
+        "/notes/hot.md",
+        "Hot Fact",
+        "The launch code is 7-7-7-7.",
+    ))
+    .await
+    .unwrap();
+
+    // The hot lookup makes one LLM call; the mock answers confidently.
+    let (client, _shared) = mock_llm(vec![text_response(
+        "The launch code is 7-7-7-7. Source: /notes/hot.md",
+    )])
+    .await;
+    let answer =
+        mycelium_librarian::hot_memory::hot_lookup(&client, &cs, "What is the launch code?").await;
+    assert_eq!(
+        answer.as_deref(),
+        Some("The launch code is 7-7-7-7. Source: /notes/hot.md")
+    );
+
+    // UNKNOWN falls through to deep memory (None).
+    let (client2, _shared2) = mock_llm(vec![text_response("UNKNOWN")]).await;
+    let miss =
+        mycelium_librarian::hot_memory::hot_lookup(&client2, &cs, "Unrelated question?").await;
+    assert!(miss.is_none(), "UNKNOWN must fall through");
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+}
+
+#[tokio::test]
+async fn hot_memory_qas_purged_on_write() {
+    // v1 staleness rule: a write may contradict previous answers —
+    // the Q&A set is purged, the written concept stays.
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let cs = ConceptStore::for_user(&store, user, master);
+
+    mycelium_librarian::hot_memory::record_hot_query(&cs.scope_id(), "q1", "old answer");
+    cs.put(&concept("/notes/new.md", "New", "fresh content"))
+        .await
+        .unwrap();
+    mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), "/notes/new.md");
+
+    // The hot context must contain the concept but NOT the stale Q&A:
+    // the mock echoes back what it was given — assert the prompt has
+    // no "PREVIOUS Q&A" section.
+    let (client, shared) = mock_llm(vec![text_response("UNKNOWN")]).await;
+    let _ = mycelium_librarian::hot_memory::hot_lookup(&client, &cs, "anything").await;
+    let guard = shared.lock().await;
+    let last = guard.requests.last().unwrap();
+    // chat_system: messages[0] = system, messages[1] = user prompt.
+    let prompt = last["messages"][1]["content"].as_str().unwrap_or("");
+    assert!(
+        !prompt.contains("PREVIOUS Q&A"),
+        "Q&As must be purged on write"
+    );
+    assert!(prompt.contains("CONCEPT /notes/new.md"));
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+}
+
+#[tokio::test]
+async fn query_cache_layers() {
+    // Layer 1 (exact cache) → layer 2 (hot) → layer 3 (deep agent).
+    // A deep answer feeds the hot set; an identical repeat hits the
+    // exact cache with no LLM call at all.
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    mycelium_librarian::query_cache::clear_query_cache();
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let cs = ConceptStore::for_user(&store, user, master);
+    cs.put(&concept("/notes/fact.md", "Fact", "Paris is the capital."))
+        .await
+        .unwrap();
+
+    // Deep run: the mock scripts a direct text answer (no tool calls).
+    let (client, shared) = mock_llm(vec![text_response("Paris.")]).await;
+    let r1 = mycelium_librarian::query_cache::run_query_cached(
+        &client,
+        &cs,
+        &no_scopes(),
+        "What is the capital of France?",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r1.source,
+        mycelium_librarian::query_cache::QuerySource::Deep
+    );
+    assert_eq!(r1.answer, "Paris.");
+
+    // Identical repeat: exact cache — no LLM call (script exhausted
+    // would 500 if one were made).
+    let r2 = mycelium_librarian::query_cache::run_query_cached(
+        &client,
+        &cs,
+        &no_scopes(),
+        "What is the capital of France?",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r2.source,
+        mycelium_librarian::query_cache::QuerySource::Cache
+    );
+    assert_eq!(r2.answer, "Paris.");
+
+    // A write invalidates the fingerprint → the next query goes deep
+    // again (and the hot set was purged of Q&As).
+    mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), "/notes/other.md");
+    cs.put(&concept("/notes/other.md", "Other", "other fact"))
+        .await
+        .unwrap();
+    let (client2, _shared2) = mock_llm(vec![text_response("Paris, fresh.")]).await;
+    let r3 = mycelium_librarian::query_cache::run_query_cached(
+        &client2,
+        &cs,
+        &no_scopes(),
+        "What is the capital of France?",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r3.source,
+        mycelium_librarian::query_cache::QuerySource::Deep
+    );
+    assert_eq!(r3.answer, "Paris, fresh.");
+    let _ = shared;
+    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    mycelium_librarian::query_cache::clear_query_cache();
 }

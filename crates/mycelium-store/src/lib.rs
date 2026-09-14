@@ -55,9 +55,29 @@ impl Store {
             .filename(db_path)
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // WAL + NORMAL: commits fsync only on checkpoint, not every
+            // transaction — the documented safe pairing for WAL (a
+            // crash can lose the last transactions but never corrupts
+            // the DB; the file repo's atomic writes keep content safe).
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
+            .after_connect(|conn, _meta| {
+                // Large-library working set: 64 MiB page cache + 256 MiB
+                // mmap so hot reads (search tokens/docs, listings) skip
+                // the syscall path. Per-connection pragmas — this runs
+                // for every connection the pool ever opens.
+                Box::pin(async move {
+                    sqlx::query("PRAGMA cache_size = -65536")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA mmap_size = 268435456")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await?;
         run_migrations(&pool).await?;

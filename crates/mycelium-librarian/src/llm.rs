@@ -140,16 +140,37 @@ impl LlmClient {
 
     /// Send a single user-message prompt; returns the assistant text.
     pub async fn chat(&self, prompt: &str) -> Result<String, LlmError> {
+        self.chat_system(None, prompt, 0.2).await
+    }
+
+    /// One tool-free generation with an optional system prompt and
+    /// explicit temperature (hot-memory lookups use system + temp 0).
+    pub async fn chat_system(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        temperature: f32,
+    ) -> Result<String, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = ChatRequest {
-            model: &self.model,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: Some(prompt),
+        let mut messages = Vec::new();
+        if let Some(sys) = system {
+            messages.push(ChatMessage {
+                role: "system",
+                content: Some(sys),
                 tool_calls: None,
                 tool_call_id: None,
-            }],
-            temperature: 0.2,
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user",
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        let body = ChatRequest {
+            model: &self.model,
+            messages,
+            temperature,
             tools: None,
         };
         let response = self.http.post(&url).json(&body).send().await?;

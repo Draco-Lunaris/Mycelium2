@@ -239,6 +239,37 @@ async fn full_web_flow() {
     let graph_json: serde_json::Value = graph.json().await.unwrap();
     assert_eq!(graph_json["nodes"].as_array().unwrap().len(), 1);
 
+    // 11b. Duplicate links collapse to a single edge (a concept linking to the
+    //      same target twice is one relationship, not two).
+    let csrf_dup = csrf_from_page(&client, &format!("{base}/"), &cookie2).await;
+    let dup_md = "---\ntype: Note\ntitle: Linked Note\n---\n\n\
+                  See [Test](/notes/test.md) and again [Test twice](/notes/test.md).";
+    let create_dup = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie2)
+        .header("x-csrf-token", &csrf_dup)
+        .form(&[("path", "/notes/linked.md"), ("markdown", dup_md)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_dup.status(), 303);
+    let graph2 = client
+        .get(format!("{base}/api/v1/graph"))
+        .header("cookie", &cookie2)
+        .send()
+        .await
+        .unwrap();
+    let g2: serde_json::Value = graph2.json().await.unwrap();
+    let edges = g2["edges"].as_array().unwrap();
+    let dup_edges = edges
+        .iter()
+        .filter(|e| e["from"] == "/notes/linked.md" && e["to"] == "/notes/test.md")
+        .count();
+    assert_eq!(
+        dup_edges, 1,
+        "duplicate links must collapse to one edge: {edges:?}"
+    );
+
     // 12. REST API: get + put + delete.
     let api_get = client
         .get(format!("{base}/api/v1/concepts/notes/test.md"))

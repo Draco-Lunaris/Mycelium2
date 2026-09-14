@@ -18,6 +18,19 @@ pub enum BooksError {
 }
 
 impl Store {
+    /// Delete a book's catalog row by slug (re-ingest support). The
+    /// caller also removes the stack text + catalog concepts.
+    pub async fn delete_book_row(&self, slug: &str) -> Result<(), BooksError> {
+        let res = sqlx::query("DELETE FROM books WHERE slug = ?")
+            .bind(slug)
+            .execute(self.pool())
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(BooksError::NotFound(slug.to_string()));
+        }
+        Ok(())
+    }
+
     /// Insert a book catalog row. Fails on a duplicate slug.
     pub async fn create_book(
         &self,

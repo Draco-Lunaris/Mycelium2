@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod handler;
 pub mod router;
+pub mod seed;
 pub mod tools;
 
 pub use router::{mcp_router, mcp_router_with_shutdown};
