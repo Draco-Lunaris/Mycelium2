@@ -161,7 +161,7 @@ pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fe
 
 pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes (the
 // layout re-settles around them, d3-style), wheel-zoom, background-pan,
-// click-to-open, hover info panel.
+// click-to-open, hover info panel, per-type palette + legend (v1).
 (function () {
   var el = document.getElementById("graph");
   var info = document.getElementById("graph-info");
@@ -172,9 +172,12 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     .then(function (data) { render(data); })
     .catch(function (e) { el.textContent = "graph load failed: " + e; });
 
+  // v1's palette, assigned to concept types in first-seen order.
+  var PALETTE = ["#64c8ff", "#a78bfa", "#34d399", "#fbbf24", "#f87171", "#f472b6", "#2dd4bf", "#a3e635"];
+
   function render(data) {
     var nodes = data.nodes.map(function (n) {
-      return { id: n.id, title: n.title, type: n.type || "",
+      return { id: n.id, title: n.title, type: n.type || "unknown",
                x: 400 + (Math.random() - 0.5) * 200,
                y: 300 + (Math.random() - 0.5) * 200,
                vx: 0, vy: 0, fixed: false, degree: 0 };
@@ -184,6 +187,14 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       return { source: byId[e.from], target: byId[e.to] };
     }).filter(function (l) { return l.source && l.target; });
     links.forEach(function (l) { l.source.degree++; l.target.degree++; });
+
+    // Type colors: palette order by first-seen type (v1 semantics).
+    var typeColors = {};
+    nodes.forEach(function (n) {
+      if (!(n.type in typeColors)) {
+        typeColors[n.type] = PALETTE[Object.keys(typeColors).length % PALETTE.length];
+      }
+    });
 
     var svgNS = "http://www.w3.org/2000/svg";
     var root = document.createElementNS(svgNS, "svg");
@@ -206,10 +217,19 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       var g = document.createElementNS(svgNS, "g");
       var c = document.createElementNS(svgNS, "circle");
       c.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2));
-      c.setAttribute("fill", n.type === "Book" ? "#b8a1e3" :
-                             n.type === "Chapter" ? "#9ece6a" : "#7aa2f7");
+      c.setAttribute("fill", typeColors[n.type]);
       c.setAttribute("stroke", "#1a1b26"); c.setAttribute("stroke-width", "1");
       c.style.cursor = "grab";
+      // Orphan highlight (v1): unlinked nodes get a red ring.
+      if (n.degree === 0) {
+        var ring = document.createElementNS(svgNS, "circle");
+        ring.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2) + 3);
+        ring.setAttribute("fill", "none");
+        ring.setAttribute("stroke", "#ef4444");
+        ring.setAttribute("stroke-width", "1.5");
+        ring.setAttribute("opacity", "0.8");
+        g.appendChild(ring);
+      }
       var t = document.createElementNS(svgNS, "title");
       t.textContent = n.title + " (" + n.id + ")";
       g.appendChild(c); g.appendChild(t);
@@ -229,6 +249,35 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "\u2026" : n.title;
       labelGroup.appendChild(t); return t;
     });
+
+    // Legend (v1): type swatches + orphan marker, top-left.
+    var legend = document.createElement("div");
+    legend.style.cssText =
+      "position:absolute;top:.6rem;left:.6rem;z-index:2;background:rgba(26,27,38,.85);" +
+      "border:1px solid #2a3140;border-radius:6px;padding:.5rem .7rem;font-size:.8rem;";
+    Object.keys(typeColors).forEach(function (t) {
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;";
+      var sw = document.createElement("span");
+      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;background:" + typeColors[t] + ";";
+      var name = document.createElement("span");
+      name.style.color = "#a9b1d6";
+      name.textContent = t;
+      row.appendChild(sw); row.appendChild(name);
+      legend.appendChild(row);
+    });
+    if (nodes.some(function (n) { return n.degree === 0; })) {
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;border-top:1px solid #2a3140;padding-top:.25rem;";
+      var sw = document.createElement("span");
+      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;border:1px solid #ef4444;";
+      var name = document.createElement("span");
+      name.style.color = "#a9b1d6";
+      name.textContent = "orphan (unlinked)";
+      row.appendChild(sw); row.appendChild(name);
+      legend.appendChild(row);
+    }
+    el.appendChild(legend);
 
     function showInfo(n) {
       if (!info) return;
@@ -283,9 +332,6 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     }, { passive: false });
 
     // --- node dragging (d3-style: reheat the simulation) ---
-    // The force sim decays and stops after the initial layout; a node
-    // drag must RESTART it (alpha back up) or the dragged node's new
-    // position never renders and the layout never re-settles.
     var dragged = null, dragMoved = false;
     var alpha = 1, tickScheduled = false;
     circles.forEach(function (g, i) {
@@ -589,7 +635,7 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "6";
+pub const ASSETS_VERSION: &str = "7";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
