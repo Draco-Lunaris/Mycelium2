@@ -159,8 +159,9 @@ pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fe
 })();
 "#;
 
-pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes,
-// wheel-zoom, background-pan, click-to-open, hover info panel.
+pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes (the
+// layout re-settles around them, d3-style), wheel-zoom, background-pan,
+// click-to-open, hover info panel.
 (function () {
   var el = document.getElementById("graph");
   var info = document.getElementById("graph-info");
@@ -172,17 +173,16 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     .catch(function (e) { el.textContent = "graph load failed: " + e; });
 
   function render(data) {
-    var nodes = data.nodes.map(function (n, i) {
+    var nodes = data.nodes.map(function (n) {
       return { id: n.id, title: n.title, type: n.type || "",
                x: 400 + (Math.random() - 0.5) * 200,
-               y: 300 + (Math.random() - 0.5) * 200, vx: 0, vy: 0 };
+               y: 300 + (Math.random() - 0.5) * 200,
+               vx: 0, vy: 0, fixed: false, degree: 0 };
     });
     var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
     var links = data.edges.map(function (e) {
       return { source: byId[e.from], target: byId[e.to] };
     }).filter(function (l) { return l.source && l.target; });
-    // Degree per node (for sizing + the info panel).
-    nodes.forEach(function (n) { n.degree = 0; });
     links.forEach(function (l) { l.source.degree++; l.target.degree++; });
 
     var svgNS = "http://www.w3.org/2000/svg";
@@ -209,11 +209,12 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       c.setAttribute("fill", n.type === "Book" ? "#b8a1e3" :
                              n.type === "Chapter" ? "#9ece6a" : "#7aa2f7");
       c.setAttribute("stroke", "#1a1b26"); c.setAttribute("stroke-width", "1");
+      c.style.cursor = "grab";
       var t = document.createElementNS(svgNS, "title");
       t.textContent = n.title + " (" + n.id + ")";
       g.appendChild(c); g.appendChild(t);
-      g.addEventListener("click", function (ev) {
-        if (dragged) return; // a drag, not a click
+      g.addEventListener("click", function () {
+        if (dragMoved) return; // it was a drag, not a click
         window.location.href = "/concept?path=" + encodeURIComponent(n.id);
       });
       g.addEventListener("mouseenter", function () { showInfo(n); });
@@ -225,7 +226,7 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       t.setAttribute("fill", "#a9b1d6"); t.setAttribute("font-size", "10");
       t.setAttribute("text-anchor", "middle");
       t.setAttribute("pointer-events", "none");
-      t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "…" : n.title;
+      t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "\u2026" : n.title;
       labelGroup.appendChild(t); return t;
     });
 
@@ -236,14 +237,14 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       var b = document.createElement("b"); b.textContent = n.title;
       info.appendChild(b);
       var type = document.createElement("div");
-      type.textContent = (n.type ? n.type : "concept") + " · " + n.degree + " link" + (n.degree === 1 ? "" : "s");
+      type.textContent = (n.type ? n.type : "concept") + " \u00b7 " + n.degree + " link" + (n.degree === 1 ? "" : "s");
       info.appendChild(type);
       var path = document.createElement("div");
       path.style.fontFamily = "monospace"; path.textContent = n.id;
       info.appendChild(path);
       var a = document.createElement("a");
       a.href = "/concept?path=" + encodeURIComponent(n.id);
-      a.textContent = "open concept →";
+      a.textContent = "open concept \u2192";
       info.appendChild(a);
     }
     function hideInfo() { if (info) info.hidden = true; }
@@ -255,7 +256,9 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     }
     var panning = false, lastPX = 0, lastPY = 0;
     el.addEventListener("mousedown", function (e) {
-      if (e.target.closest && e.target.closest("circle")) return;
+      // A press on a node (or anything inside the node layer) is a node
+      // drag, never a pan.
+      if (nodeGroup.contains(e.target)) return;
       panning = true; lastPX = e.clientX; lastPY = e.clientY;
       el.classList.add("dragging");
     });
@@ -279,27 +282,47 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       scale = ns; applyView();
     }, { passive: false });
 
-    // --- node dragging ---
-    var dragged = null;
+    // --- node dragging (d3-style: reheat the simulation) ---
+    // The force sim decays and stops after the initial layout; a node
+    // drag must RESTART it (alpha back up) or the dragged node's new
+    // position never renders and the layout never re-settles.
+    var dragged = null, dragMoved = false;
+    var alpha = 1, tickScheduled = false;
     circles.forEach(function (g, i) {
       g.addEventListener("mousedown", function (e) {
-        dragged = nodes[i]; dragged.fixed = true;
+        dragged = nodes[i];
+        dragged.fixed = true;
+        dragMoved = false;
+        alpha = Math.max(alpha, 0.3); // reheat
+        scheduleTick();
         e.stopPropagation();
+        e.preventDefault();
       });
     });
     window.addEventListener("mousemove", function (e) {
       if (!dragged) return;
+      dragMoved = true;
       var rect = el.getBoundingClientRect();
       dragged.x = (e.clientX - rect.left - panX) / scale;
       dragged.y = (e.clientY - rect.top - panY) / scale;
       dragged.vx = 0; dragged.vy = 0;
+      alpha = Math.max(alpha, 0.25); // keep the layout live while holding
     });
     window.addEventListener("mouseup", function () {
-      if (dragged) { dragged.fixed = false; dragged = null; }
+      if (dragged) {
+        dragged.fixed = false;
+        dragged = null;
+        alpha = Math.max(alpha, 0.3); // reheat: let the graph settle
+        scheduleTick();
+      }
     });
 
-    // --- simulation ---
-    var alpha = 1;
+    // --- simulation (restartable) ---
+    function scheduleTick() {
+      if (tickScheduled) return;
+      tickScheduled = true;
+      requestAnimationFrame(function () { tickScheduled = false; tick(); });
+    }
     function tick() {
       alpha *= 0.99;
       var W = el.clientWidth || 900, H = el.clientHeight || 500;
@@ -323,7 +346,7 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
         l.target.vx -= (dx / d) * f; l.target.vy -= (dy / d) * f;
       });
       nodes.forEach(function (n) {
-        if (n.fixed) return;
+        if (n.fixed) return; // the dragged node is positioned by the cursor
         n.vx += (W / 2 - n.x) * 0.002 * alpha;
         n.vy += (H / 2 - n.y) * 0.002 * alpha;
         n.x += n.vx * 0.5; n.y += n.vy * 0.5;
@@ -340,9 +363,10 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
         labels[i].setAttribute("x", n.x);
         labels[i].setAttribute("y", n.y + 18);
       });
-      if (alpha > 0.02) requestAnimationFrame(tick);
+      // Stay alive while the layout is hot OR a node is held.
+      if (alpha > 0.02 || dragged) scheduleTick();
     }
-    tick();
+    scheduleTick();
   }
 })();
 "##;
@@ -565,7 +589,7 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "5";
+pub const ASSETS_VERSION: &str = "6";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
