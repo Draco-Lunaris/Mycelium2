@@ -422,10 +422,13 @@ async fn hot_memory_answers_from_recent_writes() {
     // v1 hot-memory semantics: a write joins the hot set; a query is
     // answered from the hot excerpts by ONE tool-free LLM call (the
     // mock's scripted response) without any agent loop.
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    // Fixed UUID + scoped clears: the hot state is process-global, so
+    // clear_hot_memory(None) here would wipe another parallel test's
+    // recorded state.
+    let user = uuid::Uuid::parse_str("00000000-0000-4000-8000-0000000000a1").unwrap();
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
     let (_dir, store) = test_store().await;
     let master = mycelium_crypto::generate_master_key();
-    let user = uuid::Uuid::new_v4();
     let cs = ConceptStore::for_user(&store, user, master);
 
     // A write joins the hot set (as if the agent's write tool did it).
@@ -455,17 +458,17 @@ async fn hot_memory_answers_from_recent_writes() {
     let miss =
         mycelium_librarian::hot_memory::hot_lookup(&client2, &cs, "Unrelated question?").await;
     assert!(miss.is_none(), "UNKNOWN must fall through");
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
 }
 
 #[tokio::test]
 async fn hot_memory_qas_purged_on_write() {
     // v1 staleness rule: a write may contradict previous answers —
     // the Q&A set is purged, the written concept stays.
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    let user = uuid::Uuid::parse_str("00000000-0000-4000-8000-0000000000a2").unwrap();
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
     let (_dir, store) = test_store().await;
     let master = mycelium_crypto::generate_master_key();
-    let user = uuid::Uuid::new_v4();
     let cs = ConceptStore::for_user(&store, user, master);
 
     mycelium_librarian::hot_memory::record_hot_query(&cs.scope_id(), "q1", "old answer");
@@ -488,7 +491,7 @@ async fn hot_memory_qas_purged_on_write() {
         "Q&As must be purged on write"
     );
     assert!(prompt.contains("CONCEPT /notes/new.md"));
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
 }
 
 #[tokio::test]
@@ -496,11 +499,11 @@ async fn query_cache_layers() {
     // Layer 1 (exact cache) → layer 2 (hot) → layer 3 (deep agent).
     // A deep answer feeds the hot set; an identical repeat hits the
     // exact cache with no LLM call at all.
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    let user = uuid::Uuid::parse_str("00000000-0000-4000-8000-0000000000a3").unwrap();
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
     mycelium_librarian::query_cache::clear_query_cache();
     let (_dir, store) = test_store().await;
     let master = mycelium_crypto::generate_master_key();
-    let user = uuid::Uuid::new_v4();
     let cs = ConceptStore::for_user(&store, user, master);
     cs.put(&concept("/notes/fact.md", "Fact", "Paris is the capital."))
         .await
@@ -538,8 +541,10 @@ async fn query_cache_layers() {
     );
     assert_eq!(r2.answer, "Paris.");
 
-    // A write invalidates the fingerprint → the next query goes deep
-    // again (and the hot set was purged of Q&As).
+    // A write invalidates the fingerprint (exact cache flushed) AND
+    // puts the fresh concept in the hot set — so the next query is
+    // answered by the HOT layer (one tool-free call over the fresh
+    // excerpt), not the stale cache and not the deep agent.
     mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), "/notes/other.md");
     cs.put(&concept("/notes/other.md", "Other", "other fact"))
         .await
@@ -555,10 +560,11 @@ async fn query_cache_layers() {
     .unwrap();
     assert_eq!(
         r3.source,
-        mycelium_librarian::query_cache::QuerySource::Deep
+        mycelium_librarian::query_cache::QuerySource::Hot,
+        "a fresh write makes the hot layer answer, not the deep agent"
     );
     assert_eq!(r3.answer, "Paris, fresh.");
     let _ = shared;
-    mycelium_librarian::hot_memory::clear_hot_memory(None);
+    mycelium_librarian::hot_memory::clear_hot_memory(Some(&format!("user:{user}")));
     mycelium_librarian::query_cache::clear_query_cache();
 }
