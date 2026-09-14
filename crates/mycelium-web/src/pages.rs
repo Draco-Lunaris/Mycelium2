@@ -325,8 +325,21 @@ pub fn search_page(
 
 /// Graph page (loads graph.js for the force-directed visualization).
 pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<h1>Graph</h1><div id="graph"></div>"#.to_string();
-    layout_with_scripts("Graph", Some(user), csrf, body, &["/assets/graph.js"])
+    let body = r#"<h1>Graph</h1>
+<div id="graph-wrap">
+  <div id="graph-info" hidden></div>
+  <div id="graph"></div>
+</div>
+<div class="muted" id="graph-legend">drag nodes to rearrange · scroll to zoom · drag background to pan · click a node to open</div>"#
+        .to_string();
+    layout_full(
+        "Graph",
+        Some(user),
+        csrf,
+        body,
+        &["/assets/graph.js"],
+        "graph-page",
+    )
 }
 
 /// Skills page: private skills + global skills (read-only for users,
@@ -571,7 +584,8 @@ pub fn admin_page(
 <form method="post" action="/admin/users">
   <label>Username</label><input name="username" required>
   <label>Email</label><input name="email" type="email" required>
-  <label>Password (min 20 chars)</label><input name="password" type="password" required minlength="20">
+  <label>Password (min {} chars)</label><input name="password" type="password" required minlength="{}">
+  <label>Confirm password</label><input name="password_confirm" type="password" required minlength="{}">
   <label>Role</label><select name="role"><option value="user">user</option><option value="admin">admin</option></select>
   <button type="submit">Create</button>
 </form>
@@ -628,6 +642,9 @@ pub fn admin_page(
 <h2>Maintenance</h2>
 <form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>"#,
         flash(ok, err),
+        security.min_password_length,
+        security.min_password_length,
+        security.min_password_length,
         html_escape(llm_url),
         html_escape(llm_model),
         security.session_ttl_minutes,

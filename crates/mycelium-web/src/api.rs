@@ -188,6 +188,7 @@ async fn graph_data(State(state): State<AppState>, user: SessionUser) -> Respons
 
 #[derive(Deserialize)]
 pub struct SearchParams {
+    #[serde(default)]
     q: String,
     #[serde(default)]
     global: Option<String>,
@@ -1113,6 +1114,8 @@ pub struct CreateUserForm {
     pub username: String,
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub password_confirm: Option<String>,
     pub role: String,
 }
 
@@ -1122,6 +1125,19 @@ pub async fn admin_create_user(
     _admin: mycelium_auth::rbac::RequireAdmin,
     axum::Form(form): axum::Form<CreateUserForm>,
 ) -> Response {
+    // Confirm box: a mismatch is a client-side typo, not a policy
+    // failure — bounce back with a clear message.
+    if let Some(confirm) = &form.password_confirm
+        && confirm != &form.password
+    {
+        return error_response(StatusCode::BAD_REQUEST, "passwords do not match");
+    }
+    // Enforce the ADMIN-CONFIGURED minimum (not the hardcoded default)
+    // — the form's minlength mirrors this value.
+    let min_len = state.security_config().await.min_password_length;
+    if let Err(e) = mycelium_auth::password::check_password_policy_min(&form.password, min_len) {
+        return error_response(StatusCode::BAD_REQUEST, &e.to_string());
+    }
     let role = Role::parse(&form.role).unwrap_or(Role::User);
     let login = state.login.clone();
     match login

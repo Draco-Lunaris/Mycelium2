@@ -47,6 +47,29 @@ button.danger { background: var(--danger); color: #fff; }
 pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: auto; }
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
 
+/* Graph — full-viewport interactive layout (body.graph-page) */
+body.graph-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body.graph-page main {
+  display: flex; flex-direction: column; flex: 1;
+  max-width: none; width: 100%; margin: 0; padding: 0 1.2rem;
+  min-height: 0;
+}
+body.graph-page h1 { margin: .8rem 0 .4rem; }
+#graph-wrap { position: relative; flex: 1; min-height: 0; }
+#graph {
+  width: 100%; height: 100%; background: var(--panel);
+  border-radius: 6px; overflow: hidden; cursor: grab; touch-action: none;
+}
+#graph.dragging { cursor: grabbing; }
+#graph-info {
+  position: absolute; top: .6rem; right: .6rem; z-index: 2;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: .6rem .8rem; max-width: 22rem; font-size: .9rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,.3);
+}
+#graph-info a { display: block; margin-top: .3rem; }
+#graph-legend { margin: .4rem 0 .8rem; font-size: .85rem; }
+
 /* Librarian chat — full-viewport layout (body.chat-page) */
 body.chat-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 body.chat-page main {
@@ -136,55 +159,150 @@ pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fe
 })();
 "#;
 
-pub const GRAPH_JS: &str = r##"// Dependency-free force-directed graph renderer for /graph.
+pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes,
+// wheel-zoom, background-pan, click-to-open, hover info panel.
 (function () {
   var el = document.getElementById("graph");
+  var info = document.getElementById("graph-info");
   if (!el) return;
+
   fetch("/api/v1/graph")
     .then(function (r) { return r.json(); })
     .then(function (data) { render(data); })
     .catch(function (e) { el.textContent = "graph load failed: " + e; });
 
   function render(data) {
-    var nodes = data.nodes.map(function (n) {
-      return { id: n.id, title: n.title, x: 400 + (Math.random() - 0.5) * 200,
+    var nodes = data.nodes.map(function (n, i) {
+      return { id: n.id, title: n.title, type: n.type || "",
+               x: 400 + (Math.random() - 0.5) * 200,
                y: 300 + (Math.random() - 0.5) * 200, vx: 0, vy: 0 };
     });
     var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
     var links = data.edges.map(function (e) {
       return { source: byId[e.from], target: byId[e.to] };
     }).filter(function (l) { return l.source && l.target; });
+    // Degree per node (for sizing + the info panel).
+    nodes.forEach(function (n) { n.degree = 0; });
+    links.forEach(function (l) { l.source.degree++; l.target.degree++; });
 
-    var W = el.clientWidth || 900, H = el.clientHeight || 500;
-    var svg = "http://www.w3.org/2000/svg";
-    var root = document.createElementNS(svg, "svg");
-    root.setAttribute("width", W); root.setAttribute("height", H);
+    var svgNS = "http://www.w3.org/2000/svg";
+    var root = document.createElementNS(svgNS, "svg");
+    root.setAttribute("width", "100%");
+    root.setAttribute("height", "100%");
     el.appendChild(root);
-    var edgeGroup = document.createElementNS(svg, "g");
-    var nodeGroup = document.createElementNS(svg, "g");
-    root.appendChild(edgeGroup); root.appendChild(nodeGroup);
+    var view = document.createElementNS(svgNS, "g");
+    root.appendChild(view);
+    var edgeGroup = document.createElementNS(svgNS, "g");
+    var nodeGroup = document.createElementNS(svgNS, "g");
+    var labelGroup = document.createElementNS(svgNS, "g");
+    view.appendChild(edgeGroup); view.appendChild(nodeGroup); view.appendChild(labelGroup);
 
     var lines = links.map(function (l) {
-      var line = document.createElementNS(svg, "line");
+      var line = document.createElementNS(svgNS, "line");
       line.setAttribute("stroke", "#2a3140");
       edgeGroup.appendChild(line); return line;
     });
     var circles = nodes.map(function (n) {
-      var g = document.createElementNS(svg, "g");
-      var c = document.createElementNS(svg, "circle");
-      c.setAttribute("r", 6); c.setAttribute("fill", "#7aa2f7");
-      var t = document.createElementNS(svg, "title");
+      var g = document.createElementNS(svgNS, "g");
+      var c = document.createElementNS(svgNS, "circle");
+      c.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2));
+      c.setAttribute("fill", n.type === "Book" ? "#b8a1e3" :
+                             n.type === "Chapter" ? "#9ece6a" : "#7aa2f7");
+      c.setAttribute("stroke", "#1a1b26"); c.setAttribute("stroke-width", "1");
+      var t = document.createElementNS(svgNS, "title");
       t.textContent = n.title + " (" + n.id + ")";
       g.appendChild(c); g.appendChild(t);
-      g.addEventListener("click", function () {
+      g.addEventListener("click", function (ev) {
+        if (dragged) return; // a drag, not a click
         window.location.href = "/concept?path=" + encodeURIComponent(n.id);
       });
+      g.addEventListener("mouseenter", function () { showInfo(n); });
+      g.addEventListener("mouseleave", hideInfo);
       nodeGroup.appendChild(g); return g;
     });
+    var labels = nodes.map(function (n) {
+      var t = document.createElementNS(svgNS, "text");
+      t.setAttribute("fill", "#a9b1d6"); t.setAttribute("font-size", "10");
+      t.setAttribute("text-anchor", "middle");
+      t.setAttribute("pointer-events", "none");
+      t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "…" : n.title;
+      labelGroup.appendChild(t); return t;
+    });
 
+    function showInfo(n) {
+      if (!info) return;
+      info.hidden = false;
+      info.innerHTML = "";
+      var b = document.createElement("b"); b.textContent = n.title;
+      info.appendChild(b);
+      var type = document.createElement("div");
+      type.textContent = (n.type ? n.type : "concept") + " · " + n.degree + " link" + (n.degree === 1 ? "" : "s");
+      info.appendChild(type);
+      var path = document.createElement("div");
+      path.style.fontFamily = "monospace"; path.textContent = n.id;
+      info.appendChild(path);
+      var a = document.createElement("a");
+      a.href = "/concept?path=" + encodeURIComponent(n.id);
+      a.textContent = "open concept →";
+      info.appendChild(a);
+    }
+    function hideInfo() { if (info) info.hidden = true; }
+
+    // --- pan / zoom ---
+    var scale = 1, panX = 0, panY = 0;
+    function applyView() {
+      view.setAttribute("transform", "translate(" + panX + "," + panY + ") scale(" + scale + ")");
+    }
+    var panning = false, lastPX = 0, lastPY = 0;
+    el.addEventListener("mousedown", function (e) {
+      if (e.target.closest && e.target.closest("circle")) return;
+      panning = true; lastPX = e.clientX; lastPY = e.clientY;
+      el.classList.add("dragging");
+    });
+    window.addEventListener("mousemove", function (e) {
+      if (!panning) return;
+      panX += e.clientX - lastPX; panY += e.clientY - lastPY;
+      lastPX = e.clientX; lastPY = e.clientY;
+      applyView();
+    });
+    window.addEventListener("mouseup", function () {
+      panning = false; el.classList.remove("dragging");
+    });
+    el.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      var rect = el.getBoundingClientRect();
+      var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      var factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      var ns = Math.min(4, Math.max(0.2, scale * factor));
+      panX = mx - (mx - panX) * (ns / scale);
+      panY = my - (my - panY) * (ns / scale);
+      scale = ns; applyView();
+    }, { passive: false });
+
+    // --- node dragging ---
+    var dragged = null;
+    circles.forEach(function (g, i) {
+      g.addEventListener("mousedown", function (e) {
+        dragged = nodes[i]; dragged.fixed = true;
+        e.stopPropagation();
+      });
+    });
+    window.addEventListener("mousemove", function (e) {
+      if (!dragged) return;
+      var rect = el.getBoundingClientRect();
+      dragged.x = (e.clientX - rect.left - panX) / scale;
+      dragged.y = (e.clientY - rect.top - panY) / scale;
+      dragged.vx = 0; dragged.vy = 0;
+    });
+    window.addEventListener("mouseup", function () {
+      if (dragged) { dragged.fixed = false; dragged = null; }
+    });
+
+    // --- simulation ---
     var alpha = 1;
     function tick() {
-      alpha *= 0.985;
+      alpha *= 0.99;
+      var W = el.clientWidth || 900, H = el.clientHeight || 500;
       for (var i = 0; i < nodes.length; i++) {
         var a = nodes[i];
         for (var j = i + 1; j < nodes.length; j++) {
@@ -205,6 +323,7 @@ pub const GRAPH_JS: &str = r##"// Dependency-free force-directed graph renderer 
         l.target.vx -= (dx / d) * f; l.target.vy -= (dy / d) * f;
       });
       nodes.forEach(function (n) {
+        if (n.fixed) return;
         n.vx += (W / 2 - n.x) * 0.002 * alpha;
         n.vy += (H / 2 - n.y) * 0.002 * alpha;
         n.x += n.vx * 0.5; n.y += n.vy * 0.5;
@@ -218,6 +337,8 @@ pub const GRAPH_JS: &str = r##"// Dependency-free force-directed graph renderer 
       });
       nodes.forEach(function (n, i) {
         circles[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+        labels[i].setAttribute("x", n.x);
+        labels[i].setAttribute("y", n.y + 18);
       });
       if (alpha > 0.02) requestAnimationFrame(tick);
     }
@@ -444,7 +565,7 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "4";
+pub const ASSETS_VERSION: &str = "5";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
