@@ -111,6 +111,25 @@ pub struct AgentScopes<'a> {
     pub trace: Option<TraceSink>,
 }
 
+/// Bookshelf-visibility check for a library catalog path: the book's
+/// slug is the first path segment (`/<slug>/...`). `None` = the caller
+/// is unrestricted (admin); otherwise only books on global-read
+/// shelves pass. Mirrors the gating `search_knowledge` and
+/// `read_passage` already apply.
+fn library_path_visible(scopes: &AgentScopes<'_>, path: &str) -> bool {
+    match &scopes.visible_slugs {
+        None => true,
+        Some(vis) => {
+            let slug = path
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            vis.contains(slug)
+        }
+    }
+}
+
 /// Where agent-run traces are persisted (DB-backed; v1 .traces/ parity).
 #[derive(Clone)]
 pub struct TraceSink {
@@ -470,17 +489,8 @@ async fn execute_tool_tracked(
             // caller's bookshelf visibility.
             if let Some(ref library) = scopes.library {
                 for h in library.search(&q).await.unwrap_or_default() {
-                    if let Some(vis) = &scopes.visible_slugs {
-                        let slug = h
-                            .concept_path
-                            .trim_start_matches('/')
-                            .split('/')
-                            .next()
-                            .unwrap_or_default()
-                            .to_string();
-                        if !vis.contains(&slug) {
-                            continue;
-                        }
+                    if !library_path_visible(scopes, &h.concept_path) {
+                        continue;
                     }
                     all_hits.push(("library".to_string(), h));
                 }
@@ -546,6 +556,7 @@ async fn execute_tool_tracked(
                     }
                     if found.is_none()
                         && let Some(ref library) = scopes.library
+                        && library_path_visible(scopes, path)
                         && let Ok(c) = library.get(path).await
                     {
                         found = Some(c);

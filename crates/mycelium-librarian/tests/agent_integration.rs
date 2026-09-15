@@ -417,6 +417,143 @@ async fn reserved_filenames_rejected_on_put() {
         .unwrap();
 }
 
+// ---------- Bookshelf visibility over the library catalog ----------
+
+/// Library catalog fixture: a book on a global-read shelf (`public-book`)
+/// and one on an admin-private shelf (`secret-book`).
+async fn library_with_books(store: &Store) -> ServiceKey {
+    let service = ServiceKey::from_bytes(&[9u8; 32]).unwrap();
+    let library =
+        ConceptStore::for_service(store, service.clone(), &store.library_dir(), "library");
+    library
+        .put(&concept(
+            "/public-book/book.md",
+            "Public Book",
+            "Public book catalog hub.",
+        ))
+        .await
+        .unwrap();
+    library
+        .put(&concept(
+            "/secret-book/book.md",
+            "Secret Book",
+            "SECRET private-shelf catalog hub.",
+        ))
+        .await
+        .unwrap();
+    service
+}
+
+fn scopes_with_library<'a>(
+    library: ConceptStore<'a>,
+    visible_slugs: Option<std::collections::HashSet<String>>,
+) -> AgentScopes<'a> {
+    AgentScopes {
+        skills: None,
+        library: Some(library),
+        read_stack_text: None,
+        visible_slugs,
+        trace: None,
+    }
+}
+
+/// The tool result the model received for the first scripted tool call:
+/// the mock's second request carries [system, user, assistant(tool_calls),
+/// tool] — messages[3] is the tool result content.
+async fn first_tool_result(mock: &Shared) -> String {
+    let guard = mock.lock().await;
+    let second = &guard.requests[1];
+    let messages = second["messages"].as_array().unwrap();
+    assert_eq!(messages[3]["role"], "tool", "shape: {messages:?}");
+    messages[3]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn read_concept_rejects_library_paths_outside_visible_books() {
+    // Bookshelf visibility must gate the read_concept library fallback,
+    // exactly as it gates search_knowledge and read_passage: a non-admin
+    // caller must not read catalog concepts of admin-private books by
+    // guessing their paths.
+    let (_dir, store) = test_store().await;
+    let service = library_with_books(&store).await;
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let cs = ConceptStore::for_user(&store, user, master);
+    let library = ConceptStore::for_service(&store, service, &store.library_dir(), "library");
+    let scopes = scopes_with_library(
+        library,
+        Some(std::collections::HashSet::from(["public-book".to_string()])),
+    );
+
+    // Script: (1) final answer, (2) the model probes a private book.
+    let (client, mock) = mock_llm(vec![
+        text_response("That book is not available."),
+        tool_call_response(
+            "call-1",
+            "read_concept",
+            serde_json::json!({ "path": "/secret-book/book.md" }),
+        ),
+    ])
+    .await;
+
+    let result = agent::run_query(&client, &cs, &scopes, "read the secret book")
+        .await
+        .unwrap();
+
+    let tool_result = first_tool_result(&mock).await;
+    assert!(
+        !tool_result.contains("SECRET"),
+        "private-shelf catalog must not reach the model: {tool_result}"
+    );
+    assert!(
+        tool_result.contains("error"),
+        "the model must see an error result: {tool_result}"
+    );
+    assert!(
+        !result.answer.contains("SECRET"),
+        "the answer must not leak private-shelf content"
+    );
+}
+
+#[tokio::test]
+async fn read_concept_reads_visible_library_paths() {
+    // Guard against over-blocking: a book on a global-read shelf stays
+    // readable through the same fallback.
+    let (_dir, store) = test_store().await;
+    let service = library_with_books(&store).await;
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let cs = ConceptStore::for_user(&store, user, master);
+    let library = ConceptStore::for_service(&store, service, &store.library_dir(), "library");
+    let scopes = scopes_with_library(
+        library,
+        Some(std::collections::HashSet::from(["public-book".to_string()])),
+    );
+
+    let (client, mock) = mock_llm(vec![
+        text_response("The public book is about cataloging."),
+        tool_call_response(
+            "call-1",
+            "read_concept",
+            serde_json::json!({ "path": "/public-book/book.md" }),
+        ),
+    ])
+    .await;
+
+    agent::run_query(&client, &cs, &scopes, "read the public book")
+        .await
+        .unwrap();
+
+    let tool_result = first_tool_result(&mock).await;
+    assert!(
+        tool_result.contains("Public book catalog hub."),
+        "visible library path must remain readable: {tool_result}"
+    );
+}
+
 #[tokio::test]
 async fn hot_memory_answers_from_recent_writes() {
     // v1 hot-memory semantics: a write joins the hot set; a query is
