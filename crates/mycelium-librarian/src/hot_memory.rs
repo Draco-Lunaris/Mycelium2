@@ -208,13 +208,18 @@ mod tests {
 
     #[test]
     fn scopes_are_independent() {
-        clear_hot_memory(None);
-        record_hot_write("user:a", "/x.md");
-        record_hot_write("user:b", "/y.md");
-        let a = state_for("user:a");
+        // Scoped clears only: clear_hot_memory(None) would wipe other
+        // scopes mid-test and race with the parallel tests.
+        clear_hot_memory(Some("user:scope-a"));
+        clear_hot_memory(Some("user:scope-b"));
+        record_hot_write("user:scope-a", "/x.md");
+        record_hot_write("user:scope-b", "/y.md");
+        let a = state_for("user:scope-a");
         assert_eq!(a.concepts.len(), 1);
         assert_eq!(a.concepts[0].0, "/x.md");
-        clear_hot_memory(None);
+        assert_eq!(state_for("user:scope-b").concepts[0].0, "/y.md");
+        clear_hot_memory(Some("user:scope-a"));
+        clear_hot_memory(Some("user:scope-b"));
     }
 
     #[test]

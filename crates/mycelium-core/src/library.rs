@@ -137,10 +137,160 @@ pub fn extract_passage_capped(
     })
 }
 
+/// One recognized heading of a book's markdown: its level, the byte
+/// offset where the line starts, and — when the heading carries a GFM
+/// explicit ID (`## Title {#id}`) — that ID. v1 stacks embed `ch-` /
+/// `sec-` IDs on their headings; identification is by ID, never by
+/// counting plain headings.
+struct BookHeading {
+    level: u8,
+    offset: usize,
+    anchor_id: Option<String>,
+}
+
+/// A markdown heading line: `#{1,6} Title {#id}` — the ID optional.
+/// Mirrors v1's HEADING_RE. Fences must already have been handled by
+/// the caller.
+fn parse_heading_line(line: &str) -> Option<(u8, Option<String>)> {
+    let trimmed = line.trim_end();
+    let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    let title = rest.trim_start();
+    // Optional GFM explicit ID: trailing `{#…}`.
+    let id = title
+        .strip_suffix('}')
+        .and_then(|t| t.rsplit_once("{#"))
+        .map(|(before, id)| {
+            (
+                before.trim_end(),
+                id.strip_suffix('}').unwrap_or(id).to_string(),
+            )
+        });
+    match id {
+        Some((_, id)) => Some((hashes as u8, Some(id))),
+        None => Some((hashes as u8, None)),
+    }
+}
+
+/// Collect the recognized headings of a book's markdown (skipping
+/// fenced code blocks). Offsets are byte positions into `text`.
+fn collect_headings(text: &str) -> Vec<BookHeading> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence
+            && trimmed.starts_with('#')
+            && let Some((level, id)) = parse_heading_line(trimmed)
+        {
+            out.push(BookHeading {
+                level,
+                offset,
+                anchor_id: id,
+            });
+        }
+        offset += line.len();
+    }
+    out
+}
+
+/// The chapter index encoded in a `ch-<n>-…` or `sec-<n>-…` anchor ID,
+/// when well-formed (v1: `chapterNumberOf`).
+fn chapter_number_of(id: &str) -> Option<u32> {
+    let parts: Vec<&str> = id.split('-').collect();
+    if parts.len() >= 2 && !parts[1].is_empty() && parts[1].chars().all(|c| c.is_ascii_digit()) {
+        parts[1].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The passage slice for an anchor: from its heading to the boundary
+/// heading. Section anchors (`sec-…`) end at the next
+/// same-or-higher-level heading of any kind. Books whose headings
+/// carry no `{#id}` anchors fall back to count-based extraction.
+fn anchored_section(text: &str, chapter: u32, section: u32) -> Option<String> {
+    let headings = collect_headings(text);
+    if headings.iter().all(|h| h.anchor_id.is_none()) {
+        return None; // no anchor IDs anywhere → count-based fallback
+    }
+    let start = headings.iter().position(|h| {
+        matches!(
+            h.anchor_id.as_deref(),
+            Some(id) if section_numbers_of(id) == Some((chapter, section))
+        )
+    })?;
+    let level = headings[start].level;
+    let end = headings[start + 1..]
+        .iter()
+        .find(|h| h.level <= level)
+        .map(|h| h.offset)
+        .unwrap_or(text.len());
+    Some(text[headings[start].offset..end].to_string())
+}
+
+/// The `(chapter, section)` encoded in a `sec-<c>-<s>-…` anchor ID.
+fn section_numbers_of(id: &str) -> Option<(u32, u32)> {
+    let rest = id.strip_prefix("sec-")?;
+    let mut parts = rest.splitn(3, '-');
+    let c = parts.next()?;
+    let s = parts.next()?;
+    if c.is_empty()
+        || s.is_empty()
+        || !c.chars().all(|x| x.is_ascii_digit())
+        || !s.chars().all(|x| x.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((c.parse().ok()?, s.parse().ok()?))
+}
+
 /// Extract the n-th chapter (1-based): from its `# ` heading to the next
 /// `# ` heading. Headings inside fenced code blocks are ignored (mirrors
 /// the librarian's `parse_outline`, so anchors line up with the catalog).
 fn extract_chapter(text: &str, index: u32) -> Result<String, PassageError> {
+    // v1 semantics: the anchor's chapter number picks the heading whose
+    // embedded `{#ch-<n>-…}` ID encodes it — NOT the n-th `# ` heading
+    // (real stacks carry hundreds of H1 section headings inside
+    // chapters).
+    let headings = collect_headings(text);
+    if headings.iter().any(|h| h.anchor_id.is_some()) {
+        let start = headings.iter().position(|h| {
+            matches!(
+                h.anchor_id.as_deref(),
+                Some(id) if id.starts_with("ch-") && chapter_number_of(id) == Some(index)
+            )
+        });
+        if let Some(pos) = start {
+            let end = headings[pos + 1..]
+                .iter()
+                .find(|h| {
+                    h.anchor_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("ch-"))
+                })
+                .map(|h| h.offset)
+                .unwrap_or(text.len());
+            return Ok(text[headings[pos].offset..end].to_string());
+        }
+        // Anchored book but no such chapter → not found (no fallback:
+        // the count-based answer would be wrong on an anchored book).
+        return Err(PassageError::AnchorNotFound(format!("ch-{index}")));
+    }
+    // Fallback (no embedded anchors): the n-th `# ` heading.
+    count_based_chapter(text, index)
+}
+
+fn count_based_chapter(text: &str, index: u32) -> Result<String, PassageError> {
     let mut seen = 0u32;
     let mut start = None;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -172,6 +322,17 @@ fn extract_chapter(text: &str, index: u32) -> Result<String, PassageError> {
 /// Extract the m-th section (1-based) of the n-th chapter (1-based).
 /// Headings inside fenced code blocks are ignored (mirrors `parse_outline`).
 fn extract_section(text: &str, chapter: u32, section: u32) -> Result<String, PassageError> {
+    // v1 semantics: match by embedded `{#sec-<n>-<m>-…}` ID; the section
+    // ends at the next same-or-higher-level heading of any kind.
+    if let Some(passage) = anchored_section(text, chapter, section) {
+        return Ok(passage);
+    }
+    // Fallback (no embedded anchors): the m-th `## ` within the n-th
+    // `# ` heading's span.
+    count_based_section(text, chapter, section)
+}
+
+fn count_based_section(text: &str, chapter: u32, section: u32) -> Result<String, PassageError> {
     // Find the chapter's start offset first.
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut seen_ch = 0u32;
@@ -382,6 +543,104 @@ Second.
         assert!(s.text.starts_with("## Section 1.1"));
         // The fenced fake section must not shift section numbering.
         assert!(extract_passage("b", "sec-1-2-x", book).is_err());
+    }
+
+    // v1-format book: `# ` headings carry GFM `{#id}` anchors; top-level
+    // `# sec-N-M-…` headings live INSIDE chapters (marker-pdf emits them
+    // as H1). 430 H1 headings, 9 chapters on the real books.
+    const V1_BOOK: &str = "\
+---
+title: A Real Book
+---
+
+# Front Matter {#sec-0-1-front-matter}
+
+Publisher junk.
+
+# Chapter 1: Basics {#ch-1-chapter-1-basics}
+<!-- src: pp. 1-9 -->
+
+# Introduction {#sec-1-1-introduction}
+
+Chances are that if you've worked on Linux you know grep.
+
+## Conventions {#sec-1-2-conventions}
+
+Details of conventions.
+
+# Conceptual Overview {#sec-1-12-conceptual-overview}
+
+The conceptual overview section.
+
+# Chapter 2: Advanced {#ch-2-chapter-2-advanced}
+
+# Deep Dive {#sec-2-1-deep-dive}
+
+Deep content here.
+";
+
+    #[test]
+    fn v1_chapter_extraction_spans_embedded_h1_sections() {
+        // THE BUG: v1 stacks carry `# sec-…` H1 headings inside chapters;
+        // chapter extraction must run to the NEXT ch- ANCHORED heading,
+        // not the next `# ` line.
+        let p = extract_passage("b", "ch-1-chapter-1-basics", V1_BOOK).unwrap();
+        assert!(p.text.contains("# Chapter 1: Basics"));
+        assert!(p.text.contains("Chances are that if you've worked"));
+        assert!(p.text.contains("Conceptual Overview"));
+        assert!(p.text.contains("Details of conventions."));
+        assert!(!p.text.contains("# Chapter 2: Advanced"));
+    }
+
+    #[test]
+    fn v1_chapter_skips_front_matter_and_unanchored_headings() {
+        // Unanchored / sec-0 headings (title page, "Brief Contents") are
+        // NOT chapters: the anchor's chapter number picks the chapter,
+        // not the heading count.
+        let p = extract_passage("b", "ch-2-chapter-2-advanced", V1_BOOK).unwrap();
+        assert!(p.text.contains("# Chapter 2: Advanced"));
+        assert!(p.text.contains("Deep content here."));
+        assert!(!p.text.contains("Front Matter"));
+    }
+
+    #[test]
+    fn v1_section_extraction_by_embedded_id() {
+        // Sections match by their embedded {#sec-N-M} anchor; end at the
+        // next heading of ANY level that is same-or-higher level.
+        let p = extract_passage("b", "sec-1-12-conceptual-overview", V1_BOOK).unwrap();
+        assert!(p.text.contains("# Conceptual Overview"));
+        assert!(p.text.contains("The conceptual overview section."));
+        assert!(!p.text.contains("# Chapter 2"));
+    }
+
+    #[test]
+    fn v1_h1_section_inside_chapter_is_a_section_not_a_chapter() {
+        // `# Introduction {#sec-1-1-…}` is section 1 of chapter 1 even
+        // though it is an H1 — matching is by anchor ID, not level.
+        let p = extract_passage("b", "sec-1-1-introduction", V1_BOOK).unwrap();
+        assert!(p.text.contains("# Introduction"));
+        assert!(p.text.contains("Chances are that if you've worked"));
+        assert!(p.text.contains("Details of conventions."));
+        assert!(!p.text.contains("# Conceptual Overview"));
+    }
+
+    #[test]
+    fn v1_missing_anchor_errors() {
+        assert!(extract_passage("b", "ch-9-nope", V1_BOOK).is_err());
+        assert!(extract_passage("b", "sec-9-9-nope", V1_BOOK).is_err());
+    }
+
+    // Fallback: books whose headings carry NO {#id} anchors keep the
+    // count-based semantics (mycelium2's own synthetic/simple books).
+    #[test]
+    fn plain_book_still_extracts_by_count() {
+        let p = extract_passage("b", "ch-1-chapter-one", BOOK).unwrap();
+        assert!(p.text.starts_with("# Chapter One"));
+        assert!(p.text.contains("Section 1.2"));
+        assert!(!p.text.contains("# Chapter Two"));
+        let p2 = extract_passage("b", "ch-2-chapter-two", BOOK).unwrap();
+        assert!(p2.text.starts_with("# Chapter Two"));
+        assert!(p2.text.contains("Section 2.1"));
     }
 
     #[test]

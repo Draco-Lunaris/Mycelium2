@@ -15,17 +15,36 @@ use serde::Deserialize;
 
 use crate::llm::{LlmClient, LlmError, strip_code_fence};
 
+/// One section parsed from the book text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionOutline {
+    /// 1-based section index: for anchored books the REAL section
+    /// number encoded in the ID (`sec-1-12-…` → 12), for plain books
+    /// the encounter-order count.
+    pub index: u32,
+    /// Heading text (e.g. "Conventions").
+    pub title: String,
+    /// The REAL anchor ID (`sec-1-12-conceptual-overview`) when the
+    /// heading carries a GFM `{#id}`; None for plain books.
+    pub anchor_id: Option<String>,
+}
+
 /// One chapter parsed from the book text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChapterOutline {
-    /// 1-based chapter index.
+    /// 1-based chapter index (the number encoded in the anchor ID for
+    /// anchored books, encounter order for plain ones).
     pub index: u32,
     /// Heading text (e.g. "Chapter One").
     pub title: String,
     /// Slugified anchor suffix (e.g. "chapter-one").
     pub slug: String,
-    /// Sections within the chapter (1-based index + heading text).
-    pub sections: Vec<(u32, String)>,
+    /// Sections within the chapter.
+    pub sections: Vec<SectionOutline>,
+    /// The REAL anchor ID embedded in the stack heading
+    /// (`ch-1-chapter-1-basics`) when the book carries GFM `{#id}`
+    /// anchors; None for count-derived chapters of plain books.
+    pub anchor_id: Option<String>,
 }
 
 /// The parsed outline of a book.
@@ -34,10 +53,70 @@ pub struct BookOutline {
     pub chapters: Vec<ChapterOutline>,
 }
 
-/// Parse `# ` (chapter) and `## ` (section) headings from book text.
-/// Headings inside fenced code blocks are ignored.
+/// The GFM explicit ID of a heading line, when it carries one:
+/// `## Title {#anchor}` → `anchor`. Mirrors the core's heading parser.
+fn heading_anchor_id(trimmed: &str) -> Option<String> {
+    let title = trimmed.trim_start_matches('#').trim_start();
+    let id = title
+        .strip_suffix('}')
+        .and_then(|t| t.rsplit_once("{#"))
+        .map(|(_, id)| id.strip_suffix('}').unwrap_or(id))?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Is this embedded anchor ID a chapter ID? v1's rule: `ch-` prefix
+/// with a numeric chapter number (`ch-<n>-<slug>`; also matches
+/// digit-leading titles like `ch-1-1-python-basics`).
+fn is_chapter_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() >= 3
+        && parts[0] == "ch"
+        && !parts[1].is_empty()
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Is this embedded anchor ID a section ID? `sec-<n>-<m>-…` with both
+/// numbers present (`sec-0-…` front matter included; the caller
+/// filters by chapter number).
+fn is_section_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() >= 4
+        && parts[0] == "sec"
+        && !parts[1].is_empty()
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && !parts[2].is_empty()
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+}
+
+/// The `(chapter, section)` numbers encoded in a `sec-<c>-<s>-…` anchor
+/// ID. Mirrors the core's `section_numbers_of` (sec-0 front matter
+/// included; the caller filters it out).
+fn section_numbers_of(id: &str) -> Option<(u32, u32)> {
+    let rest = id.strip_prefix("sec-")?;
+    let mut parts = rest.splitn(3, '-');
+    let c = parts.next()?;
+    let s = parts.next()?;
+    if c.is_empty()
+        || s.is_empty()
+        || !c.chars().all(|x| x.is_ascii_digit())
+        || !s.chars().all(|x| x.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((c.parse().ok()?, s.parse().ok()?))
+}
+
+/// Parse the book outline. When headings carry GFM `{#id}` anchors
+/// (v1 stacks — 430 H1s, 9 chapters), chapters are the `ch-`-anchored
+/// headings (indexed by their embedded number, front matter excluded)
+/// and sections the `sec-`-anchored headings grouped by chapter number;
+/// plain unanchored headings fall back to counting `# ` chapters and
+/// `## ` sections. Headings inside fenced code blocks are ignored in
+/// both modes.
 pub fn parse_outline(text: &str) -> BookOutline {
-    let mut chapters: Vec<ChapterOutline> = Vec::new();
+    // Collect (anchor_id, title, level) outside fences first: the
+    // anchored path needs IDs at any heading level.
+    let mut fenced: Vec<(Option<String>, String, u8)> = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -48,19 +127,94 @@ pub fn parse_outline(text: &str) -> BookOutline {
         if in_fence {
             continue;
         }
-        if let Some(title) = trimmed.strip_prefix("# ") {
-            let index = chapters.len() as u32 + 1;
-            chapters.push(ChapterOutline {
-                index,
-                title: title.trim().to_string(),
-                slug: slugify(title),
-                sections: Vec::new(),
-            });
-        } else if let Some(title) = trimmed.strip_prefix("## ")
-            && let Some(ch) = chapters.last_mut()
-        {
-            let section_index = ch.sections.len() as u32 + 1;
-            ch.sections.push((section_index, title.trim().to_string()));
+        let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+        if hashes == 0 || hashes > 6 || !trimmed[hashes..].starts_with(' ') {
+            continue;
+        }
+        let full_title = trimmed[hashes..].trim_start().trim();
+        // Strip the `{#id}` suffix from the title, as the core does:
+        // the title alone ("Chapter 1: Basics") is what the catalog shows.
+        let title = heading_anchor_id(trimmed)
+            .and_then(|id| {
+                full_title
+                    .strip_suffix(&format!("{{#{id}}}"))
+                    .map(|t| t.trim_end().to_string())
+            })
+            .unwrap_or_else(|| full_title.to_string());
+        fenced.push((heading_anchor_id(trimmed), title, hashes as u8));
+    }
+    let anchored = fenced.iter().any(|(id, _, _)| id.is_some());
+    if anchored {
+        // v1 path: chapters and sections by embedded ID. The chapter's
+        // index comes from its `ch-<n>` number; sections group by the
+        // chapter number encoded in their ID and keep their REAL
+        // section numbers (`sec-1-12` stays 12).
+        let mut chapters: Vec<ChapterOutline> = Vec::new();
+        let mut sections_by_chapter: std::collections::BTreeMap<u32, Vec<SectionOutline>> =
+            std::collections::BTreeMap::new();
+        for (id, title, _) in &fenced {
+            let Some(id) = id else { continue };
+            if is_chapter_id(id) {
+                // `ch-<n>-<slug>`: the number after `ch-`.
+                let n = id.split('-').nth(1).and_then(|p| p.parse::<u32>().ok());
+                if let Some(n) = n.filter(|n| *n > 0) {
+                    chapters.push(ChapterOutline {
+                        index: n,
+                        title: title.clone(),
+                        slug: slugify(title),
+                        sections: Vec::new(),
+                        anchor_id: Some(id.clone()),
+                    });
+                }
+            } else if is_section_id(id) {
+                // `sec-<c>-<m>-<slug>`: chapter c, section m. sec-0 =
+                // front matter, not part of any chapter.
+                if let Some((c, m)) = section_numbers_of(id).filter(|(c, _)| *c > 0) {
+                    sections_by_chapter
+                        .entry(c)
+                        .or_default()
+                        .push(SectionOutline {
+                            index: m,
+                            title: title.clone(),
+                            anchor_id: Some(id.clone()),
+                        });
+                }
+            }
+        }
+        for ch in &mut chapters {
+            if let Some(mut secs) = sections_by_chapter.remove(&ch.index) {
+                secs.sort_by_key(|s| s.index);
+                ch.sections = secs;
+            }
+        }
+        chapters.sort_by_key(|c| c.index);
+        return BookOutline { chapters };
+    }
+    // Fallback (no embedded anchors): count `# ` chapters / `## ` sections.
+    let mut chapters: Vec<ChapterOutline> = Vec::new();
+    for (_, title, level) in &fenced {
+        match level {
+            1 => {
+                let index = chapters.len() as u32 + 1;
+                chapters.push(ChapterOutline {
+                    index,
+                    title: title.clone(),
+                    slug: slugify(title),
+                    sections: Vec::new(),
+                    anchor_id: None,
+                });
+            }
+            2 => {
+                if let Some(ch) = chapters.last_mut() {
+                    let section_index = ch.sections.len() as u32 + 1;
+                    ch.sections.push(SectionOutline {
+                        index: section_index,
+                        title: title.clone(),
+                        anchor_id: None,
+                    });
+                }
+            }
+            _ => {}
         }
     }
     BookOutline { chapters }
@@ -111,9 +265,13 @@ pub fn build_hub_concept(catalog: &BookCatalog, outline: &BookOutline) -> Concep
     }
     body.push_str("\n# Chapters\n\n");
     for ch in &outline.chapters {
+        // Link the chapter concept's REAL source path: the embedded
+        // anchor ID on anchored books, count-derived on plain ones.
         body.push_str(&format!(
-            "- [{}](/{}/ch-{}-{}.md)\n",
-            ch.title, catalog.slug, ch.index, ch.slug
+            "- [{}](/{}/{}.md)\n",
+            ch.title,
+            catalog.slug,
+            chapter_anchor_id(ch)
         ));
     }
     body.push_str("\n# Related Concepts\n\n");
@@ -131,7 +289,10 @@ pub fn build_hub_concept(catalog: &BookCatalog, outline: &BookOutline) -> Concep
     )
 }
 
-/// Build one chapter concept (`/<slug>/ch-<n>-<slug>.md`).
+/// Build one chapter concept (`/<slug>/<anchor_id>.md` for anchored
+/// books, `/<slug>/ch-<n>-<slug>.md` for plain ones). All book://
+/// references use the REAL anchor IDs from the stack, so every link
+/// resolves.
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_chapter_concept(
     catalog: &BookCatalog,
@@ -143,6 +304,8 @@ pub fn build_chapter_concept(
         .get(chapter.index as usize - 1)
         .cloned()
         .unwrap_or_default();
+    let chapter_anchor = chapter_anchor_id(chapter);
+    let chapter_uri = format!("book://{}#{}", catalog.slug, chapter_anchor);
     let mut body = String::new();
     body.push_str(&format!("# {}\n\n", chapter.title));
     if !summary.is_empty() {
@@ -152,39 +315,57 @@ pub fn build_chapter_concept(
     }
     if !chapter.sections.is_empty() {
         body.push_str("# Sections\n\n");
-        for (i, title) in &chapter.sections {
+        for section in &chapter.sections {
             body.push_str(&format!(
-                "- [{}](book://{}#sec-{}-{}-{})\n",
-                title,
+                "- [{}](book://{}#{})\n",
+                section.title,
                 catalog.slug,
-                chapter.index,
-                i,
-                slugify(title)
+                section_anchor_id(chapter, section)
             ));
         }
         body.push('\n');
     }
     body.push_str("# Full passage\n\n");
-    body.push_str(&format!(
-        "Read the full chapter via `book://{}#ch-{}-{}`.\n",
-        catalog.slug, chapter.index, chapter.slug
-    ));
+    body.push_str(&format!("Read the full chapter via `{chapter_uri}`.\n"));
     Concept::new(
         Frontmatter {
             concept_type: "Chapter".into(),
             title: Some(chapter.title.clone()),
             description: Some(format!("Chapter {} of {}", chapter.index, catalog.title)),
-            resource: Some(format!(
-                "book://{}#ch-{}-{}",
-                catalog.slug, chapter.index, chapter.slug
-            )),
+            resource: Some(chapter_uri.clone()),
             book: Some(format!("/{}/book.md", catalog.slug)),
             chapter_index: Some(chapter.index),
             ..Default::default()
         },
         body,
-        format!("/{}/ch-{}-{}.md", catalog.slug, chapter.index, chapter.slug),
+        format!("/{}/{}.md", catalog.slug, chapter_anchor),
     )
+}
+
+/// The passage anchor for a chapter concept: the stack's REAL anchor ID
+/// (`ch-1-chapter-1-basics`) when the book carries `{#id}` anchors, the
+/// count-derived `ch-<n>-<slug>` for plain books (which is exactly what
+/// the core's count-based extractor resolves).
+fn chapter_anchor_id(chapter: &ChapterOutline) -> String {
+    match &chapter.anchor_id {
+        Some(id) => id.clone(),
+        None => format!("ch-{}-{}", chapter.index, chapter.slug),
+    }
+}
+
+/// The passage anchor for one section link. Anchored books: the REAL
+/// `sec-<c>-<m>-<slug>` ID. Plain books: the count-derived anchor the
+/// core resolves.
+fn section_anchor_id(chapter: &ChapterOutline, section: &SectionOutline) -> String {
+    match &section.anchor_id {
+        Some(id) => id.clone(),
+        None => format!(
+            "sec-{}-{}-{}",
+            chapter.index,
+            section.index,
+            slugify(&section.title)
+        ),
+    }
 }
 
 /// The structured catalog the LLM is asked to produce: book-level only.
@@ -241,12 +422,14 @@ pub async fn build_catalog(
 /// any sub-headings), whitespace-collapsed. Mirrors v1's pdf-to-markdown
 /// sidecar descriptions — real text, never invented.
 ///
-/// Positional: slices the text between chapter N's `# ` heading and
-/// chapter N+1's heading (the same fence-aware walk parse_outline uses),
-/// so it works whether or not the book carries `{#anchor}` IDs.
+/// Positional for plain books: slices the text between chapter N's `# `
+/// heading and chapter N+1's heading. Anchored books: between the
+/// heading whose REAL `{#ch-<n>-…}` ID matches and the next `ch-`
+/// heading (hundreds of H1 section headings lie between two real
+/// chapters — count-position is wrong there).
 fn chapter_descriptions(outline: &BookOutline, text: &str) -> Vec<String> {
-    // Collect the line ranges of each chapter (fence-aware).
-    let mut chapter_starts: Vec<usize> = Vec::new(); // line index of each `# ` heading
+    // Fence-aware walk: (line index, level, anchor_id) per heading.
+    let mut headings: Vec<(usize, u8, Option<String>)> = Vec::new();
     let mut in_fence = false;
     for (i, line) in text.lines().enumerate() {
         let t = line.trim_start();
@@ -254,27 +437,54 @@ fn chapter_descriptions(outline: &BookOutline, text: &str) -> Vec<String> {
             in_fence = !in_fence;
             continue;
         }
-        if !in_fence && t.starts_with("# ") {
-            chapter_starts.push(i);
+        if !in_fence && t.starts_with('#') {
+            let hashes = t.len() - t.trim_start_matches('#').len();
+            if hashes > 0 && hashes <= 6 && t[hashes..].starts_with(' ') {
+                headings.push((i, hashes as u8, heading_anchor_id(t)));
+            }
         }
     }
-    let total_lines = text.lines().count();
     outline
         .chapters
         .iter()
         .map(|ch| {
-            let start = chapter_starts.get(ch.index as usize - 1).copied();
-            let Some(start) = start else {
+            // The chapter slice = the same span the passage extractor
+            // returns: on anchored books from the heading carrying the
+            // REAL ch- ID to the next ch- heading; on plain books from
+            // the n-th H1 to the next H1 (or EOF). The description is
+            // the chapter's real prose inside that span. `pos` indexes
+            // the `headings` vec; `line` is the heading's line number.
+            let found = match &ch.anchor_id {
+                Some(id) => headings
+                    .iter()
+                    .position(|(_, _, h_id)| h_id.as_deref() == Some(id.as_str()))
+                    .map(|p| (p, headings[p].0)),
+                None => headings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, level, _))| *level == 1)
+                    .nth(ch.index as usize - 1)
+                    .map(|(p, (i, _, _))| (p, *i)),
+            };
+            let Some((pos, line)) = found else {
                 return String::new();
             };
-            let end = chapter_starts
-                .get(ch.index as usize)
-                .copied()
-                .unwrap_or(total_lines);
+            let end = match &ch.anchor_id {
+                Some(_) => headings[pos + 1..]
+                    .iter()
+                    .find(|(_, _, h_id)| h_id.as_deref().is_some_and(|x| x.starts_with("ch-")))
+                    .map(|(i, _, _)| *i)
+                    .unwrap_or(text.lines().count()),
+                None => headings[pos + 1..]
+                    .iter()
+                    .find(|(_, level, _)| *level == 1)
+                    .map(|(i, _, _)| *i)
+                    .unwrap_or(text.lines().count()),
+            };
             let body = text
                 .lines()
-                .skip(start + 1) // the chapter heading line
-                .take(end.saturating_sub(start + 1))
+                .skip(line + 1) // the chapter heading line
+                .take(end.saturating_sub(line + 1))
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .collect::<Vec<_>>()
@@ -383,8 +593,102 @@ More details.
         assert_eq!(outline.chapters[0].index, 1);
         assert_eq!(outline.chapters[0].slug, "chapter-one");
         assert_eq!(outline.chapters[0].sections.len(), 2);
-        assert_eq!(outline.chapters[0].sections[0], (1, "Section 1.1".into()));
-        assert_eq!(outline.chapters[1].sections[0], (1, "Section 2.1".into()));
+        assert_eq!(outline.chapters[0].sections[0].index, 1);
+        assert_eq!(outline.chapters[0].sections[0].title, "Section 1.1");
+        assert_eq!(outline.chapters[0].sections[0].anchor_id, None);
+        assert_eq!(outline.chapters[1].sections[0].index, 1);
+        assert_eq!(outline.chapters[1].sections[0].title, "Section 2.1");
+    }
+
+    // v1-format book: `# ` headings carry GFM `{#id}` anchors and H1
+    // `sec-` sections live INSIDE chapters. Chapters are the `ch-`
+    // anchored headings; sections the `sec-` anchored ones.
+    const V1_BOOK: &str = "\
+# Front Matter {#sec-0-1-front-matter}
+
+Publisher junk.
+
+# Chapter 1: Basics {#ch-1-chapter-1-basics}
+
+# Introduction {#sec-1-1-introduction}
+
+Intro prose.
+
+## Conventions {#sec-1-2-conventions}
+
+Details of conventions.
+
+# Conceptual Overview {#sec-1-12-conceptual-overview}
+
+Overview text.
+
+# Chapter 2: Advanced {#ch-2-chapter-2-advanced}
+
+# Deep Dive {#sec-2-1-deep-dive}
+
+Deep content.
+";
+
+    #[test]
+    fn v1_outline_chapters_by_anchor_id_not_by_count() {
+        // 430 H1s, 9 chapters on the real books: ONLY ch-anchored
+        // headings are chapters; sec-0 (front matter) is not one.
+        let outline = parse_outline(V1_BOOK);
+        assert_eq!(outline.chapters.len(), 2, "got: {outline:?}");
+        assert_eq!(outline.chapters[0].title, "Chapter 1: Basics");
+        assert_eq!(outline.chapters[0].index, 1);
+        assert_eq!(outline.chapters[1].title, "Chapter 2: Advanced");
+        assert_eq!(outline.chapters[1].index, 2);
+    }
+
+    #[test]
+    fn v1_outline_sections_from_embedded_ids() {
+        // Sections group by the chapter number encoded in the sec- ID:
+        // `# Introduction {#sec-1-1-…}` and `# Conceptual Overview
+        // {#sec-1-12-…}` are BOTH chapter 1 sections despite the gap;
+        // `sec-0` front matter belongs to no chapter.
+        let outline = parse_outline(V1_BOOK);
+        let ch1 = &outline.chapters[0];
+        assert_eq!(ch1.sections.len(), 3, "sections: {:?}", ch1.sections);
+        assert_eq!(ch1.sections[0].index, 1);
+        assert_eq!(ch1.sections[0].title, "Introduction");
+        assert_eq!(ch1.sections[1].index, 2);
+        assert_eq!(ch1.sections[1].title, "Conventions");
+        assert_eq!(ch1.sections[2].index, 12, "REAL number, not renumbered");
+        assert_eq!(ch1.sections[2].title, "Conceptual Overview");
+        assert_eq!(outline.chapters[1].sections.len(), 1);
+        assert_eq!(outline.chapters[1].sections[0].index, 1);
+        assert_eq!(outline.chapters[1].sections[0].title, "Deep Dive");
+    }
+
+    #[test]
+    fn v1_outline_section_anchors_carry_real_ids() {
+        // Chapter-concept section links must use the stack's REAL
+        // `sec-` anchor IDs, not renumbered count-derived ones.
+        let outline = parse_outline(V1_BOOK);
+        assert_eq!(
+            outline.chapters[0].sections[2].anchor_id,
+            Some("sec-1-12-conceptual-overview".into())
+        );
+        assert_eq!(
+            outline.chapters[1].sections[0].anchor_id,
+            Some("sec-2-1-deep-dive".into())
+        );
+    }
+
+    #[test]
+    fn v1_outline_chapter_anchors_carry_real_ids() {
+        // Catalog chapter concepts must reference the stack's REAL
+        // anchor IDs (`ch-1-chapter-1-basics`), not count-derived ones.
+        let outline = parse_outline(V1_BOOK);
+        assert_eq!(
+            outline.chapters[0].anchor_id,
+            Some("ch-1-chapter-1-basics".into())
+        );
+        assert_eq!(
+            outline.chapters[1].anchor_id,
+            Some("ch-2-chapter-2-advanced".into())
+        );
     }
 
     #[test]
