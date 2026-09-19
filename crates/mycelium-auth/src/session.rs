@@ -1,6 +1,11 @@
 //! Server-side sessions in SQLite with CSRF tokens.
+//!
+//! Session ids (the cookie value) are stored SHA-256 hashed, like API
+//! keys — a leaked database does not yield usable session cookies. The
+//! `SessionRecord.id` returned to callers is always the raw id.
 
 use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -62,7 +67,7 @@ impl SessionManager {
         sqlx::query(
             "INSERT INTO sessions (id, user_id, csrf_token, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
         )
-        .bind(id.to_string())
+        .bind(hash_session_id(&id))
         .bind(user_id.to_string())
         .bind(&csrf)
         .bind(now.to_rfc3339())
@@ -79,12 +84,12 @@ impl SessionManager {
 
     /// Look up a session; expired sessions are deleted and reported absent.
     pub async fn get(&self, session_id: Uuid) -> Result<SessionRecord, SessionError> {
-        let row: Option<(String, String, String, String)> =
-            sqlx::query_as("SELECT id, user_id, csrf_token, expires_at FROM sessions WHERE id = ?")
-                .bind(session_id.to_string())
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT user_id, csrf_token, expires_at FROM sessions WHERE id = ?")
+                .bind(hash_session_id(&session_id))
                 .fetch_optional(&self.pool)
                 .await?;
-        let Some((id_s, user_s, csrf, expires_s)) = row else {
+        let Some((user_s, csrf, expires_s)) = row else {
             return Err(SessionError::NotFound);
         };
         let expires = DateTime::parse_from_rfc3339(&expires_s)
@@ -93,13 +98,13 @@ impl SessionManager {
         if Utc::now() > expires {
             // Expired: delete and report absent.
             let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
-                .bind(&id_s)
+                .bind(hash_session_id(&session_id))
                 .execute(&self.pool)
                 .await;
             return Err(SessionError::NotFound);
         }
         Ok(SessionRecord {
-            id: Uuid::parse_str(&id_s).map_err(|_| SessionError::NotFound)?,
+            id: session_id,
             user_id: Uuid::parse_str(&user_s).map_err(|_| SessionError::NotFound)?,
             csrf_token: csrf,
             expires_at: expires,
@@ -109,7 +114,7 @@ impl SessionManager {
     /// Delete a session (logout).
     pub async fn delete(&self, session_id: Uuid) -> Result<(), SessionError> {
         sqlx::query("DELETE FROM sessions WHERE id = ?")
-            .bind(session_id.to_string())
+            .bind(hash_session_id(&session_id))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -162,6 +167,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// SHA-256 hash of a session id (hex), matching the API-key pattern.
+/// Session ids are high-entropy random values, not user-chosen secrets.
+fn hash_session_id(session_id: &Uuid) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +197,33 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn session_ids_hashed_at_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let sessions = SessionManager::new(store.pool().clone());
+        let user_id = seed_user(store.pool()).await;
+        let s = sessions.create(user_id).await.unwrap();
+        let (stored,): (String,) = sqlx::query_as("SELECT id FROM sessions")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        // The raw session id (the cookie value) must never sit in the DB.
+        assert_ne!(stored, s.id.to_string());
+        // SHA-256 hex: 64 lowercase hex chars.
+        assert_eq!(stored.len(), 64);
+        assert!(stored.chars().all(|c| c.is_ascii_hexdigit()));
+        // Behavior is unchanged: the raw id still resolves, gets, and
+        // deletes the session.
+        let got = sessions.get(s.id).await.unwrap();
+        assert_eq!(got.user_id, user_id);
+        sessions.delete(s.id).await.unwrap();
+        assert!(matches!(
+            sessions.get(s.id).await,
+            Err(SessionError::NotFound)
+        ));
     }
 
     #[tokio::test]

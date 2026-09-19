@@ -9,6 +9,9 @@ use mycelium_auth::login::LoginService;
 use mycelium_store::Store;
 use mycelium_web::AppState;
 
+/// Known admin password for the pre-seeded account (tests log in with it).
+const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
+
 async fn boot() -> (
     String,
     tokio_util::sync::CancellationToken,
@@ -17,9 +20,15 @@ async fn boot() -> (
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
-    mycelium_auth::bootstrap_admin(&store)
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            ADMIN_PASSWORD,
+            mycelium_auth::Role::Admin,
+        )
         .await
-        .unwrap()
         .unwrap();
     let assets_dir = dir.path().join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
@@ -88,57 +97,24 @@ async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> St
     rest[..end].to_string()
 }
 
-/// Log in as the bootstrap admin and complete the forced password
-/// change; returns (cookie, csrf).
-async fn login_admin(
-    client: &reqwest::Client,
-    base: &str,
-    dir: &tempfile::TempDir,
-) -> (String, String) {
-    let password = std::fs::read_to_string(dir.path().join("config/initial-admin-password"))
-        .unwrap()
-        .trim()
-        .to_string();
+/// Log in as the pre-seeded admin; returns (cookie, csrf).
+async fn login_admin(client: &reqwest::Client, base: &str) -> (String, String) {
     let login = client
         .post(format!("{base}/login"))
-        .form(&[("username", "admin"), ("password", password.as_str())])
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
         .send()
         .await
         .unwrap();
     assert_eq!(login.status(), 303);
     let cookie = cookie_from(&login);
-    let csrf = csrf_from_page(client, &format!("{base}/password"), &cookie).await;
-    let new_password = "admin password twenty chars!";
-    let change = client
-        .post(format!("{base}/password"))
-        .header("cookie", &cookie)
-        .header("x-csrf-token", &csrf)
-        .form(&[
-            ("old", password.as_str()),
-            ("new", new_password),
-            ("repeat", new_password),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(change.status(), 303);
-    let login2 = client
-        .post(format!("{base}/login"))
-        .form(&[("username", "admin"), ("password", new_password)])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(login2.status(), 303);
-    let cookie2 = cookie_from(&login2);
-    let csrf2 = csrf_from_page(client, &format!("{base}/"), &cookie2).await;
-    (cookie2, csrf2)
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
 }
-
 #[tokio::test]
 async fn security_settings_guardrails() {
-    let (base, shutdown, dir) = boot().await;
+    let (base, shutdown, _dir) = boot().await;
     let client = client();
-    let (cookie, csrf) = login_admin(&client, &base, &dir).await;
+    let (cookie, csrf) = login_admin(&client, &base).await;
 
     // 1. The admin page renders the security form with the defaults.
     let admin_html = client
@@ -187,10 +163,7 @@ async fn security_settings_guardrails() {
     //    (Max-Age=1800) and a session that expires in ~30 min.
     let login = client
         .post(format!("{base}/login"))
-        .form(&[
-            ("username", "admin"),
-            ("password", "admin password twenty chars!"),
-        ])
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
         .send()
         .await
         .unwrap();
@@ -218,7 +191,7 @@ async fn security_settings_guardrails() {
         .header("cookie", &cookie2)
         .header("x-csrf-token", &csrf2)
         .form(&[
-            ("old", "admin password twenty chars!"),
+            ("old", ADMIN_PASSWORD),
             ("new", "tiny9char"), // 9 chars < 12 → must fail
             ("repeat", "tiny9char"),
         ])

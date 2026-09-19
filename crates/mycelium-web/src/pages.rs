@@ -127,6 +127,39 @@ pub fn login_page(csrf: &str, error: Option<&str>) -> Html<String> {
     layout("Login", None, csrf, body)
 }
 
+/// First-run setup: create the initial admin. No CSRF token — no session
+/// exists yet (mirrors /login; app.js still injects an empty field, which
+/// the middleware's no-session path exemption ignores).
+pub fn setup_page(username: &str, min_len: usize, error: Option<&str>) -> Html<String> {
+    let body = format!(
+        r#"<h1>Initial setup</h1>
+<p>Create the administrator account. This page is available only until the first account exists.</p>
+{}<form method="post" action="/setup">
+  <label>Admin username</label><input name="username" value="{}" required autofocus>
+  <label>Password (min {min_len} characters)</label><input type="password" name="password" minlength="{min_len}" required>
+  <label>Confirm password</label><input type="password" name="password_confirm" required>
+  <button type="submit">Create admin account</button>
+</form>"#,
+        flash(None, error),
+        html_escape(username)
+    );
+    layout("Setup", None, "", body)
+}
+
+/// Post-setup success: the recovery key is shown exactly once, in-page
+/// (never in a URL — same rule as admin user creation).
+pub fn setup_created(username: &str, recovery_key: &str) -> Html<String> {
+    let body = format!(
+        r#"<h1>Setup complete</h1>
+<div class="flash ok">Admin account <b>{}</b> created. Recovery key (shown ONCE — store it now; it cannot be retrieved later):</div>
+<pre>{}</pre>
+<p><a href="/login">Go to login</a></p>"#,
+        html_escape(username),
+        html_escape(recovery_key)
+    );
+    layout("Setup complete", None, "", body)
+}
+
 /// Home: the user's private bundle listing.
 pub fn home_page(
     user: &SessionUser,

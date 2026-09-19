@@ -145,6 +145,12 @@ fn derive_dek_from_service(service: &ServiceKey, info: &[u8]) -> Dek {
     Dek::from_bytes(&material).expect("32 bytes")
 }
 
+/// Derive a service-scoped DEK for encrypting server-managed secrets
+/// (e.g. TOTP secrets) with `info` as the HKDF domain separator.
+pub fn derive_service_dek(service: &ServiceKey, info: &[u8]) -> Dek {
+    derive_dek_from_service(service, info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

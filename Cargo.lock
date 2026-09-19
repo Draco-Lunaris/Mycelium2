@@ -2436,7 +2436,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "mycelium-auth",
  "mycelium-core",
  "mycelium-crypto",
  "mycelium-store",

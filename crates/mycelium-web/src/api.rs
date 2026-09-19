@@ -19,8 +19,6 @@ use crate::state::AppState;
 
 /// Construct the librarian agent's cross-scope capabilities from a store
 /// and service key (global skills + library + full-text book search).
-/// Construct the librarian agent's cross-scope capabilities from a store
-/// and service key (global skills + library + full-text book search).
 /// `visible_slugs` filters library access by bookshelf visibility
 /// (None = unrestricted, i.e. admin).
 fn build_agent_scopes<'a>(
@@ -585,6 +583,78 @@ pub async fn login_submit(
 /// GET /login — render the login page.
 pub async fn login_page(State(_state): State<AppState>) -> Response {
     pages::login_page("", None).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SetupForm {
+    pub username: String,
+    pub password: String,
+    pub password_confirm: Option<String>,
+}
+
+/// GET /setup — first-run setup page; unreachable once any user exists.
+pub async fn setup_page(State(state): State<AppState>) -> Response {
+    // Fail closed: an unreadable count is treated as "users exist".
+    if state.users.count().await.unwrap_or(1) > 0 {
+        return Redirect::to("/login").into_response();
+    }
+    let min_len = state.security_config().await.min_password_length;
+    pages::setup_page("admin", min_len, None).into_response()
+}
+
+/// POST /setup — create the initial admin from operator-chosen
+/// credentials. No throttle: the endpoint dies after the first account;
+/// the password policy is the defense. The recovery key is shown once,
+/// in the response body only (never a URL — history/referrer leakage).
+pub async fn setup_submit(
+    State(state): State<AppState>,
+    axum::Form(form): axum::Form<SetupForm>,
+) -> Response {
+    // Count re-check + UNIQUE(username): one setup wins, losers redirect.
+    if state.users.count().await.unwrap_or(1) > 0 {
+        return Redirect::to("/login").into_response();
+    }
+    let username = form.username.trim().to_string();
+    let min_len = state.security_config().await.min_password_length;
+    if username.is_empty() {
+        return pages::setup_page("admin", min_len, Some("Username must not be empty"))
+            .into_response();
+    }
+    if let Some(confirm) = &form.password_confirm
+        && confirm != &form.password
+    {
+        return pages::setup_page(&username, min_len, Some("Passwords do not match"))
+            .into_response();
+    }
+    if let Err(e) = mycelium_auth::password::check_password_policy_min(&form.password, min_len) {
+        return pages::setup_page(&username, min_len, Some(&e.to_string())).into_response();
+    }
+    let email = format!("{username}@localhost.local");
+    match state
+        .users
+        .create_local(&username, &email, &form.password, Role::Admin)
+        .await
+    {
+        Ok(created) => {
+            if let Err(e) = state
+                .persist_service_seal(created.record.id, &created.master_key)
+                .await
+            {
+                tracing::error!(
+                    user_id = %created.record.id,
+                    error = %e,
+                    "failed to persist service-key seal after setup — resealed on first login"
+                );
+            }
+            state
+                .master_keys
+                .insert(created.record.id, created.master_key);
+            tracing::info!(username = %username, "initial admin account created via /setup");
+            pages::setup_created(&username, &created.recovery_key).into_response()
+        }
+        Err(mycelium_auth::UsersError::Duplicate) => Redirect::to("/login").into_response(),
+        Err(e) => pages::setup_page(&username, min_len, Some(&e.to_string())).into_response(),
+    }
 }
 
 /// GET /logout — delete the session and clear the cookie. Public: works

@@ -53,13 +53,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load the service key (env override or 0600 file).
     let service_key = mycelium_crypto::load_or_create_service_key(&data_dir)?;
 
-    // Bootstrap the first admin (no-op when users exist).
-    if let Some(admin) = mycelium_auth::bootstrap_admin(&store).await? {
-        tracing::info!(username = %admin.username, "bootstrapped initial admin");
-        tracing::info!(
-            "initial password written to {} (0600) — change it on first login",
-            data_dir.join("config/initial-admin-password").display()
-        );
+    // First-run guidance: no users exist yet — the admin account is
+    // created through the web /setup page (no bootstrap files are ever
+    // written).
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    match users.count().await {
+        Ok(0) => tracing::info!(
+            "no users yet — open https://<host>/setup in a browser to create the admin account"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "user count check failed"),
     }
 
     // Scaffold default assets on first boot.

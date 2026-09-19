@@ -225,6 +225,9 @@ impl AppState {
             Arc::new(service_key.clone()),
             Arc::clone(&config),
         ));
+        // TOTP secrets encrypt at rest under the service key: attach it to
+        // the login service before it is shared out.
+        let login = login.with_service_key(service_key.clone());
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),

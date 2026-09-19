@@ -40,6 +40,8 @@ pub struct LoginService {
     users: UserStore,
     sessions: SessionManager,
     throttle: std::sync::Arc<std::sync::Mutex<AuthThrottle>>,
+    /// Encrypts TOTP secrets at rest (None in tests / key-less deployments).
+    service_key: Option<mycelium_crypto::ServiceKey>,
 }
 
 /// Per-call runtime security settings (admin-configurable via the web
@@ -63,7 +65,20 @@ impl LoginService {
             users: UserStore::new(pool.clone()),
             sessions: SessionManager::new(pool),
             throttle: std::sync::Arc::new(std::sync::Mutex::new(AuthThrottle::new())),
+            service_key: None,
         }
+    }
+
+    /// Attach the service key (TOTP secrets encrypt/decrypt at rest under
+    /// it). Returns `self` for chaining off `new`.
+    pub fn with_service_key(mut self, key: mycelium_crypto::ServiceKey) -> Self {
+        self.service_key = Some(key);
+        self
+    }
+
+    /// The attached service key, if any.
+    fn service_key(&self) -> Option<&mycelium_crypto::ServiceKey> {
+        self.service_key.as_ref()
     }
 
     /// Log a user in with username + password (+ optional TOTP code),
@@ -122,10 +137,16 @@ impl LoginService {
             }
             Err(e) => return Err(e.into()),
         };
-        // TOTP (enrolled users must pass a code).
-        if let Some(secret) = &auth.record.totp_secret {
+        // TOTP (enrolled users must pass a code). Encrypted secrets are
+        // decrypted under the service key; legacy plaintext rows verify
+        // regardless.
+        if let Some(stored) = &auth.record.totp_secret {
+            let secret = match crate::totp::stored_secret(stored, self.service_key())? {
+                Some(plaintext) => plaintext,
+                None => return Err(LoginError::InvalidCredentials),
+            };
             let code = totp_code.ok_or(LoginError::InvalidCredentials)?;
-            let totp = crate::totp::make_totp_for_verify(secret)?;
+            let totp = crate::totp::make_totp_for_verify(&secret)?;
             if !totp.check_current(code).is_some_and(|t| t > 0) {
                 self.throttle.lock().unwrap().record_failure(username);
                 return Err(LoginError::InvalidCredentials);
@@ -282,7 +303,7 @@ mod tests {
             .unwrap();
         // Enroll TOTP.
         let secret = crate::totp::generate_secret();
-        crate::totp::set_secret(store.pool(), created.record.id, &secret)
+        crate::totp::set_secret(store.pool(), created.record.id, &secret, None)
             .await
             .unwrap();
         // Login without a code fails.
@@ -295,5 +316,50 @@ mod tests {
         let code = totp.generate_current().to_string();
         let ok = svc.login("alice", PW, Some(&code)).await.unwrap();
         assert_eq!(ok.user.record.username, "alice");
+    }
+
+    #[tokio::test]
+    async fn totp_encrypted_secret_login_with_service_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = mycelium_crypto::ServiceKey::from_bytes(&[5u8; 32]).unwrap();
+        let svc = LoginService::new(store.pool().clone()).with_service_key(key.clone());
+        let created = svc
+            .create_user("alice", "a@t", PW, Role::User)
+            .await
+            .unwrap();
+        // Enroll with the service key attached: stored encrypted.
+        let secret = crate::totp::generate_secret();
+        crate::totp::set_secret(store.pool(), created.record.id, &secret, Some(&key))
+            .await
+            .unwrap();
+        let (stored,): (String,) = sqlx::query_as("SELECT totp_secret FROM users WHERE id = ?")
+            .bind(created.record.id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            stored.starts_with("enc1:"),
+            "service key present → secret must be encrypted at rest"
+        );
+
+        // Login through the service decrypts transparently.
+        let totp = crate::totp::make_totp_for_verify(&secret).unwrap();
+        let code = totp.generate_current().to_string();
+        let ok = svc.login("alice", PW, Some(&code)).await.unwrap();
+        assert_eq!(ok.user.record.username, "alice");
+
+        // Wrong code still rejected.
+        assert!(matches!(
+            svc.login("alice", PW, Some("000000")).await,
+            Err(LoginError::InvalidCredentials)
+        ));
+
+        // A key-less service cannot open the encrypted row: fails closed.
+        let keyless = LoginService::new(store.pool().clone());
+        assert!(matches!(
+            keyless.login("alice", PW, Some(&code)).await,
+            Err(LoginError::InvalidCredentials)
+        ));
     }
 }

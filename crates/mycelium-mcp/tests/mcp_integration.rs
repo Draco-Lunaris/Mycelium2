@@ -9,19 +9,30 @@ use mycelium_auth::login::LoginService;
 use mycelium_store::Store;
 use mycelium_web::AppState;
 
+/// Known admin password for the pre-seeded account (tests log in with it).
+const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
+
 /// Boot a test server on an ephemeral HTTPS port; returns the base URL,
 /// the shutdown token, and the temp data dir.
 async fn boot() -> (
     String,
     tokio_util::sync::CancellationToken,
     tempfile::TempDir,
+    sqlx::SqlitePool,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
+    let pool = store.pool().clone();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
-    mycelium_auth::bootstrap_admin(&store)
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            ADMIN_PASSWORD,
+            mycelium_auth::Role::Admin,
+        )
         .await
-        .unwrap()
         .unwrap();
     let assets_dir = dir.path().join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
@@ -51,7 +62,12 @@ async fn boot() -> (
         .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    (format!("https://127.0.0.1:{https_port}"), shutdown, dir)
+    (
+        format!("https://127.0.0.1:{https_port}"),
+        shutdown,
+        dir,
+        pool,
+    )
 }
 
 fn client() -> reqwest::Client {
@@ -62,19 +78,27 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
-/// Log in via the web login form, complete the forced password change,
-/// and return (session cookie, csrf token).
+/// Log in via the web login form, complete a forced password change
+/// (the flag is flipped by SQL in the test), and return (session cookie,
+/// csrf token).
 async fn login_and_settle(
     client: &reqwest::Client,
     base: &str,
-    dir: &tempfile::TempDir,
+    pool: &sqlx::SqlitePool,
     username: &str,
-    bootstrap_password: &str,
+    login_password: &str,
     new_password: &str,
 ) -> (String, String) {
+    // Flip must_change_password directly: no production path sets it
+    // anymore, but the gate still applies to admin-reset accounts.
+    sqlx::query("UPDATE users SET must_change_password = 1 WHERE username = ?")
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
     let login = client
         .post(format!("{base}/login"))
-        .form(&[("username", username), ("password", bootstrap_password)])
+        .form(&[("username", username), ("password", login_password)])
         .send()
         .await
         .unwrap();
@@ -109,7 +133,7 @@ async fn login_and_settle(
         .header("cookie", &cookie)
         .form(&[
             ("csrf_token", csrf.as_str()),
-            ("old", bootstrap_password),
+            ("old", login_password),
             ("new", new_password),
             ("repeat", new_password),
         ])
@@ -148,7 +172,6 @@ async fn login_and_settle(
     let rest = &html[idx + marker.len()..];
     let end = rest.find('"').unwrap();
     let csrf = rest[..end].to_string();
-    let _ = dir;
     (cookie, csrf)
 }
 
@@ -220,7 +243,7 @@ fn request_meta() -> serde_json::Value {
 
 #[tokio::test]
 async fn mcp_full_flow() {
-    let (base, shutdown, dir) = boot().await;
+    let (base, shutdown, dir, pool) = boot().await;
     let client = client();
 
     // --- Auth rejection (no/invalid bearer) ---
@@ -258,17 +281,12 @@ async fn mcp_full_flow() {
     assert_eq!(bad_auth.status(), 401, "invalid key must be rejected");
 
     // --- Login, settle password, mint an API key ---
-    let bootstrap_password =
-        std::fs::read_to_string(dir.path().join("config/initial-admin-password"))
-            .unwrap()
-            .trim()
-            .to_string();
     let (cookie, csrf) = login_and_settle(
         &client,
         &base,
-        &dir,
+        &pool,
         "admin",
-        &bootstrap_password,
+        ADMIN_PASSWORD,
         "a-very-long-test-password-123!",
     )
     .await;

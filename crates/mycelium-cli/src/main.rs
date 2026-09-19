@@ -1,9 +1,9 @@
 //! Mycelium2 admin CLI.
 //!
 //! Offline administrative operations against a data directory:
-//! `bootstrap-admin` (create the first admin), `migrate` (run SQL
-//! migrations), `backup` (tar the data directory), and `verify`
-//! (integrity check of the store layout).
+//! `migrate` (run SQL migrations), `backup` (tar the data directory),
+//! and `verify` (integrity check of the store layout). The admin
+//! account is created only through the web /setup page.
 
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -18,15 +18,6 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create the first admin user (no-op when users exist).
-    BootstrapAdmin {
-        #[arg(
-            long,
-            env = "MYCELIUM2_DATA_DIR",
-            default_value = "/opt/mycelium2/data"
-        )]
-        data_dir: String,
-    },
     /// Run database migrations (idempotent; the server also does this
     /// on startup).
     Migrate {
@@ -65,20 +56,6 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
-        Command::BootstrapAdmin { data_dir } => {
-            let store = mycelium_store::Store::open(Path::new(&data_dir)).await?;
-            match mycelium_auth::bootstrap_admin(&store).await? {
-                Some(_) => {
-                    println!(
-                        "admin created; initial password written to {} (0600) — change it on first login",
-                        Path::new(&data_dir)
-                            .join("config/initial-admin-password")
-                            .display()
-                    );
-                }
-                None => println!("users already exist; bootstrap is first-run only"),
-            }
-        }
         Command::Migrate { data_dir } => {
             // Store::open runs migrations as part of opening.
             let _store = mycelium_store::Store::open(Path::new(&data_dir)).await?;
@@ -140,4 +117,21 @@ async fn verify_store(store: &mycelium_store::Store) -> anyhow::Result<bool> {
         return Ok(false);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The admin account is created only through the web /setup page —
+    /// no CLI bootstrap subcommand exists.
+    #[test]
+    fn no_bootstrap_subcommand() {
+        let cmd = Args::command();
+        assert!(cmd.find_subcommand("bootstrap-admin").is_none());
+        assert!(cmd.find_subcommand("migrate").is_some());
+        assert!(cmd.find_subcommand("backup").is_some());
+        assert!(cmd.find_subcommand("verify").is_some());
+    }
 }

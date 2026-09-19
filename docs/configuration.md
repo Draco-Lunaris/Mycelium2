@@ -59,8 +59,9 @@ variables for runtime settings:
 - Login throttling with exponential backoff (threshold and cap
   admin-configurable within guardrails); TOTP/WebAuthn optional
   second factors.
-- Forced password change for the bootstrapped admin and any
-  admin-reset account.
+- Forced password change for any admin-reset account (the first admin
+  is created via `/setup` with an operator-chosen password, so no
+  forced change applies).
 - Password policy: minimum 20 characters.
 - Uploads: books capped at the admin-configured limit (default 32 MiB); multipart CSRF enforced.
 - MCP: per-user API keys (SHA-256 hashed at rest) as bearer tokens;

@@ -53,6 +53,7 @@ pub fn build_router_with_shutdown(
     Router::new()
         // Public.
         .route("/login", get(api::login_page).post(api::login_submit))
+        .route("/setup", get(api::setup_page).post(api::setup_submit))
         .route("/assets/{*path}", get(serve_asset))
         // MCP (bearer API-key auth inside the MCP router).
         .merge(mycelium_mcp::mcp_router_with_shutdown(mcp_state, shutdown))
@@ -114,7 +115,7 @@ async fn require_login_gate(
     let path = request.uri().path();
     let public = matches!(
         path,
-        "/login" | "/logout" | "/assets/style.css" | "/assets/app.js" | "/assets/graph.js"
+        "/login" | "/setup" | "/logout" | "/assets/style.css" | "/assets/app.js" | "/assets/graph.js"
     ) || path.starts_with("/assets/")
         || path.starts_with("/api/v1/health")
         || path.starts_with("/metrics")

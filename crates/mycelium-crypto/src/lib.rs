@@ -29,7 +29,7 @@ pub use seal::{
     seal_master_key, unseal_with_password, unseal_with_recovery,
 };
 pub use service::{ServiceKeyError, load_or_create_service_key, load_or_create_service_key_with};
-pub use store_keys::{FileKeys, IndexKeys};
+pub use store_keys::{FileKeys, IndexKeys, derive_service_dek};
 
 /// Unified error for the crypto layer.
 #[derive(Debug, thiserror::Error)]

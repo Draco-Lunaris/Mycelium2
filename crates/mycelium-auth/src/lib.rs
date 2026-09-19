@@ -1,7 +1,6 @@
 //! Authentication and authorization.
 
 pub mod api_key;
-pub mod bootstrap;
 pub mod jwt;
 pub mod login;
 pub mod oidc;
@@ -14,7 +13,6 @@ pub mod users;
 pub mod webauthn;
 
 pub use api_key::{ApiKeyManager, ApiKeyRecord};
-pub use bootstrap::{BootstrapError, bootstrap_admin};
 pub use jwt::{AccessTokenClaims, JwtError, JwtKeys};
 pub use login::{LoginError, LoginService, LoginSuccess};
 pub use password::{

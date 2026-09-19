@@ -9,16 +9,15 @@ agents, and an integrated librarian that catalogs uploaded books.
 
 ```sh
 docker compose up -d
-# Initial admin password:
-docker exec mycelium2 cat /opt/mycelium2/data/config/initial-admin-password
-# Open https://<host>/ (self-signed cert on first run)
+# Open https://<host>/setup (self-signed cert on first run) and create
+# the admin account — the recovery key is shown once, save it.
 ```
 
 **Quick start (binary):**
 
 ```sh
 mycelium2 --data-dir ./data --https-addr 127.0.0.1:8443 --http-addr 127.0.0.1:8080
-cat data/config/initial-admin-password
+# Open https://127.0.0.1:8443/setup and create the admin account.
 ```
 
 ## Documentation

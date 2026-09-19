@@ -13,13 +13,12 @@ lives there: SQLite database, encrypted files, config, TLS certs
 
 First boot:
 
-1. The server creates the data layout, runs migrations, and
-   bootstraps the initial admin.
-2. Read the generated password:
-   `docker exec mycelium2 cat /opt/mycelium2/data/config/initial-admin-password`
-3. Log in at `https://<host>/` — the first login forces a password
-   change (the generated password file is not removed automatically;
-   delete it after use).
+1. The server creates the data layout and runs migrations. No admin
+   account and no bootstrap files are created.
+2. Open `https://<host>/setup` and create the admin account (username
+   and password of your choice; recovery key shown once — record it).
+3. Log in at `https://<host>/`. `/setup` becomes unavailable once the
+   first account exists.
 
 ### TLS
 

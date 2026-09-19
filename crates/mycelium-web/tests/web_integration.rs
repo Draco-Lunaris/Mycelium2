@@ -9,19 +9,30 @@ use mycelium_auth::login::LoginService;
 use mycelium_store::Store;
 use mycelium_web::AppState;
 
+/// Known admin password for the pre-seeded account (tests log in with it).
+const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
+
 /// Boot a test server on ephemeral ports; returns the HTTPS base URL and
 /// the shutdown token.
 async fn boot() -> (
     String,
     tokio_util::sync::CancellationToken,
     tempfile::TempDir,
+    sqlx::SqlitePool,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
+    let pool = store.pool().clone();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
-    mycelium_auth::bootstrap_admin(&store)
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            ADMIN_PASSWORD,
+            mycelium_auth::Role::Admin,
+        )
         .await
-        .unwrap()
         .unwrap();
     let assets_dir = dir.path().join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
@@ -54,7 +65,12 @@ async fn boot() -> (
     });
     // Give the listener a moment.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    (format!("https://127.0.0.1:{https_port}"), shutdown, dir)
+    (
+        format!("https://127.0.0.1:{https_port}"),
+        shutdown,
+        dir,
+        pool,
+    )
 }
 
 fn client() -> reqwest::Client {
@@ -67,7 +83,7 @@ fn client() -> reqwest::Client {
 
 #[tokio::test]
 async fn full_web_flow() {
-    let (base, shutdown, dir) = boot().await;
+    let (base, shutdown, _dir, pool) = boot().await;
     let client = client();
 
     // 1. Health endpoint (public).
@@ -92,14 +108,16 @@ async fn full_web_flow() {
     let html = login_page.text().await.unwrap();
     assert!(html.contains("Login"));
 
-    // 4. Read the bootstrap password and log in.
-    let password = std::fs::read_to_string(dir.path().join("config/initial-admin-password"))
-        .unwrap()
-        .trim()
-        .to_string();
+    // 4. Log in (the must_change_password flag is flipped directly by SQL
+    //    below — no production path sets it anymore).
+    sqlx::query("UPDATE users SET must_change_password = 1 WHERE username = 'admin'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let password = ADMIN_PASSWORD;
     let login = client
         .post(format!("{base}/login"))
-        .form(&[("username", "admin"), ("password", password.as_str())])
+        .form(&[("username", "admin"), ("password", password)])
         .send()
         .await
         .unwrap();
@@ -147,7 +165,7 @@ async fn full_web_flow() {
         .header("cookie", &cookie)
         .header("x-csrf-token", &csrf)
         .form(&[
-            ("old", password.as_str()),
+            ("old", password),
             ("new", new_password),
             ("repeat", new_password),
         ])

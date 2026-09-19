@@ -1,9 +1,8 @@
 //! End-to-end auth integration test:
-//! bootstrap → login → session → RBAC extractors grant/reject.
+//! account creation → authenticate → session → RBAC extractors grant/reject.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use mycelium_auth::bootstrap::bootstrap_admin;
 use mycelium_auth::rbac::{RequireAdmin, Role, SessionUser};
 use mycelium_auth::session::SessionManager;
 use mycelium_auth::users::UserStore;
@@ -23,24 +22,28 @@ async fn bootstrap_login_session_rbac_flow() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
 
-    // 1. Bootstrap creates the first admin (with must_change_password).
-    let admin = bootstrap_admin(&store)
-        .await
-        .unwrap()
-        .expect("first run bootstraps");
-    assert_eq!(admin.role, Role::Admin);
-    assert!(admin.must_change_password);
-
-    // 2. Second bootstrap call is a no-op.
-    assert!(bootstrap_admin(&store).await.unwrap().is_none());
-
-    // 3. Read the generated password and log in.
-    let password = std::fs::read_to_string(dir.path().join("config/initial-admin-password"))
-        .unwrap()
-        .trim()
-        .to_string();
+    // 1. create_local makes the admin (as the web /setup page does):
+    //    must_change_password is NOT set — the operator chose the password.
     let users = UserStore::new(store.pool().clone());
-    let auth = users.authenticate_local("admin", &password).await.unwrap();
+    let created = users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            "admin password twenty chars!",
+            Role::Admin,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.record.role, Role::Admin);
+    assert!(!created.record.must_change_password);
+    assert!(!dir.path().join("config/initial-admin-password").exists());
+    let admin = created.record;
+
+    // 2. Authenticate with the chosen password.
+    let auth = users
+        .authenticate_local("admin", "admin password twenty chars!")
+        .await
+        .unwrap();
     assert_eq!(auth.record.id, admin.id);
 
     // 4. Create a session.

@@ -74,7 +74,7 @@ A Cargo workspace with separate crates from day one:
   - `User`: read/search global bookshelves, read/search/edit their private OKF bundle.
 - **Password policy**: minimum length 20 characters.
 - **Account security**: exponential backoff on failed logins; optional TOTP; optional WebAuthn second factor.
-- **First admin bootstrap**: default admin account created on first run with a generated password written to a file with restricted permissions; forced password change on first login.
+- **First admin setup**: first web access opens `/setup`, where the operator creates the admin account with their own credentials; the recovery key is shown once in the response. No generated passwords or bootstrap files are ever written.
 - **User registration**: admin-only; no public registration.
 
 Pattern alignment: reuse the LPM/LHFM `*-auth` crate pattern (JWT EdDSA/Ed25519, Argon2, RBAC, OIDC provider model).
@@ -212,6 +212,36 @@ Pattern alignment: reuse the LPM/LHFM `*-auth` crate pattern (JWT EdDSA/Ed25519,
 - **Audit**: structured logs for auth, admin, and data-modification events; configurable retention (default 90 days).
 - **Rate limiting**: in-memory per IP/user exponential backoff.
 
+### Trust boundary: the database is untrusted at rest
+
+Anyone with read access to the data directory (host shell, stolen backup,
+`docker exec`, a careless agent) is assumed to read the SQLite database and
+`config/` freely. Everything security-relevant must survive that:
+
+- **Sessions**: session ids (the cookie values) are stored SHA-256 hashed;
+  a leaked database yields no usable session cookie. Legacy plaintext rows
+  were invalidated by migration 0006.
+- **TOTP secrets**: AES-256-GCM sealed under the service key (HKDF domain
+  `totp-secret:v1`, `enc1:` prefix). Encrypted rows fail closed if the
+  service key is unavailable. Legacy plaintext rows still verify (older
+  deployments); new enrollment always encrypts.
+- **API keys**: SHA-256 hashed (established Phase 4).
+- **Passwords**: Argon2id hashes (established Phase 4).
+- **User files**: two-layer AES-256-GCM envelopes under per-user master
+  keys, sealed at rest under password + recovery key + service key.
+- **Initial admin**: created only through the first-access `/setup` page;
+  operator-chosen credentials; the recovery key is shown once in the
+  response and stored nowhere. No bootstrap password/recovery files exist.
+- **Remaining file-borne secret**: `config/service.key` (or
+  `MYCELIUM2_SERVICE_KEY`). It unseals global data, TOTP secrets, and
+  service-key master-key seals — protect it like the backups (which
+  contain it).
+- **Direct DB modification**: never used as an operational pattern; all
+  account and data changes go through the authenticated web/MCP surface.
+  Any manual DB edit on a live deployment is a trust-boundary violation,
+  not a supported path. (On throwaway test hosts it may be acceptable —
+  stop the server, edit offline, document it.)
+
 ## 15. Testing
 
 - Unit tests in each crate.
@@ -253,7 +283,7 @@ Pattern alignment: reuse the LPM/LHFM `*-auth` crate pattern (JWT EdDSA/Ed25519,
 | LLM backend | Ollama default, OpenAI-compatible configurable |
 | Bookshelves | Admin-created only; global-read or admin-private |
 | User private data | Per-user private OKF bundle |
-| First admin bootstrap | Generated password written to restricted file; forced change on first login |
+| First admin setup | First-access `/setup` page; operator-chosen credentials; recovery key shown once; no bootstrap files |
 | User registration | Admin-only |
 | MCP identity | Per-user API key as bearer token |
 | Recovery | User recovery key; admin cannot recover |
