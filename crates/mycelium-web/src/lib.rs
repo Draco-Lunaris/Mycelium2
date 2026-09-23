@@ -5,6 +5,7 @@ pub mod assets;
 pub mod cert;
 pub mod health;
 pub mod middleware;
+pub mod packaged_skills;
 pub mod pages;
 pub mod server;
 pub mod state;
