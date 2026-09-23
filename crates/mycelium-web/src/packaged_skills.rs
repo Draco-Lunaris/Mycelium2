@@ -79,11 +79,18 @@ pub async fn seed_packaged_skills(
     service_key: &ServiceKey,
     skills_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let marker = skills_dir.join(".seed-version");
+    let current = std::fs::read_to_string(&marker).unwrap_or_default();
+    if current.trim() == SKILLS_SEED_VERSION {
+        return Ok(());
+    }
     let mut concepts = Vec::with_capacity(PACKAGED_SKILLS.len());
     for (name, contents) in PACKAGED_SKILLS {
         concepts.push(Concept::parse(&format!("/{name}"), contents)?);
     }
     let cs = ConceptStore::for_service(store, service_key.clone(), skills_dir, "skills");
     cs.put_batch(&concepts).await?;
+    std::fs::create_dir_all(skills_dir)?;
+    std::fs::write(&marker, SKILLS_SEED_VERSION)?;
     Ok(())
 }
