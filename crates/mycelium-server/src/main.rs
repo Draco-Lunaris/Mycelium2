@@ -72,12 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Seed packaged skills (the pdf-to-markdown book-conversion skill)
     // into the global skills shelf — first boot writes them; later boots
     // refresh on a version bump (mirrors the assets scaffold).
-    mycelium_web::packaged_skills::seed_packaged_skills(
-        &store,
-        &service_key,
-        &store.skills_dir(),
-    )
-    .await?;
+    mycelium_web::packaged_skills::seed_packaged_skills(&store, &service_key, &store.skills_dir())
+        .await?;
 
     // Assemble the app state.
     let login = mycelium_auth::login::LoginService::new(store.pool().clone());

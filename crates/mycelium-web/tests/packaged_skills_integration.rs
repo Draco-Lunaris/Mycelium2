@@ -18,8 +18,7 @@ async fn boot() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    let service_key =
-        mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
     let skills_dir = dir.path().join("skills");
     (dir, store, service_key, skills_dir)
 }
@@ -80,11 +79,9 @@ async fn same_version_preserves_admin_edits() {
     // Simulate an admin edit through the shelf itself.
     let cs = ConceptStore::for_service(&store, service_key.clone(), &skills_dir, "skills");
     let edited = "---\ntype: Skill\ntitle: edited\n---\n\nadmin customization\n";
-    cs.put(
-        &Concept::parse("/pdf-to-markdown-conventions.md", edited).unwrap(),
-    )
-    .await
-    .unwrap();
+    cs.put(&Concept::parse("/pdf-to-markdown-conventions.md", edited).unwrap())
+        .await
+        .unwrap();
 
     // Second boot with the same packaged version: hands off.
     packaged_skills::seed_packaged_skills(&store, &service_key, &skills_dir)
@@ -135,7 +132,10 @@ async fn version_bump_refreshes_packaged_content() {
 /// fence carries exactly one separator newline — strip exactly one.
 fn extract_fenced(concept_markdown: &str) -> String {
     const OPEN: &str = "````\n";
-    let start = concept_markdown.find(OPEN).expect("opening 4-backtick fence") + OPEN.len();
+    let start = concept_markdown
+        .find(OPEN)
+        .expect("opening 4-backtick fence")
+        + OPEN.len();
     let rest = &concept_markdown[start..];
     let end = rest.find("\n````").expect("closing 4-backtick fence");
     let mut script = rest[..end].to_string();

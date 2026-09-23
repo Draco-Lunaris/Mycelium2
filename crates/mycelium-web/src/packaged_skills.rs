@@ -41,7 +41,9 @@ pub const PACKAGED_SKILLS: &[(&str, &str)] = &[
     ),
     (
         "pdf-to-markdown-script-docling-page-span.md",
-        include_str!("../packaged-skills/pdf-to-markdown/pdf-to-markdown-script-docling-page-span.md"),
+        include_str!(
+            "../packaged-skills/pdf-to-markdown/pdf-to-markdown-script-docling-page-span.md"
+        ),
     ),
     (
         "pdf-to-markdown-script-html-cleanup.md",
