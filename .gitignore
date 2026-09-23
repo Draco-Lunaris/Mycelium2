@@ -11,3 +11,6 @@ dist/
 
 # Playwright MCP browser snapshots
 .playwright-mcp/
+
+# Superpowers plan scratch (untracked by convention; may hold live test-LXC credentials)
+docs/superpowers/plans/
