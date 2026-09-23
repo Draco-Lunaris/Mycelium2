@@ -15,9 +15,14 @@ First boot:
 
 1. The server creates the data layout and runs migrations. No admin
    account and no bootstrap files are created.
-2. Open `https://<host>/setup` and create the admin account (username
+2. The packaged `pdf-to-markdown` skill — PDF book → enhanced markdown
+   ready for library ingest — is seeded into the global skills shelf
+   automatically. Every user can read it from `/skills`; admins can
+   edit. Upgrades refresh it when the packaged version changes; admin
+   edits are preserved between upgrades.
+3. Open `https://<host>/setup` and create the admin account (username
    and password of your choice; recovery key shown once — record it).
-3. Log in at `https://<host>/`. `/setup` becomes unavailable once the
+4. Log in at `https://<host>/`. `/setup` becomes unavailable once the
    first account exists.
 
 ### TLS
