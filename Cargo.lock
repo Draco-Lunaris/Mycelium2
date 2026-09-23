@@ -2586,6 +2586,7 @@ dependencies = [
  "hex",
  "hkdf",
  "leptos",
+ "md-5",
  "mycelium-auth",
  "mycelium-core",
  "mycelium-crypto",

@@ -129,3 +129,73 @@ async fn version_bump_refreshes_packaged_content() {
         SKILLS_SEED_VERSION
     );
 }
+
+/// The fence inside each script concept: opening ```` line, script bytes,
+/// closing ```` line. Packaged scripts have no trailing newline; the
+/// fence carries exactly one separator newline — strip exactly one.
+fn extract_fenced(concept_markdown: &str) -> String {
+    const OPEN: &str = "````\n";
+    let start = concept_markdown.find(OPEN).expect("opening 4-backtick fence") + OPEN.len();
+    let rest = &concept_markdown[start..];
+    let end = rest.find("\n````").expect("closing 4-backtick fence");
+    let mut script = rest[..end].to_string();
+    if script.ends_with('\n') {
+        script.pop();
+    }
+    script
+}
+
+/// Pull (script-concept stem, md5) pairs from the manifest table.
+fn manifest_md5s(manifest: &str) -> Vec<(&str, String)> {
+    let mut out = Vec::new();
+    for line in manifest.lines() {
+        let Some(i) = line.find("](/pdf-to-markdown-script-") else {
+            continue;
+        };
+        let rest = &line[i + "](/pdf-to-markdown-script-".len()..];
+        let Some(j) = rest.find(')') else { continue };
+        // Hrefs carry the full filename (`convert.md`); the stem is without
+        // the `.md` extension.
+        let stem = rest[..j]
+            .strip_suffix(".md")
+            .expect("manifest href ends in .md");
+        // The md5 is the backtick-quoted 32-hex token on the row.
+        let md5 = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .find(|seg| seg.len() == 32 && seg.chars().all(|c| c.is_ascii_hexdigit()))
+            .expect("manifest row carries a 32-hex md5")
+            .to_string();
+        out.push((stem, md5));
+    }
+    out
+}
+
+#[test]
+fn embedded_scripts_match_the_manifest_md5s() {
+    use md5::{Digest, Md5};
+
+    let contents_of = |name: &str| {
+        PACKAGED_SKILLS
+            .iter()
+            .find(|(p, _)| *p == name)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("{name} is packaged"))
+    };
+    let manifest = contents_of("pdf-to-markdown-scripts.md");
+    let expected = manifest_md5s(manifest);
+    assert_eq!(expected.len(), 7, "manifest lists 7 scripts");
+
+    for (stem, md5_expected) in expected {
+        let concept_name = format!("pdf-to-markdown-script-{stem}.md");
+        let script = extract_fenced(contents_of(&concept_name));
+        let mut h = Md5::new();
+        h.update(script.as_bytes());
+        let md5_actual = hex::encode(h.finalize());
+        assert_eq!(
+            md5_actual, md5_expected,
+            "embedded {concept_name} does not match the packaged manifest"
+        );
+    }
+}
