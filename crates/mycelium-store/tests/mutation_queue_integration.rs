@@ -132,6 +132,56 @@ async fn queue_health_counts_pending_by_tool() {
     assert!(health.oldest_pending_age_seconds.unwrap() >= 0);
 }
 
+// T10 store-side — queue_totals: per-tool rows of EVERY status (a
+// counter must never decrease) and the done-row agent-vs-fallback
+// split via the detail LIKE discriminator /metrics reads.
+#[tokio::test]
+async fn queue_totals_counts_and_provenance_split() {
+    let (store, _dir) = store().await;
+    let user = seed_user(&store, "u1").await;
+
+    // Agent-integrated done row (detail without the fallback prefix).
+    let agent = store.enqueue(user, QueueTool::Add).await.unwrap();
+    store.activate(agent).await.unwrap();
+    store.claim_due_for_user(user).await.unwrap().unwrap();
+    store
+        .mark_done(agent, &["/a.md".to_string()], "rewrote /a.md via agent")
+        .await
+        .unwrap();
+
+    // Fallback-integrated done row: queue_worker's run_fallback detail
+    // prefix, byte-identical up to the parenthesized provenance.
+    let fb = store.enqueue(user, QueueTool::Update).await.unwrap();
+    store.activate(fb).await.unwrap();
+    store.claim_due_for_user(user).await.unwrap().unwrap();
+    store
+        .mark_done(
+            fb,
+            &["/b.md".to_string()],
+            "integrated via deterministic fallback (age deadline passed)",
+        )
+        .await
+        .unwrap();
+
+    // A dead row and a still-pending row both stay in the per-tool
+    // totals (terminal rows are never un-counted).
+    let dead = store.enqueue(user, QueueTool::Maintain).await.unwrap();
+    store.activate(dead).await.unwrap();
+    store.claim_due_for_user(user).await.unwrap().unwrap();
+    store.mark_dead(dead, "fallback failed: x").await.unwrap();
+    let pending = store.enqueue(user, QueueTool::Add).await.unwrap();
+    store.activate(pending).await.unwrap();
+
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.integrated, 1);
+    assert_eq!(totals.fallback, 1);
+    assert_eq!(totals.dead, 1);
+    // Add: done + pending = 2; Update: done = 1; Maintain: dead = 1.
+    assert_eq!(totals.queued_per_tool[0], (QueueTool::Add, 2));
+    assert_eq!(totals.queued_per_tool[1], (QueueTool::Update, 1));
+    assert_eq!(totals.queued_per_tool[2], (QueueTool::Maintain, 1));
+}
+
 #[tokio::test]
 async fn enqueue_capped_rejects_at_capacity() {
     let (store, _dir) = store().await;

@@ -320,6 +320,52 @@ impl Store {
             per_tool,
         })
     }
+
+    /// Enqueue/integration counters over ALL rows (every status counts —
+    /// a Prometheus counter must never go down, so done/dead rows stay
+    /// counted). The /metrics scrape source: SQL COUNTs, deliberately
+    /// not the worker's in-memory atomics — atomics reset on restart
+    /// while rows persist.
+    pub async fn queue_totals(&self) -> Result<QueueTotals> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT tool, COUNT(*) FROM mutation_queue GROUP BY tool")
+                .fetch_all(self.pool())
+                .await?;
+        let mut queued_per_tool: Vec<(QueueTool, u64)> = vec![
+            (QueueTool::Add, 0),
+            (QueueTool::Update, 0),
+            (QueueTool::Maintain, 0),
+        ];
+        for (tool, count) in rows {
+            if let Some(t) = QueueTool::from_str(&tool)
+                && let Some(pos) = queued_per_tool.iter().position(|(s, _)| *s == t)
+            {
+                queued_per_tool[pos].1 += count as u64;
+            }
+        }
+        let (integrated,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mutation_queue WHERE status = 'done' \
+             AND detail NOT LIKE 'integrated via deterministic fallback%'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        let (fallback,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mutation_queue WHERE status = 'done' \
+             AND detail LIKE 'integrated via deterministic fallback%'",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        let (dead,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM mutation_queue WHERE status = 'dead'")
+                .fetch_one(self.pool())
+                .await?;
+        Ok(QueueTotals {
+            queued_per_tool,
+            integrated: integrated as u64,
+            fallback: fallback as u64,
+            dead: dead as u64,
+        })
+    }
 }
 
 /// The queued tool's args + user content for a mutation-queue item.
@@ -398,4 +444,18 @@ pub struct QueueHealth {
     pub dead_count: usize,
     /// (tool, non-terminal row count) for each tool.
     pub per_tool: Vec<(QueueTool, i64)>,
+}
+
+/// All-rows queue counters (store-side; the web layer formats them).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueTotals {
+    /// Rows ever enqueued, per tool (every status counts — a counter
+    /// must never decrease, so terminal rows stay counted).
+    pub queued_per_tool: Vec<(QueueTool, u64)>,
+    /// Done rows integrated by an agent run.
+    pub integrated: u64,
+    /// Done rows integrated by the deterministic fallback.
+    pub fallback: u64,
+    /// Dead rows.
+    pub dead: u64,
 }

@@ -117,6 +117,18 @@ pub enum LlmError {
     Status { status: u16, body: String },
 }
 
+/// Unix timestamp of the last successful LLM completion (0 = none
+/// yet). Set inside the response-parsing paths of `chat_system` and
+/// `chat_with_tools` so every consumer (inline query/chat, the drain,
+/// hot-memory lookups) reports through one choke point; /metrics and
+/// /health read it as the LLM-alive signal.
+pub static LLM_LAST_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_llm_success() {
+    let unix = chrono::Utc::now().timestamp().max(0) as u64;
+    LLM_LAST_SUCCESS.store(unix, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A client for one OpenAI-compatible endpoint.
 #[derive(Debug, Clone)]
 pub struct LlmClient {
@@ -183,12 +195,14 @@ impl LlmClient {
             });
         }
         let parsed: ChatResponse = response.json().await?;
-        parsed
+        let content = parsed
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or(LlmError::EmptyResponse)
+            .ok_or(LlmError::EmptyResponse)?;
+        record_llm_success();
+        Ok(content)
     }
 
     /// One agentic step: send the conversation (with tool specs) and
@@ -259,6 +273,9 @@ impl LlmClient {
             return Err(LlmError::EmptyResponse);
         };
         let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        // Both Ok returns below are successful completions — record once
+        // at the shared choke point (the Err paths already returned).
+        record_llm_success();
         if !tool_calls.is_empty() {
             Ok(StepOutput::ToolCalls(tool_calls))
         } else {

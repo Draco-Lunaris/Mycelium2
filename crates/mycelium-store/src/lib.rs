@@ -21,7 +21,8 @@ pub use models::{
     Session, User,
 };
 pub use mutation_queue::{
-    MutationPayload, QueueError, QueueHealth, payload_path, read_payload, write_payload,
+    MutationPayload, QueueError, QueueHealth, QueueTotals, payload_path, read_payload,
+    write_payload,
 };
 pub use search_index::{EncryptedIndex, IndexError};
 

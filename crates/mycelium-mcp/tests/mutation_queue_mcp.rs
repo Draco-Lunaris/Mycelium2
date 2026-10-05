@@ -912,3 +912,162 @@ async fn status_without_receipt_id_unchanged() {
 
     shutdown.cancel();
 }
+
+// ---- task 10: /health + /metrics queue surfaces ----
+
+/// T10's tests read and set the process-global LLM_LAST_SUCCESS static
+/// (the "absent until first success" assertions); a shared lock keeps
+/// them race-free while the test runner executes test fns concurrently.
+static LLM_STATIC_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// T10.1 — /health queue fields + both degraded rules. Direct SQL drives
+// the queue state (boot spawns no drain worker), and user_id binds a
+// real user row — mutation_queue references users(id) with FKs enforced.
+#[tokio::test]
+async fn health_queue_fields_and_degraded_rules() {
+    let _statics = LLM_STATIC_GUARD.lock().await;
+    // The static persists across tests in this binary: start from a
+    // clean slate whichever T10 test ran first.
+    mycelium_librarian::llm::LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let h: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(h["queue_depth"], 0);
+    assert!(h["oldest_pending_age_seconds"].is_null());
+    assert_eq!(h["queue_dead_count"], 0);
+    assert!(h["llm_last_success_seconds"].is_null());
+    assert_eq!(h["status"], "ok");
+
+    // Rule 1: a pending row older than 2× deadline (600 → 1200).
+    let uid = admin_uuid(&pool).await;
+    let old = (chrono::Utc::now() - chrono::Duration::seconds(1300)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail, created_at, updated_at)
+         VALUES (?, ?, 'update', 'pending', 0, '', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(uid.to_string())
+    .bind(&old)
+    .bind(&old)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let r = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(r.status(), 503);
+    let h2: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(h2["status"], "degraded");
+    assert!(h2["oldest_pending_age_seconds"].as_i64().unwrap() >= 1299);
+
+    // Rule 2, in isolation: a dead row 503s while the oldest-pending
+    // age stays null (no pending rows exist).
+    sqlx::query("DELETE FROM mutation_queue")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail, created_at, updated_at)
+         VALUES (?, ?, 'add', 'dead', 3, 'fallback failed: x', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(uid.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let r3 = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(r3.status(), 503);
+    let h3: serde_json::Value = r3.json().await.unwrap();
+    assert!(h3["oldest_pending_age_seconds"].is_null());
+
+    shutdown.cancel();
+}
+
+// T10.2 — /metrics: the seven metric bodies, counter zero-shapes, and
+// the llm-timestamp line's 0-suppression + post-set presence.
+#[tokio::test]
+async fn metrics_queue_lines() {
+    let _statics = LLM_STATIC_GUARD.lock().await;
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let txt = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for name in [
+        "mycelium2_mutation_queue_depth",
+        "mycelium2_mutation_queue_oldest_pending",
+        "mycelium2_mutation_queued_total",
+        "mycelium2_mutation_integrated_total",
+        "mycelium2_mutation_fallback_total",
+        "mycelium2_mutation_dead_total",
+    ] {
+        assert!(
+            txt.contains(&format!("# TYPE {name} ")),
+            "{name} missing:\n{txt}"
+        );
+    }
+    assert!(
+        !txt.contains("mycelium2_llm_last_success_timestamp"),
+        "absent until first success:\n{txt}"
+    );
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="add"} 0"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="update"} 0"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="maintain"} 0"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains("mycelium2_mutation_integrated_total 0"),
+        "{txt}"
+    );
+    assert!(txt.contains("mycelium2_mutation_fallback_total 0"), "{txt}");
+    assert!(txt.contains("mycelium2_mutation_dead_total 0"), "{txt}");
+
+    // First success → timestamp line appears (and /health seconds > 0).
+    mycelium_librarian::llm::LLM_LAST_SUCCESS
+        .store(1_759_000_000, std::sync::atomic::Ordering::Relaxed);
+    let txt2 = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        txt2.contains("mycelium2_llm_last_success_timestamp 1759000000"),
+        "{txt2}"
+    );
+    let h = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(h["llm_last_success_seconds"].as_i64().unwrap() > 0);
+    // Leave the static zeroed for whichever T10 test runs next.
+    mycelium_librarian::llm::LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    shutdown.cancel();
+}
