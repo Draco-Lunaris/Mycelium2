@@ -204,6 +204,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// The in-process librarian (book ingest worker).
     pub librarian: Arc<mycelium_librarian::LibrarianWorker>,
+    /// The mutation-queue drain worker (Phase 11).
+    pub queue_worker: Arc<mycelium_librarian::queue_worker::QueueWorker>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
     /// Librarian chat history per session (multi-turn memory).
@@ -225,6 +227,29 @@ impl AppState {
             Arc::new(service_key.clone()),
             Arc::clone(&config),
         ));
+        // One master-key cache per process: login, API keys, and the
+        // queue worker's recovery path all see the same unwrapped keys.
+        let master_keys = Arc::new(MasterKeyCache::default());
+        // Mutation-queue drain worker (spec: Phase 11). Recovery seam =
+        // the shared master-key cache + service key.
+        let recovery: Arc<mycelium_librarian::queue_worker::MasterKeyRecovery> = {
+            let cache = Arc::clone(&master_keys);
+            let s = Arc::clone(&store);
+            let k = Arc::new(service_key.clone());
+            Arc::new(move |uid| {
+                let cache = cache.clone();
+                let s = s.clone();
+                let k = k.clone();
+                Box::pin(async move { cache.for_user(&s, &k, uid).await })
+            })
+        };
+        let queue_worker = Arc::new(mycelium_librarian::queue_worker::QueueWorker::new(
+            Arc::clone(&store),
+            Arc::new(service_key.clone()),
+            Arc::clone(&config),
+            recovery,
+            mycelium_librarian::queue_worker::QueueLimits::default(),
+        ));
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
         let login = login.with_service_key(service_key.clone());
@@ -235,9 +260,10 @@ impl AppState {
             config,
             login: Arc::new(login),
             service_key: Arc::new(service_key),
-            master_keys: Arc::new(MasterKeyCache::default()),
+            master_keys,
             metrics: Arc::new(Metrics::default()),
             librarian,
+            queue_worker,
             assets_dir,
             chat_history: Arc::new(ChatHistory::default()),
         }

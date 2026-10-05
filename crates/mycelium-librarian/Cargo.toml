@@ -28,3 +28,5 @@ regex.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+mycelium-mcp = { path = "../mycelium-mcp" }
+hex = "0.4"

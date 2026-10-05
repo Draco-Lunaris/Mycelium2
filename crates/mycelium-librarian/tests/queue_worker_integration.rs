@@ -591,3 +591,57 @@ async fn drain_handles_all_due_users_separately() {
     assert!(cs1.get("/user-two-fact.md").await.is_err());
     assert!(cs2.get("/user-one-fact.md").await.is_err());
 }
+
+// ---------- T9.1: the binary's recovery-closure seam ----------
+
+// T9.1 — the binary's exact recovery-closure construction (from
+// MasterKeyCache::for_user) unseals a persisted service seal.
+#[tokio::test]
+async fn recovery_closure_matches_binary_seam() {
+    use mycelium_crypto::keys::service_seal_dek;
+    use mycelium_mcp::MasterKeyCache;
+    let dir = tempfile::tempdir().unwrap();
+    let store = mycelium_store::Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let master = mycelium_crypto::generate_master_key();
+    let user = uuid::Uuid::new_v4();
+    let sealed = mycelium_crypto::aead::aead_seal(
+        master.as_bytes(),
+        b"mycelium2/seal/service/v1",
+        &service_seal_dek(&service_key),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, role, auth_provider, password_hash, sealed_master_key, master_key_service_sealed, created_at, updated_at) VALUES (?, 'u', 'u@x', 'user', 'local', '', '', ?, ?, ?)",
+    )
+    .bind(user.to_string())
+    .bind(hex::encode(sealed))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // The binary's closure (main.rs / AppState::new shape).
+    let cache = std::sync::Arc::new(MasterKeyCache::default());
+    let store2 = std::sync::Arc::new(store);
+    let key2 = std::sync::Arc::new(service_key.clone());
+    let recovery: std::sync::Arc<mycelium_librarian::queue_worker::MasterKeyRecovery> =
+        std::sync::Arc::new({
+            let cache = cache.clone();
+            let store = store2.clone();
+            let key = key2.clone();
+            move |uid| {
+                let cache = cache.clone();
+                let store = store.clone();
+                let key = key.clone();
+                Box::pin(async move { cache.for_user(&store, &key, uid).await })
+            }
+        });
+
+    let got = (recovery)(user).await.unwrap();
+    assert_eq!(got.as_bytes(), master.as_bytes());
+    // Unknown user → RowNotFound (the queue treats it as unavailable).
+    let err = (recovery)(uuid::Uuid::new_v4()).await;
+    assert!(matches!(err, Err(sqlx::Error::RowNotFound)));
+}

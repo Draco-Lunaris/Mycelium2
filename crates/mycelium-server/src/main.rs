@@ -93,6 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => tracing::warn!(error = %e, "librarian boot sweep failed"),
     }
 
+    // Mutation-queue boot sweep: reconcile interrupted runs + staging
+    // rows, then one drain pass over whatever survived (spec §6).
+    match state.queue_worker.recover_on_boot().await {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(error = %e, "queue boot sweep failed"),
+    }
+    if let Err(e) = state.queue_worker.run_pending().await {
+        tracing::error!(error = %e, "initial queue drain failed");
+    }
+
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -119,6 +129,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("shutdown signal received");
         token.cancel();
     });
+
+    // Drain worker: long task, cancelled by the same shutdown token.
+    let worker = state.queue_worker.clone();
+    worker.spawn(shutdown.clone());
 
     mycelium_web::serve(
         state,
