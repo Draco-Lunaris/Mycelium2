@@ -100,7 +100,21 @@ async fn maintain_wires_orphans_and_flags_broken() {
     // Still absent — the broken link is only flagged in its owner.
     assert!(cs.get("/ghost.md").await.is_err());
     let flagged = cs.get("/topic-a.md").await.unwrap();
-    assert!(flagged.body.contains("<!-- mycelium2:broken-link -->"));
+    // Marker-position regression (moved from the MCP integration suite
+    // when the repair code moved here): the flag goes AFTER the link's
+    // closing paren so the markdown link stays well-formed and the
+    // scanner still sees the broken target on the next health check.
+    assert!(
+        flagged
+            .body
+            .contains("](/ghost.md) <!-- mycelium2:broken-link -->"),
+        "marker must follow the closing paren, got: {:?}",
+        flagged.body
+    );
+    assert!(
+        !flagged.body.contains("](/ghost.md <!--"),
+        "marker must NOT be inside the link destination"
+    );
     // A second run on a now-healthy graph returns the healthy string.
     // (After wiring, each previously-orphaned concept has an inbound or
     // outbound link; the flagged broken-link still counts as broken, so
