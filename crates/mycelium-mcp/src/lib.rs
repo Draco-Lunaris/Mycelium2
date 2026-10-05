@@ -49,6 +49,12 @@ pub struct McpState {
     pub master_keys: Arc<MasterKeyCache>,
     /// Runtime config source (LLM backend for the librarian agent).
     pub config: Arc<mycelium_store::ConfigStore>,
+    /// Notify handle for the drain worker (set at construction by
+    /// main.rs; the enqueue path fires it so items integrate promptly).
+    pub notify: Arc<tokio::sync::Notify>,
+    /// Queue depth cap for enqueue_capped (spec §5: 50/user; the drain
+    /// worker owns the full QueueLimits — the MCP layer needs only this).
+    pub enqueue_depth_cap: u32,
 }
 
 impl McpState {

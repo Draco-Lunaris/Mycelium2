@@ -346,8 +346,12 @@ async fn mcp_full_flow() {
         .as_str()
         .expect("text content");
     assert!(
-        text.contains("recorded at /rust/async-basics.md"),
-        "memory_add must report the path: {text}"
+        text.contains("accepted, queued receipt="),
+        "memory_add must return a receipt: {text}"
+    );
+    assert!(
+        text.contains("staging: /mutation-queue/"),
+        "the add receipt names its staging note: {text}"
     );
     assert_eq!(body["result"]["isError"], false);
 
@@ -369,9 +373,13 @@ async fn mcp_full_flow() {
     let text = body["result"]["content"][0]["text"]
         .as_str()
         .expect("text content");
+    // The staging note (title = derive_title(content), path
+    // /mutation-queue/<id>.md) is searchable immediately: the query
+    // hits on the content terms (the final concept is the drain's to
+    // write, so the old path hint appears nowhere yet).
     assert!(
-        text.contains("async-basics"),
-        "memory_query must find the added concept: {text}"
+        text.contains("tokio::select"),
+        "memory_query must find the staged content: {text}"
     );
 
     // --- tools/call: memory_status ---
@@ -419,8 +427,12 @@ async fn mcp_full_flow() {
         .as_str()
         .expect("text content");
     assert!(
-        text.contains("updated /rust/async-basics.md"),
-        "memory_update must report the path: {text}"
+        text.starts_with("accepted, queued receipt="),
+        "memory_update must return a receipt: {text}"
+    );
+    assert!(
+        !text.contains("staging:"),
+        "update receipts are receipts-only (no staging note): {text}"
     );
 
     // --- tools/call: memory_maintain ---
@@ -438,65 +450,27 @@ async fn mcp_full_flow() {
     )
     .await;
     assert_eq!(status, 200, "memory_maintain must succeed: {body}");
+    // The bundle holds one unlinked staging note → orphan → unhealthy →
+    // enqueued (a healthy graph would return early, no receipt).
     assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.starts_with("accepted, queued receipt="),
+        "memory_maintain must return a receipt: {text}"
+    );
 
-    // --- memory_maintain regression: broken-link flagging must keep the
-    //     markdown link well-formed (marker AFTER the closing paren, so
-    //     the scanner still sees the target on the next health check). ---
-    {
-        // Add a concept with a broken link.
-        let (status, _body) = rpc(
-            &client,
-            &base,
-            &token,
-            30,
-            "tools/call",
-            serde_json::json!({
-                "_meta": request_meta(),
-                "name": "mycelium2_memory_add",
-                "arguments": {
-                    "content": "See [the missing doc](/nonexistent/target.md) for details.",
-                    "path": "broken-links/holder"
-                }
-            }),
-        )
-        .await;
-        assert_eq!(status, 200);
-        let (status, _body) = rpc(
-            &client,
-            &base,
-            &token,
-            31,
-            "tools/call",
-            serde_json::json!({
-                "_meta": request_meta(),
-                "name": "mycelium2_memory_maintain",
-                "arguments": {}
-            }),
-        )
-        .await;
-        assert_eq!(status, 200);
-        // Fetch the concept via the REST API and inspect the body.
-        let fetched = client
-            .get(format!("{base}/api/v1/concepts/broken-links/holder.md"))
-            .header("authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(fetched.status(), 200);
-        let markdown = fetched.text().await.unwrap();
-        assert!(
-            markdown.contains("](/nonexistent/target.md) <!-- mycelium2:broken-link -->"),
-            "broken-link marker must follow the closing paren, got: {markdown:?}"
-        );
-        assert!(
-            !markdown.contains("](/nonexistent/target.md <!--"),
-            "marker must NOT be inside the link destination"
-        );
-    }
+    // (The broken-link marker-position regression moved with the repair
+    // code to mycelium-librarian: fallback_integration.rs asserts the
+    // marker placement in wire_and_flag_maintain. The MCP maintain
+    // tool now only enqueues — nothing to inspect here.)
 
-    // --- memory_add slug-collision regression: same path, different
-    //     content → disambiguated suffix, NOT a silent overwrite. ---
+    // --- memory_add second-record: a different content under the same
+    //     path hint gets its own receipt (path disambiguation is now
+    //     the drain's direct_write_add fallback — covered in
+    //     fallback_integration.rs), and the original staged content is
+    //     still findable. ---
     {
         let (status, body) = rpc(
             &client,
@@ -519,10 +493,10 @@ async fn mcp_full_flow() {
             .as_str()
             .expect("text content");
         assert!(
-            text.contains("recorded at /rust/async-basics-2.md"),
-            "collision must disambiguate with a suffix, got: {text}"
+            text.starts_with("accepted, queued receipt="),
+            "the second add returns its own receipt, got: {text}"
         );
-        // The original must still exist.
+        // The original staged content is still the findable match.
         let (status, body) = rpc(
             &client,
             &base,
@@ -542,7 +516,7 @@ async fn mcp_full_flow() {
             .expect("text content");
         assert!(
             text.contains("races futures"),
-            "the original concept must survive the collision, got: {text}"
+            "the original staged content must survive, got: {text}"
         );
     }
 
@@ -612,26 +586,19 @@ async fn mcp_full_flow() {
     );
 
     // --- skill_get: private-first ---
-    // Add a private skill with the same name; skill_get must return it.
-    let (status, body) = rpc(
-        &client,
-        &base,
-        &token,
-        9,
-        "tools/call",
-        serde_json::json!({
-            "_meta": request_meta(),
-            "name": "mycelium2_memory_add",
-            "arguments": {
-                "content": "Private variant: use docker instead.",
-                "path": "deploy-rust-service",
-                "concept_type": "Skill"
-            }
-        }),
-    )
-    .await;
-    assert_eq!(status, 200);
-    let _ = body;
+    // Seed a private skill with the same name via the REST API
+    // (memory_add now enqueues — it no longer lands synchronously);
+    // skill_get must return the private variant.
+    let put = client
+        .put(format!("{base}/api/v1/concepts/deploy-rust-service.md"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "markdown": "---\ntype: Skill\ntitle: Deploy Rust Service\n---\n\nPrivate variant: use docker instead.\n"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201, "private skill seed must succeed");
     let (status, body) = rpc(
         &client,
         &base,

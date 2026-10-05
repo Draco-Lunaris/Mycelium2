@@ -37,6 +37,11 @@ pub fn build_router_with_shutdown(
         service_key: Arc::clone(&state.service_key),
         master_keys: Arc::clone(&state.master_keys),
         config: Arc::clone(&state.config),
+        // Placeholder until Task 10 wires the queue worker's real
+        // handle; until then enqueues fire a notify nobody awaits
+        // (harmless — the boot sweep still drains).
+        notify: Arc::new(tokio::sync::Notify::new()),
+        enqueue_depth_cap: 50,
     };
     // Seed memory (v1 parity): build the global overview once at boot
     // so the first initialize/tools/list already carries it. Refreshed

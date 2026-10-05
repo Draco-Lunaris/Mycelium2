@@ -27,6 +27,8 @@ pub enum ConceptStoreError {
     Reserved(String),
     #[error("{0} is reserved for the mutation queue — use the enqueue API")]
     QueuePath(String),
+    #[error("queue error: {0}")]
+    Queue(#[from] crate::QueueError),
 }
 
 /// A listed concept (from the registry, no decryption needed).
