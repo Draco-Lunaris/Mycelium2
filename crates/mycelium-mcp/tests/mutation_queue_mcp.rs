@@ -2,13 +2,18 @@
 //! tools are enqueue-only — receipts, queue rows, encrypted payload
 //! blobs, staging notes; validation precedes the queue. The drain-side
 //! integration behavior (worker runs, retries, fallbacks) is task 11's
-//! tests; nothing here spawns the drain worker, so enqueued rows stay
-//! pending by design.
+//! tests; `boot()` spawns no drain worker — the task-11 tests that
+//! drain do so via the test-owned `test_worker` helper (see its
+//! doc-comment), and the remaining tests leave enqueued rows pending
+//! by design.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use mycelium_auth::login::LoginService;
-use mycelium_store::Store;
+use mycelium_librarian::queue_worker::{MasterKeyRecovery, QueueLimits, QueueWorker};
+use mycelium_store::{ConfigStore, Store};
 use mycelium_web::AppState;
 
 /// Known admin password for the pre-seeded account (tests log in with it).
@@ -324,8 +329,107 @@ fn receipt_id(text: &str) -> uuid::Uuid {
     .expect("valid uuid")
 }
 
+// ---- task-11 helpers: file-local mock LLM + test-owned drain worker ----
+
+/// A minimal OpenAI-compatible mock (copied from the librarian test
+/// suite — the mock helpers are file-local per test binary): serves
+/// scripted responses LIFO, captures every request body.
+type MockShared = Arc<tokio::sync::Mutex<MockLlmState>>;
+struct MockLlmState {
+    responses: Vec<serde_json::Value>,
+    requests: Vec<serde_json::Value>,
+}
+
+async fn mock_llm(responses: Vec<serde_json::Value>) -> (String, MockShared) {
+    let state: MockShared = Arc::new(tokio::sync::Mutex::new(MockLlmState {
+        responses,
+        requests: Vec::new(),
+    }));
+    let handler_state = Arc::clone(&state);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |body: String| {
+            let state = handler_state;
+            async move {
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let mut guard = state.lock().await;
+                guard.requests.push(parsed);
+                match guard.responses.pop() {
+                    Some(resp) => axum::Json(resp).into_response(),
+                    None => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "script exhausted",
+                    )
+                        .into_response(),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), state)
+}
+
+fn text_response(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{ "message": { "role": "assistant", "content": text } }]
+    })
+}
+
+fn tool_call_response(id: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args.to_string() }
+                }]
+            }
+        }]
+    })
+}
+
+/// A test-owned drain worker over the booted server's data dir: same
+/// store, service key, and ConfigStore "llm" the binary's worker would
+/// read. `boot()` spawns NO drain worker (verified in Task 8), so the
+/// task-11 MCP-surface tests drive draining explicitly through this.
+/// The stub recovery returns the admin's master key — the only user
+/// with queue rows in these tests.
+async fn test_worker(
+    dir: &std::path::Path,
+    pool: &sqlx::SqlitePool,
+    master: mycelium_crypto::keys::MasterKey,
+    limits: QueueLimits,
+) -> Arc<QueueWorker> {
+    let store = Arc::new(Store::open(dir).await.unwrap());
+    let service_key =
+        Arc::new(mycelium_crypto::load_or_create_service_key_with(dir, None).unwrap());
+    let config = Arc::new(ConfigStore::new(pool.clone()));
+    let recovery: Arc<MasterKeyRecovery> = Arc::new(move |_uid| {
+        let m = master.clone();
+        Box::pin(async move { Ok(m) })
+    });
+    Arc::new(QueueWorker::new(
+        store,
+        service_key,
+        config,
+        recovery,
+        limits,
+    ))
+}
+
 // T6.1 — memory_add returns a receipt with LLM dead; row + payload +
 // staging note all landed, and the tool never waited on the LLM.
+// T11.8 [spec §7.8 — staging-note immediate visibility] extends this
+// test: the staged content is queryable the moment the receipt
+// returns, and after a drain-to-integration the real concept is
+// queryable while the staging path is gone.
 #[tokio::test]
 async fn memory_add_returns_receipt_no_llm_contact() {
     let (base, shutdown, dir, pool) = boot().await;
@@ -405,6 +509,92 @@ async fn memory_add_returns_receipt_no_llm_contact() {
         "staging note tagged queue-staging: {:?}",
         note.frontmatter.tags
     );
+
+    // ---- T11.8 extension: staging-note visibility across the
+    // integration lifecycle ----
+
+    // Immediately after the receipt: the content is queryable via the
+    // staging note (the deterministic search path — the LLM is dead,
+    // so memory_query falls to ranked keyword hits).
+    let (_s, q1) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_query",
+            "arguments": {"question": "receipt lifecycle"}
+        }),
+    )
+    .await;
+    assert_eq!(q1["result"]["isError"], false, "{q1}");
+    let q1_text = q1["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        q1_text.contains("queued receipt test content"),
+        "staged content must be visible immediately: {q1_text}"
+    );
+    assert!(
+        q1_text.contains("/mutation-queue/"),
+        "the hit is the staging note: {q1_text}"
+    );
+
+    // Integrate: a test-owned drain worker with the age deadline
+    // already passed routes straight to the deterministic fallback —
+    // no LLM contact, the concept lands at the payload's path hint.
+    let master2 = admin_master_key(dir.path(), &pool).await;
+    let worker = test_worker(
+        dir.path(),
+        &pool,
+        master2,
+        QueueLimits {
+            age_deadline_secs: 0,
+            ..QueueLimits::default()
+        },
+    )
+    .await;
+    for _ in 0..10 {
+        if worker.run_pending().await.unwrap() == 0 {
+            break;
+        }
+    }
+    let (state_row,): (String,) = sqlx::query_as("SELECT status FROM mutation_queue WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state_row, "done");
+
+    // After integration: the query still finds the content — now the
+    // real concept — and no staging path appears in the results.
+    let (_s, q2) = rpc(
+        &client,
+        &base,
+        &token,
+        3,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_query",
+            "arguments": {"question": "receipt lifecycle"}
+        }),
+    )
+    .await;
+    assert_eq!(q2["result"]["isError"], false, "{q2}");
+    let q2_text = q2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        q2_text.contains("queued receipt test content"),
+        "integrated content must stay visible: {q2_text}"
+    );
+    assert!(
+        !q2_text.contains("/mutation-queue/"),
+        "staging path must be gone from results: {q2_text}"
+    );
+    assert!(
+        q2_text.contains("path: /tq/one.md"),
+        "the hit is the integrated concept: {q2_text}"
+    );
+    // The staging tree is empty in the registry.
+    assert!(cs.list_prefix("/mutation-queue/").await.unwrap().is_empty());
 
     shutdown.cancel();
 }
@@ -1069,5 +1259,161 @@ async fn metrics_queue_lines() {
     // Leave the static zeroed for whichever T10 test runs next.
     mycelium_librarian::llm::LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
 
+    shutdown.cancel();
+}
+
+// T11.13 [spec §7.13 — /health + /metrics under a live drain]: an
+// MCP-enqueued add integrates through a real agent run (mock LLM),
+// and every queue surface then reports the drained state — /health
+// depth 0 / dead 0 / llm-alive non-null, /metrics counters counting
+// the row (integrated, per-tool), depth gauge 0, and the
+// LLM-success timestamp line set by the drain itself (Task 10's
+// static, reset at test start under the shared guard).
+#[tokio::test]
+async fn health_and_metrics_reflect_a_live_drain() {
+    let _statics = LLM_STATIC_GUARD.lock().await;
+    mycelium_librarian::llm::LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (base, shutdown, dir, pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle_admin(&client, &base, &pool).await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    // A mock LLM: the drain's agent run integrates via a real
+    // write_concept call (integrated_total, not fallback_total).
+    let (url, _mock) = mock_llm(vec![
+        text_response("recorded"),
+        tool_call_response(
+            "c1",
+            "write_concept",
+            serde_json::json!({
+                "path": "/notes/health-drain.md",
+                "frontmatter": { "type": "Note", "title": "Health Drain" },
+                "body": "health drain body"
+            }),
+        ),
+    ])
+    .await;
+    sqlx::query(
+        "INSERT INTO config (key, value, updated_at) VALUES ('llm', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(serde_json::json!({ "url": url, "model": "mock" }).to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Enqueue through the MCP surface (the receipt path).
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_add",
+            "arguments": {"content": "health drain probe"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("accepted, queued receipt="), "{text}");
+    let id = receipt_id(text);
+
+    // /health mid-queue: depth 1, still ok (a fresh pending row is not
+    // degraded — only stale or dead rows 503).
+    let h0: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(h0["queue_depth"], 1, "{h0}");
+    assert_eq!(h0["status"], "ok", "{h0}");
+
+    // Drain through a test-owned worker: a real agent run (fresh row,
+    // default deadline — the age branch must NOT fire).
+    let master = admin_master_key(dir.path(), &pool).await;
+    let worker = test_worker(dir.path(), &pool, master, QueueLimits::default()).await;
+    for _ in 0..10 {
+        if worker.run_pending().await.unwrap() == 0 {
+            break;
+        }
+    }
+
+    // The receipt is done with the agent's paths.
+    let (_s, rs) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": id.to_string()}
+        }),
+    )
+    .await;
+    let rtext = rs["result"]["content"][0]["text"].as_str().unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(rtext).unwrap();
+    assert_eq!(receipt["state"], "done", "{rtext}");
+    assert_eq!(
+        receipt["final_paths"],
+        serde_json::json!(["/notes/health-drain.md"]),
+        "{rtext}"
+    );
+
+    // /health after the drain: depth 0, no dead rows, llm alive.
+    let h = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(h.status(), 200);
+    let h: serde_json::Value = h.json().await.unwrap();
+    assert_eq!(h["status"], "ok", "{h}");
+    assert_eq!(h["queue_depth"], 0, "{h}");
+    assert_eq!(h["queue_dead_count"], 0, "{h}");
+    assert!(
+        h["llm_last_success_seconds"]
+            .as_i64()
+            .is_some_and(|s| s >= 0),
+        "the drain sets the llm-alive signal (null before any success; 0 = within the last second): {h}"
+    );
+
+    // /metrics: the row is counted in every queue surface.
+    let txt = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(txt.contains("mycelium2_mutation_queue_depth 0"), "{txt}");
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="add"} 1"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="update"} 0"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains(r#"mycelium2_mutation_queued_total{tool="maintain"} 0"#),
+        "{txt}"
+    );
+    assert!(
+        txt.contains("mycelium2_mutation_integrated_total 1"),
+        "{txt}"
+    );
+    assert!(txt.contains("mycelium2_mutation_fallback_total 0"), "{txt}");
+    assert!(txt.contains("mycelium2_mutation_dead_total 0"), "{txt}");
+    assert!(
+        txt.contains("mycelium2_llm_last_success_timestamp"),
+        "set by the drain's successful LLM completion: {txt}"
+    );
+
+    // Leave the static zeroed for whichever T10/T11 test runs next.
+    mycelium_librarian::llm::LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
     shutdown.cancel();
 }
