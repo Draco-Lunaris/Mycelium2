@@ -243,32 +243,11 @@ impl AppState {
         }
     }
 
-    /// Fetch (or recover) a user's master key: cache → service-key seal.
+    /// Fetch (or recover) a user's master key (delegates to the cache).
     pub async fn master_key_for(&self, user_id: Uuid) -> Result<MasterKey, sqlx::Error> {
-        if let Some(key) = self.master_keys.get(user_id) {
-            return Ok(key);
-        }
-        // Recover from the service-key seal (column added in migration 0002).
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT master_key_service_sealed FROM users WHERE id = ?")
-                .bind(user_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await?;
-        let Some((Some(sealed_hex),)) = row else {
-            return Err(sqlx::Error::RowNotFound);
-        };
-        let sealed_bytes = hex::decode(&sealed_hex)
-            .map_err(|_| sqlx::Error::Decode("bad service seal hex".into()))?;
-        let master = mycelium_crypto::aead::aead_open(
-            &sealed_bytes,
-            b"mycelium2/seal/service/v1",
-            &service_dek(&self.service_key),
-        )
-        .map_err(|_| sqlx::Error::Decode("service seal unseal failed".into()))?;
-        let key = MasterKey::from_bytes(&master)
-            .map_err(|_| sqlx::Error::Decode("bad master key length".into()))?;
-        self.master_keys.insert(user_id, key.clone());
-        Ok(key)
+        self.master_keys
+            .for_user(&self.store, &self.service_key, user_id)
+            .await
     }
 
     /// Seal a user's master key under the service key and persist it
@@ -281,7 +260,7 @@ impl AppState {
         let sealed = mycelium_crypto::aead::aead_seal(
             master_key.as_bytes(),
             b"mycelium2/seal/service/v1",
-            &service_dek(&self.service_key),
+            &mycelium_crypto::keys::service_seal_dek(&self.service_key),
         )
         .map_err(|e| sqlx::Error::Decode(format!("seal failed: {e}").into()))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -293,14 +272,6 @@ impl AppState {
             .await?;
         Ok(())
     }
-}
-
-/// Derive the DEK used for service-key seals (purpose-bound).
-fn service_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
-    let mut material = [0u8; 32];
-    let _ = hk.expand(b"mycelium2/service-seal-dek/v1", &mut material);
-    mycelium_crypto::keys::Dek::from_bytes(&material).expect("32 bytes")
 }
 
 /// Derive the DEK used for encrypted config values (purpose-bound).

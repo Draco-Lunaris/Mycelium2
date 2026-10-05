@@ -156,6 +156,15 @@ pub fn derive_dek(master_key: &MasterKey, path: &str) -> Result<Dek, KeyError> {
     Ok(Dek(dek))
 }
 
+/// Derive the DEK used for service-key seals (purpose-bound; single
+/// source — the web and MCP layers previously duplicated this).
+pub fn service_seal_dek(service_key: &ServiceKey) -> Dek {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
+    let mut material = [0u8; 32];
+    let _ = hk.expand(b"mycelium2/service-seal-dek/v1", &mut material);
+    Dek::from_bytes(&material).expect("32 bytes")
+}
+
 /// Generate a random 16-byte Argon2 salt.
 pub fn generate_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];

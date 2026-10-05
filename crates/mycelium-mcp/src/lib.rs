@@ -38,6 +38,40 @@ impl MasterKeyCache {
     pub fn remove(&self, user_id: Uuid) {
         self.inner.lock().unwrap().remove(&user_id);
     }
+
+    /// Fetch (or recover) a user's master key: cache → service-key
+    /// seal. One body for the web and MCP layers (was duplicated in
+    /// McpState::master_key_for and AppState::master_key_for).
+    pub async fn for_user(
+        &self,
+        store: &Store,
+        service_key: &ServiceKey,
+        user_id: Uuid,
+    ) -> Result<MasterKey, sqlx::Error> {
+        if let Some(key) = self.get(user_id) {
+            return Ok(key);
+        }
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT master_key_service_sealed FROM users WHERE id = ?")
+                .bind(user_id.to_string())
+                .fetch_optional(store.pool())
+                .await?;
+        let Some((Some(sealed_hex),)) = row else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+        let sealed_bytes = hex::decode(&sealed_hex)
+            .map_err(|_| sqlx::Error::Decode("bad service seal hex".into()))?;
+        let master = mycelium_crypto::aead::aead_open(
+            &sealed_bytes,
+            b"mycelium2/seal/service/v1",
+            &mycelium_crypto::keys::service_seal_dek(service_key),
+        )
+        .map_err(|_| sqlx::Error::Decode("service seal unseal failed".into()))?;
+        let key = MasterKey::from_bytes(&master)
+            .map_err(|_| sqlx::Error::Decode("bad master key length".into()))?;
+        self.insert(user_id, key.clone());
+        Ok(key)
+    }
 }
 
 /// Shared state for the MCP server (a lean sibling of the web AppState —
@@ -58,40 +92,50 @@ pub struct McpState {
 }
 
 impl McpState {
-    /// Fetch (or recover) a user's master key: cache → service-key seal
-    /// (mirrors mycelium-web's AppState::master_key_for).
+    /// Fetch (or recover) a user's master key (delegates to the shared
+    /// cache; kept for the existing tools' call sites).
     pub async fn master_key_for(&self, user_id: Uuid) -> Result<MasterKey, sqlx::Error> {
-        if let Some(key) = self.master_keys.get(user_id) {
-            return Ok(key);
-        }
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT master_key_service_sealed FROM users WHERE id = ?")
-                .bind(user_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await?;
-        let Some((Some(sealed_hex),)) = row else {
-            return Err(sqlx::Error::RowNotFound);
-        };
-        let sealed_bytes = hex::decode(&sealed_hex)
-            .map_err(|_| sqlx::Error::Decode("bad service seal hex".into()))?;
-        let master = mycelium_crypto::aead::aead_open(
-            &sealed_bytes,
-            b"mycelium2/seal/service/v1",
-            &service_seal_dek(&self.service_key),
-        )
-        .map_err(|_| sqlx::Error::Decode("service seal unseal failed".into()))?;
-        let key = MasterKey::from_bytes(&master)
-            .map_err(|_| sqlx::Error::Decode("bad master key length".into()))?;
-        self.master_keys.insert(user_id, key.clone());
-        Ok(key)
+        self.master_keys
+            .for_user(&self.store, &self.service_key, user_id)
+            .await
     }
 }
 
-/// Derive the DEK used for service-key seals (purpose-bound; identical to
-/// the web layer's derivation so seals interoperate).
-fn service_seal_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
-    let mut material = [0u8; 32];
-    let _ = hk.expand(b"mycelium2/service-seal-dek/v1", &mut material);
-    mycelium_crypto::keys::Dek::from_bytes(&material).expect("32 bytes")
+#[cfg(test)]
+mod master_key_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn for_user_roundtrip_and_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let service_key =
+            mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+        let master = mycelium_crypto::generate_master_key();
+        let user = uuid::Uuid::new_v4();
+        // Persist a service seal for the user (the row the method reads).
+        let sealed = mycelium_crypto::aead::aead_seal(
+            master.as_bytes(),
+            b"mycelium2/seal/service/v1",
+            &mycelium_crypto::keys::service_seal_dek(&service_key),
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO users (id, username, email, role, auth_provider, password_hash, sealed_master_key, master_key_service_sealed, created_at, updated_at) VALUES (? , 'u', 'u@x', 'user', 'local', '', '', ?, ?, ?)")
+            .bind(user.to_string())
+            .bind(hex::encode(sealed))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(store.pool()).await.unwrap();
+        let cache = MasterKeyCache::default();
+        let key = cache.for_user(&store, &service_key, user).await.unwrap();
+        assert_eq!(key.as_bytes(), master.as_bytes());
+        // Cache path: remove the row, ask again — must still answer.
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let again = cache.for_user(&store, &service_key, user).await.unwrap();
+        assert_eq!(again.as_bytes(), master.as_bytes());
+    }
 }
