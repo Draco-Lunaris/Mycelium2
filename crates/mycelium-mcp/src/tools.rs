@@ -8,7 +8,7 @@ use mycelium_core::graph::{self, GraphHealth};
 use mycelium_core::search::SearchQuery;
 use mycelium_store::concept_store::{ConceptStore, ConceptStoreError};
 use mycelium_store::file_repo::FileRepo;
-use mycelium_store::models::QueueTool;
+use mycelium_store::models::{QueueStatus, QueueTool};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -408,7 +408,12 @@ pub async fn memory_update(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
-pub struct MemoryStatusArgs {}
+pub struct MemoryStatusArgs {
+    /// Enqueue receipt id (the `receipt=<uuid>` from an add/update/;
+    /// maintain call) — look up that item's integration state instead
+    /// of reporting graph health.
+    pub receipt_id: Option<String>,
+}
 
 /// Report the health of the caller's private bundle: concept count,
 /// edges, broken links, orphans.
@@ -430,6 +435,54 @@ pub async fn memory_status(
     }
     let g = graph::build_graph_from_concepts(&concepts);
     Ok(g.health())
+}
+
+/// Integration state for one of the caller's receipts. Another user's
+/// id (or an absent id) resolves to state "unknown" — never leaks
+/// existence (spec §4.1).
+pub async fn receipt_view(
+    state: &McpState,
+    user: &McpUser,
+    id: &str,
+) -> Result<String, ConceptStoreError> {
+    // Unparseable ids are simply unknown (no error — probing is cheap
+    // and erroring would leak validation behavior).
+    let Ok(uuid) = Uuid::parse_str(id.trim()) else {
+        return Ok(serde_json::json!({ "state": "unknown" }).to_string());
+    };
+    // User scoping lives in the SQL (`WHERE id = ? AND user_id = ?`):
+    // a foreign id is indistinguishable from an absent one.
+    let item = mycelium_store::Store::queue_item(state.store.as_ref(), user.user_id, uuid)
+        .await
+        .map_err(ConceptStoreError::Queue)?;
+    let Some(item) = item else {
+        return Ok(serde_json::json!({ "state": "unknown" }).to_string());
+    };
+    // Receipt views never say staging (spec §4.1): enqueue-phase rows
+    // render as pending. Everything else maps 1:1.
+    let status_str = match item.status {
+        QueueStatus::Staging => "pending",
+        QueueStatus::Pending => "pending",
+        QueueStatus::Running => "running",
+        QueueStatus::Done => "done",
+        QueueStatus::Dead => "dead",
+    };
+    // final_paths is the raw column string (written only by mark_done
+    // as a JSON array); None or a parse failure both render null.
+    let final_paths = item
+        .final_paths
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+    Ok(serde_json::json!({
+        "state": status_str,
+        "tool": item.tool.as_str(),
+        "attempts": item.attempts,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+        "final_paths": final_paths,
+        "detail": item.detail,
+    })
+    .to_string())
 }
 
 // ---------------------------------------------------------------------------

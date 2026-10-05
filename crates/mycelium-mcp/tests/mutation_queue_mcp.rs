@@ -684,3 +684,231 @@ async fn empty_content_rejected_before_enqueue() {
 
     shutdown.cancel();
 }
+
+// ---- task 8: memory_status(receipt_id) — the receipt lookup ----
+
+/// Known password for the second (non-admin) user in the scoping probe.
+const BOB_PASSWORD: &str = "bob password known to the test suite!";
+
+// T8.1 — receipt_id lifecycle: add → "pending" (staging mapped to
+// pending, never "staging"); done → final_paths JSON; unknown and
+// unparseable ids → "unknown"; another user's id → "unknown" (no leak).
+#[tokio::test]
+async fn receipt_transitions_and_scoping() {
+    let (base, shutdown, dir, pool) = boot().await;
+    dead_llm(&pool).await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle_admin(&client, &base, &pool).await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    // Enqueue one add; harvest the receipt id from the receipt line.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_add",
+            "arguments": {"content": "receipt lifecycle content"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "add must succeed: {body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let id = receipt_id(text);
+
+    // Lookup with the id: pending, tool add, attempts 0, final_paths null.
+    let (_s, b2) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": id.to_string()}
+        }),
+    )
+    .await;
+    assert_eq!(b2["result"]["isError"], false, "{b2}");
+    let t2 = b2["result"]["content"][0]["text"].as_str().unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(t2).unwrap();
+    assert_eq!(receipt["state"], "pending", "{t2}");
+    assert_eq!(receipt["tool"], "add", "{t2}");
+    assert_eq!(receipt["attempts"], 0, "{t2}");
+    assert_eq!(receipt["final_paths"], serde_json::Value::Null, "{t2}");
+
+    // A staging row (SQL flip — the enqueue path never leaves one
+    // observable, it flips to pending before returning) still renders
+    // "pending": receipt views never say staging (spec §4.1).
+    sqlx::query("UPDATE mutation_queue SET status = 'staging' WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_s, b3) = rpc(
+        &client,
+        &base,
+        &token,
+        3,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": id.to_string()}
+        }),
+    )
+    .await;
+    let t3 = b3["result"]["content"][0]["text"].as_str().unwrap();
+    let staged: serde_json::Value = serde_json::from_str(t3).unwrap();
+    assert_eq!(staged["state"], "pending", "{t3}");
+
+    // A done row renders done with final_paths as a JSON array (the raw
+    // column is written only by mark_done) and the provenance detail.
+    let store = Store::open(dir.path()).await.unwrap();
+    let paths = vec!["/receipt/lifecycle.md".to_string()];
+    store.mark_done(id, &paths, "integrated").await.unwrap();
+    let (_s, b4) = rpc(
+        &client,
+        &base,
+        &token,
+        4,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": id.to_string()}
+        }),
+    )
+    .await;
+    let t4 = b4["result"]["content"][0]["text"].as_str().unwrap();
+    let done: serde_json::Value = serde_json::from_str(t4).unwrap();
+    assert_eq!(done["state"], "done", "{t4}");
+    assert_eq!(
+        done["final_paths"],
+        serde_json::json!(["/receipt/lifecycle.md"]),
+        "{t4}"
+    );
+    assert_eq!(done["detail"], "integrated", "{t4}");
+
+    // A random uuid → state unknown, success (never an error — probing
+    // is cheap and erroring would leak validation behavior).
+    let (_s, b5) = rpc(
+        &client,
+        &base,
+        &token,
+        5,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": uuid::Uuid::new_v4().to_string()}
+        }),
+    )
+    .await;
+    assert_eq!(b5["result"]["isError"], false, "{b5}");
+    let t5 = b5["result"]["content"][0]["text"].as_str().unwrap();
+    let unknown: serde_json::Value = serde_json::from_str(t5).unwrap();
+    assert_eq!(unknown["state"], "unknown", "{t5}");
+
+    // An unparseable id → same unknown shape.
+    let (_s, b6) = rpc(
+        &client,
+        &base,
+        &token,
+        6,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": "not-a-uuid"}
+        }),
+    )
+    .await;
+    assert_eq!(b6["result"]["isError"], false, "{b6}");
+    let t6 = b6["result"]["content"][0]["text"].as_str().unwrap();
+    let bad: serde_json::Value = serde_json::from_str(t6).unwrap();
+    assert_eq!(bad["state"], "unknown", "{t6}");
+
+    // Another user's id → unknown: user scoping is enforced in the SQL
+    // (`WHERE id = ? AND user_id = ?`), so a foreign receipt is
+    // indistinguishable from an absent one — no existence leak.
+    let users = mycelium_auth::UserStore::new(pool.clone());
+    users
+        .create_local(
+            "bob",
+            "bob@example.com",
+            BOB_PASSWORD,
+            mycelium_auth::Role::User,
+        )
+        .await
+        .unwrap();
+    let (bob_cookie, bob_csrf) =
+        login_and_settle(&client, &base, &pool, "bob", BOB_PASSWORD, BOB_PASSWORD).await;
+    let bob_token = mint_key(&client, &base, &bob_cookie, &bob_csrf).await;
+    let (_s, b7) = rpc(
+        &client,
+        &base,
+        &bob_token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {"receipt_id": id.to_string()}
+        }),
+    )
+    .await;
+    assert_eq!(b7["result"]["isError"], false, "{b7}");
+    let t7 = b7["result"]["content"][0]["text"].as_str().unwrap();
+    let foreign: serde_json::Value = serde_json::from_str(t7).unwrap();
+    assert_eq!(foreign["state"], "unknown", "{t7}");
+
+    shutdown.cancel();
+}
+
+// T8.2 — no-arg call is byte-identical to today's output (back-compat:
+// graph-health text, four lines) — with an empty arguments object and
+// with the arguments key absent entirely.
+#[tokio::test]
+async fn status_without_receipt_id_unchanged() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle_admin(&client, &base, &pool).await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    // Fresh admin bundle, zero enqueues: nothing staggers the concept
+    // count, so the graph-health text starts at zero.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status",
+            "arguments": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "concepts: 0\nedges: 0\nbroken links: 0\norphans: 0");
+
+    // No arguments key at all: the optional field keeps the call valid
+    // (rmcp treats absent arguments as an empty object).
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(), "name": "mycelium2_memory_status"
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "concepts: 0\nedges: 0\nbroken links: 0\norphans: 0");
+
+    shutdown.cancel();
+}

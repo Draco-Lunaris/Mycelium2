@@ -125,9 +125,20 @@ impl MyceliumMcpServer {
     async fn memory_status(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        _args: Parameters<tools::MemoryStatusArgs>,
+        args: Parameters<tools::MemoryStatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
+        let args = args.0;
+        if let Some(rid) = args.receipt_id {
+            let text = tools::receipt_view(&self.state, &user, &rid)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "memory tool internal error");
+                    ErrorData::internal_error("internal storage error", None)
+                })?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
+        }
+        // No receipt id: the existing graph-health path, byte-identical.
         let health = tools::memory_status(&self.state, &user)
             .await
             .map_err(|e| {
