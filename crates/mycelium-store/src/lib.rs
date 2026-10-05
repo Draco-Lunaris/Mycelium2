@@ -7,6 +7,7 @@ pub mod config;
 pub mod file_repo;
 pub mod migrations;
 pub mod models;
+pub mod mutation_queue;
 pub mod search_index;
 
 pub use books::{BookRow, BooksError};
@@ -15,7 +16,11 @@ pub use config::ConfigError;
 pub use config::ConfigStore;
 pub use file_repo::{FileRepo, FileRepoError, Scope};
 pub use migrations::run_migrations;
-pub use models::{ApiKey, Book, Bookshelf, IngestJob, IngestStatus, Session, User};
+pub use models::{
+    ApiKey, Book, Bookshelf, IngestJob, IngestStatus, MutationQueueItem, QueueStatus, QueueTool,
+    Session, User,
+};
+pub use mutation_queue::{QueueError, QueueHealth};
 pub use search_index::{EncryptedIndex, IndexError};
 
 use std::path::Path;
