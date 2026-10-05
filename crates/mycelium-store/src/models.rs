@@ -99,7 +99,8 @@ pub struct IngestJob {
 }
 
 /// The tool that enqueued a mutation-queue item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QueueTool {
     Add,
     Update,

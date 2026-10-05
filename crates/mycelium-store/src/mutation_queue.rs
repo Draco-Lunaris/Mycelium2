@@ -6,9 +6,11 @@
 //! books.rs: conditional UPDATEs for atomicity, RFC 3339 timestamps.
 
 use chrono::Utc;
+use mycelium_crypto::keys::MasterKey;
 use uuid::Uuid;
 
 use crate::Store;
+use crate::file_repo::{FileRepo, FileRepoError, Scope};
 use crate::models::{MutationQueueItem, QueueStatus, QueueTool};
 
 #[derive(Debug, thiserror::Error)]
@@ -317,6 +319,71 @@ impl Store {
             dead_count: usize::try_from(dead).unwrap_or(0),
             per_tool,
         })
+    }
+}
+
+/// The queued tool's args + user content for a mutation-queue item.
+/// Serialized as JSON into the item's FileRepo payload blob at
+/// /mutation-queue/<id>. `args_json` holds the original tool args
+/// verbatim (a JSON object string), so the drain rebuilds the exact
+/// instruction.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MutationPayload {
+    pub tool: QueueTool,
+    pub args_json: String,
+    pub content: String,
+}
+
+/// The canonical payload path for a queue item (raw blob — NOT `.md`,
+/// so it never collides with the staging note below).
+pub fn payload_path(id: Uuid) -> String {
+    format!("/mutation-queue/{id}")
+}
+
+/// The canonical concept path for an `add` item's staging note. The
+/// caller writes it through `ConceptStore::put_batch_internal` with a
+/// caller-derived title (the store layer is title-agnostic).
+pub fn stage_note_path(id: Uuid) -> String {
+    format!("/mutation-queue/{id}.md")
+}
+
+/// Write a queue payload as a raw FileRepo blob (user scope). NOT a
+/// concept: no registry row, no index entry, no index.md regen.
+pub async fn write_payload(
+    repo: &FileRepo,
+    master_key: &MasterKey,
+    id: Uuid,
+    content: &MutationPayload,
+) -> std::result::Result<(), FileRepoError> {
+    let bytes = serde_json::to_vec(content).map_err(|e| {
+        FileRepoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
+    repo.write(&payload_path(id), &bytes, &Scope::User(master_key.clone()))
+        .await
+}
+
+/// Read a queue payload. `None` when the blob is absent — a wrong
+/// master key also derives a different opaque stored filename, so a
+/// wrong key is indistinguishable from a missing blob (no existence
+/// leak); a deserialize failure maps to `None` as well, and the drain
+/// fails fast with "payload missing" for a row whose blob is
+/// unparseable (a same-version server never writes one, but a
+/// corrupted store may hit one).
+pub async fn read_payload(
+    repo: &FileRepo,
+    master_key: &MasterKey,
+    id: Uuid,
+) -> std::result::Result<Option<MutationPayload>, FileRepoError> {
+    match repo
+        .read(&payload_path(id), &Scope::User(master_key.clone()))
+        .await
+    {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(FileRepoError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

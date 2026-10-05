@@ -20,7 +20,9 @@ pub use models::{
     ApiKey, Book, Bookshelf, IngestJob, IngestStatus, MutationQueueItem, QueueStatus, QueueTool,
     Session, User,
 };
-pub use mutation_queue::{QueueError, QueueHealth};
+pub use mutation_queue::{
+    MutationPayload, QueueError, QueueHealth, payload_path, read_payload, write_payload,
+};
 pub use search_index::{EncryptedIndex, IndexError};
 
 use std::path::Path;

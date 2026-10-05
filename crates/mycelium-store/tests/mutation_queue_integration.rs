@@ -217,3 +217,108 @@ async fn concurrent_activate_all_reach_pending() {
         );
     }
 }
+
+mod payload {
+    use mycelium_store::QueueTool;
+    use mycelium_store::file_repo::FileRepo;
+    use mycelium_store::mutation_queue::{self, MutationPayload};
+
+    #[tokio::test]
+    async fn payload_roundtrip_and_not_found() {
+        let (store, _dir) = super::store().await;
+        let user = super::seed_user(&store, "u1").await;
+        let master = mycelium_crypto::generate_master_key();
+        let repo = FileRepo::new(store.user_dir(user));
+        let id = uuid::Uuid::new_v4();
+        let p = MutationPayload {
+            tool: QueueTool::Add,
+            args_json: r#"{"content":"x"}"#.to_string(),
+            content: "x".to_string(),
+        };
+        mutation_queue::write_payload(&repo, &master, id, &p)
+            .await
+            .unwrap();
+        let back = mutation_queue::read_payload(&repo, &master, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.content, "x");
+        assert_eq!(back.tool, QueueTool::Add);
+        // A different master key derives a different opaque stored
+        // filename (the HMAC is keyed by the master key), so the blob is
+        // simply not found → None — no existence leak, and no
+        // decryption error to distinguish a wrong key from a missing
+        // blob.
+        let other = mycelium_crypto::generate_master_key();
+        assert!(
+            mutation_queue::read_payload(&repo, &other, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Same key, unknown id → absent blob → None.
+        assert!(
+            mutation_queue::read_payload(&repo, &master, uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Stored name is opaque + flat: list() never shows canonical paths.
+        let names = repo.list().await.unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].len(), 64);
+    }
+}
+
+mod reservation {
+    use mycelium_core::concept::{Concept, Frontmatter};
+    use mycelium_store::ConceptStore;
+
+    #[tokio::test]
+    async fn external_put_rejected_internal_allowed() {
+        let (store, _dir) = super::store().await;
+        let user = super::seed_user(&store, "u1").await;
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master);
+        // External caller: reserved prefix rejected.
+        let foreign = Concept::new(
+            Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("x".into()),
+                ..Default::default()
+            },
+            "hi".to_string(),
+            "/mutation-queue/12345678-1234-1234-1234-123456789abc".to_string(),
+        );
+        assert!(matches!(
+            cs.put(&foreign).await,
+            Err(mycelium_store::ConceptStoreError::QueuePath(_))
+        ));
+        // Other paths are unaffected.
+        let ok = Concept::new(
+            Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("y".into()),
+                ..Default::default()
+            },
+            "hi".to_string(),
+            "/notes/y.md".to_string(),
+        );
+        cs.put(&ok).await.unwrap();
+        // Internal caller: the exact same path writes through.
+        cs.put_batch_internal(std::slice::from_ref(&foreign))
+            .await
+            .unwrap();
+        let read_back = cs.get(foreign.source_path.as_str()).await.unwrap();
+        assert_eq!(read_back.body, "hi");
+        // External delete also rejected; internal delete works.
+        assert!(matches!(
+            cs.delete(foreign.source_path.as_str()).await,
+            Err(mycelium_store::ConceptStoreError::QueuePath(_))
+        ));
+        cs.delete_internal(foreign.source_path.as_str())
+            .await
+            .unwrap();
+        assert!(cs.get(foreign.source_path.as_str()).await.is_err());
+    }
+}

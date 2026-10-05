@@ -25,6 +25,8 @@ pub enum ConceptStoreError {
     NotFound(String),
     #[error("{0} is a reserved filename (index.md, log.md, info.md) — system-maintained")]
     Reserved(String),
+    #[error("{0} is reserved for the mutation queue — use the enqueue API")]
+    QueuePath(String),
 }
 
 /// A listed concept (from the registry, no decryption needed).
@@ -132,6 +134,9 @@ impl<'a> ConceptStore<'a> {
     /// rejected — they are system-maintained (index.md is regenerated
     /// on every write) and a concept there would be silently clobbered.
     pub async fn put(&self, concept: &Concept) -> Result<(), ConceptStoreError> {
+        if concept.source_path.starts_with("/mutation-queue/") {
+            return Err(ConceptStoreError::QueuePath(concept.source_path.clone()));
+        }
         self.put_batch(std::slice::from_ref(concept)).await
     }
 
@@ -139,7 +144,24 @@ impl<'a> ConceptStore<'a> {
     /// at the end (put() regenerates per concept — O(n²) on a
     /// 300-chapter catalog ingest). Same ordering guarantees as put():
     /// file → registry → index per concept, then the single regen.
+    ///
+    /// Rejects the mutation queue's reserved `/mutation-queue/` prefix —
+    /// only the queue's internal bypass may write there.
     pub async fn put_batch(&self, concepts: &[Concept]) -> Result<(), ConceptStoreError> {
+        for concept in concepts {
+            if concept.source_path.starts_with("/mutation-queue/") {
+                return Err(ConceptStoreError::QueuePath(concept.source_path.clone()));
+            }
+        }
+        self.put_batch_internal(concepts).await
+    }
+
+    /// Internal write path for the mutation queue: identical to
+    /// `put_batch` minus the reserved-prefix check (staging notes live
+    /// under `/mutation-queue/` by design). The reserved-basename check
+    /// (index.md/log.md/info.md) still applies — a queue path never
+    /// collides with those, but the bypass must not weaken it.
+    pub async fn put_batch_internal(&self, concepts: &[Concept]) -> Result<(), ConceptStoreError> {
         if concepts.is_empty() {
             return Ok(());
         }
@@ -297,7 +319,19 @@ impl<'a> ConceptStore<'a> {
     /// Delete a concept: registry + index first, then the file (a crash
     /// leaves an orphaned encrypted file — harmless, cleaned by
     /// maintenance; never a stale listing). Regenerates index.md.
+    ///
+    /// Rejects the mutation queue's reserved `/mutation-queue/` prefix —
+    /// only the queue's internal bypass may delete there.
     pub async fn delete(&self, path: &str) -> Result<(), ConceptStoreError> {
+        if path.starts_with("/mutation-queue/") {
+            return Err(ConceptStoreError::QueuePath(path.to_string()));
+        }
+        self.delete_internal(path).await
+    }
+
+    /// Internal delete path for the mutation queue: the `delete` body
+    /// minus the reserved-prefix check.
+    pub async fn delete_internal(&self, path: &str) -> Result<(), ConceptStoreError> {
         let scope_id = self.scope.scope_id();
         sqlx::query("DELETE FROM scope_files WHERE scope = ? AND path = ?")
             .bind(&scope_id)
