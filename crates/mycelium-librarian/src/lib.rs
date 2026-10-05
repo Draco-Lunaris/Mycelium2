@@ -8,6 +8,7 @@ pub mod hot_memory;
 pub mod ingest;
 pub mod llm;
 pub mod query_cache;
+pub mod queue_worker;
 pub mod trace;
 pub mod worker;
 

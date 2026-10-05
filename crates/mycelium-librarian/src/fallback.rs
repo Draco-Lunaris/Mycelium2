@@ -301,3 +301,100 @@ fn tokenize(s: &str) -> Vec<String> {
         .map(|t| t.to_string())
         .collect()
 }
+
+// ---- instruction wrappers (the exact texts the MCP tools build
+// today; Task 6 deletes tools.rs's copies, ending the duplication) ----
+
+/// The add tool's persist directive (v1 rule: bare content reads as
+/// chat and gets answered, not stored — the wrapper is what makes it
+/// a store instruction).
+pub fn add_instruction(content: &str, path: Option<&str>, concept_type: Option<&str>) -> String {
+    let mut instruction = format!(
+        "Persist the following knowledge into the knowledge base. First search for \
+         related or owning concepts. If this is an attribute or detail of an \
+         existing concept, patch it into that concept rather than creating a new \
+         one. Only a distinct stand-alone entity or substantial topic gets its own \
+         concept — and then you must also patch the related existing concepts to \
+         link back to it. This is content to store, not a message to answer — you \
+         must use the write tools.\n\nKNOWLEDGE TO RECORD:\n{content}"
+    );
+    if let Some(path) = path {
+        instruction.push_str(&format!("\n\nIf it fits, place new content at {path}."));
+    }
+    if let Some(kind) = concept_type {
+        instruction.push_str(&format!(
+            "\n\nThe knowledge is of kind/type \"{kind}\" — use it as the concept `type`."
+        ));
+    }
+    instruction
+}
+
+/// The update tool's change directive (same rule: the wrapper makes it
+/// an apply instruction, not a message to answer).
+pub fn update_instruction(instruction_text: &str, path: Option<&str>) -> String {
+    let mut instruction = format!(
+        "Apply the following change to the knowledge base. Locate the concept(s) \
+         the change concerns (search first, read them), then apply targeted edits \
+         with the write tools. This is a change to apply, not a message to answer.\n\n\
+         CHANGE TO APPLY:\n{instruction_text}"
+    );
+    if let Some(path) = path {
+        instruction.push_str(&format!("\n\nThe target concept is at {path}."));
+    }
+    instruction
+}
+
+/// The maintain tool's repair instruction, built from live graph state
+/// (a store read + format — no LLM). Returns the instruction and the
+/// BEFORE health (the caller may want before-counts for its receipt).
+/// A healthy graph is NOT an early return here: the healthy-check
+/// shortcut lives in the tool (the drain still runs a maintain item —
+/// the agent answers healthy-nothing-to-do, files_changed is empty,
+/// the row converges to done).
+pub async fn maintain_instruction(
+    cs: &ConceptStore<'_>,
+) -> Result<(String, mycelium_core::graph::GraphHealth), ConceptStoreError> {
+    let entries = cs.list().await?;
+    let mut concepts = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        if let Ok(c) = cs.get(&entry.path).await {
+            concepts.push(c);
+        }
+    }
+    let g = graph::build_graph_from_concepts(&concepts);
+    let health = g.health();
+    let orphan_list = g
+        .orphans
+        .iter()
+        .map(|o| format!("- {o}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let broken_list = g
+        .broken_links
+        .iter()
+        .map(|b| format!("- {} → {} (missing)", b.from, b.to))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instruction = format!(
+        "Repair the knowledge graph. This is a maintenance task — use the write tools.\n\n\
+         ORPHANED CONCEPTS (no other concept links to them). For each, read it and the \
+         concepts it relates to, then wire it in: patch a genuinely related concept to \
+         reference it, and/or add outbound links from it to related concepts. Do NOT \
+         invent relationships that don't exist — if an orphan genuinely relates to \
+         nothing, leave it.\n{}\n\n\
+         BROKEN LINKS (target does not exist). Fix the path if the target was renamed/moved, \
+         or remove the link if the target is gone.\n{}\n\n\
+         Follow the enrich / link-both-ways rules. Read concepts before editing.",
+        if orphan_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            orphan_list
+        },
+        if broken_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            broken_list
+        },
+    );
+    Ok((instruction, health))
+}
