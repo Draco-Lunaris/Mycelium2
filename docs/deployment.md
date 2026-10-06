@@ -87,11 +87,19 @@ WantedBy=multi-user.target
 ## Health and monitoring
 
 - `GET /health` — public JSON status (unauthenticated by design, for
-  container orchestration; returns only coarse status).
+  container orchestration). It also reports the mutation queue —
+  `queue_depth`, `oldest_pending_age_seconds`, `queue_dead_count`,
+  `llm_last_success_seconds` — and answers 503 `degraded` when the
+  database is unreachable, any queued item is dead, or a pending item
+  has waited past twice the integration deadline.
 - `GET /api/v1/health` — detailed JSON status (authenticated).
 - `GET /metrics` — Prometheus counters (logins, searches, ingests,
-  backups, ...) — public by design for scrape endpoints; put it behind
-  a firewall or reverse-proxy auth if your threat model requires.
+  backups, mutation-queue totals, ...) plus gauges for the mutation
+  queue depth, the oldest pending item's age, and
+  `mycelium2_llm_last_success_timestamp` (last successful LLM
+  completion; absent until the first success) — public by design for
+  scrape endpoints; put it behind a firewall or reverse-proxy auth if
+  your threat model requires.
 - Container healthcheck: the HTTP redirect listener answers on port
   80 (`curl http://127.0.0.1:80/`).
 
