@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-auth"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "argon2",
  "axum",
@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-cli"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-core"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "chrono",
  "regex",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-crypto"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "argon2",
  "hex",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-librarian"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "axum",
  "chrono",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-mcp"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "axum",
  "chrono",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-server"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-store"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "chrono",
  "flate2",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "mycelium-web"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "async-stream",
  "axum",
