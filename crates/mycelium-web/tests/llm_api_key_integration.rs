@@ -253,6 +253,17 @@ async fn admin_save_seals_key_never_renders_it_and_blank_keeps_it() {
     assert_eq!(resp.status(), 303);
     let cfg = stored_llm_config(dir.path()).await.expect("still stored");
     assert_eq!(cfg.api_key.as_deref(), Some(TEST_KEY));
+
+    // A whitespace-only value also counts as blank (trimmed) and keeps
+    // the stored key.
+    let resp = admin_save_llm(&cl, &base, &cookie, &csrf, &llm_url, Some(" \t\n")).await;
+    assert_eq!(resp.status(), 303);
+    let cfg = stored_llm_config(dir.path()).await.expect("still stored");
+    assert_eq!(
+        cfg.api_key.as_deref(),
+        Some(TEST_KEY),
+        "whitespace-only api_key must keep the stored key"
+    );
 }
 
 #[tokio::test]

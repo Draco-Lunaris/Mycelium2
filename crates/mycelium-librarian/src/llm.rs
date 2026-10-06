@@ -4,13 +4,29 @@
 //! with the OpenAI request/response shape. Timeouts are enforced so a
 //! hung backend can never wedge an ingest job.
 
+use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
+/// Redacted `Debug` so a future `debug!(cfg = ?cfg, ...)` site can't leak
+/// the key. (Not derived: derive(Debug) would print api_key verbatim.)
+macro_rules! debug_redacted {
+    ($name:ident { $($field:ident),+ $(,)? }, key: $key:ident) => {
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name))
+                    $(.field(stringify!($field), &self.$field))+
+                    .field(stringify!($key), &self.$key.as_ref().map(|_| "***"))
+                    .finish()
+            }
+        }
+    };
+}
 
 /// Admin-managed LLM backend config (stored in ConfigStore under "llm").
 /// Ollama default per DESIGN; any OpenAI-compatible endpoint works.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub url: String,
     pub model: String,
@@ -21,6 +37,8 @@ pub struct LlmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
+
+debug_redacted!(LlmConfig { url, model }, key: api_key);
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -137,7 +155,7 @@ fn record_llm_success() {
 }
 
 /// A client for one OpenAI-compatible endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
@@ -145,6 +163,8 @@ pub struct LlmClient {
     /// Bearer token attached to every request when configured.
     api_key: Option<String>,
 }
+
+debug_redacted!(LlmClient { http, base_url, model }, key: api_key);
 
 impl LlmClient {
     pub fn new(config: &LlmConfig) -> Self {
@@ -473,5 +493,25 @@ mod tests {
         assert_eq!(cfg.url, "http://b/v1");
         assert_eq!(cfg.model, "mycelium");
         assert_eq!(cfg.api_key, None);
+    }
+
+    #[test]
+    fn debug_impl_redacts_api_key() {
+        // A future debug!-formatting site must never leak the key.
+        let cfg = LlmConfig {
+            url: "http://b/v1".into(),
+            model: "m".into(),
+            api_key: Some("super-secret".into()),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("***"),
+            "key placeholder missing: {rendered}"
+        );
+        assert!(!rendered.contains("super-secret"), "key leaked: {rendered}");
+        let client = LlmClient::new(&cfg);
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("***"));
+        assert!(!rendered.contains("super-secret"));
     }
 }
