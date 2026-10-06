@@ -396,8 +396,8 @@ fn tool_call_response(id: &str, name: &str, args: serde_json::Value) -> serde_js
 }
 
 /// A test-owned drain worker over the booted server's data dir: same
-/// store, service key, and ConfigStore "llm" the binary's worker would
-/// read. `boot()` spawns NO drain worker (verified in Task 8), so the
+/// store and ConfigStore "llm" the binary's worker would read.
+/// `boot()` spawns NO drain worker (verified in Task 8), so the
 /// task-11 MCP-surface tests drive draining explicitly through this.
 /// The stub recovery returns the admin's master key — the only user
 /// with queue rows in these tests.
@@ -408,20 +408,12 @@ async fn test_worker(
     limits: QueueLimits,
 ) -> Arc<QueueWorker> {
     let store = Arc::new(Store::open(dir).await.unwrap());
-    let service_key =
-        Arc::new(mycelium_crypto::load_or_create_service_key_with(dir, None).unwrap());
     let config = Arc::new(ConfigStore::new(pool.clone()));
     let recovery: Arc<MasterKeyRecovery> = Arc::new(move |_uid| {
         let m = master.clone();
         Box::pin(async move { Ok(m) })
     });
-    Arc::new(QueueWorker::new(
-        store,
-        service_key,
-        config,
-        recovery,
-        limits,
-    ))
+    Arc::new(QueueWorker::new(store, config, recovery, limits))
 }
 
 // T6.1 — memory_add returns a receipt with LLM dead; row + payload +

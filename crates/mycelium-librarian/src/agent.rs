@@ -201,7 +201,12 @@ pub async fn run_query(
     Ok(QueryResult { answer, steps: 0 })
 }
 
-/// Run the agent in mutation mode (write tools enabled).
+/// Run the agent in mutation mode (write tools enabled) at the
+/// default `MAX_STEPS` cap, acquiring one global LLM permit.
+/// Intentional public API — the inline mutation entry point: the dream
+/// maintenance pass (`dream::run_dream`, POST /api/v1/dream) calls it
+/// in production. The queue drain does NOT use it — it runs
+/// `run_mutation_capped` instead, under its own permit and step cap.
 pub async fn run_mutation(
     client: &LlmClient,
     store: &ConceptStore<'_>,

@@ -7,7 +7,7 @@ use mycelium_core::concept::{Concept, Frontmatter};
 use mycelium_core::graph::{self, GraphHealth};
 use mycelium_core::search::SearchQuery;
 use mycelium_store::concept_store::{ConceptStore, ConceptStoreError};
-use mycelium_store::file_repo::FileRepo;
+use mycelium_store::file_repo::{FileRepo, Scope};
 use mycelium_store::models::{QueueStatus, QueueTool};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use schemars::JsonSchema;
@@ -284,7 +284,10 @@ fn receipt_text(id: Uuid) -> String {
 /// staging note (add only) → flip to pending → notify the drain
 /// worker. Returns the receipt id. Queue and store failures surface as
 /// ConceptStoreError (render_store_error maps capacity to a caller-
-/// visible retry hint, everything else to the internal-error arm).
+/// visible retry hint, everything else to the internal-error arm). A
+/// failure in a step after the row exists deads the row best-effort
+/// (`abandon_row`) so a stranded staging row can't hold a depth-cap
+/// slot until the next boot sweep.
 async fn enqueue_mutation(
     state: &McpState,
     user: &McpUser,
@@ -311,14 +314,27 @@ async fn enqueue_mutation(
         content: content.to_string(),
     };
     let repo = FileRepo::new(state.store.user_dir(user.user_id));
-    mutation_queue::write_payload(&repo, &master, id, &payload).await?;
+    if let Err(e) = mutation_queue::write_payload(&repo, &master, id, &payload).await {
+        // The row exists but can never become runnable: dead it
+        // best-effort so the depth cap isn't held until the boot sweep
+        // (the row stays — the receipt resolves to the dead state).
+        abandon_row(
+            state,
+            user.user_id,
+            &master,
+            id,
+            "enqueue failed: payload blob unwritable",
+        )
+        .await;
+        return Err(e.into());
+    }
 
     // 3. Staging note for add (spec D4): the content is searchable
     //    immediately while the integration runs in the background.
     //    The internal bypass — /mutation-queue/ is reserved for
     //    exactly this path.
     if tool == QueueTool::Add {
-        let cs = user_store(state, user.user_id, master);
+        let cs = user_store(state, user.user_id, master.clone());
         let note_path = mutation_queue::stage_note_path(id);
         let note = Concept::new(
             Frontmatter {
@@ -331,7 +347,17 @@ async fn enqueue_mutation(
             content.to_string(),
             note_path.clone(),
         );
-        cs.put_batch_internal(&[note]).await?;
+        if let Err(e) = cs.put_batch_internal(&[note]).await {
+            abandon_row(
+                state,
+                user.user_id,
+                &master,
+                id,
+                "enqueue failed: staging note unwritable",
+            )
+            .await;
+            return Err(e);
+        }
         // Hot memory (spec §3.3): the staging write joins the hot set,
         // mirroring the fallback's per-write registration.
         mycelium_librarian::hot_memory::record_hot_write(&cs.scope_id(), &note_path);
@@ -345,6 +371,36 @@ async fn enqueue_mutation(
     state.notify.notify_one();
 
     Ok(id)
+}
+
+/// Best-effort terminal cleanup for an enqueue whose row was created
+/// but a later step failed. Without this the row strands in `staging`,
+/// holding a depth-cap slot (and skewing /health) until the boot sweep.
+/// Also drops the payload blob any earlier step managed to write — a
+/// dead row's blob is never re-read (the recovery is a fresh enqueue),
+/// so it is deleted here rather than left on disk forever. Never
+/// deletes the row (the receipt still resolves to the dead state) and
+/// never masks the original error returned to the caller.
+async fn abandon_row(
+    state: &McpState,
+    user_id: Uuid,
+    master: &mycelium_crypto::keys::MasterKey,
+    id: Uuid,
+    why: &str,
+) {
+    if let Err(e) = state.store.mark_dead(id, why).await {
+        tracing::warn!(error = %e, receipt = %id, "cannot dead stranded enqueue row");
+    }
+    let repo = FileRepo::new(state.store.user_dir(user_id));
+    if let Err(e) = repo
+        .delete(
+            &mutation_queue::payload_path(id),
+            &Scope::User(master.clone()),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, receipt = %id, "stranded enqueue payload delete failed");
+    }
 }
 
 /// Kebab-case a string for use in a bundle path.

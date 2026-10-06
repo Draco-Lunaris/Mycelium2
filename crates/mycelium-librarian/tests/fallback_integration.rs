@@ -66,6 +66,14 @@ async fn addendum_appends_dated_block() {
     fallback::direct_write_add(&cs, "original content", Some("topic"), None, None)
         .await
         .unwrap();
+    // The add stamped the concept's frontmatter; the addendum must
+    // bump that timestamp, not just append the dated block.
+    let before = cs.get("/topic.md").await.unwrap();
+    let ts_before = before
+        .frontmatter
+        .timestamp
+        .clone()
+        .expect("direct_write_add stamps a timestamp");
     let p = fallback::dated_addendum_update(&cs, "correct the second paragraph", Some("/topic.md"))
         .await
         .unwrap();
@@ -73,6 +81,17 @@ async fn addendum_appends_dated_block() {
     let c = cs.get(&p).await.unwrap();
     assert!(c.body.contains("correct the second paragraph"));
     assert!(c.body.contains("<!-- mycelium2:update:"));
+    let ts_after = c
+        .frontmatter
+        .timestamp
+        .clone()
+        .expect("the addendum bumps the timestamp");
+    let parsed_before = chrono::DateTime::parse_from_rfc3339(&ts_before).unwrap();
+    let parsed_after = chrono::DateTime::parse_from_rfc3339(&ts_after).unwrap();
+    assert!(
+        parsed_after > parsed_before,
+        "timestamp must bump: {ts_before} -> {ts_after}"
+    );
     // No-match addendum is a NotFound.
     let err = fallback::dated_addendum_update(&cs, "no such topic anywhere", None).await;
     assert!(matches!(
@@ -95,8 +114,21 @@ async fn maintain_wires_orphans_and_flags_broken() {
     c.body.push_str("\n[missing](/ghost.md)\n");
     cs.put(&c).await.unwrap(); // cs is plain user scope; put is fine (not queue path)
     let summary = fallback::wire_and_flag_maintain(&cs).await.unwrap();
-    // Orphan wiring: one of the two same-topic concepts got linked.
+    // Orphan wiring: the summary reports the wiring count.
     assert!(summary.contains("wired"));
+    // ... and the wiring actually landed in the body — not just a
+    // summary that could say "wired" at zero wirings. topic-a2 is THE
+    // orphan (topic-a's broken link counts as a link in the graph's
+    // orphan exclusion, so it is never orphaned); the wiring appends
+    // the exact cross-link to its title-overlap twin.
+    assert!(
+        cs.get("/topic-a2.md")
+            .await
+            .unwrap()
+            .body
+            .contains("Related: [topic A body](/topic-a.md)"),
+        "topic-a2 must carry the real cross-link the run added"
+    );
     // Still absent — the broken link is only flagged in its owner.
     assert!(cs.get("/ghost.md").await.is_err());
     let flagged = cs.get("/topic-a.md").await.unwrap();

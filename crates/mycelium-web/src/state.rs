@@ -245,7 +245,6 @@ impl AppState {
         };
         let queue_worker = Arc::new(mycelium_librarian::queue_worker::QueueWorker::new(
             Arc::clone(&store),
-            Arc::new(service_key.clone()),
             Arc::clone(&config),
             recovery,
             mycelium_librarian::queue_worker::QueueLimits::default(),

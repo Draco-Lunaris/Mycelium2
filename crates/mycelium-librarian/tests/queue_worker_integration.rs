@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use axum::response::IntoResponse;
 use mycelium_core::concept::{Concept, Frontmatter};
 use mycelium_core::search::SearchQuery;
-use mycelium_crypto::keys::{MasterKey, ServiceKey};
+use mycelium_crypto::keys::MasterKey;
+use mycelium_crypto::store_keys::FileKeys;
 use mycelium_librarian::agent;
 use mycelium_librarian::fallback::derive_title;
 use mycelium_librarian::llm::{LlmClient, LlmConfig};
@@ -272,10 +273,8 @@ fn worker(
     limits: QueueLimits,
 ) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
     let config = Arc::new(ConfigStore::new(store.pool().clone()));
-    let service_key = Arc::new(ServiceKey::from_bytes(&[9u8; 32]).unwrap());
     let w = Arc::new(QueueWorker::new(
         Arc::clone(store),
-        service_key,
         Arc::clone(&config),
         recovery,
         limits,
@@ -379,6 +378,21 @@ async fn drain_integrates_queued_add() {
     // Staging note gone from the bundle.
     let note_path = mutation_queue::stage_note_path(id);
     assert!(!cs.list().await.unwrap().iter().any(|e| e.path == note_path));
+    // Terminal done: the payload blob is dropped (the integrated
+    // concept holds the content; nothing re-reads the blob).
+    let repo = FileRepo::new(store.user_dir(uid));
+    assert!(
+        mutation_queue::read_payload(&repo, &master, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "payload blob must be dropped at done"
+    );
+    let stored = FileKeys::from_master_key(&master).stored_name(&mutation_queue::payload_path(id));
+    assert!(
+        !store.user_dir(uid).join(stored).exists(),
+        "payload file must be physically gone"
+    );
     // The concept the mock's write_concept call supplied.
     let written = cs.get("/notes/drainme.md").await.unwrap();
     assert_eq!(written.body.trim(), "drain me please");
@@ -435,6 +449,16 @@ async fn dead_llm_retries_then_fallback() {
     let integrated = cs.get("/fallback-me.md").await.unwrap();
     assert_eq!(integrated.body.trim(), "fallback me");
     assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 1);
+    // Terminal done: the payload blob is dropped (the fallback-success
+    // arm of the terminal cleanup). That the fallback could read it on
+    // wake 2 also pins: the blob is NOT deleted before a retry.
+    assert!(
+        mutation_queue::read_payload(&FileRepo::new(store.user_dir(uid)), &master, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "payload blob must be dropped at done"
+    );
 }
 
 // ---------- T5.3: no capacity → the drain defers, never blocks ----------
@@ -570,6 +594,131 @@ async fn fallback_failure_marks_dead() {
         row.detail
     );
     assert_eq!(worker.dead_count.load(Ordering::Relaxed), 1);
+    // Terminal dead: the payload blob is dropped (the row — the
+    // receipt — persists; the staged content does not).
+    assert!(
+        mutation_queue::read_payload(&FileRepo::new(store.user_dir(uid)), &master, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "payload blob must be dropped at dead"
+    );
+}
+
+// ---------- T12.I1: error detail persisted into the row is bounded ----------
+//
+// LLM status errors embed the upstream HTTP body; the drain persists
+// error Display text into `detail` (re-served by receipts), so an
+// over-cap body must be truncated at the queue's 512-byte detail cap.
+// Also pins: the deterministic-error provenance keeps the
+// `integrated via deterministic fallback (...)` literal byte-exact
+// (the queue_totals LIKE discriminator depends on its prefix).
+#[tokio::test]
+async fn long_error_detail_is_bounded() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t12i1").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // Bodies far past the 512-byte cap; the distinctive tails sit well
+    // inside the LLM client's own 500-char body window but past the
+    // queue's detail window. LIFO: the older item runs first (its 500
+    // is the LAST script entry), the newer item's 400 second.
+    let body_500 = format!("{}TAILQZX9{}", "B".repeat(485), "C".repeat(100));
+    let body_400 = format!("{}NOLO_TAIL{}", "D".repeat(485), "E".repeat(100));
+    let (url, _mock) = mock_llm_status(vec![
+        (400, serde_json::json!(body_400)),
+        (500, serde_json::json!(body_500)),
+    ])
+    .await;
+    // Default limits: the 500 item re-arms with a 30 s backoff, so its
+    // failed-attempt detail stays observable on the row.
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let id_retry = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "bound my retry error detail" }),
+        "bound my retry error detail",
+    )
+    .await;
+    let id_det = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "bound my deterministic error detail" }),
+        "bound my deterministic error detail",
+    )
+    .await;
+
+    assert_eq!(worker.run_pending().await.unwrap(), 2);
+
+    // Site 1 — "attempt {n}: {e}" on the retry path: bounded, marker
+    // present, past-cap tail absent. "attempt 1: " + capped error
+    // (512) + marker ("…" is 3 bytes → 15).
+    let row = store.queue_item(uid, id_retry).await.unwrap().unwrap();
+    assert_eq!(row.attempts, 1);
+    assert!(
+        row.detail.starts_with("attempt 1: "),
+        "failed-attempt context prefixes the detail: {}",
+        row.detail
+    );
+    assert!(
+        row.detail.contains("[truncated]"),
+        "over-cap detail carries the truncation marker: {}",
+        row.detail
+    );
+    assert!(
+        !row.detail.contains("TAILQZX9"),
+        "content past the cap must not persist: {}",
+        row.detail
+    );
+    assert!(
+        row.detail.len() <= "attempt 1: ".len() + 512 + "… [truncated]".len(),
+        "detail: {}",
+        row.detail
+    );
+
+    // Site 3 — "deterministic error: {e}" as the fallback provenance:
+    // the pinned literal stays byte-exact around the bounded error,
+    // so the queue_totals LIKE discriminator still matches.
+    let row = store.queue_item(uid, id_det).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Done);
+    assert!(
+        row.detail
+            .starts_with("integrated via deterministic fallback (deterministic error: "),
+        "pinned provenance literal intact: {}",
+        row.detail
+    );
+    assert!(
+        row.detail.contains("[truncated]"),
+        "bounded provenance carries the marker: {}",
+        row.detail
+    );
+    assert!(
+        !row.detail.contains("NOLO_TAIL"),
+        "content past the cap must not persist: {}",
+        row.detail
+    );
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.fallback, 1, "discriminator still matches");
+    assert_eq!(totals.integrated, 0);
 }
 
 // ---------- T5.6: boot sweep reconciles interrupted state ----------
@@ -1291,6 +1440,14 @@ async fn persistent_failure_goes_dead_then_recovers() {
     );
     assert_eq!(worker.dead_count.load(Ordering::Relaxed), 1);
     assert_eq!(store.queue_totals().await.unwrap().dead, 1);
+    // Terminal dead: the payload blob is dropped; the row persists.
+    assert!(
+        mutation_queue::read_payload(&FileRepo::new(store.user_dir(uid)), &master, dead_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "payload blob must be dropped at dead"
+    );
 
     // Operator recovery: the backend answers again (fresh mock) and a
     // NEW enqueue integrates — the dead row is never resurrected.

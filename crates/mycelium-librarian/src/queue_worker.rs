@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use mycelium_crypto::keys::{MasterKey, ServiceKey};
+use mycelium_crypto::keys::MasterKey;
 use mycelium_crypto::store_keys::FileKeys;
 use mycelium_store::config::ConfigStore;
-use mycelium_store::file_repo::FileRepo;
+use mycelium_store::file_repo::{FileRepo, Scope};
 use mycelium_store::models::{MutationQueueItem, QueueStatus, QueueTool};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use mycelium_store::{ConceptStore, ConceptStoreError, Store};
@@ -68,17 +68,41 @@ impl Default for QueueLimits {
     }
 }
 
+// ---- error-detail bounding (I1) ----
+
+/// Cap on error text persisted into `mutation_queue.detail` (and
+/// re-served through receipts): LLM status errors embed upstream HTTP
+/// bodies, so the drain bounds what it persists.
+const DETAIL_CAP: usize = 512;
+
+/// Bound an error's Display text for the `detail` column: byte-safe
+/// truncation at the cap, cut on a char boundary, with the marker
+/// appended only when something was actually cut. Short errors pass
+/// through unchanged.
+fn short_detail(e: impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    if s.len() <= DETAIL_CAP {
+        return s;
+    }
+    let mut end = DETAIL_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &s[..end])
+}
+
 // ---- worker ----
 
 pub struct QueueWorker {
     pub store: Arc<Store>,
-    pub service_key: Arc<ServiceKey>,
     pub config: Arc<ConfigStore>,
     pub recovery: Arc<MasterKeyRecovery>,
     pub notify: Arc<tokio::sync::Notify>,
     pub limits: QueueLimits,
-    /// Fallback-integration counter (mirrors the /metrics gauge;
-    /// atomic so the drain can bump it without the web layer).
+    /// Fallback-integration counter. In-process test-visibility aid
+    /// only — /metrics does NOT read this atomic; it reads the durable
+    /// SQL COUNTs in `Store::queue_totals`, which survive restarts
+    /// (this resets with the process).
     pub fallback_count: AtomicU64,
     pub dead_count: AtomicU64,
     pub integrated_count: AtomicU64,
@@ -111,14 +135,12 @@ pub async fn llm_config(config: &ConfigStore) -> LlmConfig {
 impl QueueWorker {
     pub fn new(
         store: Arc<Store>,
-        service_key: Arc<ServiceKey>,
         config: Arc<ConfigStore>,
         recovery: Arc<MasterKeyRecovery>,
         limits: QueueLimits,
     ) -> Self {
         Self {
             store,
-            service_key,
             config,
             recovery,
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -216,6 +238,9 @@ impl QueueWorker {
             let master = match ((self.recovery)(item.user_id)).await {
                 Ok(m) => m,
                 Err(_) => {
+                    // No key → the blob's stored name cannot be derived,
+                    // so terminal cleanup can only skip it (it stays
+                    // sealed, same as the row's content).
                     self.store
                         .mark_dead(
                             item.id,
@@ -238,6 +263,10 @@ impl QueueWorker {
                     )
                     .await
                     .map_err(QueueWorkerError::Queue)?;
+                // Terminal dead: drop the blob (no-op here — the
+                // existence check just proved it absent; kept for
+                // uniformity with the other dead flips).
+                self.delete_payload(item.user_id, &master, item.id).await;
             }
         }
         Ok(())
@@ -294,6 +323,9 @@ impl QueueWorker {
                         )
                         .await
                         .map_err(QueueWorkerError::Queue)?;
+                // Terminal dead: drop the blob (a no-op when absent; a
+                // present-but-unparseable one gets cleaned up too).
+                self.delete_payload(uid, &master, item.id).await;
                 self.reconcile_notes(uid).await;
                 return Ok(true);
             }
@@ -302,9 +334,14 @@ impl QueueWorker {
                 // Unseal/corrupt errors: dead (content unreadable;
                 // a retry can't fix a key/path mismatch).
                 self.store
-                    .mark_dead(item.id, &format!("payload unreadable: {e}"))
+                    .mark_dead(
+                        item.id,
+                        &format!("payload unreadable: {}", short_detail(&e)),
+                    )
                     .await
                     .map_err(QueueWorkerError::Queue)?;
+                // Terminal dead: the blob is unreadable garbage — drop it.
+                self.delete_payload(uid, &master, item.id).await;
                 self.reconcile_notes(uid).await;
                 return Ok(true);
             }
@@ -328,7 +365,7 @@ impl QueueWorker {
             Ok(res) => {
                 drop(permit);
                 let cs = self.user_cs(uid, &master);
-                self.finish_success(&item, &cs, res).await?;
+                self.finish_success(&item, &master, &cs, res).await?;
                 Ok(true)
             }
             Err(e) => {
@@ -347,7 +384,11 @@ impl QueueWorker {
                     let next =
                         (chrono::Utc::now() + chrono::Duration::seconds(backoff)).to_rfc3339();
                     self.store
-                        .mark_failed(item.id, next, &format!("attempt {}: {e}", item.attempts))
+                        .mark_failed(
+                            item.id,
+                            next,
+                            &format!("attempt {}: {}", item.attempts, short_detail(&e)),
+                        )
                         .await
                         .map_err(QueueWorkerError::Queue)?;
                     Ok(true)
@@ -356,7 +397,7 @@ impl QueueWorker {
                     // in-flight deadline pass → fallback (the
                     // provenance names which).
                     let why = if !Self::is_transient(&e) {
-                        format!("deterministic error: {e}")
+                        format!("deterministic error: {}", short_detail(&e))
                     } else {
                         format!(
                             "attempts exhausted ({} of {})",
@@ -445,6 +486,9 @@ impl QueueWorker {
         provenance: &str,
     ) -> Result<(), QueueWorkerError> {
         let Some(master) = master else {
+            // No key → the payload blob's stored name cannot be derived,
+            // so terminal cleanup can only skip it (it stays sealed and
+            // unrecoverable, same as the row's content).
             self.store
                 .mark_dead(item.id, "fallback unavailable: master-key recovery failed")
                 .await
@@ -464,6 +508,9 @@ impl QueueWorker {
                 )
                 .await
                 .map_err(QueueWorkerError::Queue)?;
+            // Terminal dead: drop the blob (no-op when absent; cleans a
+            // present-but-unparseable one).
+            self.delete_payload(item.user_id, master, item.id).await;
             self.dead_count.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
@@ -508,16 +555,21 @@ impl QueueWorker {
                     )
                     .await
                     .map_err(QueueWorkerError::Queue)?;
+                // Terminal done: drop the payload blob (the integrated
+                // concept holds the content now).
+                self.delete_payload(item.user_id, master, item.id).await;
                 self.delete_staging_note(&cs, item.id).await?;
                 self.fallback_count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
                 self.store
-                    .mark_dead(item.id, &format!("fallback failed: {e}"))
+                    .mark_dead(item.id, &format!("fallback failed: {}", short_detail(&e)))
                     .await
                     .map_err(QueueWorkerError::Queue)?;
-                // Note cleanup is best-effort even on dead.
+                // Terminal dead: drop the payload blob, then the note
+                // cleanup (best-effort even on dead).
+                self.delete_payload(item.user_id, master, item.id).await;
                 self.delete_staging_note(&cs, item.id).await?;
                 self.dead_count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -526,10 +578,11 @@ impl QueueWorker {
     }
 
     /// Terminal success from an agent run: mark done with the run's
-    /// files + summary, drop the staging note.
+    /// files + summary, drop the payload blob and the staging note.
     async fn finish_success(
         &self,
         item: &MutationQueueItem,
+        master: &MasterKey,
         cs: &ConceptStore<'_>,
         res: MutationResult,
     ) -> Result<(), QueueWorkerError> {
@@ -537,9 +590,34 @@ impl QueueWorker {
             .mark_done(item.id, &res.files_changed, &res.summary)
             .await
             .map_err(QueueWorkerError::Queue)?;
+        // Terminal done: drop the payload blob (the integrated concept
+        // holds the content now).
+        self.delete_payload(item.user_id, master, item.id).await;
         self.delete_staging_note(cs, item.id).await?;
         self.integrated_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Delete an item's staged payload blob (the user-scope FileRepo
+    /// file at /mutation-queue/<id>): terminal cleanup. After done the
+    /// integrated concept holds the content; after dead the recovery
+    /// is a fresh enqueue — nothing ever re-reads the blob past the
+    /// terminal flip, so it is dropped there (only there: the retry
+    /// path re-reads it between attempts). Best-effort — a failure
+    /// logs and never fails the row transition; a missing blob is
+    /// already the desired state (delete is a no-op), and a
+    /// present-but-corrupt one is cleaned up too.
+    async fn delete_payload(&self, uid: Uuid, master: &MasterKey, id: Uuid) {
+        let repo = FileRepo::new(self.store.user_dir(uid));
+        if let Err(e) = repo
+            .delete(
+                &mutation_queue::payload_path(id),
+                &Scope::User(master.clone()),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, receipt = %id, "terminal payload-blob delete failed");
+        }
     }
 
     /// Delete an item's staging note (present only for `add` items);
@@ -638,5 +716,29 @@ impl QueueWorker {
             // BadToolArgs and Store errors are deterministic.
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_detail;
+
+    #[test]
+    fn short_detail_caps_byte_safe() {
+        // Under the cap: unchanged, no marker.
+        assert_eq!(short_detail("boom"), "boom");
+        assert_eq!(short_detail("x".repeat(512)), "x".repeat(512));
+        // Over the cap (ASCII): cut at the cap + marker.
+        let out = short_detail("x".repeat(600));
+        assert_eq!(out.len(), 512 + "… [truncated]".len());
+        assert!(out.ends_with("[truncated]"));
+        // Over the cap (multibyte): the cut backs off to a char
+        // boundary — no panic, never past the cap + marker. "€" is
+        // 3 bytes, so byte 512 lands mid-char and the back-off loop
+        // must move the cut to 510.
+        let out = short_detail("€".repeat(200)); // 600 bytes
+        assert!(out.ends_with("[truncated]"));
+        assert_eq!(out.len(), 510 + "… [truncated]".len());
+        assert!(out.starts_with(&"€".repeat(100)));
     }
 }

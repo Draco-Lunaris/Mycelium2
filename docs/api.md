@@ -69,11 +69,11 @@ shelf must be global-read (or the caller is an admin).
 Detailed JSON health (authenticated). `GET /health` (public coarse
 status plus the mutation-queue fields `queue_depth`,
 `oldest_pending_age_seconds`, `queue_dead_count`, and
-`llm_last_success_seconds`; it answers 503 `degraded` when any queued
-item is dead or a pending item has waited past twice the integration
-deadline) and `GET /metrics` (Prometheus text) live outside `/api/v1`
-and are public by design — for container orchestration and scrape
-endpoints.
+`llm_last_success_seconds`; it answers 503 `degraded` when the
+database is unreachable, any queued item is dead, or a pending item
+has waited past twice the integration deadline) and `GET /metrics`
+(Prometheus text) live outside `/api/v1` and are public by design —
+for container orchestration and scrape endpoints.
 
 ## Error shape
 
