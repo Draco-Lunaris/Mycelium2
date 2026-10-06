@@ -23,10 +23,15 @@ data directory — without it, global data is unrecoverable.
 Stored in SQLite, edited via the admin portal — no environment
 variables for runtime settings:
 
-- **LLM backend** — OpenAI-compatible base URL + model. Default
-  `http://localhost:11434/v1` (Ollama). Used by the librarian for
-  chapter/section extraction; unreachable backends fall back to a
-  heuristic catalog (ingest never fails on LLM errors).
+- **LLM backend** — OpenAI-compatible base URL + model, plus an
+  optional API key (sent as a Bearer auth header when set, omitted
+  otherwise — keyless endpoints like plain Ollama keep working). The
+  key is sealed at rest with the service key and never rendered back
+  (the form shows only whether one is stored); a blank save keeps the
+  stored key. Default `http://localhost:11434/v1` (Ollama). Used by
+  the librarian for chapter/section extraction and the /chat agent;
+  unreachable backends fall back to a heuristic catalog (ingest never
+  fails on LLM errors).
 - **Upload limits** — maximum book upload size (MiB, 1–255; default
   32, the original Mycelium's default). Takes effect immediately.
 - **Security settings** — tunable within guardrails (out-of-range

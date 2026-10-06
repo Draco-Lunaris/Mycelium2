@@ -4,23 +4,48 @@
 //! with the OpenAI request/response shape. Timeouts are enforced so a
 //! hung backend can never wedge an ingest job.
 
+use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
+/// Redacted `Debug` so a future `debug!(cfg = ?cfg, ...)` site can't leak
+/// the key. (Not derived: derive(Debug) would print api_key verbatim.)
+macro_rules! debug_redacted {
+    ($name:ident { $($field:ident),+ $(,)? }, key: $key:ident) => {
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name))
+                    $(.field(stringify!($field), &self.$field))+
+                    .field(stringify!($key), &self.$key.as_ref().map(|_| "***"))
+                    .finish()
+            }
+        }
+    };
+}
 
 /// Admin-managed LLM backend config (stored in ConfigStore under "llm").
 /// Ollama default per DESIGN; any OpenAI-compatible endpoint works.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub url: String,
     pub model: String,
+    /// Optional bearer token for endpoints that require auth (an
+    /// API-key gateway). Sealed at rest by the admin surface; sent as
+    /// `Authorization: Bearer <api_key>` when present, no header when
+    /// absent (keyless endpoints keep working).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
+
+debug_redacted!(LlmConfig { url, model }, key: api_key);
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             url: "http://localhost:11434/v1".into(),
             model: "default".into(),
+            api_key: None,
         }
     }
 }
@@ -130,12 +155,16 @@ fn record_llm_success() {
 }
 
 /// A client for one OpenAI-compatible endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    /// Bearer token attached to every request when configured.
+    api_key: Option<String>,
 }
+
+debug_redacted!(LlmClient { http, base_url, model }, key: api_key);
 
 impl LlmClient {
     pub fn new(config: &LlmConfig) -> Self {
@@ -147,7 +176,23 @@ impl LlmClient {
                 .expect("reqwest client"),
             base_url: config.url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
+            api_key: config.api_key.clone(),
         }
+    }
+
+    /// The chat-completions request with auth (Bearer when a key is
+    /// configured, bare otherwise) — the single POST site both send
+    /// paths go through.
+    async fn post_chat(
+        &self,
+        url: &str,
+        body: &ChatRequest<'_>,
+    ) -> Result<reqwest::Response, LlmError> {
+        let mut request = self.http.post(url);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        Ok(request.json(body).send().await?)
     }
 
     /// Send a single user-message prompt; returns the assistant text.
@@ -185,7 +230,7 @@ impl LlmClient {
             temperature,
             tools: None,
         };
-        let response = self.http.post(&url).json(&body).send().await?;
+        let response = self.post_chat(&url, &body).await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -259,7 +304,7 @@ impl LlmClient {
             temperature,
             tools: Some(tools),
         };
-        let response = self.http.post(&url).json(&body).send().await?;
+        let response = self.post_chat(&url, &body).await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -341,6 +386,12 @@ pub fn strip_code_fence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    // The header tests need axum + IntoResponse; axum is a dev-dependency
+    // (re-exported here via the workspace dep in tests), so these imports
+    // are test-scope only.
+    use axum::response::IntoResponse;
 
     #[test]
     fn strips_fences() {
@@ -355,7 +406,112 @@ mod tests {
         let client = LlmClient::new(&LlmConfig {
             url: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
+            api_key: None,
         });
         assert!(client.chat("hi").await.is_err());
+    }
+
+    /// An axum mock that echoes back the request's Authorization header
+    /// (`Some("Bearer ...")`, or None when the header is absent) so
+    /// tests can assert exactly what the client put on the wire.
+    async fn auth_echo_mock() -> (String, Arc<tokio::sync::Mutex<Option<String>>>) {
+        type Captured = Arc<tokio::sync::Mutex<Option<String>>>;
+        let state: Captured = Arc::new(tokio::sync::Mutex::new(None));
+        let handler_state = Arc::clone(&state);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let state = handler_state;
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
+                    *state.lock().await = auth;
+                    axum::Json(serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), state)
+    }
+
+    #[tokio::test]
+    async fn bearer_header_sent_when_key_configured() {
+        let (url, captured) = auth_echo_mock().await;
+        let client = LlmClient::new(&LlmConfig {
+            url: url.clone(),
+            model: "m".into(),
+            api_key: Some("test-secret".into()),
+        });
+        assert_eq!(client.chat("hi").await.unwrap(), "ok");
+        let seen = captured.lock().await.clone();
+        let expected = Some("Bearer test-secret".to_string());
+        assert_eq!(seen, expected, "plain chat must send the Bearer header");
+        // One generation with tools goes through the same POST site.
+        let no_params = serde_json::json!({});
+        let spec = tool_spec("noop", "nothing", &no_params);
+        let step = client
+            .chat_with_tools("sys", &[], &[spec], 0.2)
+            .await
+            .unwrap();
+        assert!(matches!(step, StepOutput::Text(_)));
+        let seen = captured.lock().await.clone();
+        assert_eq!(
+            seen, expected,
+            "Authorization: Bearer must ride both send paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_header_without_key() {
+        let (url, captured) = auth_echo_mock().await;
+        let client = LlmClient::new(&LlmConfig {
+            url,
+            model: "m".into(),
+            api_key: None,
+        });
+        assert_eq!(client.chat("hi").await.unwrap(), "ok");
+        let seen = captured.lock().await.clone();
+        assert_eq!(
+            seen, None,
+            "no Authorization header may be sent for a keyless endpoint"
+        );
+    }
+
+    #[test]
+    fn legacy_config_json_parses_without_api_key() {
+        // What v0.2.0-beta.1's admin surface wrote: no api_key field.
+        let cfg: LlmConfig =
+            serde_json::from_str(r#"{"url": "http://b/v1", "model": "mycelium"}"#).unwrap();
+        assert_eq!(cfg.url, "http://b/v1");
+        assert_eq!(cfg.model, "mycelium");
+        assert_eq!(cfg.api_key, None);
+    }
+
+    #[test]
+    fn debug_impl_redacts_api_key() {
+        // A future debug!-formatting site must never leak the key.
+        let cfg = LlmConfig {
+            url: "http://b/v1".into(),
+            model: "m".into(),
+            api_key: Some("super-secret".into()),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("***"),
+            "key placeholder missing: {rendered}"
+        );
+        assert!(!rendered.contains("super-secret"), "key leaked: {rendered}");
+        let client = LlmClient::new(&cfg);
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("***"));
+        assert!(!rendered.contains("super-secret"));
     }
 }

@@ -70,13 +70,12 @@ impl LibrarianWorker {
         }
     }
 
-    /// The current LLM config (admin-managed; Ollama default).
+    /// The current LLM config (admin-managed; Ollama default). Sealed
+    /// rows decrypt under the service key; legacy plaintext rows read
+    /// as before.
     async fn llm_config(&self) -> LlmConfig {
-        self.config
-            .get::<LlmConfig>("llm")
+        mycelium_store::config::get_sealed(&self.config, &self.service_key, "llm")
             .await
-            .ok()
-            .flatten()
             .unwrap_or_default()
     }
 

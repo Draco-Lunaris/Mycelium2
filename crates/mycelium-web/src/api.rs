@@ -1271,8 +1271,11 @@ pub async fn admin_view(
     )
     .await
     .is_some();
-    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
-    let llm = llm.unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
+    let llm_api_key_set = llm.api_key.is_some();
     let upload = state.upload_config().await;
     let security = state.security_config().await;
     let shelves = state.store.list_bookshelves().await.unwrap_or_default();
@@ -1304,6 +1307,7 @@ pub async fn admin_view(
         oidc,
         &llm.url,
         &llm.model,
+        llm_api_key_set,
         upload.max_book_mib,
         &security,
         &shelf_tuples,
@@ -1397,24 +1401,46 @@ pub async fn admin_save_oidc(
 pub struct LlmForm {
     pub url: String,
     pub model: String,
+    /// Blank = keep the currently stored key (no approved way to clear
+    /// a key exists; re-saving the config without a key is done by the
+    /// admin re-entering the URL/model with the key field cleared only
+    /// from a keyless state).
+    pub api_key: Option<String>,
 }
 
-/// POST /admin/llm — save the LLM config (admin only).
+/// POST /admin/llm — save the LLM config (admin only). The whole config
+/// (api_key is the sensitive part) seals under the service key before
+/// storage, mirroring the OIDC secret handling. A blank api_key keeps
+/// the stored key; the key is never rendered back to the browser.
 pub async fn admin_save_llm(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
     axum::Form(form): axum::Form<LlmForm>,
 ) -> Response {
-    let _ = state
-        .config
-        .set(
-            "llm",
-            &crate::LlmConfig {
-                url: form.url,
-                model: form.model,
-            },
-        )
-        .await;
+    // The existing config (blank-key keep + legacy row migration both
+    // read through it) or the default.
+    let existing =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
+    let api_key = match form.api_key.as_deref().map(str::trim) {
+        None | Some("") => existing.api_key,
+        Some(k) => Some(k.to_string()),
+    };
+    let cfg = crate::LlmConfig {
+        url: form.url.trim().to_string(),
+        model: form.model.trim().to_string(),
+        api_key,
+    };
+    // Seal (serialize + AEAD); a failure must not land plaintext.
+    let sealed = crate::state::seal_config(&state.service_key, "llm", &cfg);
+    if let Err(e) = state.config.set("llm", &sealed).await {
+        return Redirect::to(&format!(
+            "/admin?error={}",
+            pages::urlencoding_encode(&e.to_string())
+        ))
+        .into_response();
+    }
     Redirect::to("/admin").into_response()
 }
 
@@ -1792,8 +1818,10 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
-    let llm = llm.unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     let scopes = build_agent_scopes(
         &state.store,
@@ -1824,8 +1852,10 @@ pub async fn api_chat(
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
-    let llm = llm.unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Multi-turn memory: the session's prior turns + this message.
     let mut history = state.chat_history.get(session.0);
@@ -1883,8 +1913,10 @@ pub async fn api_chat_stream(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let llm: Option<crate::LlmConfig> = state.config.get("llm").await.unwrap_or(None);
-    let llm = llm.unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Multi-turn memory: the session's prior turns + this message.
     let mut history = state.chat_history.get(session.0);

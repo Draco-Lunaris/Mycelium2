@@ -222,9 +222,11 @@ impl AppState {
         let pool = store.pool().clone();
         let store = Arc::new(store);
         let config = Arc::new(ConfigStore::new(pool.clone()));
+        let service_key =
+            Arc::new(ServiceKey::from_bytes(service_key.as_bytes()).expect("32 bytes"));
         let librarian = Arc::new(mycelium_librarian::LibrarianWorker::new(
             Arc::clone(&store),
-            Arc::new(service_key.clone()),
+            Arc::clone(&service_key),
             Arc::clone(&config),
         ));
         // One master-key cache per process: login, API keys, and the
@@ -235,7 +237,7 @@ impl AppState {
         let recovery: Arc<mycelium_librarian::queue_worker::MasterKeyRecovery> = {
             let cache = Arc::clone(&master_keys);
             let s = Arc::clone(&store);
-            let k = Arc::new(service_key.clone());
+            let k = Arc::clone(&service_key);
             Arc::new(move |uid| {
                 let cache = cache.clone();
                 let s = s.clone();
@@ -247,18 +249,19 @@ impl AppState {
             Arc::clone(&store),
             Arc::clone(&config),
             recovery,
+            Arc::clone(&service_key),
             mycelium_librarian::queue_worker::QueueLimits::default(),
         ));
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
-        let login = login.with_service_key(service_key.clone());
+        let login = login.with_service_key((*service_key).clone());
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),
             sessions: Arc::new(SessionManager::new(pool.clone())),
             config,
             login: Arc::new(login),
-            service_key: Arc::new(service_key),
+            service_key,
             master_keys,
             metrics: Arc::new(Metrics::default()),
             librarian,
@@ -301,23 +304,23 @@ impl AppState {
 
 /// Derive the DEK used for encrypted config values (purpose-bound).
 pub fn config_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
-    let mut material = [0u8; 32];
-    let _ = hk.expand(b"mycelium2/config-dek/v1", &mut material);
-    mycelium_crypto::keys::Dek::from_bytes(&material).expect("32 bytes")
+    mycelium_store::config::config_dek(service_key)
+}
+
+/// Seal a config value for the config table (hex envelope; JSON +
+/// AEAD, purpose `mycelium2/config-{key}/v1`). The web layer uses this
+/// for every sensitive admin config (OIDC secret, LLM api_key).
+pub fn seal_config<T: serde::Serialize>(service_key: &ServiceKey, key: &str, value: &T) -> String {
+    mycelium_store::config::seal_config(service_key, key, value)
 }
 
 /// Read + decrypt an encrypted config value (hex envelope) stored under
-/// `key`; None when absent or corrupt.
+/// `key`; None when absent or corrupt. Legacy plaintext-JSON rows (pre-
+/// sealing) stay readable.
 pub async fn decrypt_config<T: serde::de::DeserializeOwned>(
     config: &ConfigStore,
     service_key: &ServiceKey,
     key: &str,
 ) -> Option<T> {
-    let sealed_hex: Option<String> = config.get(key).await.ok().flatten();
-    let sealed = hex::decode(sealed_hex?).ok()?;
-    let aad = format!("mycelium2/config-{key}/v1");
-    let plain =
-        mycelium_crypto::aead::aead_open(&sealed, aad.as_bytes(), &config_dek(service_key)).ok()?;
-    serde_json::from_slice(&plain).ok()
+    mycelium_store::config::get_sealed(config, service_key, key).await
 }

@@ -551,6 +551,7 @@ pub fn admin_page(
     oidc_configured: bool,
     llm_url: &str,
     llm_model: &str,
+    llm_api_key_set: bool,
     max_book_mib: u64,
     security: &crate::state::SecurityConfig,
     bookshelves: &[(String, bool)],
@@ -608,6 +609,8 @@ pub fn admin_page(
     } else {
         "not configured"
     };
+    // Status only — the key itself is never rendered back to the browser.
+    let llm_api_key_status = if llm_api_key_set { "stored" } else { "not set" };
     let body = format!(
         r#"<h1>Admin</h1>
 {}
@@ -632,9 +635,11 @@ pub fn admin_page(
   <button type="submit">Save OIDC config</button>
 </form>
 <h2>LLM backend</h2>
+<p class="muted">API key: {llm_api_key_status}</p>
 <form method="post" action="/admin/llm">
   <label>OpenAI-compatible base URL</label><input name="url" value="{}">
   <label>Model</label><input name="model" value="{}">
+  <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
   <button type="submit">Save LLM config</button>
 </form>
 <h2>Bookshelves</h2>

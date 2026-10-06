@@ -413,7 +413,19 @@ async fn test_worker(
         let m = master.clone();
         Box::pin(async move { Ok(m) })
     });
-    Arc::new(QueueWorker::new(store, config, recovery, limits))
+    // These tests only exercise legacy plaintext / default config rows;
+    // the key just satisfies the (unused) sealed-decrypt seam.
+    let sk = mycelium_crypto::keys::ServiceKey::from_bytes(
+        mycelium_crypto::generate_master_key().as_bytes(),
+    )
+    .expect("32 bytes");
+    Arc::new(QueueWorker::new(
+        store,
+        config,
+        recovery,
+        Arc::new(sk),
+        limits,
+    ))
 }
 
 // T6.1 — memory_add returns a receipt with LLM dead; row + payload +

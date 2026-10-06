@@ -773,6 +773,7 @@ Deep content.
         let client = LlmClient::new(&crate::llm::LlmConfig {
             url: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
+            api_key: None,
         });
         let catalog = build_catalog(Some(&client), "my-book", "My Book", &outline, BOOK).await;
         assert_eq!(catalog.title, "My Book");

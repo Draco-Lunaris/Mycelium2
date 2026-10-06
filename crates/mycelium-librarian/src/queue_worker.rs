@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use mycelium_crypto::keys::MasterKey;
+use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_crypto::store_keys::FileKeys;
 use mycelium_store::config::ConfigStore;
 use mycelium_store::file_repo::{FileRepo, Scope};
@@ -97,6 +97,8 @@ pub struct QueueWorker {
     pub store: Arc<Store>,
     pub config: Arc<ConfigStore>,
     pub recovery: Arc<MasterKeyRecovery>,
+    /// The service key, needed to decrypt the sealed LLM config row.
+    pub service_key: Arc<ServiceKey>,
     pub notify: Arc<tokio::sync::Notify>,
     pub limits: QueueLimits,
     /// Fallback-integration counter. In-process test-visibility aid
@@ -120,15 +122,13 @@ pub enum QueueWorkerError {
     File(#[from] mycelium_store::file_repo::FileRepoError),
 }
 
-/// The drain's LLM backend config (admin-managed key "llm"); config
-/// errors degrade to the default (Ollama localhost) — the drain's own
-/// retry/fallback handles an unreachable backend.
-pub async fn llm_config(config: &ConfigStore) -> LlmConfig {
-    config
-        .get::<LlmConfig>("llm")
+/// The drain's LLM backend config (admin-managed key "llm"): sealed
+/// rows decrypt under the service key, legacy plaintext rows read as
+/// before; config errors degrade to the default (Ollama localhost) —
+/// the drain's own retry/fallback handles an unreachable backend.
+pub async fn llm_config(config: &ConfigStore, service_key: &ServiceKey) -> LlmConfig {
+    mycelium_store::config::get_sealed(config, service_key, "llm")
         .await
-        .ok()
-        .flatten()
         .unwrap_or_default()
 }
 
@@ -137,12 +137,14 @@ impl QueueWorker {
         store: Arc<Store>,
         config: Arc<ConfigStore>,
         recovery: Arc<MasterKeyRecovery>,
+        service_key: Arc<ServiceKey>,
         limits: QueueLimits,
     ) -> Self {
         Self {
             store,
             config,
             recovery,
+            service_key,
             notify: Arc::new(tokio::sync::Notify::new()),
             limits,
             fallback_count: AtomicU64::new(0),
@@ -423,7 +425,7 @@ impl QueueWorker {
         payload: &MutationPayload,
     ) -> Result<MutationResult, AgentError> {
         let uid = item.user_id;
-        let client = LlmClient::new(&llm_config(&self.config).await);
+        let client = LlmClient::new(&llm_config(&self.config, &self.service_key).await);
         let cs = self.user_cs(uid, master);
         let scopes = AgentScopes {
             skills: None,
