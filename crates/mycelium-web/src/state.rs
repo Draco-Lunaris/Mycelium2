@@ -204,6 +204,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// The in-process librarian (book ingest worker).
     pub librarian: Arc<mycelium_librarian::LibrarianWorker>,
+    /// The mutation-queue drain worker (Phase 11).
+    pub queue_worker: Arc<mycelium_librarian::queue_worker::QueueWorker>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
     /// Librarian chat history per session (multi-turn memory).
@@ -225,6 +227,28 @@ impl AppState {
             Arc::new(service_key.clone()),
             Arc::clone(&config),
         ));
+        // One master-key cache per process: login, API keys, and the
+        // queue worker's recovery path all see the same unwrapped keys.
+        let master_keys = Arc::new(MasterKeyCache::default());
+        // Mutation-queue drain worker (spec: Phase 11). Recovery seam =
+        // the shared master-key cache + service key.
+        let recovery: Arc<mycelium_librarian::queue_worker::MasterKeyRecovery> = {
+            let cache = Arc::clone(&master_keys);
+            let s = Arc::clone(&store);
+            let k = Arc::new(service_key.clone());
+            Arc::new(move |uid| {
+                let cache = cache.clone();
+                let s = s.clone();
+                let k = k.clone();
+                Box::pin(async move { cache.for_user(&s, &k, uid).await })
+            })
+        };
+        let queue_worker = Arc::new(mycelium_librarian::queue_worker::QueueWorker::new(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            recovery,
+            mycelium_librarian::queue_worker::QueueLimits::default(),
+        ));
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
         let login = login.with_service_key(service_key.clone());
@@ -235,40 +259,20 @@ impl AppState {
             config,
             login: Arc::new(login),
             service_key: Arc::new(service_key),
-            master_keys: Arc::new(MasterKeyCache::default()),
+            master_keys,
             metrics: Arc::new(Metrics::default()),
             librarian,
+            queue_worker,
             assets_dir,
             chat_history: Arc::new(ChatHistory::default()),
         }
     }
 
-    /// Fetch (or recover) a user's master key: cache → service-key seal.
+    /// Fetch (or recover) a user's master key (delegates to the cache).
     pub async fn master_key_for(&self, user_id: Uuid) -> Result<MasterKey, sqlx::Error> {
-        if let Some(key) = self.master_keys.get(user_id) {
-            return Ok(key);
-        }
-        // Recover from the service-key seal (column added in migration 0002).
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT master_key_service_sealed FROM users WHERE id = ?")
-                .bind(user_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await?;
-        let Some((Some(sealed_hex),)) = row else {
-            return Err(sqlx::Error::RowNotFound);
-        };
-        let sealed_bytes = hex::decode(&sealed_hex)
-            .map_err(|_| sqlx::Error::Decode("bad service seal hex".into()))?;
-        let master = mycelium_crypto::aead::aead_open(
-            &sealed_bytes,
-            b"mycelium2/seal/service/v1",
-            &service_dek(&self.service_key),
-        )
-        .map_err(|_| sqlx::Error::Decode("service seal unseal failed".into()))?;
-        let key = MasterKey::from_bytes(&master)
-            .map_err(|_| sqlx::Error::Decode("bad master key length".into()))?;
-        self.master_keys.insert(user_id, key.clone());
-        Ok(key)
+        self.master_keys
+            .for_user(&self.store, &self.service_key, user_id)
+            .await
     }
 
     /// Seal a user's master key under the service key and persist it
@@ -281,7 +285,7 @@ impl AppState {
         let sealed = mycelium_crypto::aead::aead_seal(
             master_key.as_bytes(),
             b"mycelium2/seal/service/v1",
-            &service_dek(&self.service_key),
+            &mycelium_crypto::keys::service_seal_dek(&self.service_key),
         )
         .map_err(|e| sqlx::Error::Decode(format!("seal failed: {e}").into()))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -293,14 +297,6 @@ impl AppState {
             .await?;
         Ok(())
     }
-}
-
-/// Derive the DEK used for service-key seals (purpose-bound).
-fn service_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
-    let mut material = [0u8; 32];
-    let _ = hk.expand(b"mycelium2/service-seal-dek/v1", &mut material);
-    mycelium_crypto::keys::Dek::from_bytes(&material).expect("32 bytes")
 }
 
 /// Derive the DEK used for encrypted config values (purpose-bound).

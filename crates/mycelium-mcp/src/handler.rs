@@ -82,7 +82,7 @@ impl MyceliumMcpServer {
     /// Record new knowledge in the calling user's private bundle.
     #[tool(
         name = "mycelium2_memory_add",
-        description = "Record new knowledge (facts, docs, decisions, runbooks) in the user's private knowledge base."
+        description = "Record new knowledge (facts, docs, decisions, runbooks) in the user's private knowledge base. Writes are accepted and integrated in the background by the librarian — the call returns immediately with a receipt; check integration with memory_status."
     )]
     async fn memory_add(
         &self,
@@ -91,9 +91,7 @@ impl MyceliumMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
         match tools::memory_add(&self.state, &user, &args.0).await {
-            Ok(path) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "recorded at {path}"
-            ))])),
+            Ok(receipt) => Ok(CallToolResult::success(vec![ContentBlock::text(receipt)])),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 tools::render_store_error(&e),
             )])),
@@ -103,7 +101,7 @@ impl MyceliumMcpServer {
     /// Apply a change to existing knowledge in the calling user's bundle.
     #[tool(
         name = "mycelium2_memory_update",
-        description = "Apply a change to existing knowledge: correct a fact, deprecate a concept, or restructure."
+        description = "Apply a change to existing knowledge: correct a fact, deprecate a concept, or restructure. Writes are accepted and integrated in the background by the librarian — the call returns immediately with a receipt; check integration with memory_status."
     )]
     async fn memory_update(
         &self,
@@ -112,9 +110,7 @@ impl MyceliumMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
         match tools::memory_update(&self.state, &user, &args.0).await {
-            Ok(path) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "updated {path}"
-            ))])),
+            Ok(receipt) => Ok(CallToolResult::success(vec![ContentBlock::text(receipt)])),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 tools::render_store_error(&e),
             )])),
@@ -129,9 +125,20 @@ impl MyceliumMcpServer {
     async fn memory_status(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        _args: Parameters<tools::MemoryStatusArgs>,
+        args: Parameters<tools::MemoryStatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
+        let args = args.0;
+        if let Some(rid) = args.receipt_id {
+            let text = tools::receipt_view(&self.state, &user, &rid)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "memory tool internal error");
+                    ErrorData::internal_error("internal storage error", None)
+                })?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
+        }
+        // No receipt id: the existing graph-health path, byte-identical.
         let health = tools::memory_status(&self.state, &user)
             .await
             .map_err(|e| {
@@ -147,7 +154,7 @@ impl MyceliumMcpServer {
     /// Health-check and repair the calling user's bundle graph.
     #[tool(
         name = "mycelium2_memory_maintain",
-        description = "Health-check and repair the user's knowledge-base graph: wire orphaned concepts into related concepts and flag broken links."
+        description = "Health-check and repair the user's knowledge-base graph: wire orphaned concepts into related concepts and flag broken links. Maintenance runs in the background by the librarian — the call returns immediately with a receipt; check completion with memory_status."
     )]
     async fn memory_maintain(
         &self,
@@ -156,7 +163,7 @@ impl MyceliumMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let user = tools::caller(&parts)?;
         match tools::memory_maintain(&self.state, &user).await {
-            Ok(summary) => Ok(CallToolResult::success(vec![ContentBlock::text(summary)])),
+            Ok(receipt) => Ok(CallToolResult::success(vec![ContentBlock::text(receipt)])),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 tools::render_store_error(&e),
             )])),

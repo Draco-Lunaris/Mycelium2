@@ -37,6 +37,12 @@ pub fn build_router_with_shutdown(
         service_key: Arc::clone(&state.service_key),
         master_keys: Arc::clone(&state.master_keys),
         config: Arc::clone(&state.config),
+        // The drain worker's wake handle: enqueues fire it, the drain
+        // loop awaits it — one Notify for both sides. The enqueue
+        // depth cap is the drain's own QueueLimits constant (single
+        // source of truth), not an independent literal.
+        notify: state.queue_worker.notify(),
+        enqueue_depth_cap: mycelium_librarian::queue_worker::QueueLimits::default().depth_cap,
     };
     // Seed memory (v1 parity): build the global overview once at boot
     // so the first initialize/tools/list already carries it. Refreshed

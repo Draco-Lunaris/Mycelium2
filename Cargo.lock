@@ -2481,8 +2481,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "hex",
  "mycelium-core",
  "mycelium-crypto",
+ "mycelium-mcp",
  "mycelium-store",
  "regex",
  "reqwest 0.13.5",

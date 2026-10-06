@@ -19,6 +19,11 @@ use crate::llm::{ConversationTurn, LlmClient, StepOutput, ToolCall, tool_spec};
 /// cross-scope search over large libraries — the model needs room to
 /// search, read, and synthesize across user + skills + library scopes).
 pub const MAX_STEPS: u32 = 30;
+
+/// Global cap on concurrent LLM runs (agent entries acquire one
+/// permit each; the queue drain try_acquires non-blockingly and holds
+/// at most one, so queries/chats always have spare permits).
+pub static LLM_RUNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 /// Bundles larger than this get a compact tree summary in the prompt
 /// (v1: LARGE_BUNDLE_THRESHOLD = 300).
 const LARGE_BUNDLE_THRESHOLD: usize = 300;
@@ -149,7 +154,7 @@ pub enum AgentError {
     Store(#[from] ConceptStoreError),
     #[error("LLM error: {0}")]
     Llm(#[from] crate::llm::LlmError),
-    #[error("agent exceeded {MAX_STEPS} steps without finishing")]
+    #[error("agent step cap exceeded")]
     StepCapExceeded,
     #[error("tool {name} returned invalid arguments: {reason}")]
     BadToolArgs { name: String, reason: String },
@@ -185,6 +190,7 @@ pub async fn run_query(
     scopes: &AgentScopes<'_>,
     question: &str,
 ) -> Result<QueryResult, AgentError> {
+    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
     let system = build_system_prompt(store, AgentMode::Query).await?;
     let tools = read_tool_specs();
     let answer = agent_loop(
@@ -195,12 +201,49 @@ pub async fn run_query(
     Ok(QueryResult { answer, steps: 0 })
 }
 
-/// Run the agent in mutation mode (write tools enabled).
+/// Run the agent in mutation mode (write tools enabled) at the
+/// default `MAX_STEPS` cap, acquiring one global LLM permit.
+/// Intentional public API — the inline mutation entry point: the dream
+/// maintenance pass (`dream::run_dream`, POST /api/v1/dream) calls it
+/// in production. The queue drain does NOT use it — it runs
+/// `run_mutation_capped` instead, under its own permit and step cap.
 pub async fn run_mutation(
     client: &LlmClient,
     store: &ConceptStore<'_>,
     scopes: &AgentScopes<'_>,
     instruction: &str,
+) -> Result<MutationResult, AgentError> {
+    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
+    let system = build_system_prompt(store, AgentMode::Mutate).await?;
+    let tools = all_tool_specs();
+    let (summary, files) = agent_loop_tracked(
+        client,
+        store,
+        scopes,
+        &system,
+        instruction,
+        &tools,
+        true,
+        0.2,
+        MAX_STEPS,
+    )
+    .await?;
+    Ok(MutationResult {
+        summary,
+        files_changed: files,
+        steps: 0,
+    })
+}
+
+/// Mutation run with a caller-supplied step cap (the queue drain's
+/// entry: the drain itself holds the single LLM permit from its
+/// capacity check through the mark, so this acquires none).
+pub async fn run_mutation_capped(
+    client: &LlmClient,
+    store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
+    instruction: &str,
+    max_steps: u32,
 ) -> Result<MutationResult, AgentError> {
     let system = build_system_prompt(store, AgentMode::Mutate).await?;
     let tools = all_tool_specs();
@@ -213,6 +256,7 @@ pub async fn run_mutation(
         &tools,
         true,
         0.2,
+        max_steps,
     )
     .await?;
     Ok(MutationResult {
@@ -254,6 +298,7 @@ pub async fn run_chat_streaming(
     history: &[ConversationTurn],
     events: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<String, AgentError> {
+    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
     let emit = |event: AgentEvent| {
         if let Some(tx) = &events {
             let _ = tx.send(event);
@@ -352,6 +397,7 @@ async fn agent_loop(
         tools,
         allow_writes,
         temperature,
+        MAX_STEPS,
     )
     .await?;
     Ok(text)
@@ -369,6 +415,7 @@ async fn agent_loop_tracked(
     tools: &[crate::llm::ToolSpec<'_>],
     allow_writes: bool,
     temperature: f32,
+    max_steps: u32,
 ) -> Result<(String, Vec<String>), AgentError> {
     let kind = if allow_writes {
         crate::trace::TraceKind::Mutation
@@ -378,7 +425,7 @@ async fn agent_loop_tracked(
     let mut recorder = crate::trace::TraceRecorder::new();
     let mut conversation = vec![ConversationTurn::User(prompt.to_string())];
     let mut files_changed: Vec<String> = Vec::new();
-    for _ in 0..MAX_STEPS {
+    for _ in 0..max_steps {
         let output = client
             .chat_with_tools(system, &conversation, tools, temperature)
             .await?;

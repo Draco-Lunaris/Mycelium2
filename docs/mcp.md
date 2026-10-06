@@ -33,15 +33,19 @@ per-request metadata (stateless mode).
 | Tool | Description |
 |---|---|
 | `mycelium2_memory_query` | Search the caller's private bundle with a natural-language question. Returns ranked results (path, title, snippet, score). Stays private by default — global scopes are not included (that is the web default). |
-| `mycelium2_memory_add` | Store new knowledge as an OKF concept (free-form prose in, structured concept out). |
-| `mycelium2_memory_update` | Correct or extend an existing concept (explicit path, or best search match for the instruction). |
-| `mycelium2_memory_status` | Bundle statistics: concept counts, graph health. |
-| `mycelium2_memory_maintain` | Health-check the knowledge graph: wire orphans into related concepts, fix broken links. |
+| `mycelium2_memory_add` | Store new knowledge as an OKF concept (free-form prose in, structured concept out). Returns immediately with a queue receipt — the librarian integrates it in the background; check with `memory_status(receipt_id=…)`. |
+| `mycelium2_memory_update` | Correct or extend an existing concept (explicit path, or best search match for the instruction). Returns a queue receipt immediately; check integration with `memory_status(receipt_id=…)`. |
+| `mycelium2_memory_status` | Bundle statistics: concept counts, graph health. Pass `receipt_id` to check a queued mutation's state (pending/running/done/dead). |
+| `mycelium2_memory_maintain` | Health-check the knowledge graph, then repair it in the background (receipt immediately; check completion with `memory_status`). |
 | `mycelium2_skill_get` | Fetch a skill's full markdown by name — private skills first, then the global skills shelf. |
 | `mycelium2_skill_list` | List available skills: the caller's private skills plus global skills. |
 
 ## Semantics
 
+- **Deferred writes**: memory_add/update/maintain return a receipt; integration by the
+  librarian happens in the background (deterministic fallback if the LLM is down — items
+  are only lost if they exceed the retry deadline, never silently). Receipts survive
+  restarts.
 - **Identity**: the bearer key resolves to a user; all reads/writes
   are scoped to that user's encrypted bundle (plus the global skills
   shelf for the skill tools).

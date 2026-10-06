@@ -97,3 +97,89 @@ pub struct IngestJob {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// The tool that enqueued a mutation-queue item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueTool {
+    Add,
+    Update,
+    Maintain,
+}
+
+impl QueueTool {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Update => "update",
+            Self::Maintain => "maintain",
+        }
+    }
+
+    // Deliberate inherent `from_str -> Option` (plan interface; mirrors the
+    // `IngestStatus::parse`-style `Option` contract), not `std::str::FromStr`,
+    // which would force a `Result` and diverge from the queue models' contract.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "add" => Some(Self::Add),
+            "update" => Some(Self::Update),
+            "maintain" => Some(Self::Maintain),
+            _ => None,
+        }
+    }
+}
+
+/// A mutation-queue item's lifecycle. `staging` is internal (enqueue
+/// phase); receipt views map it to `pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueueStatus {
+    Staging,
+    Pending,
+    Running,
+    Done,
+    Dead,
+}
+
+impl QueueStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Dead => "dead",
+        }
+    }
+
+    // Deliberate inherent `from_str -> Option` (plan interface; mirrors the
+    // `IngestStatus::parse`-style `Option` contract), not `std::str::FromStr`,
+    // which would force a `Result` and diverge from the queue models' contract.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "staging" => Some(Self::Staging),
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "dead" => Some(Self::Dead),
+            _ => None,
+        }
+    }
+}
+
+/// A queued mutation item (metadata only — content lives in the
+/// encrypted FileRepo payload at /mutation-queue/<id>).
+#[derive(Debug, Clone)]
+pub struct MutationQueueItem {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub tool: QueueTool,
+    pub status: QueueStatus,
+    pub attempts: u32,
+    pub detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub next_retry_at: Option<String>,
+    pub final_paths: Option<String>,
+}

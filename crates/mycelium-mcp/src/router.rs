@@ -47,6 +47,8 @@ pub fn mcp_service(
         service_key: Arc::clone(&state.service_key),
         master_keys: Arc::clone(&state.master_keys),
         config: Arc::clone(&state.config),
+        notify: Arc::clone(&state.notify),
+        enqueue_depth_cap: state.enqueue_depth_cap,
     };
     let service_key = (*state.service_key).clone();
     StreamableHttpService::new(
@@ -56,6 +58,8 @@ pub fn mcp_service(
                 service_key: Arc::new(service_key.clone()),
                 master_keys: Arc::clone(&inner_state.master_keys),
                 config: Arc::clone(&inner_state.config),
+                notify: Arc::clone(&inner_state.notify),
+                enqueue_depth_cap: inner_state.enqueue_depth_cap,
             }))
         },
         Default::default(),
