@@ -301,23 +301,27 @@ impl AppState {
 
 /// Derive the DEK used for encrypted config values (purpose-bound).
 pub fn config_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
-    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, service_key.as_bytes());
-    let mut material = [0u8; 32];
-    let _ = hk.expand(b"mycelium2/config-dek/v1", &mut material);
-    mycelium_crypto::keys::Dek::from_bytes(&material).expect("32 bytes")
+    mycelium_store::config::config_dek(service_key)
+}
+
+/// Seal a config value for the config table (hex envelope; JSON +
+/// AEAD, purpose `mycelium2/config-{key}/v1`). The web layer uses this
+/// for every sensitive admin config (OIDC secret, LLM api_key).
+pub fn seal_config<T: serde::Serialize>(
+    service_key: &ServiceKey,
+    key: &str,
+    value: &T,
+) -> String {
+    mycelium_store::config::seal_config(service_key, key, value)
 }
 
 /// Read + decrypt an encrypted config value (hex envelope) stored under
-/// `key`; None when absent or corrupt.
+/// `key`; None when absent or corrupt. Legacy plaintext-JSON rows (pre-
+/// sealing) stay readable.
 pub async fn decrypt_config<T: serde::de::DeserializeOwned>(
     config: &ConfigStore,
     service_key: &ServiceKey,
     key: &str,
 ) -> Option<T> {
-    let sealed_hex: Option<String> = config.get(key).await.ok().flatten();
-    let sealed = hex::decode(sealed_hex?).ok()?;
-    let aad = format!("mycelium2/config-{key}/v1");
-    let plain =
-        mycelium_crypto::aead::aead_open(&sealed, aad.as_bytes(), &config_dek(service_key)).ok()?;
-    serde_json::from_slice(&plain).ok()
+    mycelium_store::config::get_sealed(config, service_key, key).await
 }
