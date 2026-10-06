@@ -263,6 +263,7 @@ fn dead_port_config() -> LlmConfig {
     LlmConfig {
         url: "http://127.0.0.1:1/v1".into(),
         model: "m".into(),
+        api_key: None,
     }
 }
 
@@ -273,13 +274,23 @@ fn worker(
     limits: QueueLimits,
 ) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
     let config = Arc::new(ConfigStore::new(store.pool().clone()));
+    let service_key = Arc::new(test_service_key());
     let w = Arc::new(QueueWorker::new(
         Arc::clone(store),
         Arc::clone(&config),
         recovery,
+        service_key,
         limits,
     ));
     (config, w)
+}
+
+/// A deterministic service key for tests that seed sealed config rows
+/// (or read legacy ones without decrypting).
+fn test_service_key() -> mycelium_crypto::keys::ServiceKey {
+    use mycelium_crypto::keys::{ServiceKey, generate_master_key};
+    let k = generate_master_key();
+    ServiceKey::from_bytes(k.as_bytes()).expect("32 bytes")
 }
 
 /// Enqueue a full item the way the MCP tool will: row (capped), payload
@@ -353,6 +364,7 @@ async fn drain_integrates_queued_add() {
             &LlmConfig {
                 url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -641,6 +653,7 @@ async fn long_error_detail_is_bounded() {
             &LlmConfig {
                 url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1241,6 +1254,7 @@ async fn age_deadline_routes_to_fallback() {
             &LlmConfig {
                 url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1337,6 +1351,7 @@ async fn transient_errors_retry_then_integrate() {
             &LlmConfig {
                 url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1408,6 +1423,7 @@ async fn persistent_failure_goes_dead_then_recovers() {
             &LlmConfig {
                 url: url_a,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1470,6 +1486,7 @@ async fn persistent_failure_goes_dead_then_recovers() {
             &LlmConfig {
                 url: url_b,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1630,6 +1647,7 @@ async fn receipt_state_flips_pending_running_done() {
             &LlmConfig {
                 url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await
@@ -1712,6 +1730,7 @@ async fn drain_defers_while_queries_wait() {
     let client = LlmClient::new(&LlmConfig {
         url,
         model: "mock".into(),
+                api_key: None,
     });
     let mut handles = Vec::new();
     for q in ["first question", "second question", "third question"] {

@@ -222,9 +222,10 @@ impl AppState {
         let pool = store.pool().clone();
         let store = Arc::new(store);
         let config = Arc::new(ConfigStore::new(pool.clone()));
+        let service_key = Arc::new(ServiceKey::from_bytes(service_key.as_bytes()).expect("32 bytes"));
         let librarian = Arc::new(mycelium_librarian::LibrarianWorker::new(
             Arc::clone(&store),
-            Arc::new(service_key.clone()),
+            Arc::clone(&service_key),
             Arc::clone(&config),
         ));
         // One master-key cache per process: login, API keys, and the
@@ -235,7 +236,7 @@ impl AppState {
         let recovery: Arc<mycelium_librarian::queue_worker::MasterKeyRecovery> = {
             let cache = Arc::clone(&master_keys);
             let s = Arc::clone(&store);
-            let k = Arc::new(service_key.clone());
+            let k = Arc::clone(&service_key);
             Arc::new(move |uid| {
                 let cache = cache.clone();
                 let s = s.clone();
@@ -247,18 +248,19 @@ impl AppState {
             Arc::clone(&store),
             Arc::clone(&config),
             recovery,
+            Arc::clone(&service_key),
             mycelium_librarian::queue_worker::QueueLimits::default(),
         ));
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
-        let login = login.with_service_key(service_key.clone());
+        let login = login.with_service_key((*service_key).clone());
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),
             sessions: Arc::new(SessionManager::new(pool.clone())),
             config,
             login: Arc::new(login),
-            service_key: Arc::new(service_key),
+            service_key,
             master_keys,
             metrics: Arc::new(Metrics::default()),
             librarian,

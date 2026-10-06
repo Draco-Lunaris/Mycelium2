@@ -96,6 +96,7 @@ async fn boot(
             &mycelium_web::LlmConfig {
                 url: llm_url,
                 model: "mock".into(),
+                api_key: None,
             },
         )
         .await

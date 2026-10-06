@@ -101,11 +101,16 @@ async fn agent_scopes<'a>(
 }
 
 /// The librarian agent's LLM client from the runtime config (admin-
-/// managed via ConfigStore key "llm"; Ollama default).
+/// managed via ConfigStore key "llm"; Ollama default). Sealed rows
+/// decrypt under the service key; legacy plaintext rows read as before.
 async fn agent_client(state: &McpState) -> Option<mycelium_librarian::llm::LlmClient> {
-    let cfg: Option<mycelium_librarian::llm::LlmConfig> =
-        state.config.get("llm").await.ok().flatten();
-    let cfg = cfg.unwrap_or_default();
+    let cfg = mycelium_store::config::get_sealed::<mycelium_librarian::llm::LlmConfig>(
+        &state.config,
+        &state.service_key,
+        "llm",
+    )
+    .await
+    .unwrap_or_default();
     Some(mycelium_librarian::llm::LlmClient::new(&cfg))
 }
 
