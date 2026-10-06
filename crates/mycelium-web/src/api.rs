@@ -1271,13 +1271,10 @@ pub async fn admin_view(
     )
     .await
     .is_some();
-    let llm = crate::state::decrypt_config::<crate::LlmConfig>(
-        &state.config,
-        &state.service_key,
-        "llm",
-    )
-    .await
-    .unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let llm_api_key_set = llm.api_key.is_some();
     let upload = state.upload_config().await;
     let security = state.security_config().await;
@@ -1422,13 +1419,10 @@ pub async fn admin_save_llm(
 ) -> Response {
     // The existing config (blank-key keep + legacy row migration both
     // read through it) or the default.
-    let existing = crate::state::decrypt_config::<crate::LlmConfig>(
-        &state.config,
-        &state.service_key,
-        "llm",
-    )
-    .await
-    .unwrap_or_default();
+    let existing =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let api_key = match form.api_key.as_deref().map(str::trim) {
         None | Some("") => existing.api_key,
         Some(k) => Some(k.to_string()),
@@ -1824,13 +1818,10 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let llm = crate::state::decrypt_config::<crate::LlmConfig>(
-        &state.config,
-        &state.service_key,
-        "llm",
-    )
-    .await
-    .unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     let scopes = build_agent_scopes(
         &state.store,
@@ -1861,13 +1852,10 @@ pub async fn api_chat(
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    let llm = crate::state::decrypt_config::<crate::LlmConfig>(
-        &state.config,
-        &state.service_key,
-        "llm",
-    )
-    .await
-    .unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Multi-turn memory: the session's prior turns + this message.
     let mut history = state.chat_history.get(session.0);
@@ -1925,13 +1913,10 @@ pub async fn api_chat_stream(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let llm = crate::state::decrypt_config::<crate::LlmConfig>(
-        &state.config,
-        &state.service_key,
-        "llm",
-    )
-    .await
-    .unwrap_or_default();
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Multi-turn memory: the session's prior turns + this message.
     let mut history = state.chat_history.get(session.0);

@@ -1730,7 +1730,7 @@ async fn drain_defers_while_queries_wait() {
     let client = LlmClient::new(&LlmConfig {
         url,
         model: "mock".into(),
-                api_key: None,
+        api_key: None,
     });
     let mut handles = Vec::new();
     for q in ["first question", "second question", "third question"] {

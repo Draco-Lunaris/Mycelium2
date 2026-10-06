@@ -163,7 +163,11 @@ impl LlmClient {
     /// The chat-completions request with auth (Bearer when a key is
     /// configured, bare otherwise) — the single POST site both send
     /// paths go through.
-    async fn post_chat(&self, url: &str, body: &ChatRequest<'_>) -> Result<reqwest::Response, LlmError> {
+    async fn post_chat(
+        &self,
+        url: &str,
+        body: &ChatRequest<'_>,
+    ) -> Result<reqwest::Response, LlmError> {
         let mut request = self.http.post(url);
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
@@ -429,9 +433,7 @@ mod tests {
         assert_eq!(client.chat("hi").await.unwrap(), "ok");
         let seen = captured.lock().await.clone();
         let expected = Some("Bearer test-secret".to_string());
-        assert_eq!(
-            seen, expected, "plain chat must send the Bearer header"
-        );
+        assert_eq!(seen, expected, "plain chat must send the Bearer header");
         // One generation with tools goes through the same POST site.
         let no_params = serde_json::json!({});
         let spec = tool_spec("noop", "nothing", &no_params);

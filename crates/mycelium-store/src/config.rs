@@ -36,9 +36,8 @@ pub fn seal_config<T: Serialize>(
 ) -> String {
     let json = serde_json::to_vec(value).expect("serialize config value");
     let aad = format!("mycelium2/config-{key}/v1");
-    let sealed =
-        mycelium_crypto::aead::aead_seal(&json, aad.as_bytes(), &config_dek(service_key))
-            .expect("seal config value");
+    let sealed = mycelium_crypto::aead::aead_seal(&json, aad.as_bytes(), &config_dek(service_key))
+        .expect("seal config value");
     hex::encode(sealed)
 }
 
@@ -130,6 +129,7 @@ impl ConfigStore {
 ///   column is a JSON string wrapping the hex envelope.
 /// - **Legacy** (the first releases): `set(key, &T)` — the column is
 ///   the JSON document itself (the live `{url, model}` LLM rows).
+///
 /// New writes are always sealed; legacy rows stay readable.
 pub async fn get_sealed<T: DeserializeOwned>(
     config: &ConfigStore,
@@ -142,7 +142,9 @@ pub async fn get_sealed<T: DeserializeOwned>(
         && let Ok(sealed) = hex::decode(&hex_envelope)
     {
         let aad = format!("mycelium2/config-{key}/v1");
-        let plain = mycelium_crypto::aead::aead_open(&sealed, aad.as_bytes(), &config_dek(service_key)).ok()?;
+        let plain =
+            mycelium_crypto::aead::aead_open(&sealed, aad.as_bytes(), &config_dek(service_key))
+                .ok()?;
         return serde_json::from_slice(&plain).ok();
     }
     // Legacy shape: the column is the JSON document itself.
@@ -221,13 +223,15 @@ mod tests {
             model: "m".into(),
             api_key: Some("secret-key".into()),
         };
-        config.set("llm", &seal_config(&key, "llm", &value)).await.unwrap();
+        config
+            .set("llm", &seal_config(&key, "llm", &value))
+            .await
+            .unwrap();
         // The stored row is the hex envelope — the plaintext never lands.
-        let (row,): (String,) =
-            sqlx::query_as("SELECT value FROM config WHERE key = 'llm'")
-                .fetch_one(&store.pool() as &sqlx::Pool<sqlx::Sqlite>)
-                .await
-                .unwrap();
+        let (row,): (String,) = sqlx::query_as("SELECT value FROM config WHERE key = 'llm'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
         assert!(!row.contains("secret-key"));
         assert!(!row.contains("http://gateway"));
 
@@ -253,7 +257,10 @@ mod tests {
             model: "m".into(),
             api_key: Some("k".into()),
         };
-        config.set("llm", &seal_config(&key, "llm", &value)).await.unwrap();
+        config
+            .set("llm", &seal_config(&key, "llm", &value))
+            .await
+            .unwrap();
         assert_eq!(get_sealed::<Sealed>(&config, &wrong, "llm").await, None);
     }
 

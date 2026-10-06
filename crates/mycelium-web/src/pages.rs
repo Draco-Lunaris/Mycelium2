@@ -610,11 +610,7 @@ pub fn admin_page(
         "not configured"
     };
     // Status only — the key itself is never rendered back to the browser.
-    let llm_api_key_status = if llm_api_key_set {
-        "stored"
-    } else {
-        "not set"
-    };
+    let llm_api_key_status = if llm_api_key_set { "stored" } else { "not set" };
     let body = format!(
         r#"<h1>Admin</h1>
 {}

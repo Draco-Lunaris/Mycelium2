@@ -222,7 +222,8 @@ impl AppState {
         let pool = store.pool().clone();
         let store = Arc::new(store);
         let config = Arc::new(ConfigStore::new(pool.clone()));
-        let service_key = Arc::new(ServiceKey::from_bytes(service_key.as_bytes()).expect("32 bytes"));
+        let service_key =
+            Arc::new(ServiceKey::from_bytes(service_key.as_bytes()).expect("32 bytes"));
         let librarian = Arc::new(mycelium_librarian::LibrarianWorker::new(
             Arc::clone(&store),
             Arc::clone(&service_key),
@@ -309,11 +310,7 @@ pub fn config_dek(service_key: &ServiceKey) -> mycelium_crypto::keys::Dek {
 /// Seal a config value for the config table (hex envelope; JSON +
 /// AEAD, purpose `mycelium2/config-{key}/v1`). The web layer uses this
 /// for every sensitive admin config (OIDC secret, LLM api_key).
-pub fn seal_config<T: serde::Serialize>(
-    service_key: &ServiceKey,
-    key: &str,
-    value: &T,
-) -> String {
+pub fn seal_config<T: serde::Serialize>(service_key: &ServiceKey, key: &str, value: &T) -> String {
     mycelium_store::config::seal_config(service_key, key, value)
 }
 
