@@ -1743,8 +1743,20 @@ async fn drain_defers_while_queries_wait() {
             agent::run_query(&client, &cs, &scopes, q).await
         }));
     }
-    // Let the first two acquire and enter the LLM call.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Synchronize on the actual permit state, not on a fixed sleep:
+    // the drain must defer EXACTLY while both permits are held, and
+    // available_permits()==0 is the observable form of that state. A
+    // sleep races the mock's 400ms hold — on a slow runner the queries
+    // can finish and free the permits before the drain runs, which
+    // once failed CI (drain legitimately claimed, Ok(1) != 0).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while agent::LLM_RUNS.available_permits() > 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "query runs never acquired both permits"
+        );
+    }
 
     let limits = QueueLimits {
         age_deadline_secs: 0,
