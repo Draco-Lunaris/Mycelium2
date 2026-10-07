@@ -2563,6 +2563,7 @@ dependencies = [
  "futures-executor",
  "hex",
  "hkdf",
+ "md-5",
  "mycelium-core",
  "mycelium-crypto",
  "serde",
