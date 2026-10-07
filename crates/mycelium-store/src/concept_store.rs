@@ -32,7 +32,7 @@ pub enum ConceptStoreError {
 }
 
 /// A listed concept (from the registry, no decryption needed).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConceptEntry {
     pub path: String,
     pub title: String,

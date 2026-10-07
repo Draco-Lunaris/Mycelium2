@@ -9,6 +9,7 @@ pub mod migrations;
 pub mod models;
 pub mod mutation_queue;
 pub mod search_index;
+pub mod skill_group;
 
 pub use books::{BookRow, BooksError};
 pub use concept_store::{ConceptEntry, ConceptScope, ConceptStore, ConceptStoreError};
@@ -25,6 +26,7 @@ pub use mutation_queue::{
     write_payload,
 };
 pub use search_index::{EncryptedIndex, IndexError};
+pub use skill_group::{SkillGroup, SkillListings, group_skills};
 
 use std::path::Path;
 
