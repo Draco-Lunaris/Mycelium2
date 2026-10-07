@@ -10,6 +10,7 @@ use mycelium_store::concept_store::{ConceptStore, ConceptStoreError};
 use mycelium_store::file_repo::{FileRepo, Scope};
 use mycelium_store::models::{QueueStatus, QueueTool};
 use mycelium_store::mutation_queue::{self, MutationPayload};
+use mycelium_store::{ConceptEntry, group_skills};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -594,13 +595,20 @@ pub async fn memory_maintain(
 
 #[derive(Deserialize, JsonSchema)]
 pub struct SkillGetArgs {
-    /// The skill name to fetch (e.g. `deploy-rust-service`).
-    #[schemars(description = "The skill name to fetch")]
+    /// The skill to fetch: a bare slug (resolved to the bundle hub
+    /// `/{slug}/skill.md`, falling back to the flat `/{slug}.md`) or an
+    /// exact bundle path ending in `.md`.
+    #[schemars(
+        description = "The skill to fetch: a bare slug (resolves the bundle hub /{slug}/skill.md, falling back to the flat /{slug}.md) or an exact bundle path ending in .md"
+    )]
     pub name: String,
 }
 
-/// Fetch a skill by name — the caller's private skills first, then the
-/// global skills shelf. Returns the skill's full markdown.
+/// Fetch a skill: the caller's private skills first, then the global
+/// skills shelf. A name ending in `.md` is an exact bundle path;
+/// anything else is a slug, resolving the nested bundle hub
+/// `/{slug}/skill.md` first with the legacy flat `/{slug}.md` as
+/// fallback. Returns the skill's full markdown.
 pub async fn skill_get(
     state: &McpState,
     user: &McpUser,
@@ -611,24 +619,29 @@ pub async fn skill_get(
         .await
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
-    let name = slugify(&args.name);
-    let path = format!("/{name}.md");
-
-    // Private first. A NotFound falls through to the global shelf; any
-    // other error (corruption, crypto) propagates rather than masking.
-    match cs.get(&path).await {
-        Ok(c) if c.frontmatter.concept_type == "Skill" => return Ok(Some(c)),
-        Ok(_) => {}
-        Err(ConceptStoreError::NotFound(_)) => {}
-        Err(e) => return Err(e),
-    }
-    // Then global.
     let global = global_skills(state);
-    match global.get(&path).await {
-        Ok(c) if c.frontmatter.concept_type == "Skill" => return Ok(Some(c)),
-        Ok(_) => {}
-        Err(ConceptStoreError::NotFound(_)) => {}
-        Err(e) => return Err(e),
+
+    // The candidate paths: an exact `.md` name is looked up as given; a
+    // bare slug tries the bundle hub, then the legacy flat root.
+    let candidates: Vec<String> = if args.name.ends_with(".md") {
+        vec![format!("/{}", args.name.trim_start_matches('/'))]
+    } else {
+        let slug = slugify(&args.name);
+        vec![format!("/{slug}/skill.md"), format!("/{slug}.md")]
+    };
+
+    // Private first, then global. A NotFound falls through to the next
+    // candidate; any other error (corruption, crypto) propagates rather
+    // than masking. Every hit still requires `type: Skill`.
+    for store in [&cs, &global] {
+        for path in &candidates {
+            match store.get(path).await {
+                Ok(c) if c.frontmatter.concept_type == "Skill" => return Ok(Some(c)),
+                Ok(_) => {}
+                Err(ConceptStoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
     Ok(None)
 }
@@ -636,7 +649,9 @@ pub async fn skill_get(
 #[derive(Deserialize, JsonSchema)]
 pub struct SkillListArgs {}
 
-/// List available skills: the caller's private skills plus global skills.
+/// List available skills, one entry per logical skill: each nested
+/// bundle appears as its hub (`/{slug}/skill.md`); legacy flat skills
+/// appear as themselves. The caller's private skills plus global skills.
 pub async fn skill_list(
     state: &McpState,
     user: &McpUser,
@@ -646,21 +661,27 @@ pub async fn skill_list(
         .await
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
-    let mut skills = cs
-        .list()
-        .await?
-        .into_iter()
-        .filter(|e| e.concept_type == "Skill")
-        .collect::<Vec<_>>();
     let global = global_skills(state);
-    let mut global_skills = global
-        .list()
-        .await?
-        .into_iter()
-        .filter(|e| e.concept_type == "Skill")
-        .collect::<Vec<_>>();
-    skills.append(&mut global_skills);
-    skills.sort_by(|a, b| a.path.cmp(&b.path));
-    skills.dedup_by(|a, b| a.path == b.path);
-    Ok(skills)
+
+    // Group BOTH scopes structurally; the catalog is hubs only plus
+    // flat Skill roots — companions and non-Skill entries never list.
+    let mut out: Vec<ConceptEntry> = Vec::new();
+    for entries in [cs.list().await?, global.list().await?] {
+        let listings = group_skills(&entries);
+        for g in listings.grouped {
+            if g.hub.concept_type == "Skill" {
+                // The hub entry IS the skill: its title, its path.
+                out.push(g.hub);
+            }
+        }
+        out.extend(
+            listings
+                .flat
+                .into_iter()
+                .filter(|e| e.concept_type == "Skill"),
+        );
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
+    Ok(out)
 }

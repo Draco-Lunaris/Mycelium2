@@ -170,10 +170,11 @@ impl MyceliumMcpServer {
         }
     }
 
-    /// Fetch a skill by name — private first, then the global shelf.
+    /// Fetch a skill — private first, then the global shelf. A bare
+    /// slug resolves the bundle hub; a `.md` name is an exact path.
     #[tool(
         name = "mycelium2_skill_get",
-        description = "Fetch a skill by name from the user's private skills, falling back to the global skills shelf."
+        description = "Fetch a skill by name from the user's private skills, falling back to the global skills shelf. A bare slug resolves the nested bundle hub /{slug}/skill.md first (falling back to the flat /{slug}.md); a name ending in .md is an exact bundle path."
     )]
     async fn skill_get(
         &self,
@@ -203,10 +204,11 @@ impl MyceliumMcpServer {
         }
     }
 
-    /// List available skills — private plus global.
+    /// List available skills — one entry per logical skill, private
+    /// plus global.
     #[tool(
         name = "mycelium2_skill_list",
-        description = "List available skills from the user's private bundle and the global skills shelf."
+        description = "List available skills from the user's private bundle and the global skills shelf, one entry per logical skill: nested bundles appear as their hub, legacy flat skills as themselves."
     )]
     async fn skill_list(
         &self,

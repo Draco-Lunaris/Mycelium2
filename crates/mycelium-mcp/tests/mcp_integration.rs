@@ -844,3 +844,322 @@ async fn mcp_full_flow() {
 async fn revoked_ok(resp: reqwest::Response) -> bool {
     resp.status().is_success() || resp.status().as_u16() == 303
 }
+
+// ---------------------------------------------------------------------------
+// Skill bundles: skill_list returns one entry per logical skill (the hub
+// of each nested bundle plus flat Skill roots); skill_get resolves a
+// bare slug to its hub, falling back to the flat path.
+// ---------------------------------------------------------------------------
+
+/// Seed concepts into the global skills shelf via a second store handle
+/// (the service scope is shared with the booted server; the seeding
+/// pattern mcp_full_flow established, batched for one index regen).
+async fn seed_global_skills(dir: &std::path::Path, concepts: &[(&str, &str)]) {
+    let store = Store::open(dir).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir, None).unwrap();
+    let cs = mycelium_store::concept_store::ConceptStore::for_service(
+        &store,
+        service_key,
+        &store.skills_dir(),
+        "skills",
+    );
+    let parsed = concepts
+        .iter()
+        .map(|(path, md)| mycelium_core::concept::Concept::parse(path, md).unwrap())
+        .collect::<Vec<_>>();
+    cs.put_batch(&parsed).await.unwrap();
+}
+
+/// Seed a concept into the caller's private bundle via the REST API (the
+/// bearer-authenticated PUT mcp_full_flow established).
+async fn put_private_concept(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    path: &str,
+    markdown: &str,
+) {
+    let put = client
+        .put(format!("{base}/api/v1/concepts/{path}"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "markdown": markdown }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201, "private seed of {path} must succeed");
+}
+
+#[tokio::test]
+async fn skill_list_returns_one_entry_per_nested_skill() {
+    let (base, shutdown, dir, pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle(
+        &client,
+        &base,
+        &pool,
+        "admin",
+        ADMIN_PASSWORD,
+        "a-very-long-test-password-123!",
+    )
+    .await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    // Global shelf: a nested skill (hub + companion), a flat legacy
+    // skill, a hub whose type is not Skill, and a flat non-Skill note.
+    seed_global_skills(
+        dir.path(),
+        &[
+            (
+                "/nested/skill.md",
+                "---\ntype: Skill\ntitle: Nested Skill\n---\n\nnested hub body\n",
+            ),
+            (
+                "/nested/companion.md",
+                "---\ntype: Skill\ntitle: Companion\n---\n\ncompanion body\n",
+            ),
+            (
+                "/legacy-skill.md",
+                "---\ntype: Skill\ntitle: Legacy Skill\n---\n\nlegacy flat body\n",
+            ),
+            (
+                "/not-a-skill/skill.md",
+                "---\ntype: Note\ntitle: Not A Skill\n---\n\nhub-shaped but wrong type\n",
+            ),
+            (
+                "/plain-note.md",
+                "---\ntype: Note\ntitle: Plain Note\n---\n\njust a note\n",
+            ),
+        ],
+    )
+    .await;
+
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_list",
+            "arguments": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_list must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    // One entry per logical skill, path-sorted: the nested skill appears
+    // as its hub only; the companion, the non-Skill hub, and the flat
+    // non-Skill note never appear.
+    assert_eq!(
+        text, "- Legacy Skill (/legacy-skill.md)\n- Nested Skill (/nested/skill.md)",
+        "skill_list must return one entry per logical skill"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn skill_get_resolves_nested_hub_by_slug_and_falls_back_to_flat() {
+    let (base, shutdown, dir, pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle(
+        &client,
+        &base,
+        &pool,
+        "admin",
+        ADMIN_PASSWORD,
+        "a-very-long-test-password-123!",
+    )
+    .await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    seed_global_skills(
+        dir.path(),
+        &[
+            (
+                "/nested/skill.md",
+                "---\ntype: Skill\ntitle: Nested Skill\n---\n\nHUB: nested hub body\n",
+            ),
+            (
+                "/nested/companion.md",
+                "---\ntype: Skill\ntitle: Companion\n---\n\nCOMPANION: companion body\n",
+            ),
+            (
+                "/legacy-skill.md",
+                "---\ntype: Skill\ntitle: Legacy Skill\n---\n\nFLAT: legacy flat body\n",
+            ),
+        ],
+    )
+    .await;
+
+    // Bare slug → the nested skill's hub (never a companion).
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_get",
+            "arguments": {"name": "nested"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_get must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.contains("HUB: nested hub body"),
+        "slug resolves the hub: {text}"
+    );
+    assert!(
+        !text.contains("COMPANION:"),
+        "the hub, not a companion: {text}"
+    );
+
+    // Flat fallback for legacy skills.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_get",
+            "arguments": {"name": "legacy-skill"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_get must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.contains("FLAT: legacy flat body"),
+        "flat fallback for legacy skills: {text}"
+    );
+
+    // Exact bundle path (an arg ending in .md) fetches a companion
+    // directly.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        3,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_get",
+            "arguments": {"name": "/nested/companion.md"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_get must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.contains("COMPANION: companion body"),
+        "exact .md path fetches the companion directly: {text}"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn private_shelf_gets_the_same_grouping() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_and_settle(
+        &client,
+        &base,
+        &pool,
+        "admin",
+        ADMIN_PASSWORD,
+        "a-very-long-test-password-123!",
+    )
+    .await;
+    let token = mint_key(&client, &base, &cookie, &csrf).await;
+
+    // Private bundle: a nested skill (hub + companion) plus a flat
+    // legacy skill.
+    put_private_concept(
+        &client,
+        &base,
+        &token,
+        "nested/skill.md",
+        "---\ntype: Skill\ntitle: Private Nested\n---\n\nPRIVATE HUB: private hub body\n",
+    )
+    .await;
+    put_private_concept(
+        &client,
+        &base,
+        &token,
+        "nested/companion.md",
+        "---\ntype: Skill\ntitle: Private Companion\n---\n\nprivate companion body\n",
+    )
+    .await;
+    put_private_concept(
+        &client,
+        &base,
+        &token,
+        "legacy-skill.md",
+        "---\ntype: Skill\ntitle: Private Legacy\n---\n\nprivate legacy body\n",
+    )
+    .await;
+
+    // skill_list groups the private scope identically: hub only for the
+    // nested skill, flat listed, path-sorted.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        1,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_list",
+            "arguments": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_list must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(
+        text, "- Private Legacy (/legacy-skill.md)\n- Private Nested (/nested/skill.md)",
+        "private skills group identically: hub only, flat listed"
+    );
+
+    // And skill_get resolves the private hub by slug.
+    let (status, body) = rpc(
+        &client,
+        &base,
+        &token,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "_meta": request_meta(),
+            "name": "mycelium2_skill_get",
+            "arguments": {"name": "nested"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "skill_get must succeed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        text.contains("PRIVATE HUB: private hub body"),
+        "slug resolves the private hub: {text}"
+    );
+
+    shutdown.cancel();
+}
