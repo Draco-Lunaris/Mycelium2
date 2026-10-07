@@ -8,6 +8,7 @@ pub mod middleware;
 pub mod packaged_skills;
 pub mod pages;
 pub mod server;
+pub mod skill_zip;
 pub mod state;
 
 pub use server::serve;

@@ -11,7 +11,9 @@ use uuid::Uuid;
 use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
 use mycelium_core::search::SearchQuery;
-use mycelium_store::{ConceptStore, SkillGroup, group_skills};
+use mycelium_store::{
+    ConceptStore, FileRepo, Scope, SkillBundleError, SkillGroup, bundle_skill_files, group_skills,
+};
 
 use crate::middleware::SessionId;
 use crate::pages;
@@ -121,6 +123,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/dream", post(api_dream))
         .route("/chat", post(api_chat))
         .route("/chat/stream", post(api_chat_stream))
+        // Skill bundle download: deterministic zip of a nested skill
+        // (global shelf for everyone, private skills owner-only).
+        .route("/skills/{slug}/bundle", get(skill_bundle))
 }
 
 // ---------- JSON API ----------
@@ -400,6 +405,111 @@ async fn api_delete_concept(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
+}
+
+/// GET /api/v1/skills/{slug}/bundle — download a skill as a
+/// Claude-Code-shaped zip with deterministic bytes (fixed entry
+/// order, mtime, perms — see `skill_zip`). Same visibility as the
+/// skills page: the global skills shelf for everyone, private skills
+/// only from the caller's own bundle. A slug naming only a legacy flat
+/// skill (or nothing at all) is 404 — indistinguishable, never an
+/// oracle. Integrity errors (traversal manifest, md5 mismatch, missing
+/// payload, zip failure) are logged server-side and answered with a
+/// generic 500; no internal detail reaches the client.
+pub async fn skill_bundle(
+    State(state): State<AppState>,
+    user: SessionUser,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    // 1. Resolve the slug to a bundle: the global shelf (service key)
+    //    first, then the caller's own bundle. NotBundle ("no
+    //    /<slug>/skill.md here") falls through to the next surface; a
+    //    hard error does not — the shelf is corrupt, which is a
+    //    server-side problem, not a "try elsewhere".
+    let global_cs = ConceptStore::for_service(
+        &state.store,
+        (*state.service_key).clone(),
+        &state.store.skills_dir(),
+        "skills",
+    );
+    let global_repo = FileRepo::new(state.store.skills_dir());
+    let global_scope = Scope::Service((*state.service_key).clone());
+    let files = match bundle_skill_files(&global_cs, &global_repo, &global_scope, &slug).await {
+        Ok(files) => files,
+        Err(SkillBundleError::NotBundle(_)) => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => {
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                }
+            };
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master.clone());
+            let repo = FileRepo::new(state.store.user_dir(user.user_id));
+            match bundle_skill_files(&cs, &repo, &Scope::User(master), &slug).await {
+                Ok(files) => files,
+                Err(SkillBundleError::NotBundle(_)) => {
+                    return error_response(StatusCode::NOT_FOUND, "not found");
+                }
+                Err(e) => {
+                    tracing::error!(slug = %slug, error = %e, "skill bundle assembly failed");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(slug = %slug, error = %e, "skill bundle assembly failed");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+
+    // 2. Deterministic zip. In-memory (a Vec cursor) and effectively
+    //    infallible, but never leaked: logged, generic 500.
+    let bytes = match crate::skill_zip::zip_files(&files) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(slug = %slug, error = %e, "skill zip failed");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+
+    // 3. Download response. The filename embeds the slug, so keep only
+    //    filename-safe ASCII: a single route segment can still carry
+    //    %-decoded quotes/backslashes (Content-Disposition attribute
+    //    injection) or non-ASCII (an invalid HeaderValue — only after
+    //    the archive was already built). no-store: the backup-download
+    //    precedent — never sit in a shared/CDN cache.
+    let safe: String = slug
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    let filename = if safe.is_empty() {
+        "skill.zip".to_string()
+    } else {
+        format!("{safe}-skill.zip")
+    };
+    let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    match axum::http::HeaderValue::from_str(&disposition) {
+        Ok(v) => {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_DISPOSITION, v);
+        }
+        Err(e) => {
+            tracing::error!(slug = %slug, error = %e, "content-disposition build failed");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    }
+    response
 }
 
 /// GET /api/v1/health — detailed status (DESIGN decision).
