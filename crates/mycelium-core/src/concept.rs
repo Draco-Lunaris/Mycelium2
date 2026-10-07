@@ -4,6 +4,81 @@ use serde::{Deserialize, Serialize};
 
 use crate::reserved_names;
 
+/// Role of a file inside a skill bundle. Display/ordering only —
+/// never enforced. Unknown role strings deserialize to `Reference`
+/// (lenient — `#[serde(other)]` can't express that fallback with
+/// rename_all, so the enum gets a small manual `Deserialize` impl;
+/// mirroring how `type` is a plain lenient String).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub enum SkillRole {
+    #[serde(rename = "script")]
+    Script,
+    #[default]
+    #[serde(rename = "reference")]
+    Reference,
+    #[serde(rename = "example")]
+    Example,
+}
+
+impl<'de> Deserialize<'de> for SkillRole {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "script" => SkillRole::Script,
+            "example" => SkillRole::Example,
+            _ => SkillRole::Reference, // "reference" + unknown → lenient
+        })
+    }
+}
+
+/// One file of a skill bundle. `path` is relative to the skill
+/// directory (`/<slug>/`) and must resolve inside it — checked by
+/// [`SkillManifest::validated`]. Non-`.md` paths are raw payload files
+/// (never concepts); `.md` paths are companion concepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillFile {
+    pub path: String,
+    #[serde(default)]
+    pub role: SkillRole,
+    /// Optional integrity check verified at bundle time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+}
+
+/// Skills manifest carried on the `/<slug>/skill.md` hub concept
+/// (`skill:` frontmatter key). Known field on `Frontmatter` — unknown
+/// keys are dropped by the lenient parser, so a one-off key would not
+/// survive `Concept::parse` (precedent: `book`/`chapter_index`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SkillManifest {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub files: Vec<SkillFile>,
+}
+
+impl SkillManifest {
+    /// Validate every file path: relative (no leading `/`), no `..`
+    /// OR `.` segments (traversal/escapes), no backslashes (Windows
+    /// separators), no NUL, non-empty. Paths are relative to the skill
+    /// dir; the caller joins them only after this passes.
+    pub fn validated(&self) -> Result<(), ConceptError> {
+        for f in &self.files {
+            let p = &f.path;
+            let ok = !p.is_empty()
+                && !p.starts_with('/')
+                && !p.contains('\\')
+                && !p.contains('\0')
+                && p.split('/')
+                    .all(|seg| seg != ".." && seg != "." && !seg.is_empty());
+            if !ok {
+                return Err(ConceptError::InvalidSkillPath { path: p.clone() });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Frontmatter of an OKF concept. `type` is the only required field;
 /// all others are optional and unknown fields are ignored (lenient parsing).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -27,6 +102,9 @@ pub struct Frontmatter {
     /// Chapter concepts: 1-based chapter index within the book.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chapter_index: Option<u32>,
+    /// Skill-bundle manifest carried by a `/<slug>/skill.md` hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillManifest>,
 }
 
 /// A parsed OKF concept: frontmatter + markdown body + canonical path.
@@ -46,6 +124,8 @@ pub enum ConceptError {
     MissingTypeField,
     #[error("frontmatter YAML error: {0}")]
     Yaml(#[from] serde_yaml_ng::Error),
+    #[error("skill manifest path escapes the skill directory: {path}")]
+    InvalidSkillPath { path: String },
 }
 
 impl Concept {
@@ -232,5 +312,87 @@ mod tests {
         assert!(!md.contains("tags:"));
         assert!(!md.contains("book:"));
         assert!(!md.contains("chapter_index:"));
+    }
+
+    #[test]
+    fn skill_manifest_parses_from_hub_frontmatter() {
+        let md = "---\ntype: Skill\ntitle: t\nskill:\n  version: 1\n  files:\n    - {path: scripts/convert.py, role: script, md5: abc}\n    - {path: conventions.md, role: reference}\n---\n\nbody";
+        let c = Concept::parse("/s/skill.md", md).unwrap();
+        let m = c.frontmatter.skill.expect("manifest parsed");
+        assert_eq!(m.version, 1);
+        assert_eq!(m.files.len(), 2);
+        assert_eq!(m.files[0].path, "scripts/convert.py");
+        assert_eq!(m.files[0].role, SkillRole::Script);
+        assert_eq!(m.files[0].md5.as_deref(), Some("abc"));
+        assert_eq!(m.files[1].role, SkillRole::Reference);
+    }
+
+    #[test]
+    fn skill_manifest_roundtrips_without_altering_other_fields() {
+        let md = "---\ntype: Skill\ntitle: t\nskill:\n  version: 1\n  files:\n    - {path: a.md, role: reference}\n---\n\nbody";
+        let c1 = Concept::parse("/s/skill.md", md).unwrap();
+        let out = c1.to_markdown().unwrap();
+        let c2 = Concept::parse("/s/skill.md", &out).unwrap();
+        assert_eq!(c1.frontmatter.skill, c2.frontmatter.skill);
+        assert_eq!(c1.frontmatter.title, c2.frontmatter.title);
+        // A concept WITHOUT the manifest serializes exactly as before.
+        let plain = "---\ntype: Skill\ntitle: t\n---\n\nbody";
+        assert_eq!(
+            Concept::parse("/s.md", plain)
+                .unwrap()
+                .to_markdown()
+                .unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn skill_manifest_unknown_role_is_lenient() {
+        let md = "---\ntype: Skill\nskill:\n  version: 1\n  files:\n    - {path: x.md, role: mysterious}\n---\n\nb";
+        let c = Concept::parse("/s.md", md).unwrap();
+        assert_eq!(
+            c.frontmatter.skill.unwrap().files[0].role,
+            SkillRole::Reference
+        );
+    }
+
+    #[test]
+    fn skill_manifest_validation_rejects_traversal() {
+        for bad in [
+            "./out.md",
+            "../escape.md",
+            "..\\win.md",
+            "/absolute.md",
+            "",
+            "a/../../escape",
+            "scripts/../../escape.md",
+            "a\0b",
+        ] {
+            let m = SkillManifest {
+                version: 1,
+                files: vec![SkillFile {
+                    path: bad.into(),
+                    role: SkillRole::Script,
+                    md5: None,
+                }],
+            };
+            assert!(m.validated().is_err(), "must reject {bad:?}");
+        }
+        let good = SkillManifest {
+            version: 1,
+            files: vec![
+                SkillFile {
+                    path: "scripts/convert.py".into(),
+                    role: SkillRole::Script,
+                    md5: None,
+                },
+                SkillFile {
+                    path: "LICENSE.txt".into(),
+                    role: SkillRole::Reference,
+                    md5: None,
+                },
+            ],
+        };
+        assert!(good.validated().is_ok());
     }
 }
