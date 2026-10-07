@@ -11,7 +11,7 @@ use uuid::Uuid;
 use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
 use mycelium_core::search::SearchQuery;
-use mycelium_store::ConceptStore;
+use mycelium_store::{ConceptStore, SkillGroup, group_skills};
 
 use crate::middleware::SessionId;
 use crate::pages;
@@ -1024,6 +1024,56 @@ pub async fn graph_view(
     pages::graph_page(&user, &csrf).into_response()
 }
 
+/// One scope's skills-page listing (spec §"Web: skills page"):
+/// grouped skills, flat rows, and manifest script labels parallel to
+/// the groups. Grouping runs over the FULL entry list so non-Skill
+/// companions stay inside their group; groups whose hub is not
+/// `type: Skill` are dropped, and flat rows keep the legacy
+/// `type: Skill` filter. Script labels are the hub manifest's
+/// non-`.md` paths, sorted — display-only rows (payload files are
+/// not concepts).
+async fn skill_sections(
+    cs: &ConceptStore<'_>,
+) -> (
+    Vec<SkillGroup>,
+    Vec<mycelium_store::ConceptEntry>,
+    Vec<Vec<String>>,
+) {
+    let all = cs.list().await.unwrap_or_default();
+    let listings = group_skills(&all);
+    let mut groups = Vec::new();
+    let mut scripts = Vec::new();
+    for group in listings.grouped {
+        if group.hub.concept_type != "Skill" {
+            continue;
+        }
+        let labels = cs
+            .get(&group.hub.path)
+            .await
+            .ok()
+            .and_then(|c| c.frontmatter.skill)
+            .map(|manifest| {
+                let mut paths: Vec<String> = manifest
+                    .files
+                    .iter()
+                    .filter(|f| !f.path.ends_with(".md"))
+                    .map(|f| f.path.clone())
+                    .collect();
+                paths.sort();
+                paths
+            })
+            .unwrap_or_default();
+        groups.push(group);
+        scripts.push(labels);
+    }
+    let flat: Vec<mycelium_store::ConceptEntry> = listings
+        .flat
+        .into_iter()
+        .filter(|e| e.concept_type == "Skill")
+        .collect();
+    (groups, flat, scripts)
+}
+
 /// GET /skills — skills page (private + global).
 pub async fn skills_view(
     State(state): State<AppState>,
@@ -1036,31 +1086,25 @@ pub async fn skills_view(
         Err(_) => return pages::not_found().into_response(),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-    // Private skills: only `type: Skill` concepts from the user bundle.
-    let private: Vec<mycelium_store::ConceptEntry> = cs
-        .list()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e.concept_type == "Skill")
-        .collect();
+    let (private_groups, private_flat, private_scripts) = skill_sections(&cs).await;
     let global_cs = ConceptStore::for_service(
         &state.store,
         (*state.service_key).clone(),
         &state.store.skills_dir(),
         "skills",
     );
-    // Global skills: same `type: Skill` filter as the private section
-    // (the shelf is admin-managed, but a stray non-Skill concept
-    // should not surface on the Skills page).
-    let global: Vec<mycelium_store::ConceptEntry> = global_cs
-        .list()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e.concept_type == "Skill")
-        .collect();
-    pages::skills_page(&user, &csrf, &private, &global).into_response()
+    let (global_groups, global_flat, global_scripts) = skill_sections(&global_cs).await;
+    pages::skills_page(
+        &user,
+        &csrf,
+        &private_groups,
+        &private_flat,
+        &private_scripts,
+        &global_groups,
+        &global_flat,
+        &global_scripts,
+    )
+    .into_response()
 }
 
 #[derive(Deserialize)]

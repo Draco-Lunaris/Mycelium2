@@ -536,3 +536,250 @@ async fn global_bookshelves_browse_search_and_skills() {
 
     shutdown.cancel();
 }
+
+/// POST /concept as the logged-in user (scope None = private bundle).
+async fn put_concept(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    markdown: &str,
+    scope: Option<&str>,
+) {
+    let req = client
+        .post(format!("{base}/concept"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf);
+    let req = match scope {
+        Some(s) => req.form(&[("path", path), ("markdown", markdown), ("scope", s)]),
+        None => req.form(&[("path", path), ("markdown", markdown)]),
+    };
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status(), 303, "seeding {path}");
+}
+
+/// Skills page grouped display (spec §"Web: skills page"): nested
+/// skill dirs render as one group — hub link with companions and
+/// manifest script labels indented beneath — while legacy root-level
+/// skills stay flat rows. Non-Skill hubs drop out entirely; script
+/// labels are the manifest's non-`.md` paths only, sorted.
+#[tokio::test]
+async fn skills_page_groups_nested_bundles_with_script_labels() {
+    let (base, shutdown, _dir) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Global shelf: a bundle whose manifest lists its script paths in
+    // deliberately unsorted order, two manifest-less hubs seeded in
+    // reverse-slug order, a legacy flat skill, a non-Skill hub (the
+    // whole group must drop, members included), and a Note in a
+    // hubless dir (the flat `type: Skill` filter must drop it).
+    // Raw string: `\` line-continuations would strip the YAML's
+    // leading indentation and silently drop the manifest.
+    let hub_md = r#"---
+type: Skill
+title: pdf-to-markdown
+skill:
+  version: 1
+  files:
+    - {path: conventions.md, role: reference}
+    - {path: scripts/convert.py, role: script}
+    - {path: LICENSE.txt, role: reference}
+    - {path: scripts/postprocess.py, role: script}
+---
+
+Convert PDFs."#;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/pdf-to-markdown/skill.md",
+        hub_md,
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/pdf-to-markdown/conventions.md",
+        "---\ntype: Note\ntitle: Conventions\n---\n\nCompanion notes.",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/zeta/skill.md",
+        "---\ntype: Skill\ntitle: Zeta\n---\n\nz",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/alpha/skill.md",
+        "---\ntype: Skill\ntitle: Alpha\n---\n\na",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/standalone.md",
+        "---\ntype: Skill\ntitle: Standalone\n---\n\nOld-style.",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/not-a-skill/skill.md",
+        "---\ntype: Note\ntitle: Not A Skill\n---\n\nx",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/not-a-skill/extra.md",
+        "---\ntype: Skill\ntitle: Extra\n---\n\nx",
+        Some("skills"),
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/plain-notes/notes.md",
+        "---\ntype: Note\ntitle: Plain Notes\n---\n\nx",
+        Some("skills"),
+    )
+    .await;
+    // Private bundle (scope absent): a manifest-less hub with a Note
+    // companion, plus a legacy flat private skill.
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/my-tool/skill.md",
+        "---\ntype: Skill\ntitle: my-tool\n---\n\nSteps.",
+        None,
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/my-tool/usage.md",
+        "---\ntype: Note\ntitle: Usage\n---\n\nHow.",
+        None,
+    )
+    .await;
+    put_concept(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/old-private.md",
+        "---\ntype: Skill\ntitle: Old Private\n---\n\nx",
+        None,
+    )
+    .await;
+
+    let page = client
+        .get(format!("{base}/skills"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+
+    let link = |path: &str, scope: &str, title: &str| {
+        format!(r#"<a href="/concept?path={path}&scope={scope}">{title}</a>"#)
+    };
+    // Group: the hub links the skill.md concept, and a non-Skill
+    // companion renders indented beneath it.
+    assert!(
+        html.contains(&link(
+            "/pdf-to-markdown/skill.md",
+            "skills",
+            "pdf-to-markdown"
+        )),
+        "hub row links the skill.md concept"
+    );
+    assert!(
+        html.contains(&link(
+            "/pdf-to-markdown/conventions.md",
+            "skills",
+            "Conventions"
+        )),
+        "non-Skill companions render inside the group"
+    );
+    // Script labels: exactly the manifest's non-`.md` paths, as plain
+    // label rows, sorted (the manifest lists them unsorted).
+    let label = |path: &str| format!(r#"<li class="muted">{path}</li>"#);
+    assert_eq!(
+        html.matches("<li class=\"muted\">").count(),
+        3,
+        "exactly the 3 non-.md manifest files are label rows"
+    );
+    assert!(
+        !html.contains(&label("conventions.md")),
+        ".md manifest paths are companions, not script labels"
+    );
+    let (l1, l2, l3) = (
+        html.find(&label("LICENSE.txt")).expect("LICENSE.txt label"),
+        html.find(&label("scripts/convert.py"))
+            .expect("convert.py label"),
+        html.find(&label("scripts/postprocess.py"))
+            .expect("postprocess.py label"),
+    );
+    assert!(l1 < l2 && l2 < l3, "script labels render sorted");
+    // Deterministic listing order: groups by slug, then flat rows.
+    let (a, z, s) = (
+        html.find(&link("/alpha/skill.md", "skills", "Alpha"))
+            .expect("alpha group"),
+        html.find(&link("/zeta/skill.md", "skills", "Zeta"))
+            .expect("zeta group"),
+        html.find(&link("/standalone.md", "skills", "Standalone"))
+            .expect("flat row"),
+    );
+    assert!(a < z && z < s, "groups sort by slug, then flat rows follow");
+    // A non-Skill hub drops the whole group — hub and members alike.
+    assert!(
+        !html.contains("/not-a-skill/"),
+        "non-Skill hub group must not render"
+    );
+    assert!(!html.contains("Not A Skill"));
+    // A Note in a hubless dir falls to flat, where the Skill filter
+    // drops it.
+    assert!(
+        !html.contains("/plain-notes/"),
+        "hubless-dir non-Skill must not render"
+    );
+    // The private scope groups the same way; a hub without a
+    // manifest simply has no script labels.
+    assert!(html.contains(&link("/my-tool/skill.md", "user", "my-tool")));
+    assert!(html.contains(&link("/my-tool/usage.md", "user", "Usage")));
+    assert!(html.contains(&link("/old-private.md", "user", "Old Private")));
+
+    shutdown.cancel();
+}

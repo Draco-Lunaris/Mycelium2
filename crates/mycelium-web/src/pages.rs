@@ -376,37 +376,74 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
 }
 
 /// Skills page: private skills + global skills (read-only for users,
-/// editable by admins).
+/// editable by admins). Nested skills (`/<slug>/skill.md` hubs) render
+/// as one group: the hub row with companions and manifest script
+/// labels indented beneath it; legacy root-level skills stay flat
+/// rows exactly as before.
+#[allow(clippy::too_many_arguments)]
 pub fn skills_page(
     user: &SessionUser,
     csrf: &str,
-    private: &[mycelium_store::ConceptEntry],
-    global: &[mycelium_store::ConceptEntry],
+    private_groups: &[mycelium_store::SkillGroup],
+    private_flat: &[mycelium_store::ConceptEntry],
+    private_scripts: &[Vec<String>],
+    global_groups: &[mycelium_store::SkillGroup],
+    global_flat: &[mycelium_store::ConceptEntry],
+    global_scripts: &[Vec<String>],
 ) -> Html<String> {
-    let list = |entries: &[mycelium_store::ConceptEntry], scope: &str| {
-        entries
+    let entry_link = |e: &mycelium_store::ConceptEntry, scope: &str| {
+        format!(
+            r#"<a href="/concept?path={}&scope={scope}">{}</a>"#,
+            urlencoding_encode(&e.path),
+            html_escape(&e.title)
+        )
+    };
+    // One nested skill: hub row, then companions and manifest script
+    // labels indented beneath it. Scripts are label-only rows — raw
+    // payload files, not concepts, so they carry no link.
+    let group_block = |g: &mycelium_store::SkillGroup, scripts: &[String], scope: &str| {
+        let members = g
+            .members
             .iter()
-            .map(|e| {
-                format!(
-                    r#"<li><a href="/concept?path={}&scope={scope}">{}</a></li>"#,
-                    urlencoding_encode(&e.path),
-                    html_escape(&e.title)
-                )
-            })
-            .collect::<String>()
+            .map(|m| format!("<li>{}</li>", entry_link(m, scope)))
+            .collect::<String>();
+        let labels = scripts
+            .iter()
+            .map(|p| format!(r#"<li class="muted">{}</li>"#, html_escape(p)))
+            .collect::<String>();
+        format!(
+            r#"<li>{}<ul>{members}{labels}</ul></li>"#,
+            entry_link(&g.hub, scope)
+        )
+    };
+    // One section: grouped blocks (slug order), then flat rows.
+    let list = |groups: &[mycelium_store::SkillGroup],
+                scripts: &[Vec<String>],
+                flat: &[mycelium_store::ConceptEntry],
+                scope: &str| {
+        let rows = groups
+            .iter()
+            .zip(scripts.iter())
+            .map(|(g, s)| group_block(g, s, scope))
+            .chain(
+                flat.iter()
+                    .map(|e| format!("<li>{}</li>", entry_link(e, scope))),
+            )
+            .collect::<String>();
+        format!("<ul>{rows}</ul>")
     };
     let global_section = if user.role == Role::Admin {
         format!(
             r#"<h2>Global skills</h2>
 <ul>{}</ul>
 <p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#,
-            list(global, "skills")
+            list(global_groups, global_scripts, global_flat, "skills")
         )
     } else {
         format!(
             r#"<h2>Global skills</h2>
 <ul>{}</ul>"#,
-            list(global, "skills")
+            list(global_groups, global_scripts, global_flat, "skills")
         )
     };
     let body = format!(
@@ -415,7 +452,7 @@ pub fn skills_page(
 <ul>{}</ul>
 <p><a href="/concept?new=1&scope=skills-private">New private skill</a></p>
 {global_section}"#,
-        list(private, "user"),
+        list(private_groups, private_scripts, private_flat, "user"),
     );
     layout("Skills", Some(user), csrf, body)
 }
