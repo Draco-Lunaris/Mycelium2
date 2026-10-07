@@ -1,24 +1,3 @@
----
-type: Skill
-title: pdf-to-markdown script — docling_page_span.py
-description: Verbatim copy of the pdf-to-markdown skill's python script `docling_page_span.py`. MarkdownDocSerializer subclass replacing Docling page-break tokens with page-span <span> markers (imported by convert.py). Extract the fenced block byte-exact; verify md5 `d9d548923cfed4b2dc9b0e0679f69bf0` against the [scripts manifest](/pdf-to-markdown-scripts.md).
-tags:
-- pdf-to-markdown
-- docling
-- script
-- packaged
-timestamp: 2026-09-21T00:00:00Z
----
-
-# pdf-to-markdown script — docling_page_span.py
-
-Byte-exact copy of `docling_page_span.py` from the [pdf-to-markdown](/pdf-to-markdown.md) skill (source tree: `scripts/docling_page_span.py`). **no trailing newline**
-
-Extract the fenced block below **exactly**: strip the opening ` ```` ` line and the closing ` ```` ` line, keep every byte between them — including the final line's missing newline if the manifest says "no trailing newline" (an editor that silently appends one is harmless for these scripts, but the md5 will differ).
-
-`4887 bytes, md5 d9d548923cfed4b2dc9b0e0679f69bf0`
-
-````
 #!/usr/bin/env python3
 """Page-span adapter for the pdf-to-markdown skill (Docling engine).
 
@@ -128,5 +107,3 @@ def export_to_markdown_with_page_spans(
         traverse_pictures=traverse_pictures,
     )
     return PageSpanMarkdownSerializer(doc=new_doc, params=params).serialize().text
-
-````

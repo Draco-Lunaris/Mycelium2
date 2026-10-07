@@ -1,24 +1,3 @@
----
-type: Skill
-title: pdf-to-markdown script — setup_venv.sh
-description: 'Verbatim copy of the pdf-to-markdown skill''s shell script `setup_venv.sh`. One-time venv setup: uv + managed Python 3.12 + requirements.txt. Extract the fenced block byte-exact; verify md5 `9a881a2b5d93e09cbd7ec18f09bd8faf` against the [scripts manifest](/pdf-to-markdown-scripts.md).'
-tags:
-- pdf-to-markdown
-- docling
-- script
-- packaged
-timestamp: 2026-09-21T00:00:00Z
----
-
-# pdf-to-markdown script — setup_venv.sh
-
-Byte-exact copy of `setup_venv.sh` from the [pdf-to-markdown](/pdf-to-markdown.md) skill (source tree: `scripts/setup_venv.sh`). **no trailing newline**
-
-Extract the fenced block below **exactly**: strip the opening ` ```` ` line and the closing ` ```` ` line, keep every byte between them — including the final line's missing newline if the manifest says "no trailing newline" (an editor that silently appends one is harmless for these scripts, but the md5 will differ).
-
-`1604 bytes, md5 9a881a2b5d93e09cbd7ec18f09bd8faf`
-
-````
 #!/usr/bin/env bash
 #
 # pdf-to-markdown skill — one-time venv setup (Docling engine).
@@ -60,5 +39,3 @@ echo "Convert with:"
 echo "  $VENV/bin/python $SCRIPT_DIR/convert.py --input book.pdf --output-dir /out"
 echo
 echo "Verify with:  uv pip check --python $VENV   (expect: all packages compatible)"
-
-````

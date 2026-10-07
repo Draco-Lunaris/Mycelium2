@@ -1,24 +1,3 @@
----
-type: Skill
-title: pdf-to-markdown script — postprocess.py
-description: Verbatim copy of the pdf-to-markdown skill's python script `postprocess.py`. Adds frontmatter, TOC, stable heading IDs, page citations and the figure manifest (imports html_cleanup). Extract the fenced block byte-exact; verify md5 `ebce3858e7b192a14e376a70daf28284` against the [scripts manifest](/pdf-to-markdown-scripts.md).
-tags:
-- pdf-to-markdown
-- docling
-- script
-- packaged
-timestamp: 2026-09-21T00:00:00Z
----
-
-# pdf-to-markdown script — postprocess.py
-
-Byte-exact copy of `postprocess.py` from the [pdf-to-markdown](/pdf-to-markdown.md) skill (source tree: `scripts/postprocess.py`). **no trailing newline**
-
-Extract the fenced block below **exactly**: strip the opening ` ```` ` line and the closing ` ```` ` line, keep every byte between them — including the final line's missing newline if the manifest says "no trailing newline" (an editor that silently appends one is harmless for these scripts, but the md5 will differ).
-
-`30079 bytes, md5 ebce3858e7b192a14e376a70daf28284`
-
-````
 #!/usr/bin/env python3
 """postprocess_v2 — outline-driven chapter detection prototype.
 
@@ -682,5 +661,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-````

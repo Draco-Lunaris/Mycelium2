@@ -1,24 +1,3 @@
----
-type: Skill
-title: pdf-to-markdown script — convert.py
-description: Verbatim copy of the pdf-to-markdown skill's python script `convert.py`. Drives Docling to convert a PDF to raw markdown with page spans (imports docling_page_span). Extract the fenced block byte-exact; verify md5 `80ddf66fe575e11e0e1c8c64b2bb3b6f` against the [scripts manifest](/pdf-to-markdown-scripts.md).
-tags:
-- pdf-to-markdown
-- docling
-- script
-- packaged
-timestamp: 2026-09-21T00:00:00Z
----
-
-# pdf-to-markdown script — convert.py
-
-Byte-exact copy of `convert.py` from the [pdf-to-markdown](/pdf-to-markdown.md) skill (source tree: `scripts/convert.py`). **no trailing newline**
-
-Extract the fenced block below **exactly**: strip the opening ` ```` ` line and the closing ` ```` ` line, keep every byte between them — including the final line's missing newline if the manifest says "no trailing newline" (an editor that silently appends one is harmless for these scripts, but the md5 will differ).
-
-`12601 bytes, md5 80ddf66fe575e11e0e1c8c64b2bb3b6f`
-
-````
 #!/usr/bin/env python3
 """
 pdf-to-markdown skill — Docling conversion driver.
@@ -329,5 +308,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-````

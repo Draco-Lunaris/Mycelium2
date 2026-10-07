@@ -8,6 +8,19 @@ tags:
 - pdf
 - books
 - conversion
+skill:
+  version: 1
+  files:
+    - {path: conventions.md, role: reference}
+    - {path: references/docling-options.md, role: reference}
+    - {path: LICENSE.txt, role: reference, md5: ac22751348351ef471066f455e1ba8d8}
+    - {path: scripts/convert.py, role: script, md5: 80ddf66fe575e11e0e1c8c64b2bb3b6f}
+    - {path: scripts/postprocess.py, role: script, md5: ebce3858e7b192a14e376a70daf28284}
+    - {path: scripts/docling_page_span.py, role: script, md5: d9d548923cfed4b2dc9b0e0679f69bf0}
+    - {path: scripts/html_cleanup.py, role: script, md5: 9fa07ded3cf2f877a12020f98f65995d}
+    - {path: scripts/inspect_pdf.py, role: script, md5: 75e95808510774038a9523fe5a3a7d87}
+    - {path: scripts/setup_venv.sh, role: script, md5: 9a881a2b5d93e09cbd7ec18f09bd8faf}
+    - {path: scripts/requirements.txt, role: script, md5: 3daed4196aca9d9ecf6fae04840f7000}
 timestamp: 2026-09-20T00:00:00Z
 ---
 
@@ -86,7 +99,7 @@ A conversion run produces, under `<output-dir>/<book-slug>/`:
     └── manifest.json          # figure id -> page, caption, alt
 ```
 
-The readable book follows the [pdf-to-markdown conventions](/pdf-to-markdown-conventions.md).
+The readable book follows the [pdf-to-markdown conventions](/pdf-to-markdown/conventions.md).
 
 ## Decisions you make
 
@@ -107,10 +120,8 @@ The readable book follows the [pdf-to-markdown conventions](/pdf-to-markdown-con
 
 ## Packaged with this skill (all in this shelf)
 
-The skill is **self-contained in Mycelium2's global skills shelf** — the executable scripts, their manifest, the reference doc and the license are sibling concepts:
+The skill is **self-contained in Mycelium2's global skills shelf** — this hub, its companion concepts, the raw script payloads and the proprietary license live under `/pdf-to-markdown/`:
 
-- [pdf-to-markdown scripts](/pdf-to-markdown-scripts.md) — the file manifest (bytes + md5 per file) and the extraction instructions. Start here when materializing the skill on a host.
-- [pdf-to-markdown script — convert.py](/pdf-to-markdown-script-convert.md), [postprocess.py](/pdf-to-markdown-script-postprocess.md), [docling_page_span.py](/pdf-to-markdown-script-docling-page-span.md), [html_cleanup.py](/pdf-to-markdown-script-html-cleanup.md), [inspect_pdf.py](/pdf-to-markdown-script-inspect-pdf.md), [setup_venv.sh](/pdf-to-markdown-script-setup-venv.md), [requirements.txt](/pdf-to-markdown-script-requirements.md) — byte-exact fenced copies; extract, md5-verify, run.
-- [pdf-to-markdown docling options](/pdf-to-markdown-docling-options.md) — the `references/docling-options.md` reference (OCR, Ollama VLM, formulas, images, page spans, GPU).
-- [pdf-to-markdown license](/pdf-to-markdown-license.md) — the proprietary LICENSE.txt.
-- [pdf-to-markdown conventions](/pdf-to-markdown-conventions.md) — the full output spec (frontmatter, heading IDs, citations, manifest).
+- [pdf-to-markdown conventions](/pdf-to-markdown/conventions.md) — the full output spec (frontmatter, heading IDs, citations, manifest).
+- [pdf-to-markdown docling options](/pdf-to-markdown/references/docling-options.md) — the `references/docling-options.md` reference (OCR, Ollama VLM, formulas, images, page spans, GPU).
+- Scripts and their md5s live in the bundle; download via the skills page.

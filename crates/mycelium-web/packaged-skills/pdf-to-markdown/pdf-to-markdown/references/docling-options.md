@@ -13,7 +13,7 @@ timestamp: 2026-09-21T00:00:00Z
 
 # pdf-to-markdown docling options
 
-Read before running `convert.py` when the PDF is scanned, math-heavy, multi-column, or the user asks about GPU / OCR / the Ollama VLM. Verbatim reference from the [pdf-to-markdown](/pdf-to-markdown.md) skill (`references/docling-options.md`; no trailing newline in the source).
+Read before running `convert.py` when the PDF is scanned, math-heavy, multi-column, or the user asks about GPU / OCR / the Ollama VLM. Verbatim reference from the [pdf-to-markdown](/pdf-to-markdown/skill.md) skill (`references/docling-options.md`; no trailing newline in the source).
 
 ````
 # docling-options.md

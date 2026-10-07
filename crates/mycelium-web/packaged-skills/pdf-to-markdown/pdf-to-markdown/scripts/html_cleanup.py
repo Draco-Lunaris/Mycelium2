@@ -1,24 +1,3 @@
----
-type: Skill
-title: pdf-to-markdown script — html_cleanup.py
-description: Verbatim copy of the pdf-to-markdown skill's python script `html_cleanup.py`. HTML-to-markdown cleanup for run-on HTML blobs (imported by postprocess.py). Extract the fenced block byte-exact; verify md5 `9fa07ded3cf2f877a12020f98f65995d` against the [scripts manifest](/pdf-to-markdown-scripts.md).
-tags:
-- pdf-to-markdown
-- docling
-- script
-- packaged
-timestamp: 2026-09-21T00:00:00Z
----
-
-# pdf-to-markdown script — html_cleanup.py
-
-Byte-exact copy of `html_cleanup.py` from the [pdf-to-markdown](/pdf-to-markdown.md) skill (source tree: `scripts/html_cleanup.py`). **no trailing newline**
-
-Extract the fenced block below **exactly**: strip the opening ` ```` ` line and the closing ` ```` ` line, keep every byte between them — including the final line's missing newline if the manifest says "no trailing newline" (an editor that silently appends one is harmless for these scripts, but the md5 will differ).
-
-`7938 bytes, md5 9fa07ded3cf2f877a12020f98f65995d`
-
-````
 #!/usr/bin/env python3
 """HTML-body cleanup for marker's degraded output (e.g. Python Crash Course,
 where marker emits the body as one giant run-on line of <p>/<h1>/<i>/<b>/<pre>/
@@ -175,5 +154,3 @@ if __name__ == "__main__":
         print(f"wrote {len(res)} chars to {out}")
     else:
         print(res[:4000])
-
-````

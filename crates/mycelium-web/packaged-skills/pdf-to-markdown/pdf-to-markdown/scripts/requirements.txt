@@ -1,0 +1,16 @@
+# pdf-to-markdown skill — Docling engine (replaces marker/surya/vLLM).
+#
+# Docling runs its layout/table/OCR models inline (in-process, clean exit — no
+# surya-style persistent GPU servers, no vLLM, no Docker). The [rapidocr] extra
+# pulls RapidOCR for scanned-PDF OCR; [remote-serving] enables the optional
+# Ollama cloud-vision VLM for figure description (--use-ollama-vlm).
+#
+# NOTE: onnxruntime is the RapidOCR inference backend. rapidocr does NOT declare
+# onnxruntime as a hard dependency (it is a multi-backend package), so it must be
+# listed explicitly or OCR crashes with:
+#   ImportError: onnxruntime is not installed.
+docling[rapidocr,remote-serving]>=2.118.1
+onnxruntime>=1.28.0
+pypdfium2>=4.0
+pdfplumber>=0.10
+PyYAML>=6.0

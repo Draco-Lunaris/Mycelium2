@@ -13,7 +13,7 @@ timestamp: 2026-09-20T00:00:00Z
 
 # pdf-to-markdown conventions
 
-The spec for the **enhanced readable book** (`<book>.md`) produced by the [pdf-to-markdown](/pdf-to-markdown.md) skill. The goal is a markdown file that is both pleasant for a human to read and easy for an LLM to index, navigate, cite, and chunk.
+The spec for the **enhanced readable book** (`<book>.md`) produced by the [pdf-to-markdown](/pdf-to-markdown/skill.md) skill. The goal is a markdown file that is both pleasant for a human to read and easy for an LLM to index, navigate, cite, and chunk.
 
 ## What postprocess.py applies
 
