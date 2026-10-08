@@ -25,3 +25,9 @@ sqlx.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test harness mirrors the web skill-bundle integration tests: the
+# packaged skills are seeded via the production seeder, and payload
+# md5s are verified with the workspace idiom (md-5 + hex crates).
+mycelium-web = { path = "../mycelium-web" }
+md-5 = "0.10"
+hex = "0.4"

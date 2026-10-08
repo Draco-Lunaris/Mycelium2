@@ -25,6 +25,10 @@ pub enum ServiceKeyError {
     Malformed { path: String },
     #[error("MYCELIUM2_SERVICE_KEY env var is not 64 hex chars")]
     BadEnv,
+    #[error(
+        "service key not found at {path} and MYCELIUM2_SERVICE_KEY is not set; refusing to create one (the server creates it on first boot)"
+    )]
+    Absent { path: String },
 }
 
 /// Load the service key, creating it on first run if needed.
@@ -112,6 +116,38 @@ pub fn load_or_create_service_key(data_dir: &Path) -> Result<ServiceKey, Service
     load_or_create_service_key_with(data_dir, env_hex.as_deref())
 }
 
+/// Load the service key WITHOUT creating it (offline/export paths).
+///
+/// Same priority as [`load_or_create_service_key_with`]: `env_hex`
+/// override → `<data_dir>/config/service.key`. A missing key file
+/// with no override is [`ServiceKeyError::Absent`] — export-style
+/// callers must never mint a key: creating one belongs to the
+/// server's first boot. An existing file reuses the full
+/// create-path loader (`load_existing_key_with_retry`, with its
+/// mid-write retry and permission checks).
+pub fn load_service_key_with(
+    data_dir: &Path,
+    env_hex: Option<&str>,
+) -> Result<ServiceKey, ServiceKeyError> {
+    if let Some(hex_str) = env_hex {
+        return parse_key_hex(hex_str).map_err(|_| ServiceKeyError::BadEnv);
+    }
+    let path = data_dir.join(SERVICE_KEY_FILE);
+    if !path.exists() {
+        return Err(ServiceKeyError::Absent {
+            path: path.display().to_string(),
+        });
+    }
+    load_existing_key_with_retry(&path)
+}
+
+/// Load-only production entry point: reads `MYCELIUM2_SERVICE_KEY`
+/// from the environment; never creates the key file.
+pub fn load_service_key(data_dir: &Path) -> Result<ServiceKey, ServiceKeyError> {
+    let env_hex = std::env::var("MYCELIUM2_SERVICE_KEY").ok();
+    load_service_key_with(data_dir, env_hex.as_deref())
+}
+
 fn parse_key_hex(hex_str: &str) -> Result<ServiceKey, ()> {
     let bytes = hex::decode(hex_str).map_err(|_| ())?;
     ServiceKey::from_bytes(&bytes).map_err(|_| ())
@@ -181,6 +217,36 @@ mod tests {
             load_or_create_service_key_with(dir.path(), None),
             Err(ServiceKeyError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn load_service_key_fails_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // ServiceKey is not Debug, so no unwrap_err() — match instead.
+        let err = match load_service_key_with(dir.path(), None) {
+            Err(e) => e,
+            Ok(_) => panic!("an absent key must not load"),
+        };
+        assert!(matches!(err, ServiceKeyError::Absent { .. }), "{err}");
+        // Load-only: a missing key is an error, and no key file is
+        // created as a side effect.
+        assert!(!dir.path().join(SERVICE_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn load_service_key_reads_existing_without_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = load_or_create_service_key_with(dir.path(), None).unwrap();
+        let loaded = load_service_key_with(dir.path(), None).unwrap();
+        assert_eq!(loaded.as_bytes(), created.as_bytes());
+    }
+
+    #[test]
+    fn load_service_key_env_override_wins_over_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = generate_master_key();
+        let loaded = load_service_key_with(dir.path(), Some(&hex::encode(key.as_bytes()))).unwrap();
+        assert_eq!(loaded.as_bytes(), key.as_bytes());
     }
 
     #[test]

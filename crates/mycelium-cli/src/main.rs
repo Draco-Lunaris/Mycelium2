@@ -2,8 +2,9 @@
 //!
 //! Offline administrative operations against a data directory:
 //! `migrate` (run SQL migrations), `backup` (tar the data directory),
-//! and `verify` (integrity check of the store layout). The admin
-//! account is created only through the web /setup page.
+//! `verify` (integrity check of the store layout), and `skill-export`
+//! (unpack a nested skill to an install directory). The admin account
+//! is created only through the web /setup page.
 
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -49,6 +50,22 @@ enum Command {
             default_value = "/opt/mycelium2/data"
         )]
         data_dir: String,
+    },
+    /// Export a skill from the global skills shelf as a ready-to-install
+    /// bundle directory (SKILL.md + companions + scripts).
+    SkillExport {
+        #[arg(
+            long,
+            env = "MYCELIUM2_DATA_DIR",
+            default_value = "/opt/mycelium2/data"
+        )]
+        data_dir: String,
+        /// Skill slug (top-level directory in the skills shelf).
+        #[arg(long)]
+        slug: String,
+        /// Output directory (must not exist, sibling-safe).
+        #[arg(long)]
+        out: String,
     },
 }
 
@@ -96,6 +113,20 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("store verification failed");
             }
         }
+        Command::SkillExport {
+            data_dir,
+            slug,
+            out,
+        } => {
+            // Errors propagate to anyhow's main: nonzero exit, message
+            // on stderr (not a nested skill bundle / md5 mismatch /
+            // invalid manifest / absent service key).
+            let written =
+                mycelium_cli::export_skill(Path::new(&data_dir), Path::new(&out), &slug).await?;
+            for path in &written {
+                println!("{}", path.display());
+            }
+        }
     }
     Ok(())
 }
@@ -125,7 +156,8 @@ mod tests {
     use clap::CommandFactory;
 
     /// The admin account is created only through the web /setup page —
-    /// no CLI bootstrap subcommand exists.
+    /// no CLI bootstrap subcommand exists. Task 9's `skill-export` is
+    /// registered alongside migrate/backup/verify.
     #[test]
     fn no_bootstrap_subcommand() {
         let cmd = Args::command();
@@ -133,5 +165,16 @@ mod tests {
         assert!(cmd.find_subcommand("migrate").is_some());
         assert!(cmd.find_subcommand("backup").is_some());
         assert!(cmd.find_subcommand("verify").is_some());
+        let export = cmd
+            .find_subcommand("skill-export")
+            .expect("skill-export subcommand registered");
+        // The long flags are the CLI contract (clap's internal arg ids
+        // are the field names, an implementation detail).
+        for flag in ["data-dir", "slug", "out"] {
+            assert!(
+                export.get_arguments().any(|a| a.get_long() == Some(flag)),
+                "skill-export takes --{flag}"
+            );
+        }
     }
 }
