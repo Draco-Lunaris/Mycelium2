@@ -67,7 +67,7 @@ shelf must be global-read (or the caller is an admin).
 
 ### `GET /api/v1/skills/{slug}/bundle`
 Download a nested skill as a Claude-Code-shaped zip
-(`application/zip`): `SKILL.md` (the hub markdown verbatim), the
+(`application/zip`): `SKILL.md` (the hub concept's markdown), the
 skill's companion concepts, and its manifest-declared scripts at
 their manifest paths. Same visibility as the skills page — any user
 may bundle a global skill; a private skill only from its own bundle.

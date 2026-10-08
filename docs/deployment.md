@@ -127,5 +127,8 @@ The packaged `pdf-to-markdown` skill seeds as a nested bundle
 3. The `.seed-version` marker gates refresh as before: a matching
    marker is a no-op (admin edits to the packaged paths survive
    between bumps), and extra admin-created skills are never touched.
-   Seeding fails fast on a bad embedded manifest or md5 — the server
-   refuses to boot half-seeded.
+   Seeding validates the embedded concepts and manifest paths before
+   any store write and fails fast on error — the server refuses to
+   boot half-seeded. Payload md5s are a different gate: verified
+   against the hub manifest at bundle download/export time, and
+   pinned by the packaged-skills asset test.
