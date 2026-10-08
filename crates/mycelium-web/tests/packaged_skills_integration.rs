@@ -1,9 +1,10 @@
-//! Packaged-skills seeding (v2): the pdf-to-markdown skill installs as a
-//! nested bundle — hub (`/pdf-to-markdown/skill.md`, carrying the bundle
-//! manifest) + companions as concepts under `/pdf-to-markdown/`, and the
-//! scripts + license as raw FileRepo payloads (never concepts). A live
-//! v1 shelf (flat `/pdf-to-markdown*.md` concepts) is migrated: legacy
-//! paths deleted, nested bundle installed, payloads written.
+//! Packaged-skills seeding (v3): BOTH packaged skills install as nested
+//! bundles (pdf since v2, ebook since v3) — each hub
+//! (`/<slug>/skill.md`, carrying the bundle manifest) + companions as
+//! concepts under `/<slug>/`, and the scripts (pdf also the license) as
+//! raw FileRepo payloads (never concepts). A live v1 shelf (flat
+//! `/pdf-to-markdown*.md` concepts) is migrated: legacy paths deleted,
+//! nested bundle installed, payloads written.
 
 use std::path::{Path, PathBuf};
 
@@ -2214,15 +2215,24 @@ async fn fresh_seed_installs_nested_bundle_and_payloads() {
         .unwrap();
     let cs = skills_store(&svc, &store, &skills_dir);
     let paths = listed_paths(&cs).await;
-    // 3 concepts: hub + conventions + references/docling-options (the
-    // license CONCEPT is gone — LICENSE.txt is a raw payload now).
-    assert_eq!(paths.len(), 3, "paths: {paths:?}");
+    // 7 concepts: 3 pdf (hub + conventions + references/docling-options —
+    // the license CONCEPT is gone, LICENSE.txt is a raw payload) and
+    // 4 ebook (its licensing story IS the license.md companion).
+    assert_eq!(paths.len(), 7, "paths: {paths:?}");
     assert!(paths.contains(&"/pdf-to-markdown/skill.md".to_string()));
     assert!(paths.contains(&"/pdf-to-markdown/conventions.md".to_string()));
     assert!(paths.contains(&"/pdf-to-markdown/references/docling-options.md".to_string()));
     assert!(
         !paths.iter().any(|p| p.starts_with("/pdf-to-markdown-")),
         "no legacy flat paths"
+    );
+    assert!(paths.contains(&"/ebook-to-markdown/skill.md".to_string()));
+    assert!(paths.contains(&"/ebook-to-markdown/conventions.md".to_string()));
+    assert!(paths.contains(&"/ebook-to-markdown/license.md".to_string()));
+    assert!(paths.contains(&"/ebook-to-markdown/references/ebook-options.md".to_string()));
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/ebook-to-markdown-")),
+        "no ebook flat paths (it never shipped flat)"
     );
     // Payloads: real bytes under the skills scope FileRepo, md5-verified.
     let repo = FileRepo::new(&skills_dir);
@@ -2239,9 +2249,23 @@ async fn fresh_seed_installs_nested_bundle_and_payloads() {
         .await
         .unwrap();
     assert_eq!(md5_hex(&lic), "ac22751348351ef471066f455e1ba8d8");
+    // Ebook spot-check: a script payload with the pinned md5.
+    let eb = repo
+        .read(
+            "/ebook-to-markdown/scripts/convert.py",
+            &Scope::Service(svc.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(md5_hex(&eb), "87ff45ad5c677a73c42a8ecd4bd4c1d9");
     // Payloads are NOT concepts (the payload bytes do not parse as a
     // concept, and the registry never listed them).
     assert!(cs.get("/pdf-to-markdown/scripts/convert.py").await.is_err());
+    assert!(
+        cs.get("/ebook-to-markdown/scripts/convert.py")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -2264,13 +2288,18 @@ async fn migration_from_v1_shelf_deletes_legacy_and_installs_nested() {
         !paths.iter().any(|p| p.starts_with("/pdf-to-markdown-")),
         "legacy deleted"
     );
-    // The migration completed: exactly the nested bundle remains.
-    assert_eq!(paths.len(), 3, "paths: {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/ebook-to-markdown-")),
+        "no ebook flat paths (they never existed — vacuous but symmetric)"
+    );
+    // The migration completed: exactly the two nested bundles remain
+    // (3 pdf + 4 ebook concepts).
+    assert_eq!(paths.len(), 7, "paths: {paths:?}");
     assert_eq!(
         std::fs::read_to_string(skills_dir.join(".seed-version"))
             .unwrap()
             .trim(),
-        "2"
+        SKILLS_SEED_VERSION
     );
 }
 
@@ -2291,7 +2320,7 @@ async fn seed_twice_is_idempotent_and_marker_written() {
         std::fs::read_to_string(skills_dir.join(".seed-version"))
             .unwrap()
             .trim(),
-        "2"
+        SKILLS_SEED_VERSION
     );
 }
 
@@ -2301,10 +2330,14 @@ async fn same_version_preserves_admin_edits() {
     packaged_skills::seed_packaged_skills(&store, &svc, &skills_dir)
         .await
         .unwrap();
-    // Simulate an admin edit through the shelf itself.
+    // Simulate admin edits through the shelf itself — one per skill.
     let cs = skills_store(&svc, &store, &skills_dir);
     let edited = "---\ntype: Skill\ntitle: edited\n---\n\nadmin customization\n";
     cs.put(&Concept::parse("/pdf-to-markdown/skill.md", edited).unwrap())
+        .await
+        .unwrap();
+    let edited_ebook = "---\ntype: Skill\ntitle: edited ebook\n---\n\nadmin ebook customization\n";
+    cs.put(&Concept::parse("/ebook-to-markdown/conventions.md", edited_ebook).unwrap())
         .await
         .unwrap();
     // Second boot with the same packaged version: hands off.
@@ -2314,6 +2347,9 @@ async fn same_version_preserves_admin_edits() {
     let got = cs.get("/pdf-to-markdown/skill.md").await.unwrap();
     assert_eq!(got.frontmatter.title.as_deref(), Some("edited"));
     assert!(got.body.contains("admin customization"));
+    let got_ebook = cs.get("/ebook-to-markdown/conventions.md").await.unwrap();
+    assert_eq!(got_ebook.frontmatter.title.as_deref(), Some("edited ebook"));
+    assert!(got_ebook.body.contains("admin ebook customization"));
     assert_eq!(
         std::fs::read_to_string(skills_dir.join(".seed-version"))
             .unwrap()
@@ -2329,14 +2365,24 @@ async fn version_bump_refreshes_packaged_content_and_payloads() {
         .await
         .unwrap();
     let cs = skills_store(&svc, &store, &skills_dir);
-    // Admin drift on the hub + a corrupted payload.
+    // Admin drift on both hubs + corrupted payloads in both skills.
     let edited = "---\ntype: Skill\ntitle: stale\n---\n\nold content\n";
     cs.put(&Concept::parse("/pdf-to-markdown/skill.md", edited).unwrap())
+        .await
+        .unwrap();
+    cs.put(&Concept::parse("/ebook-to-markdown/skill.md", edited).unwrap())
         .await
         .unwrap();
     let repo = FileRepo::new(&skills_dir);
     repo.write(
         "/pdf-to-markdown/scripts/convert.py",
+        b"tampered",
+        &Scope::Service(svc.clone()),
+    )
+    .await
+    .unwrap();
+    repo.write(
+        "/ebook-to-markdown/scripts/convert.py",
         b"tampered",
         &Scope::Service(svc.clone()),
     )
@@ -2350,7 +2396,12 @@ async fn version_bump_refreshes_packaged_content_and_payloads() {
     let got = cs.get("/pdf-to-markdown/skill.md").await.unwrap();
     assert_ne!(got.frontmatter.title.as_deref(), Some("stale"));
     assert_eq!(got.frontmatter.title.as_deref(), Some("pdf-to-markdown"));
-    // The payload was re-written with the packaged bytes.
+    let got_eb = cs.get("/ebook-to-markdown/skill.md").await.unwrap();
+    assert_eq!(
+        got_eb.frontmatter.title.as_deref(),
+        Some("ebook-to-markdown")
+    );
+    // The payloads were re-written with the packaged bytes.
     let bytes = repo
         .read(
             "/pdf-to-markdown/scripts/convert.py",
@@ -2359,6 +2410,14 @@ async fn version_bump_refreshes_packaged_content_and_payloads() {
         .await
         .unwrap();
     assert_eq!(md5_hex(&bytes), "80ddf66fe575e11e0e1c8c64b2bb3b6f");
+    let eb_bytes = repo
+        .read(
+            "/ebook-to-markdown/scripts/convert.py",
+            &Scope::Service(svc.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(md5_hex(&eb_bytes), "87ff45ad5c677a73c42a8ecd4bd4c1d9");
     assert_eq!(
         std::fs::read_to_string(skills_dir.join(".seed-version"))
             .unwrap()
@@ -2397,49 +2456,69 @@ async fn extra_admin_skills_are_untouched() {
     assert!(paths.contains(&"/my-thing/skill.md".to_string()));
     assert!(paths.contains(&"/my-thing/x.md".to_string()));
     assert!(paths.contains(&"/pdf-to-markdown/skill.md".to_string()));
-    assert_eq!(paths.len(), 5, "paths: {paths:?}");
+    assert!(paths.contains(&"/ebook-to-markdown/skill.md".to_string()));
+    // 2 admin concepts + 7 packaged (3 pdf + 4 ebook).
+    assert_eq!(paths.len(), 9, "paths: {paths:?}");
 }
 
-/// Reverse-direction table consistency (carried from the Task-2 review):
-/// every `PACKAGED_SCRIPTS_PAYLOADS` key appears as a non-`.md` path in
-/// the hub manifest, and every manifest path not covered by payloads is
+/// Reverse-direction table consistency (carried from the Task-2
+/// review), parameterized over BOTH hubs: every
+/// `PACKAGED_SCRIPTS_PAYLOADS` key is skill-prefixed, names a known
+/// skill, is not a `.md` path, and appears in that skill's hub
+/// manifest; and every manifest path not covered by payloads is
 /// either an `.md` companion (present in PACKAGED_CONCEPTS under the
 /// skill dir) or a payload-less entry with no md5 declared.
 #[test]
 fn tables_are_consistent_with_hub_manifest() {
-    let (_, hub_md) = PACKAGED_CONCEPTS
-        .iter()
-        .find(|(p, _)| *p == "pdf-to-markdown/skill.md")
-        .expect("hub present");
-    let hub = Concept::parse("/pdf-to-markdown/skill.md", hub_md).unwrap();
-    let man = hub
-        .frontmatter
-        .skill
-        .as_ref()
-        .expect("hub carries manifest");
-    man.validated().expect("manifest paths valid");
-
+    const SLUGS: [&str; 2] = ["pdf-to-markdown", "ebook-to-markdown"];
     for (p, _) in PACKAGED_SCRIPTS_PAYLOADS {
         assert!(
             !p.ends_with(".md"),
             "payload {p} must not be a .md concept path"
         );
-        assert!(
-            man.files.iter().any(|f| f.path.as_str() == *p),
-            "payload {p} missing from the hub manifest"
-        );
+        let (slug, _) = p.split_once('/').expect("payload keys are skill-prefixed");
+        assert!(SLUGS.contains(&slug), "payload {p} names an unknown skill");
     }
-    for f in &man.files {
-        if PACKAGED_SCRIPTS_PAYLOADS.iter().any(|(p, _)| *p == f.path) {
-            continue;
-        }
-        if f.path.ends_with(".md") {
-            let shelf = format!("pdf-to-markdown/{}", f.path);
+    for slug in SLUGS {
+        let hub_path = format!("{slug}/skill.md");
+        let (_, hub_md) = PACKAGED_CONCEPTS
+            .iter()
+            .find(|(p, _)| **p == hub_path)
+            .unwrap_or_else(|| panic!("{slug} hub present"));
+        let hub = Concept::parse(&format!("/{hub_path}"), hub_md).unwrap();
+        let man = hub
+            .frontmatter
+            .skill
+            .as_ref()
+            .expect("hub carries manifest");
+        man.validated().expect("manifest paths valid");
+
+        for (p, _) in PACKAGED_SCRIPTS_PAYLOADS {
+            let (p_slug, rel) = p.split_once('/').expect("skill-prefixed key");
+            if p_slug != slug {
+                continue;
+            }
             assert!(
-                PACKAGED_CONCEPTS.iter().any(|(c, _)| *c == shelf),
-                "companion {shelf} missing from PACKAGED_CONCEPTS"
+                man.files.iter().any(|f| f.path == rel),
+                "payload {p} missing from the {slug} hub manifest"
             );
-        } else {
+        }
+        for f in &man.files {
+            if f.path.ends_with(".md") {
+                let shelf = format!("{slug}/{}", f.path);
+                assert!(
+                    PACKAGED_CONCEPTS.iter().any(|(c, _)| *c == shelf),
+                    "companion {shelf} missing from PACKAGED_CONCEPTS"
+                );
+                continue;
+            }
+            let payload_key = format!("{slug}/{}", f.path);
+            if PACKAGED_SCRIPTS_PAYLOADS
+                .iter()
+                .any(|(p, _)| *p == payload_key)
+            {
+                continue;
+            }
             assert!(
                 f.md5.is_none(),
                 "manifest path {} declares an md5 with no packaged payload to verify",

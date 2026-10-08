@@ -3,12 +3,13 @@
 //! (`assets::scaffold_defaults`): first boot writes everything; the
 //! version marker decides refresh; admin edits survive between bumps.
 //!
-//! Seed v2 installs the pdf-to-markdown skill as a nested bundle: the
-//! hub (`/pdf-to-markdown/skill.md`, carrying the bundle manifest) and
-//! its companion concepts under `/pdf-to-markdown/`, plus the scripts
-//! and license as raw FileRepo payloads (never concepts). A live v1
-//! shelf's flat `/pdf-to-markdown*.md` concepts are deleted
-//! (idempotently) so the migration is clean.
+//! Seed v3 installs BOTH packaged skills as nested bundles (pdf since
+//! v2, ebook since v3): each skill's hub (`/<slug>/skill.md`, carrying
+//! the bundle manifest), its companion concepts under `/<slug>/`, and
+//! its raw script payloads (plus, for pdf, the license) as FileRepo
+//! payloads (never concepts). A live v1 shelf's flat
+//! `/pdf-to-markdown*.md` concepts are deleted (idempotently) so the
+//! migration is clean.
 
 use std::path::Path;
 
@@ -19,7 +20,7 @@ use mycelium_store::{ConceptStore, ConceptStoreError, FileRepo, Scope, Store};
 /// The packaged skills' content version. Bumped when the packaged skill
 /// content changes; a stale (or missing) marker triggers a full refresh
 /// of the packaged paths — extra admin-created skills are never touched.
-pub const SKILLS_SEED_VERSION: &str = "2";
+pub const SKILLS_SEED_VERSION: &str = "3";
 
 /// The packaged skill concepts in the nested layout: (repo-relative
 /// path, full OKF file contents), embedded at compile time. Shelf paths
@@ -40,50 +41,93 @@ pub const PACKAGED_CONCEPTS: &[(&str, &str)] = &[
             "../packaged-skills/pdf-to-markdown/pdf-to-markdown/references/docling-options.md"
         ),
     ),
+    (
+        "ebook-to-markdown/skill.md",
+        include_str!("../packaged-skills/ebook-to-markdown/skill.md"),
+    ),
+    (
+        "ebook-to-markdown/conventions.md",
+        include_str!("../packaged-skills/ebook-to-markdown/conventions.md"),
+    ),
+    (
+        "ebook-to-markdown/license.md",
+        include_str!("../packaged-skills/ebook-to-markdown/license.md"),
+    ),
+    (
+        "ebook-to-markdown/references/ebook-options.md",
+        include_str!("../packaged-skills/ebook-to-markdown/references/ebook-options.md"),
+    ),
 ];
 
-/// The packaged skill's raw script payload files — real bytes, never
-/// concepts: (path relative to the skill dir, bytes). Paths match the
-/// hub manifest's `skill.files[].path` entries exactly; `asset_tests`
-/// pins each payload's md5 against the manifest.
+/// The packaged skills' raw script payload files — real bytes, never
+/// concepts: (skill-prefixed path, bytes). Keys are `<skill slug>/<path
+/// relative to the skill dir>` so the two skills' `scripts/…` trees
+/// cannot clash; the FileRepo write path is the key with a leading `/`.
+/// The skill-relative remainder matches the hub manifest's
+/// `skill.files[].path` entries exactly; `asset_tests` pins each
+/// payload's md5 against its skill's hub manifest.
 pub const PACKAGED_SCRIPTS_PAYLOADS: &[(&str, &[u8])] = &[
     (
-        "LICENSE.txt",
+        "pdf-to-markdown/LICENSE.txt",
         include_bytes!("../packaged-skills/pdf-to-markdown/pdf-to-markdown/LICENSE.txt"),
     ),
     (
-        "scripts/convert.py",
+        "pdf-to-markdown/scripts/convert.py",
         include_bytes!("../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/convert.py"),
     ),
     (
-        "scripts/postprocess.py",
+        "pdf-to-markdown/scripts/postprocess.py",
         include_bytes!("../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/postprocess.py"),
     ),
     (
-        "scripts/docling_page_span.py",
+        "pdf-to-markdown/scripts/docling_page_span.py",
         include_bytes!(
             "../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/docling_page_span.py"
         ),
     ),
     (
-        "scripts/html_cleanup.py",
+        "pdf-to-markdown/scripts/html_cleanup.py",
         include_bytes!(
             "../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/html_cleanup.py"
         ),
     ),
     (
-        "scripts/inspect_pdf.py",
+        "pdf-to-markdown/scripts/inspect_pdf.py",
         include_bytes!("../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/inspect_pdf.py"),
     ),
     (
-        "scripts/setup_venv.sh",
+        "pdf-to-markdown/scripts/setup_venv.sh",
         include_bytes!("../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/setup_venv.sh"),
     ),
     (
-        "scripts/requirements.txt",
+        "pdf-to-markdown/scripts/requirements.txt",
         include_bytes!(
             "../packaged-skills/pdf-to-markdown/pdf-to-markdown/scripts/requirements.txt"
         ),
+    ),
+    (
+        "ebook-to-markdown/scripts/inspect_ebook.py",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/inspect_ebook.py"),
+    ),
+    (
+        "ebook-to-markdown/scripts/convert.py",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/convert.py"),
+    ),
+    (
+        "ebook-to-markdown/scripts/ebook_html.py",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/ebook_html.py"),
+    ),
+    (
+        "ebook-to-markdown/scripts/postprocess.py",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/postprocess.py"),
+    ),
+    (
+        "ebook-to-markdown/scripts/setup_venv.sh",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/setup_venv.sh"),
+    ),
+    (
+        "ebook-to-markdown/scripts/requirements.txt",
+        include_bytes!("../packaged-skills/ebook-to-markdown/scripts/requirements.txt"),
     ),
 ];
 
@@ -150,8 +194,10 @@ pub async fn seed_packaged_skills(
     // the registry or the search index.
     let repo = FileRepo::new(skills_dir);
     for (rel, bytes) in PACKAGED_SCRIPTS_PAYLOADS {
+        // Keys are skill-prefixed (`<slug>/<skill-relative path>`), so
+        // the FileRepo path is the key with a leading `/`.
         repo.write(
-            &format!("/pdf-to-markdown/{rel}"),
+            &format!("/{rel}"),
             bytes,
             &Scope::Service(service_key.clone()),
         )
@@ -166,37 +212,41 @@ pub async fn seed_packaged_skills(
 mod asset_tests {
     use super::*;
 
-    /// The embedded repo assets must match the hub manifest: every
-    /// payload in `PACKAGED_SCRIPTS_PAYLOADS` md5s to its declared
-    /// manifest value on the `skill.md` hub.
+    /// The embedded repo assets must match the hub manifests: every
+    /// md5-bearing row of each skill's hub manifest md5s to its
+    /// payload in `PACKAGED_SCRIPTS_PAYLOADS` (skill-prefixed keys).
     #[test]
     fn embedded_payloads_match_hub_manifest_md5s() {
         use md5::{Digest, Md5};
 
-        let (_, hub_md) = PACKAGED_CONCEPTS
-            .iter()
-            .find(|(p, _)| *p == "pdf-to-markdown/skill.md")
-            .expect("hub present");
-        let hub = mycelium_core::concept::Concept::parse("/pdf-to-markdown/skill.md", hub_md)
-            .expect("hub parses");
-        let man = hub
-            .frontmatter
-            .skill
-            .as_ref()
-            .expect("hub carries manifest");
-        man.validated().expect("manifest paths valid");
-        for f in &man.files {
-            if f.md5.is_none() {
-                continue;
-            }
-            let (_, bytes) = PACKAGED_SCRIPTS_PAYLOADS
+        for slug in ["pdf-to-markdown", "ebook-to-markdown"] {
+            let hub_path = format!("{slug}/skill.md");
+            let (_, hub_md) = PACKAGED_CONCEPTS
                 .iter()
-                .find(|(p, _)| *p == f.path)
-                .unwrap_or_else(|| panic!("payload {} present", f.path));
-            let mut h = Md5::new();
-            h.update(*bytes);
-            let digest = hex::encode(h.finalize());
-            assert_eq!(digest, f.md5.as_deref().unwrap(), "{}", f.path);
+                .find(|(p, _)| **p == hub_path)
+                .unwrap_or_else(|| panic!("{slug} hub present"));
+            let hub = mycelium_core::concept::Concept::parse(&format!("/{hub_path}"), hub_md)
+                .expect("hub parses");
+            let man = hub
+                .frontmatter
+                .skill
+                .as_ref()
+                .expect("hub carries manifest");
+            man.validated().expect("manifest paths valid");
+            for f in &man.files {
+                let Some(expected) = f.md5.as_deref() else {
+                    continue;
+                };
+                let payload_key = format!("{slug}/{}", f.path);
+                let (_, bytes) = PACKAGED_SCRIPTS_PAYLOADS
+                    .iter()
+                    .find(|(p, _)| **p == payload_key)
+                    .unwrap_or_else(|| panic!("payload {payload_key} present"));
+                let mut h = Md5::new();
+                h.update(*bytes);
+                let digest = hex::encode(h.finalize());
+                assert_eq!(digest, expected, "{}", f.path);
+            }
         }
     }
 
