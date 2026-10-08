@@ -1,5 +1,5 @@
 //! Library surface of the admin CLI: the operation behind the
-//! `skill-export` subcommand, extracted so tests can drive it directly
+//! `skill export` subcommand, extracted so tests can drive it directly
 //! against a temp data dir (the crate's tests are in-module; the
 //! binary stays thin — flag parsing and dispatch only).
 
