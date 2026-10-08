@@ -414,8 +414,8 @@ async fn api_delete_concept(
 /// only from the caller's own bundle. A slug naming only a legacy flat
 /// skill (or nothing at all) is 404 — indistinguishable, never an
 /// oracle. Integrity errors (traversal manifest, md5 mismatch, missing
-/// payload, zip failure) are logged server-side and answered with a
-/// generic 500; no internal detail reaches the client.
+/// payload, key recovery, zip failure) are logged server-side and
+/// answered with a generic 500; no internal detail reaches the client.
 pub async fn skill_bundle(
     State(state): State<AppState>,
     user: SessionUser,
@@ -439,8 +439,14 @@ pub async fn skill_bundle(
         Err(SkillBundleError::NotBundle(_)) => {
             let master = match state.master_key_for(user.user_id).await {
                 Ok(m) => m,
-                Err(_) => {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                Err(e) => {
+                    tracing::error!(
+                        slug = %slug,
+                        user_id = %user.user_id,
+                        error = %e,
+                        "master key unavailable for private bundle lookup"
+                    );
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             };
             let cs = ConceptStore::for_user(&state.store, user.user_id, master.clone());

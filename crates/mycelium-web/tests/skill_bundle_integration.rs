@@ -3,7 +3,9 @@
 //! deterministic zip bytes for the seeded global skill, 404 for legacy
 //! flat skills and unknown slugs, private-skill visibility (owner-only),
 //! and hostile-hub containment (a traversal manifest never yields a
-//! downloadable bundle).
+//! downloadable bundle). Also pinned: the download filename sanitizes
+//! hostile slug characters (Content-Disposition injection), and a
+//! cookieless GET is bounced by the auth gate before the handler.
 //!
 //! Harness copied from tests/phase8_integration.rs (boot/client/login
 //! helpers; `create_local` does not set must_change_password, so plain
@@ -402,5 +404,102 @@ async fn traversal_manifest_hub_never_yields_a_bundle() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
+    shutdown.cancel();
+}
+
+/// The download filename embeds the slug, so hostile characters must
+/// never reach Content-Disposition: a %-decoded quote would terminate
+/// the quoted-string early (attribute injection), and backslashes or
+/// non-ASCII have no business in a filename. A hub whose slug carries
+/// all three still downloads — under the sanitized filename — and a
+/// slug of nothing but hostile characters falls back to the empty-safe
+/// bare name. Never a 404/500: the skill is real, only the name is
+/// hostile.
+#[tokio::test]
+async fn hostile_slug_yields_sanitized_download_filename() {
+    let (base, shutdown, _dir, store, svc) = boot().await;
+    // Hubs under hostile slugs: quote + backslash + non-ASCII, and a
+    // pure-quote slug (the empty-safe fallback).
+    let cs = ConceptStore::for_service(&store, svc.clone(), &store.skills_dir(), "skills");
+    for path in ["/café\"r\\ude/skill.md", "/\"\"\"/skill.md"] {
+        cs.put(
+            &mycelium_core::concept::Concept::parse(
+                path,
+                "---\ntype: Skill\ntitle: hostile name\n---\n\nbody",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let client = client();
+    let cookie = login(&client, &base, "admin", ADMIN_PASSWORD).await;
+
+    // The hostile segment is pre-encoded in the URL: reqwest's URL
+    // parser would send a RAW backslash as a path separator (WHATWG
+    // special-scheme rule), so %5C must be written by hand; %22/%C3%A9
+    // stay untouched either way, and axum percent-decodes the segment
+    // into the slug.
+    let resp = client
+        .get(format!("{base}/api/v1/skills/caf%C3%A9%22r%5Cude/bundle"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        // c, a, f survive; é, quote, and backslash are filtered out.
+        "attachment; filename=\"cafrude-skill.zip\""
+    );
+    // The sanitized name still names the real bundle.
+    let bytes = resp.bytes().await.unwrap().to_vec();
+    let za = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(za.file_names().next(), Some("SKILL.md"));
+
+    // An all-hostile slug sanitizes to nothing → the bare fallback
+    // name, never an empty or injectable filename.
+    let bare = client
+        .get(format!("{base}/api/v1/skills/%22%22%22/bundle"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 200);
+    assert_eq!(
+        bare.headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "attachment; filename=\"skill.zip\""
+    );
+    shutdown.cancel();
+}
+
+/// A cookieless GET never reaches the handler: the require-login gate
+/// (the middleware layer covering every authenticated route, including
+/// all of /api/v1) answers anonymous requests with a redirect to the
+/// login page. The test client disables redirect-following, so the
+/// redirect itself is what is observed — the zip of a global-read
+/// skill is for signed-in users, not anonymous fetches.
+#[tokio::test]
+async fn bundle_download_requires_authentication() {
+    let (base, shutdown, _dir, _store, _svc) = boot().await;
+    let client = client();
+    let resp = client
+        .get(format!("{base}/api/v1/skills/pdf-to-markdown/bundle"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303, "the auth gate redirects to /login");
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
     shutdown.cancel();
 }
