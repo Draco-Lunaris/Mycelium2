@@ -14,6 +14,7 @@ mycelium-crypto = { path = "../mycelium-crypto" }
 mycelium-auth = { path = "../mycelium-auth" }
 mycelium-mcp = { path = "../mycelium-mcp" }
 mycelium-librarian = { path = "../mycelium-librarian" }
+mycelium-ui.workspace = true
 axum.workspace = true
 async-stream.workspace = true
 axum-server.workspace = true
