@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let assets_dir = data_dir.join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir)?;
 
-    // Seed packaged skills (the pdf-to-markdown book-conversion skill)
+    // Seed the packaged skills (pdf- and ebook-to-markdown)
     // into the global skills shelf — first boot writes them; later boots
     // refresh on a version bump (mirrors the assets scaffold).
     mycelium_web::packaged_skills::seed_packaged_skills(&store, &service_key, &store.skills_dir())
