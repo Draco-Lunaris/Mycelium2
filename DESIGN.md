@@ -10,10 +10,12 @@
 - **User authentication** for the web interface, with self-contained local accounts and optional OIDC SSO.
 - **Global read bookshelves**: an administrator can create bookshelves and mark them as globally readable by all users.
 - **Skills store**: agentic skills (SKILL.md-style markdown files) are stored as OKF concepts — private per-user skills and admin-managed global skills — so Mycelium2 acts as a central memory and skills store.
-  A packaged skill (`pdf-to-markdown`, PDF-book conversion) ships embedded
-  in the server binary and is seeded into the global skills shelf on boot
-  (seed v2, the nested bundle layout); refresh semantics mirror the
-  default assets (version marker, admin edits preserved between bumps).
+  Two packaged skills ship embedded in the server binary and are
+  seeded into the global skills shelf on boot as nested bundles
+  (seed v3): `pdf-to-markdown` (PDF-book conversion) and
+  `ebook-to-markdown` (epub/mobi/azw3/fb2-book conversion via the
+  calibre engine); refresh semantics mirror the default assets
+  (version marker, admin edits preserved between bumps).
   Skills are installable bundles: a skill lives in a directory — the
   `/<slug>/skill.md` hub concept carries the bundle manifest (file roles
   and md5s), companion concepts live under `/<slug>/`, and scripts are

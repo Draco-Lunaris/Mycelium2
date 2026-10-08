@@ -15,11 +15,22 @@ First boot:
 
 1. The server creates the data layout and runs migrations. No admin
    account and no bootstrap files are created.
-2. The packaged `pdf-to-markdown` skill — PDF book → enhanced markdown
-   ready for library ingest — is seeded into the global skills shelf
-   automatically. Every user can read it from `/skills`; admins can
-   edit. Upgrades refresh it when the packaged version changes; admin
-   edits are preserved between upgrades.
+2. Two packaged skills — `pdf-to-markdown` (PDF book → enhanced
+   markdown ready for library ingest) and `ebook-to-markdown`
+   (epub/mobi/azw3/fb2 → the same kind of enhanced markdown book,
+   via the calibre engine) — are seeded into the global skills shelf
+   automatically. Every user can read them from `/skills`; admins can
+   edit. Upgrades refresh them when the packaged version changes; admin
+   edits are preserved between upgrades. A shelf seeded by an earlier
+   release sits at seed v1 (flat `pdf-to-markdown`) or v2 (nested
+   `pdf-to-markdown` only), depending on when it last upgraded; one
+   boot of this release brings either state to seed v3 — from v1, the
+   legacy flat paths are deleted and both skills' nested layouts are
+   written; from v2, the pdf layout is already correct and the ebook
+   skill is added nested. Admin edits to the legacy flat paths do
+   not survive the v1 migration — copy them out first. Admin edits to
+   the packaged paths survive between upgrades; only the refresh that
+   bumps the packaged version overwrites them.
 3. Open `https://<host>/setup` and create the admin account (username
    and password of your choice; recovery key shown once — record it).
 4. Log in at `https://<host>/`. `/setup` becomes unavailable once the
@@ -109,21 +120,26 @@ The image is data-free: pull the new image and restart. Migrations run
 automatically on startup. Take a backup first (see
 [Backup and restore](backup.md)).
 
-### Packaged skills (seed v2)
+### Packaged skills (seed v3)
 
-The packaged `pdf-to-markdown` skill seeds as a nested bundle
-(`SKILLS_SEED_VERSION` 2):
+The packaged `pdf-to-markdown` and `ebook-to-markdown` skills seed
+as nested bundles (`SKILLS_SEED_VERSION` 3):
 
-1. Fresh boots write the nested layout directly: the
-   `/pdf-to-markdown/skill.md` hub (carrying the bundle manifest),
-   its companion concepts under `/pdf-to-markdown/`, and the scripts
-   as raw payload files — scripts are never concepts (no registry
-   row, no search entry).
+1. Fresh boots write the nested layouts directly: each skill's
+   `/<slug>/skill.md` hub (carrying the bundle manifest), its
+   companion concepts under `/<slug>/`, and the scripts as raw
+   payload files — scripts are never concepts (no registry row, no
+   search entry).
 2. A shelf seeded by an older release migrates on the first boot of
-   the new binary: the legacy flat `/pdf-to-markdown*.md` concepts
-   are deleted (idempotently) and the nested layout is written.
-   Admin edits to the legacy flat packaged paths do not survive this
-   one-time migration — copy them out first if you modified them.
+   the new binary, from either earlier seed: from seed v1 (the flat
+   pdf layout), the legacy flat `/pdf-to-markdown*.md` concepts are
+   deleted (idempotently) and both nested bundles are written; from
+   seed v2 (nested pdf only), the pdf layout is already correct and
+   the ebook bundle is added nested. The flat-deletion concern is
+   pdf-only — the ebook skill never shipped flat, so it installs
+   nested either way. Admin edits to the legacy flat packaged paths
+   do not survive the v1 migration — copy them out first if you
+   modified them.
 3. The `.seed-version` marker gates refresh as before: a matching
    marker is a no-op (admin edits to the packaged paths survive
    between bumps), and extra admin-created skills are never touched.
