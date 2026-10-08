@@ -108,3 +108,24 @@ WantedBy=multi-user.target
 The image is data-free: pull the new image and restart. Migrations run
 automatically on startup. Take a backup first (see
 [Backup and restore](backup.md)).
+
+### Packaged skills (seed v2)
+
+The packaged `pdf-to-markdown` skill seeds as a nested bundle
+(`SKILLS_SEED_VERSION` 2):
+
+1. Fresh boots write the nested layout directly: the
+   `/pdf-to-markdown/skill.md` hub (carrying the bundle manifest),
+   its companion concepts under `/pdf-to-markdown/`, and the scripts
+   as raw payload files — scripts are never concepts (no registry
+   row, no search entry).
+2. A shelf seeded by an older release migrates on the first boot of
+   the new binary: the legacy flat `/pdf-to-markdown*.md` concepts
+   are deleted (idempotently) and the nested layout is written.
+   Admin edits to the legacy flat packaged paths do not survive this
+   one-time migration — copy them out first if you modified them.
+3. The `.seed-version` marker gates refresh as before: a matching
+   marker is a no-op (admin edits to the packaged paths survive
+   between bumps), and extra admin-created skills are never touched.
+   Seeding fails fast on a bad embedded manifest or md5 — the server
+   refuses to boot half-seeded.

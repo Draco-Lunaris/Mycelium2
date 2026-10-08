@@ -17,7 +17,7 @@ In active development. The crypto, storage, authentication, MCP, and librarian l
 
 - **Agent memory.** Agents store and query knowledge as markdown concepts with YAML frontmatter, cross-linked into a graph. Each user has a private, encrypted bundle.
 - **Bookshelves.** An administrator uploads books; a librarian catalogs them into chapters and sections that agents can search and read by passage.
-- **Skills store.** Agents fetch skills (SKILL.md-style markdown) by name: private skills per user and administrator-managed global skills.
+- **Skills store.** Agents fetch skills (SKILL.md-style markdown) by name: private skills per user and administrator-managed global skills, with installable bundles (zip download / CLI export).
 - **MCP server.** Seven tools over Streamable HTTP at `/mcp`, authenticated per user.
 - **Web interface.** Bundle browser, concept editor, search, graph view, chat, and an admin portal.
 

@@ -63,6 +63,41 @@ Read a passage from the shared library stacks. Anchors:
 anchor returns the whole text (truncated at 128k chars). The book's
 shelf must be global-read (or the caller is an admin).
 
+## Skills
+
+### `GET /api/v1/skills/{slug}/bundle`
+Download a nested skill as a Claude-Code-shaped zip
+(`application/zip`): `SKILL.md` (the hub markdown verbatim), the
+skill's companion concepts, and its manifest-declared scripts at
+their manifest paths. Same visibility as the skills page — any user
+may bundle a global skill; a private skill only from its own bundle.
+Script payloads are md5-verified against the hub manifest during
+assembly; a mismatch refuses the download rather than serving bad
+bytes. The archive is deterministic — fixed entry order (`SKILL.md`,
+companions sorted, scripts sorted), fixed mtime 1980-01-01, fixed
+unix perms 0644, deflate — so two GETs of the same skill return
+byte-identical bodies. `200` responses carry:
+
+- `Content-Disposition: attachment; filename="<slug>-skill.zip"`
+  (filename characters restricted to `[A-Za-z0-9._-]`; a slug that
+  sanitizes to nothing falls back to `skill.zip`)
+- `Cache-Control: no-store, no-cache, must-revalidate`
+
+`404` when the slug names no nested skill — unknown slugs and legacy
+flat skills answer identically (no oracle). Every other error
+(traversal manifest, md5 mismatch, missing payload, key or zip
+failure) is logged server-side and answered with a generic
+`500 {"error": "internal error"}`.
+
+Install into a Claude Code skills directory:
+
+```sh
+curl -fsSL -H "Authorization: Bearer myc2-..." \
+  https://mycelium.example.com/api/v1/skills/pdf-to-markdown/bundle \
+  -o pdf-to-markdown-skill.zip
+unzip pdf-to-markdown-skill.zip -d ~/.claude/skills/pdf-to-markdown/
+```
+
 ## Health
 
 ### `GET /api/v1/health`

@@ -37,8 +37,20 @@ per-request metadata (stateless mode).
 | `mycelium2_memory_update` | Correct or extend an existing concept (explicit path, or best search match for the instruction). Returns a queue receipt immediately; check integration with `memory_status(receipt_id=…)`. |
 | `mycelium2_memory_status` | Bundle statistics: concept counts, graph health. Pass `receipt_id` to check a queued mutation's state (pending/running/done/dead). |
 | `mycelium2_memory_maintain` | Health-check the knowledge graph, then repair it in the background (receipt immediately; check completion with `memory_status`). |
-| `mycelium2_skill_get` | Fetch a skill's full markdown by name — private skills first, then the global skills shelf. |
-| `mycelium2_skill_list` | List available skills: the caller's private skills plus global skills. |
+| `mycelium2_skill_get` | Fetch a skill's full markdown by name — private skills first, then the global skills shelf. A bare slug resolves the bundle hub `/{slug}/skill.md` first, falling back to the legacy flat `/{slug}.md`; a name ending in `.md` is taken as an exact bundle path. |
+| `mycelium2_skill_list` | List available skills, one entry per logical skill: each nested bundle appears as its hub (`/{slug}/skill.md`); legacy flat skills appear as themselves. The caller's private skills plus global skills. |
+
+## Skills
+
+A skill uses the nested bundle layout: `/<slug>/skill.md` is the hub
+(a `type: Skill` concept whose frontmatter carries the bundle
+manifest — file roles and md5s), companion concepts under `/<slug>/`
+are its docs, and scripts are raw payload files, never concepts. So
+`skill_list` returns one entry per skill (the hub; companions and
+scripts never list), and `skill_get` resolves a bare slug to the hub
+first. To install a skill on a machine, download the bundle zip from
+`GET /api/v1/skills/{slug}/bundle` (see [API](api.md)) or export a
+directory tree with `mycelium2-cli skill export`.
 
 ## Semantics
 
