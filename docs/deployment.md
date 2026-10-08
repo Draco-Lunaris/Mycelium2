@@ -27,10 +27,13 @@ First boot:
    boot of this release brings either state to seed v3 — from v1, the
    legacy flat paths are deleted and both skills' nested layouts are
    written; from v2, the pdf layout is already correct and the ebook
-   skill is added nested. Admin edits to the legacy flat paths do
-   not survive the v1 migration — copy them out first. Admin edits to
-   the packaged paths survive between upgrades; only the refresh that
-   bumps the packaged version overwrites them.
+   skill is added nested — this boot is a version-bump refresh, so
+   admin edits to the pdf packaged paths are overwritten, as with
+   any bump. Admin edits to the legacy flat paths do not survive the
+   v1 migration — copy them out first. Admin edits to the packaged
+   paths survive between upgrades; the refresh that bumps the packaged
+   version — or a lost `.seed-version` marker, which triggers the same
+   refresh — overwrites them.
 3. Open `https://<host>/setup` and create the admin account (username
    and password of your choice; recovery key shown once — record it).
 4. Log in at `https://<host>/`. `/setup` becomes unavailable once the
@@ -135,11 +138,12 @@ as nested bundles (`SKILLS_SEED_VERSION` 3):
    pdf layout), the legacy flat `/pdf-to-markdown*.md` concepts are
    deleted (idempotently) and both nested bundles are written; from
    seed v2 (nested pdf only), the pdf layout is already correct and
-   the ebook bundle is added nested. The flat-deletion concern is
-   pdf-only — the ebook skill never shipped flat, so it installs
-   nested either way. Admin edits to the legacy flat packaged paths
-   do not survive the v1 migration — copy them out first if you
-   modified them.
+   the ebook bundle is added nested — this boot is a version-bump
+   refresh, so admin edits to the pdf packaged paths are overwritten,
+   as with any bump. The flat-deletion concern is pdf-only — the
+   ebook skill never shipped flat, so it installs nested either way.
+   Admin edits to the legacy flat packaged paths do not survive the
+   v1 migration — copy them out first if you modified them.
 3. The `.seed-version` marker gates refresh as before: a matching
    marker is a no-op (admin edits to the packaged paths survive
    between bumps), and extra admin-created skills are never touched.
