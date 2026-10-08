@@ -75,19 +75,35 @@ replacing the ~130-line string constant in `assets.rs`, still delivered
 via `scaffold_defaults` + `?v=ASSETS_VERSION` cache-busting. All colors
 are `:root` custom properties. Dark-only per decision (d).
 
-**CSP**: unchanged. `script-src 'self' 'nonce-…'`
-(crates/mycelium-web/src/middleware.rs:353) already permits this design:
-every script (chat.js, graph.js, d3.min.js, the hydrate bundle,
-confirm.js, copy.js) loads from `/assets` as an external file covered by
-`'self'`. No handler ever emits an inline script or a `style=`
-attribute — components carry class names only. The existing per-response
-nonce stays generated-and-unused (harmless defense-in-depth); threading
-it into handlers is not needed.
+**CSP**: one amendment, required by hydration: `script-src` gains
+`'wasm-unsafe-eval'` (WebAssembly compilation is blocked without it, so
+the hydrate bundle cannot load). The CSP header changes exactly once, in
+PR 1:
+`script-src 'self' 'wasm-unsafe-eval' 'nonce-…'`. Everything else
+holds: every script loads from `/assets` as an external file covered by
+`'self'`; no handler ever emits an inline script or a `style=`
+attribute — components carry class names only. The existing
+per-response nonce stays generated-and-unused (harmless
+defense-in-depth); threading it into handlers is not needed.
+
+**Build structure**: the component library is its own crate,
+`crates/mycelium-ui`, because `mycelium-web` pulls sqlx/argon2 and
+cannot compile for wasm32. `mycelium-ui` depends only on leptos (SSR
+by default, hydrate+islands for the wasm build) and takes
+primitive-only props (&str, bool, u64…). `mycelium-web` consumes its
+SSR render helpers. The wasm entry is `#[wasm_bindgen(start)] →
+leptos::mount::hydrate_islands()`, built with
+`--no-default-features --features hydrate`, bundled with wasm-bindgen
+(web target) to `/assets/hydrate.js` + `/assets/hydrate.wasm`. The
+hydration traversal script is leptos's own `island_script.js`,
+vendored alongside the bundle. Islands themselves are `#[island]`
+components (the macro auto-generates the per-island exported functions
+that the traversal script calls via `data-component`).
 
 ## 4. Component library
 
-New module tree under `crates/mycelium-web/src/ui/`, compiled for both
-targets:
+New crate `crates/mycelium-ui/` (compiled for both targets — see §3),
+consumed by `mycelium-web`:
 
 - `mod.rs` — re-exports
 - `shell.rs` — Shell, NavGroup, NavItem, UserChip, PageHeader, AuthCard
@@ -95,6 +111,7 @@ targets:
   TabBar, FormActions
 - `primitives.rs` — Chip, Button, Banner, EmptyState, Field + inputs,
   ConfirmDialog
+- `render.rs` — SSR render helpers (the `into_view().to_html()` bridge)
 
 `pages.rs`'s 772 lines of `format!` strings are replaced wholesale: every
 page becomes handler → data → component composition.
@@ -174,20 +191,27 @@ distillation pass read it as navy; the sampling corrects that).
 Success: no distinct green beyond the accent family — the success banner
 reuses accent tints (design decision; not separately mocked).
 
-Type / radius / spacing — proposed now, **pinned against mockup 14 by a
-vision fork before the stylesheet tokens freeze in PR 1** (§9.4):
+Type / radius / spacing — pinned against mockup 14 by a vision fork on
+2026-10-08 ("Pinned tokens (2026-10-08)" section of
+`/tmp/mycelium2-issue2-mockups/NOTES.md`; the fork's readings sit within
+the [e] estimation bands recorded there):
 
-| Token | Proposal |
+| Token | Pinned value |
 |---|---|
-| `--text-page-title` | 22px / 600 |
+| `--text-page-title` | 24px / 700 |
 | `--text-section` | 17px / 600 |
 | `--text-body` | 15px / 400 |
 | `--text-caption` | 13px / 400 (nav group headers + table headers: uppercase, +0.08em) |
 | font | system UI stack — zero external font requests |
 | `--radius-card` / `--radius-control` / chip radius | 12px / 8px / full pill |
-| spacing | 4px grid: 4, 8, 12, 16, 24, 32 |
+| spacing | 4px grid: 4, 8, 12, 16, 24, 32 (panel gaps ~16–24) |
 | `--sidebar-width` / `--rail-width` / content max-width | 280px / 60px / ~1200px |
-| focus | 2px accent outline on `:focus-visible` |
+| focus | accent border on `:focus-visible` (ring treatment [u] at implementation) |
+| modal backdrop | ~70% black (60–80% band); dialog ~400–480px wide |
+| control heights | buttons ~38px; inputs ~40px; nav items ~38px (36–40 bands) |
+
+Primary buttons carry dark text on the accent fill (14: accent fill is
+light, `#8FD3A8`; dark text keeps ≥4.5:1).
 
 ## 6. Pages, routes, navigation
 
@@ -392,10 +416,12 @@ session caused autocompact thrash; recorded in mycelium at
 fork-mediated (forks inherit the session model — real vision; cheaper
 subagent tiers map to local backends with unverified vision):
 
-1. **Implementation-time pinning**: a fork confirms the §5
-   type/radius/spacing proposals and the remaining uncertain details
-   ([u] markers in NOTES.md) against mockups 14/01 before the
-   stylesheet tokens freeze in PR 1.
+1. **Implementation-time pinning**: DONE 2026-10-08 — the type/radius/
+   spacing values are pinned (§5 tables record the results; details in
+   `/tmp/mycelium2-issue2-mockups/NOTES.md`, "Pinned tokens
+   (2026-10-08)"). Remaining [u] markers (e.g. exact modal copy, focus
+   ring treatment) are settled in the PR that builds the component
+   carrying them.
 2. **Fidelity passes**: after PR 2 (user pages) and PR 4 (all pages),
    a fork screenshots the rendered pages and compares them against the
    mockups + NOTES.md, reporting deviations. Requires a browser in
