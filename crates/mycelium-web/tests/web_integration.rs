@@ -566,6 +566,49 @@ async fn full_web_flow() {
     shutdown.cancel();
 }
 
+/// The API keys page renders the revoke confirm dialog (Task 7) and
+/// loads confirm.js — the dialog is UX confirmation, the CSRF token is
+/// the security gate, so the page must ship both without a key existing.
+#[tokio::test]
+async fn keys_dialog_renders() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("myc2_session="));
+
+    // API keys page: revoke confirm dialog markup + confirm.js script tag.
+    let keys = client
+        .get(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keys.status(), 200);
+    let html = keys.text().await.unwrap();
+    assert!(html.contains("<dialog"), "confirm dialog missing: {html}");
+    assert!(html.contains("/assets/confirm.js?v="), "{html}");
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

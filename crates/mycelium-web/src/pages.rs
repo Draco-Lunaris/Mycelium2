@@ -523,7 +523,7 @@ pub fn keys_page(
             let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td><form method="post" action="/keys/revoke"><input type="hidden" name="id" value="{}"><button class="danger">Revoke</button></form></td></tr>"#,
+<td><button type="button" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></td></tr>"#,
                 html_escape(&k.label),
                 status,
                 k.created_at.format("%Y-%m-%d"),
@@ -532,6 +532,22 @@ pub fn keys_page(
             )
         })
         .collect::<String>();
+    // One revoke dialog per page: confirm.js opens it from any row's
+    // trigger, copying that row's data-key-id into the form's hidden
+    // id input. The form's own action + hidden fields (including the
+    // CSRF token) carry the confirm POST — no inline scripts.
+    let dialog = mycelium_ui::render::render(mycelium_ui::confirm_dialog(
+        "revoke",
+        "Revoke this key?",
+        "Revoking a key takes effect immediately — any tool using it stops working. This cannot be undone.",
+        "Revoke",
+        "danger",
+        "/keys/revoke",
+        &[
+            ("id".to_string(), String::new()),
+            ("csrf_token".to_string(), csrf.to_string()),
+        ],
+    ));
     let minted_html = minted
         .map(|t| format!(r#"<div class="flash ok">New key (shown once): <code>{t}</code></div>"#))
         .unwrap_or_default();
@@ -539,15 +555,24 @@ pub fn keys_page(
         r#"<h1>API keys</h1>
 {minted_html}
 <table><tr><th>Label</th><th>Status</th><th>Created</th><th>Last used</th><th></th></tr>{rows}</table>
+{dialog}
 <h2>Mint a key</h2>
 <form method="post" action="/keys">
   <label>Label</label><input name="label" required>
   <button type="submit">Mint</button>
 </form>"#,
         rows = rows,
+        dialog = dialog,
         minted_html = minted_html
     );
-    layout("API keys", Some(user), csrf, "/keys", body)
+    layout_with_scripts(
+        "API keys",
+        Some(user),
+        csrf,
+        "/keys",
+        body,
+        &["/assets/confirm.js"],
+    )
 }
 
 /// Admin portal.

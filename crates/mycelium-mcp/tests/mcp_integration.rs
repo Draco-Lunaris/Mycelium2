@@ -669,8 +669,9 @@ async fn mcp_full_flow() {
         .await
         .unwrap();
     let html = page.text().await.unwrap();
-    // Find the revoke form's key id (the most recently minted key's row).
-    let revoke_marker = "name=\"id\" value=\"";
+    // Find the revoke trigger's key id (the most recently minted key's
+    // row — the confirm dialog's trigger carries data-key-id).
+    let revoke_marker = "data-key-id=\"";
     let mut revoke_id = None;
     let mut search_from = 0;
     while let Some(idx) = html[search_from..].find(revoke_marker) {
@@ -679,7 +680,7 @@ async fn mcp_full_flow() {
         revoke_id = Some(rest[..end].to_string());
         search_from += idx + revoke_marker.len();
     }
-    let revoke_id = revoke_id.expect("revoke form present");
+    let revoke_id = revoke_id.expect("revoke trigger present");
     let revoke = client
         .post(format!("{base}/keys/revoke"))
         .header("cookie", &cookie)

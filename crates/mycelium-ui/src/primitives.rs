@@ -197,9 +197,12 @@ pub fn field(id: &str, label: &str, input_type: &str, hint: &str, error: &str) -
 }
 
 /// Native `<dialog id class="modal">` with a title, body, and a
-/// `method="post"` form holding a plain `type="button"` cancel (closed
-/// by `confirm.js`, Task 7) and the confirm submit button
-/// (`btn btn--{confirm_class}`).
+/// `method="post"` form (`action` + `hidden_fields`) holding a plain
+/// `type="button"` cancel tagged `data-confirm-cancel` (closed by
+/// `confirm.js`, Task 7) and the confirm submit button
+/// (`btn btn--{confirm_class}`). The hidden fields are what carry the
+/// confirm submit — e.g. the target id (set per trigger by confirm.js)
+/// and the CSRF token (the security gate).
 #[cfg(feature = "ssr")]
 pub fn confirm_dialog(
     id: &str,
@@ -207,17 +210,31 @@ pub fn confirm_dialog(
     body: &str,
     confirm_label: &str,
     confirm_class: &str,
+    action: &str,
+    hidden_fields: &[(String, String)],
 ) -> impl IntoView {
     let id = id.to_string();
     let title = title.to_string();
     let body = body.to_string();
     let confirm_label = confirm_label.to_string();
+    let action = action.to_string();
+    let hidden_inputs = hidden_fields
+        .iter()
+        .map(|(name, value)| {
+            let name = name.clone();
+            let value = value.clone();
+            view! {
+                <input r#type="hidden" name={name} value={value} />
+            }
+        })
+        .collect::<Vec<_>>();
     view! {
         <dialog id={id} class="modal">
             <h3>{title}</h3>
             <p>{body}</p>
-            <form method="post">
-                <button r#type="button">Cancel</button>
+            <form method="post" action={action}>
+                {hidden_inputs}
+                <button r#type="button" data-confirm-cancel="true">Cancel</button>
                 <button r#type="submit" class={button_class(confirm_class)}>{confirm_label}</button>
             </form>
         </dialog>
@@ -280,9 +297,20 @@ mod tests {
             "This cannot be undone.",
             "Revoke",
             "danger",
+            "/keys/revoke",
+            &[
+                ("id".to_string(), String::new()),
+                ("csrf_token".to_string(), "tok-123".to_string()),
+            ],
         ));
         assert!(html.contains("<dialog"), "{html}");
         assert!(html.contains(r#"id="revoke-key""#), "{html}");
         assert!(html.contains("method=\"post\""), "{html}");
+        assert!(html.contains(r#"action="/keys/revoke""#), "{html}");
+        assert!(html.contains(r#"name="id""#), "{html}");
+        assert!(html.contains(r#"name="csrf_token""#), "{html}");
+        assert!(html.contains(r#"value="tok-123""#), "{html}");
+        // confirm.js's close hook (Task 7).
+        assert!(html.contains("data-confirm-cancel"), "{html}");
     }
 }

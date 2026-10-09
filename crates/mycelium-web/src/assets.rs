@@ -1,7 +1,8 @@
 //! Default static assets: written to the assets directory on first boot
 //! and served from disk (DESIGN decision). Contains the stylesheet, the
-//! graph visualization script (dependency-free force-directed layout), and
-//! the shared client script (CSRF header injection).
+//! graph visualization script (dependency-free force-directed layout),
+//! the shared client script (CSRF header injection), and the confirm
+//! dialog script (native `<dialog>` open/close wiring).
 
 use std::path::Path;
 
@@ -959,12 +960,47 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
 })();
 "#;
 
+/// Confirm-dialog wiring (external asset — CSP-safe like chat.js):
+/// `[data-confirm-dialog]` triggers open the page's named native
+/// `<dialog>`. The trigger's `data-key-id` (when present) is copied
+/// into the dialog form's hidden `id` input before `showModal()`, so
+/// one dialog serves every row; cancel buttons
+/// (`[data-confirm-cancel]`) and the backdrop close without
+/// submitting. The confirm button is a plain form submit — the form's
+/// own action + hidden fields (including the CSRF token) carry the
+/// POST, so the CSRF token remains the security gate.
+pub const CONFIRM_JS: &str = r#"// Confirm dialogs: [data-confirm-dialog] triggers open the named
+// native <dialog> (copying data-key-id into the form's hidden id
+// input first); cancel/backdrop close without submitting. The CSRF
+// token in the form remains the security gate.
+(function () {
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest("[data-confirm-dialog]");
+    if (t) {
+      e.preventDefault();
+      var d = document.getElementById(t.dataset.confirmDialog);
+      if (d) {
+        var idInput = d.querySelector('input[name="id"]');
+        if (idInput && t.dataset.keyId) idInput.value = t.dataset.keyId;
+        d.showModal();
+      }
+    }
+    if (e.target.matches("[data-confirm-cancel]")) {
+      e.target.closest("dialog").close();
+    }
+    if (e.target.matches("dialog")) {
+      e.target.close();
+    }
+  });
+})();
+"#;
+
 /// The default assets' content version. Bumped when the built-in
 /// defaults change; a mismatching (or missing) marker file triggers a
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "8";
+pub const ASSETS_VERSION: &str = "9";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -980,6 +1016,7 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("app.js", APP_JS),
         ("graph.js", GRAPH_JS),
         ("chat.js", CHAT_JS),
+        ("confirm.js", CONFIRM_JS),
     ];
     for (name, contents) in files {
         let path = assets_dir.join(name);
@@ -1005,6 +1042,7 @@ mod tests {
         assert!(dir.path().join("app.js").exists());
         assert!(dir.path().join("graph.js").exists());
         assert!(dir.path().join("chat.js").exists());
+        assert!(dir.path().join("confirm.js").exists());
         // Same version: does not overwrite (admin customization safe).
         std::fs::write(dir.path().join("style.css"), "custom").unwrap();
         scaffold_defaults(dir.path()).unwrap();
