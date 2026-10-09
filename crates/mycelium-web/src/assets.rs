@@ -1,8 +1,11 @@
 //! Default static assets: written to the assets directory on first boot
 //! and served from disk (DESIGN decision). Contains the stylesheet, the
 //! graph visualization script (dependency-free force-directed layout),
-//! the shared client script (CSRF header injection), and the confirm
-//! dialog script (native `<dialog>` open/close wiring).
+//! the shared client script (CSRF header injection), the confirm dialog
+//! script (native `<dialog>` open/close wiring), and the mycelium-ui
+//! hydrate bundle (wasm-bindgen output — `mycelium_ui.js` +
+//! `mycelium_ui_bg.wasm`, regenerated from `crates/mycelium-ui` per the
+//! sequence in `docs/deployment.md`).
 
 use std::path::Path;
 
@@ -995,12 +998,23 @@ pub const CONFIRM_JS: &str = r#"// Confirm dialogs: [data-confirm-dialog] trigge
 })();
 "#;
 
+/// The mycelium-ui hydrate bundle's JS wrapper — wasm-bindgen output
+/// (`--target web`), NOT hand-written: do not edit. It fetches its
+/// sibling `mycelium_ui_bg.wasm` by filename, so the pair's names are
+/// load-bearing. The `&str` embedding is only for the scaffold — the
+/// bundle is served from disk like every other asset.
+pub const HYDRATE_JS: &str = include_str!("../assets/mycelium_ui.js");
+
+/// The mycelium-ui hydrate bundle's compiled wasm — wasm-bindgen
+/// output, the sibling module `HYDRATE_JS` fetches at runtime.
+pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm");
+
 /// The default assets' content version. Bumped when the built-in
 /// defaults change; a mismatching (or missing) marker file triggers a
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "9";
+pub const ASSETS_VERSION: &str = "10";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -1017,12 +1031,21 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("graph.js", GRAPH_JS),
         ("chat.js", CHAT_JS),
         ("confirm.js", CONFIRM_JS),
+        // The hydrate bundle is a bindgen output pair — the JS wrapper
+        // fetches `mycelium_ui_bg.wasm` by filename, so both names are
+        // load-bearing. The wasm is written separately after the loop
+        // (the array is `&str` pairs).
+        ("mycelium_ui.js", HYDRATE_JS),
     ];
     for (name, contents) in files {
         let path = assets_dir.join(name);
         if !path.exists() || refresh {
             std::fs::write(path, contents)?;
         }
+    }
+    let wasm_path = assets_dir.join("mycelium_ui_bg.wasm");
+    if !wasm_path.exists() || refresh {
+        std::fs::write(&wasm_path, HYDRATE_WASM)?;
     }
     if refresh {
         std::fs::write(&marker, ASSETS_VERSION)?;
@@ -1050,6 +1073,15 @@ mod tests {
             std::fs::read_to_string(dir.path().join("style.css")).unwrap(),
             "custom"
         );
+    }
+
+    #[test]
+    fn scaffolds_hydrate_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_defaults(dir.path()).unwrap();
+        let js = std::fs::read_to_string(dir.path().join("mycelium_ui.js")).unwrap();
+        assert!(js.contains("wasm"), "{js}");
+        assert!(dir.path().join("mycelium_ui_bg.wasm").exists());
     }
 
     #[test]
