@@ -43,7 +43,7 @@ pub const STYLE_CSS: &str = r#"/* Mycelium2 v8 — token stylesheet (spec §5; s
   --bg: var(--color-bg-page);
   --panel: var(--color-surface);
   --text: var(--color-text-body);
-  --muted: var(--color-text-muted);
+  --muted: var(--color-text-body);
   --accent: var(--color-accent);
   --border: var(--color-border);
   --danger: var(--color-danger);
@@ -200,7 +200,7 @@ body.chat-page main {
 }
 .btn--ghost {
   background: transparent; border-color: transparent;
-  color: var(--color-text-muted);
+  color: var(--color-text-body);
 }
 .btn:hover { border-color: var(--color-accent); color: var(--color-text-heading); }
 .btn--primary:hover, .btn--danger:hover { color: var(--color-bg-page); }
@@ -274,7 +274,7 @@ body.chat-page main {
 }
 .field__hint {
   margin: var(--gap-1) 0 0;
-  color: var(--color-text-muted); font-size: var(--text-caption);
+  color: var(--color-text-body); font-size: var(--text-caption);
 }
 .field--error input, .field--error select, .field--error textarea {
   border-color: var(--color-danger);
@@ -680,7 +680,7 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 "##;
 
 /// The chat page's client logic (external asset — CSP-safe: the site
-/// policy is script-src 'self' + nonce, so inline scripts are blocked;
+/// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline scripts are blocked;
 /// /assets/chat.js loads under 'self').
 pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/chat/stream (SSE).
 (function () {
