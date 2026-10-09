@@ -19,7 +19,7 @@ pub mod render {
 mod primitives;
 
 #[cfg(feature = "ssr")]
-pub use primitives::button_class;
+pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_state, field};
 
 /// Hydration entry: wasm-bindgen calls this on module start; it walks
 /// whatever <leptos-island> roots the page carries. Islands themselves
