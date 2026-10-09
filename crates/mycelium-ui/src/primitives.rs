@@ -1,7 +1,8 @@
 //! Primitive components: Button, Chip, Banner, EmptyState, Field,
 //! ConfirmDialog. All components are SSR-gated — they render HTML through
-//! the `crate::render` bridge; the variant-class helper is pinned here so
-//! both builds have a stable surface.
+//! the `crate::render` bridge; the variant-class helper (`button_class`)
+//! is `#[cfg(feature = "ssr")]` like the rest (the hydrate build compiles
+//! this module empty) and is pinned here so the SSR surface stays stable.
 //!
 //! Escaping rule: user text goes into `view!` TEXT interpolation positions
 //! only (`{label}`, `{message}`) — leptos escapes those automatically.
@@ -275,10 +276,19 @@ mod tests {
 
     #[test]
     fn banner_kinds_render_icons() {
-        for kind in ["info", "success", "warning", "danger"] {
+        for (kind, role) in [
+            ("info", "status"),
+            ("success", "status"),
+            ("warning", "alert"),
+            ("danger", "alert"),
+        ] {
             let html = render(banner(kind, "msg"));
             assert!(html.contains(&format!("banner--{kind}")), "{html}");
             assert!(html.contains("<svg"), "{html}");
+            assert!(
+                html.contains(&format!(r#"role="{role}""#)),
+                "{kind} must carry role={role}: {html}"
+            );
         }
     }
 

@@ -152,6 +152,7 @@ async fn csp_sweep_no_inline_style_or_script() {
         "/keys",
         "/password",
         "/admin",
+        "/concept?new=1",
     ] {
         let resp = client
             .get(format!("{base}{route}"))

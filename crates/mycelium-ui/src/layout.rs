@@ -109,7 +109,7 @@ pub fn breadcrumb(parts: &[(&str, Option<&str>)]) -> impl IntoView {
             let label = label.to_string();
             let sep = (i > 0).then(|| view! { <span aria-hidden="true">/</span> }.into_any());
             let item = match href {
-                Some(href) => view! { <a href={href.to_string()}>{label.clone()}</a> }.into_any(),
+                Some(href) => view! { <a href={href.to_string()}>{label}</a> }.into_any(),
                 None => view! { <span>{label}</span> }.into_any(),
             };
             [sep, Some(item)].into_iter().flatten()

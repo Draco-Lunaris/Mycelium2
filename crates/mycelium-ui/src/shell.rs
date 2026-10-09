@@ -164,6 +164,24 @@ fn sidebar(name: &str, user: Option<(&str, bool)>, active_path: &str) -> impl In
     }
 }
 
+/// `<header class="page-header"><h1>{title}</h1><div class="actions">…</div>
+/// </header>` — the page title row: title left, actions right (wraps to a
+/// top bar under 720px). The class names match the `.page-header` block
+/// in mycelium-web's assets stylesheet (the actions container is
+/// `.actions`, not a BEM modifier). The title goes into a `view!` TEXT
+/// position, where leptos escapes it; `actions` is caller-composed markup
+/// passed as a child (same contract as `card`'s body).
+#[cfg(feature = "ssr")]
+pub fn page_header(title: &str, actions: String) -> impl IntoView {
+    let title = title.to_string();
+    view! {
+        <header class="page-header">
+            <h1>{title}</h1>
+            <div class="actions">{actions}</div>
+        </header>
+    }
+}
+
 /// The full HTML document for a shelled page: head tokens (csrf meta,
 /// title, stylesheet), then the body — sidebar shell (brand lockup,
 /// grouped nav, user chip + logout; no sidebar at all without a user),
@@ -289,6 +307,14 @@ mod tests {
         let html = auth_shell("Sign in", String::from("<form></form>"));
         assert!(html.contains("auth"), "{html}");
         assert!(!html.contains("nav-item"), "{html}");
+    }
+
+    #[test]
+    fn page_header_renders_title_and_actions_slot() {
+        let html = render(page_header("Browse", String::new()));
+        assert!(html.contains("page-header"), "{html}");
+        assert!(html.contains("Browse"), "{html}");
+        assert!(!html.contains("style="), "{html}");
     }
 
     #[test]
