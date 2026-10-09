@@ -16,8 +16,13 @@ pub mod render {
     }
 }
 
+mod layout;
 mod primitives;
 
+#[cfg(feature = "ssr")]
+pub use layout::{
+    breadcrumb, card, data_table, form_actions, nav_group, nav_item, stat_tile, tab_bar,
+};
 #[cfg(feature = "ssr")]
 pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_state, field};
 
