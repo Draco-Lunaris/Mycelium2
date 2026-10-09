@@ -213,6 +213,15 @@ the [e] estimation bands recorded there):
 Primary buttons carry dark text on the accent fill (14: accent fill is
 light, `#8FD3A8`; dark text keeps ≥4.5:1).
 
+**Muted-text token resolution:** sampled `--color-text-muted #3A453F`
+measures ≈1.9:1 on `#101312` — it cannot serve as body text under the
+4.5:1 baseline. Resolved: `--color-text-muted` is a **decorative /
+disabled-only** token (borders, disabled labels, watermark text), never
+prose text; readable secondary text uses `--color-text-body #9AA69F`
+(≈7.4:1). The PR-1 contrast test asserts the three text tokens
+(heading/label/body) and **excludes** the muted token from the 4.5:1
+requirement (it is asserted decorative-only in the stylesheet).
+
 ## 6. Pages, routes, navigation
 
 Sidebar groups (locked):
