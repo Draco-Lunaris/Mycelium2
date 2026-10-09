@@ -521,13 +521,19 @@ pub fn keys_page(
         .iter()
         .map(|k| {
             let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
+            // The trigger is a plain submit inside its own row form:
+            // without JS, clicking it POSTs /keys/revoke directly (the
+            // server-rendered csrf_token is the security gate); with
+            // JS, confirm.js's preventDefault opens the dialog instead.
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td><button type="button" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></td></tr>"#,
+<td><form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form></td></tr>"#,
                 html_escape(&k.label),
                 status,
                 k.created_at.format("%Y-%m-%d"),
                 k.last_used_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                html_escape(csrf),
+                k.id,
                 k.id
             )
         })
