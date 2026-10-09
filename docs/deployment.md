@@ -152,3 +152,40 @@ as nested bundles (`SKILLS_SEED_VERSION` 3):
    boot half-seeded. Payload md5s are a different gate: verified
    against the hub manifest at bundle download/export time, and
    pinned by the packaged-skills asset test.
+
+### Hydrate bundle
+
+The interactive frontend ships as a wasm hydrate bundle built from
+`crates/mycelium-ui`: two checked-in artifacts under
+`crates/mycelium-web/assets/` — `mycelium_ui.js` (the wasm-bindgen JS
+wrapper) and `mycelium_ui_bg.wasm` (the compiled module). The JS
+wrapper fetches its sibling `.wasm` by filename, so the pair's names
+are load-bearing — do not rename. Delivery works like every other
+default asset: both files are embedded in the binary and the asset
+scaffold writes them to the data-dir assets directory on first boot or
+when the assets version marker is stale (an `ASSETS_VERSION` bump
+delivers a regenerated bundle to existing deployments; delete the
+`.defaults-version` marker to opt out of refreshes). There is no
+separate Dockerfile stage — the image ships the bundle through the
+same scaffold. `serve_asset` serves the `.wasm` as
+`application/wasm`, and the site CSP carries `'wasm-unsafe-eval'`
+(WASM modules compile at runtime). No page loads the bundle yet —
+island hydration lands with the follow-up UI work.
+
+Regenerate the bundle whenever `crates/mycelium-ui`'s island code
+changes (requires the `wasm32-unknown-unknown` rustup target):
+
+```sh
+cargo build -p mycelium-ui --no-default-features --features hydrate \
+  --release --target wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128 --locked   # one-time; pin matters
+wasm-bindgen --target web --out-dir /tmp/hydrate-pkg \
+  target/wasm32-unknown-unknown/release/mycelium_ui.wasm
+cp /tmp/hydrate-pkg/mycelium_ui.js crates/mycelium-web/assets/mycelium_ui.js
+cp /tmp/hydrate-pkg/mycelium_ui_bg.wasm crates/mycelium-web/assets/mycelium_ui_bg.wasm
+```
+
+Commit the two updated artifacts and bump `ASSETS_VERSION` in both
+`crates/mycelium-web/src/assets.rs` and `crates/mycelium-ui/src/shell.rs`
+(they must stay equal — a lockstep test enforces it) so running
+deployments refresh.

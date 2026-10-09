@@ -7,10 +7,19 @@ use mycelium_auth::rbac::{Role, SessionUser};
 
 use crate::middleware::SessionId;
 
-/// Common page chrome. Every page is server-rendered; app.js (CSRF header
-/// injection) loads on every page, graph.js only on the graph page.
-pub fn layout(title: &str, user: Option<&SessionUser>, csrf: &str, body: String) -> Html<String> {
-    layout_with_scripts(title, user, csrf, body, &[])
+/// Common page chrome — a thin wrapper over the mycelium-ui shell.
+/// Every page is server-rendered; app.js (CSRF header injection) loads
+/// on every page, graph.js only on the graph page. `active_path` is the
+/// page's own route constant (drives the sidebar highlight), never
+/// derived from the title.
+pub fn layout(
+    title: &str,
+    user: Option<&SessionUser>,
+    csrf: &str,
+    active_path: &str,
+    body: String,
+) -> Html<String> {
+    layout_with_scripts(title, user, csrf, active_path, body, &[])
 }
 
 /// Layout with extra script sources (e.g. graph.js).
@@ -18,79 +27,36 @@ pub fn layout_with_scripts(
     title: &str,
     user: Option<&SessionUser>,
     csrf: &str,
+    active_path: &str,
     body: String,
     extra_scripts: &[&str],
 ) -> Html<String> {
-    layout_full(title, user, csrf, body, extra_scripts, "")
+    layout_full(title, user, csrf, active_path, body, extra_scripts, "")
 }
 
 /// Full-control layout: extra scripts + a body class (e.g. the chat
-/// page's full-viewport mode).
-#[allow(clippy::too_many_arguments)]
+/// page's full-viewport mode). Adapts the session user to the shell's
+/// primitive `(name, is_admin)` pair and delegates the whole document
+/// to `mycelium_ui::shell::shell`.
 pub fn layout_full(
     title: &str,
     user: Option<&SessionUser>,
     csrf: &str,
+    active_path: &str,
     body: String,
     extra_scripts: &[&str],
     body_class: &str,
 ) -> Html<String> {
-    let nav = match user {
-        Some(u) => format!(
-            r#"<nav>
-                <a href="/">Home</a>
-                <a href="/search">Search</a>
-                <a href="/graph">Graph</a>
-                <a href="/skills">Skills</a>
-                <a href="/books">Books</a>
-                <a href="/chat">Librarian</a>
-                <a href="/keys">API Keys</a>
-                <a href="/password">Password</a>
-                {}
-                <a href="/logout">Logout</a>
-            </nav>"#,
-            if u.role == mycelium_auth::rbac::Role::Admin {
-                r#"<a href="/admin">Admin</a>"#
-            } else {
-                ""
-            }
-        ),
-        None => r#"<nav><a href="/login">Login</a></nav>"#.to_string(),
-    };
-    let scripts = extra_scripts
-        .iter()
-        .map(|s| {
-            format!(
-                r#"<script src="{s}?v={}"></script>"#,
-                crate::assets::ASSETS_VERSION
-            )
-        })
-        .collect::<String>();
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf-token" content="{}">
-<title>{} — Mycelium2</title>
-<link rel="stylesheet" href="/assets/style.css?v={}">
-</head>
-<body class="{}">
-<header><a href="/">Mycelium2</a>{}</header>
-<main>{}</main>
-<script src="/assets/app.js?v={}"></script>{scripts}
-</body>
-</html>"#,
-        html_escape(csrf),
-        html_escape(title),
-        crate::assets::ASSETS_VERSION,
-        body_class,
-        nav,
+    let user = user.map(|u| (u.username.as_str(), u.role == Role::Admin));
+    Html(mycelium_ui::shell::shell(
+        title,
+        user,
+        csrf,
+        active_path,
         body,
-        crate::assets::ASSETS_VERSION
-    );
-    Html(html)
+        extra_scripts,
+        body_class,
+    ))
 }
 
 /// Flash message rendering.
@@ -111,8 +77,11 @@ pub fn flash(ok: Option<&str>, err: Option<&str>) -> String {
     out
 }
 
-/// The login page.
+/// The login page — rendered through the outside-shell auth card
+/// (`csrf` is accepted for signature stability and always empty here:
+/// no session exists yet, so there is no token to embed).
 pub fn login_page(csrf: &str, error: Option<&str>) -> Html<String> {
+    let _ = csrf;
     let body = format!(
         r#"<h1>Login</h1>
 {}
@@ -124,7 +93,7 @@ pub fn login_page(csrf: &str, error: Option<&str>) -> Html<String> {
 </form>"#,
         flash(None, error)
     );
-    layout("Login", None, csrf, body)
+    Html(mycelium_ui::shell::auth_shell("Login", body))
 }
 
 /// First-run setup: create the initial admin. No CSRF token — no session
@@ -143,7 +112,7 @@ pub fn setup_page(username: &str, min_len: usize, error: Option<&str>) -> Html<S
         flash(None, error),
         html_escape(username)
     );
-    layout("Setup", None, "", body)
+    Html(mycelium_ui::shell::auth_shell("Setup", body))
 }
 
 /// Post-setup success: the recovery key is shown exactly once, in-page
@@ -157,7 +126,7 @@ pub fn setup_created(username: &str, recovery_key: &str) -> Html<String> {
         html_escape(username),
         html_escape(recovery_key)
     );
-    layout("Setup complete", None, "", body)
+    Html(mycelium_ui::shell::auth_shell("Setup complete", body))
 }
 
 /// Home: the user's private bundle listing.
@@ -188,7 +157,7 @@ pub fn home_page(
         flash(ok, err),
         entries.len()
     );
-    layout("Home", Some(user), csrf, body)
+    layout("Home", Some(user), csrf, "/", body)
 }
 
 /// Concept view/edit page (plain textarea with the raw markdown).
@@ -215,7 +184,7 @@ pub fn concept_page(
         html_escape(path),
         textarea_escape(markdown)
     );
-    layout("Concept", Some(user), csrf, body)
+    layout("Concept", Some(user), csrf, "/concept", body)
 }
 
 /// Concept view page for a scoped store (library catalogs, global
@@ -259,7 +228,7 @@ pub fn concept_page_scoped(
 {form}"#,
         html_escape(path)
     );
-    layout("Concept", Some(user), csrf, body)
+    layout("Concept", Some(user), csrf, "/concept", body)
 }
 
 /// New-concept page.
@@ -301,7 +270,7 @@ pub fn new_concept_page_with(
 </form>"#,
         html_escape(template)
     );
-    layout("New concept", Some(user), csrf, body)
+    layout("New concept", Some(user), csrf, "/concept", body)
 }
 
 /// Search page.
@@ -353,7 +322,7 @@ pub fn search_page(
 <ul>{rows}</ul>"#,
         html_escape(query)
     );
-    layout("Search", Some(user), csrf, body)
+    layout("Search", Some(user), csrf, "/search", body)
 }
 
 /// Graph page (loads graph.js for the force-directed visualization).
@@ -369,6 +338,7 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
         "Graph",
         Some(user),
         csrf,
+        "/graph",
         body,
         &["/assets/graph.js"],
         "graph-page",
@@ -454,7 +424,7 @@ pub fn skills_page(
 {global_section}"#,
         list(private_groups, private_scripts, private_flat, "user"),
     );
-    layout("Skills", Some(user), csrf, body)
+    layout("Skills", Some(user), csrf, "/skills", body)
 }
 
 /// Books browse page: shelves with their books. Each book links to its
@@ -494,7 +464,7 @@ pub fn books_page(
         r#"<h1>Bookshelves</h1>
 {sections}"#
     );
-    layout("Books", Some(user), csrf, body)
+    layout("Books", Some(user), csrf, "/books", body)
 }
 
 /// Chat page: talk to the librarian agent (the same agent behind the
@@ -517,6 +487,7 @@ pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
         "Librarian",
         Some(user),
         csrf,
+        "/chat",
         body,
         &["/assets/chat.js"],
         "chat-page",
@@ -536,7 +507,7 @@ pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<St
 </form>"#,
         flash(ok, err)
     );
-    layout("Password", None, csrf, body)
+    layout("Password", None, csrf, "/password", body)
 }
 
 /// API keys page.
@@ -550,17 +521,39 @@ pub fn keys_page(
         .iter()
         .map(|k| {
             let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
+            // The trigger is a plain submit inside its own row form:
+            // without JS, clicking it POSTs /keys/revoke directly (the
+            // server-rendered csrf_token is the security gate); with
+            // JS, confirm.js's preventDefault opens the dialog instead.
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td><form method="post" action="/keys/revoke"><input type="hidden" name="id" value="{}"><button class="danger">Revoke</button></form></td></tr>"#,
+<td><form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form></td></tr>"#,
                 html_escape(&k.label),
                 status,
                 k.created_at.format("%Y-%m-%d"),
                 k.last_used_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                html_escape(csrf),
+                k.id,
                 k.id
             )
         })
         .collect::<String>();
+    // One revoke dialog per page: confirm.js opens it from any row's
+    // trigger, copying that row's data-key-id into the form's hidden
+    // id input. The form's own action + hidden fields (including the
+    // CSRF token) carry the confirm POST — no inline scripts.
+    let dialog = mycelium_ui::render::render(mycelium_ui::confirm_dialog(
+        "revoke",
+        "Revoke this key?",
+        "Revoking a key takes effect immediately — any tool using it stops working. This cannot be undone.",
+        "Revoke",
+        "danger",
+        "/keys/revoke",
+        &[
+            ("id".to_string(), String::new()),
+            ("csrf_token".to_string(), csrf.to_string()),
+        ],
+    ));
     let minted_html = minted
         .map(|t| format!(r#"<div class="flash ok">New key (shown once): <code>{t}</code></div>"#))
         .unwrap_or_default();
@@ -568,15 +561,24 @@ pub fn keys_page(
         r#"<h1>API keys</h1>
 {minted_html}
 <table><tr><th>Label</th><th>Status</th><th>Created</th><th>Last used</th><th></th></tr>{rows}</table>
+{dialog}
 <h2>Mint a key</h2>
 <form method="post" action="/keys">
   <label>Label</label><input name="label" required>
   <button type="submit">Mint</button>
 </form>"#,
         rows = rows,
+        dialog = dialog,
         minted_html = minted_html
     );
-    layout("API keys", Some(user), csrf, body)
+    layout_with_scripts(
+        "API keys",
+        Some(user),
+        csrf,
+        "/keys",
+        body,
+        &["/assets/confirm.js"],
+    )
 }
 
 /// Admin portal.
@@ -728,7 +730,7 @@ pub fn admin_page(
         security.min_password_length,
         security.passage_max_chars
     );
-    layout("Admin", Some(user), csrf, body)
+    layout("Admin", Some(user), csrf, "/admin", body)
 }
 
 /// Minimal percent-encoding for query-string values.
@@ -782,23 +784,23 @@ mod tests {
     /// Regression: the page body must render inside `<main>`, and the
     /// app.js `<script>` tag must carry a clean `?v=` version — not the body.
     /// (A swapped `format!` argument once put the whole body into the script
-    /// tag and left `<main>` holding the bare asset version.)
+    /// tag and left `<main>` holding the bare asset version.) Drives a real
+    /// shelled page through the mycelium-ui shell.
     #[test]
     fn layout_renders_body_into_main_not_script() {
-        let html = login_page("", None).0;
+        let user = SessionUser {
+            user_id: uuid::Uuid::new_v4(),
+            username: "test".to_string(),
+            role: Role::User,
+        };
+        let entries: Vec<mycelium_store::ConceptEntry> = Vec::new();
+        let html = home_page(&user, "", &entries, None, None).0;
         assert!(
-            html.contains("<main><h1>Login</h1>"),
+            html.contains("<main><h1>Your bundle</h1>"),
             "body should open inside <main>: {html}"
         );
         assert!(
-            html.contains("</form></main>"),
-            "form should close before </main>: {html}"
-        );
-        assert!(
-            html.contains(&format!(
-                r#"<script src="/assets/app.js?v={}"></script>"#,
-                crate::assets::ASSETS_VERSION
-            )),
+            html.contains(r#"<script src="/assets/app.js?v="#),
             "app.js script tag should be well-formed: {html}"
         );
         // The body must not leak into the script src attribute.
@@ -807,8 +809,43 @@ mod tests {
             "body leaked into the app.js script tag: {html}"
         );
         assert!(
-            !html.contains(&format!("<main>{}</main>", crate::assets::ASSETS_VERSION)),
+            !html.contains(&format!("<main>{}", crate::assets::ASSETS_VERSION)),
             "<main> should not hold the bare asset version: {html}"
+        );
+    }
+
+    /// Review Focus 3: the concept editor round-trips user markdown
+    /// through a textarea — a hostile `</textarea><script>` sequence must
+    /// be neutralized (escaped, never executable markup), matching the
+    /// XSS integration-test posture.
+    #[test]
+    fn concept_editor_neutralizes_textarea_breakout() {
+        let user = SessionUser {
+            user_id: uuid::Uuid::new_v4(),
+            username: "test".to_string(),
+            role: Role::User,
+        };
+        let hostile = "</textarea><script>alert(1)</script>";
+        let html = concept_page(&user, "", "/notes/x.md", hostile, None, None).0;
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw script tag leaked through the editor textarea: {html}"
+        );
+        assert!(
+            html.contains("&lt;/textarea&gt;"),
+            "escaped form missing: {html}"
+        );
+    }
+
+    /// mycelium-ui's shell emits asset URLs with its own version constant;
+    /// it must equal this crate's scaffold version, so a one-sided bump
+    /// fails here. Lives in mycelium-web (the only crate seeing both).
+    #[test]
+    fn assets_versions_lockstep() {
+        assert_eq!(
+            crate::assets::ASSETS_VERSION,
+            mycelium_ui::ASSETS_VERSION,
+            "mycelium-ui and mycelium-web asset versions must bump together"
         );
     }
 }

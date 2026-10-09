@@ -35,6 +35,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Wasm build (mycelium-ui hydrate)
+        run: cargo build -p mycelium-ui --no-default-features --features hydrate --target wasm32-unknown-unknown
+
   build:
     name: build release binaries
     runs-on: ubuntu-latest

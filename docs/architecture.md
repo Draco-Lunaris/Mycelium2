@@ -1,6 +1,6 @@
 # Architecture
 
-Mycelium2 is a Rust workspace of nine crates over an axum HTTPS
+Mycelium2 is a Rust workspace of ten crates over an axum HTTPS
 server. Everything is self-contained: SQLite metadata, encrypted files
 on disk, no external services (the LLM backend is optional).
 
@@ -83,6 +83,21 @@ identity comes from the bearer API key (rmcp injects the request parts
 into each call). Tools: `mycelium2_memory_query/add/update/status/
 maintain`, `mycelium2_skill_get/list`. MCP queries stay private to the
 caller's bundle by default (web search spans user + global scopes).
+
+## Frontend (mycelium-ui)
+
+`mycelium-ui` is the Leptos-based frontend crate that `mycelium-web`
+depends on for rendering. It is feature-split: `ssr` (the default)
+server-renders components and the app shell to HTML strings that the
+axum handlers interpolate into their pages, and `hydrate` builds the
+wasm island bundle that re-attaches behavior client-side. Components
+take primitive-only props (strings, options, tuples — no axum or
+state types), so the crate stays free of server concerns and compiles
+cleanly to `wasm32-unknown-unknown`; the hydrate bundle's artifacts
+(`mycelium_ui.js` + `mycelium_ui_bg.wasm`) are checked in under
+`crates/mycelium-web/assets/` and delivered by the asset scaffold (see
+[Deployment](deployment.md)). `ASSETS_VERSION` is mirrored in the
+crate's shell and must bump in lockstep with mycelium-web's.
 
 ## Determinism
 

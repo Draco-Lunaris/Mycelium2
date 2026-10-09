@@ -361,7 +361,7 @@ pub async fn security_headers(request: Request<axum::body::Body>, next: Next) ->
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     let csp = format!(
-        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; \
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}'; \
          style-src 'self'; img-src 'self' data:; connect-src 'self'; \
          frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     );

@@ -172,6 +172,7 @@ async fn serve_asset(
             let mime = match path.rsplit('.').next() {
                 Some("css") => "text/css",
                 Some("js") => "application/javascript",
+                Some("wasm") => "application/wasm",
                 Some("svg") => "image/svg+xml",
                 Some("png") => "image/png",
                 _ => "application/octet-stream",

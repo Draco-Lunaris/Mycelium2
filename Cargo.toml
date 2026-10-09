@@ -4,6 +4,7 @@ members = [
     "crates/mycelium-crypto",
     "crates/mycelium-store",
     "crates/mycelium-auth",
+    "crates/mycelium-ui",
     "crates/mycelium-web",
     "crates/mycelium-mcp",
     "crates/mycelium-librarian",
@@ -60,6 +61,8 @@ rmcp = { version = "3.2", features = ["server", "macros", "transport-streamable-
 
 # Frontend
 leptos = { version = "0.8" }
+wasm-bindgen = "0.2.128"
+mycelium-ui = { path = "crates/mycelium-ui" }
 
 # Observability
 tracing = "0.1"
