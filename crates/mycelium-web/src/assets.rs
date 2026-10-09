@@ -88,7 +88,7 @@ pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: a
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
 
 /* Graph — full-viewport interactive layout (body.graph-page) */
-body.graph-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body.graph-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
 body.graph-page main {
   display: flex; flex-direction: column; flex: 1;
   max-width: none; width: 100%; margin: 0; padding: 0 1.2rem;
@@ -111,7 +111,7 @@ body.graph-page h1 { margin: .8rem 0 .4rem; }
 #graph-legend { margin: .4rem 0 .8rem; font-size: .85rem; }
 
 /* Librarian chat — full-viewport layout (body.chat-page) */
-body.chat-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+body.chat-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
 body.chat-page main {
   display: flex; flex-direction: column; flex: 1;
   max-width: none; width: 100%; margin: 0; padding: 0;
@@ -397,6 +397,73 @@ body.chat-page main {
   font-size: var(--text-section); font-weight: 600;
 }
 .modal p { margin: 0 0 var(--gap-4); }
+
+/* Shell (Task 6): sidebar + content row. body.shelled is the flex-row
+   hook the shell emits for signed-in pages; the sidebar is sticky so
+   long content scrolls beside it. */
+body.shelled { display: flex; min-height: 100vh; min-height: 100dvh; }
+body.shelled main { flex: 1 1 auto; min-width: 0; }
+.sidebar {
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh; height: 100dvh;
+  overflow-y: auto;
+}
+.brand {
+  display: inline-flex; align-items: center; gap: var(--gap-2);
+  margin: 0 0 var(--gap-4); padding: 0 var(--gap-2);
+  color: var(--color-text-heading); text-decoration: none;
+  font-size: var(--text-section); font-weight: 700;
+}
+.brand:hover { color: var(--color-accent); }
+.sidebar__footer {
+  margin-top: auto; display: flex; align-items: center; gap: var(--gap-3);
+  padding: var(--gap-3) var(--gap-2) 0;
+}
+.user-chip {
+  display: inline-flex; align-items: center; gap: var(--gap-2);
+  min-width: 0; color: var(--color-text-label);
+}
+.user-chip__avatar {
+  flex: 0 0 auto; display: inline-flex; align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px; border-radius: var(--radius-pill);
+  background: var(--color-accent-surface); color: var(--color-accent);
+  font-size: var(--text-caption); font-weight: 600;
+}
+.user-chip__name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: var(--text-caption);
+}
+.sidebar__logout {
+  margin-left: auto; color: var(--color-text-body);
+  font-size: var(--text-caption); text-decoration: none; white-space: nowrap;
+}
+.sidebar__logout:hover { color: var(--color-danger); }
+
+/* Auth shell (login/setup): centered card on the page background. */
+body.auth { display: flex; min-height: 100vh; }
+body.auth main {
+  display: flex; flex: 1; align-items: center; justify-content: center;
+  max-width: none; width: 100%; margin: 0;
+  padding: var(--gap-5) var(--gap-4);
+}
+.auth-card { width: 100%; max-width: 26rem; margin: 0; }
+.auth-card .brand { margin: 0 0 var(--gap-4); }
+
+/* Narrow (720px): the sidebar collapses to the 60px icon rail — labels
+   hide, icons stay; the shell keeps one DOM (spec §10, mockup 15). */
+@media (max-width: 720px) {
+  .sidebar {
+    width: var(--rail-width); flex: 0 0 var(--rail-width);
+    padding: var(--gap-3) var(--gap-1); align-items: center;
+  }
+  .brand { margin: 0 0 var(--gap-3); padding: 0; }
+  .brand svg + span, .sidebar__group-label, .nav-item span,
+  .user-chip__name, .sidebar__logout span { display: none; }
+  .nav-item { justify-content: center; padding: 0.4rem 0; }
+  .sidebar__footer { padding: var(--gap-3) 0 0; flex-direction: column; gap: var(--gap-2); }
+  .sidebar__logout { margin: 0; }
+}
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.

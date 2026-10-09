@@ -18,6 +18,8 @@ pub mod render {
 
 mod layout;
 mod primitives;
+#[cfg(feature = "ssr")]
+pub mod shell;
 
 #[cfg(feature = "ssr")]
 pub use layout::{
@@ -25,6 +27,8 @@ pub use layout::{
 };
 #[cfg(feature = "ssr")]
 pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_state, field};
+#[cfg(feature = "ssr")]
+pub use shell::ASSETS_VERSION;
 
 /// Hydration entry: wasm-bindgen calls this on module start; it walks
 /// whatever <leptos-island> roots the page carries. Islands themselves

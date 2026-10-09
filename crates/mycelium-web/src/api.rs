@@ -1405,7 +1405,7 @@ pub async fn admin_create_user(
                 role: Role::Admin,
             };
             // Render with the creating admin's identity for the nav.
-            pages::layout("User created", Some(&admin), "", body).into_response()
+            pages::layout("User created", Some(&admin), "", "/admin", body).into_response()
         }
         Err(e) => Redirect::to(&format!(
             "/admin?error={}",
