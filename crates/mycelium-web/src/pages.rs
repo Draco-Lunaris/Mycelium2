@@ -935,19 +935,45 @@ pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
     )
 }
 
-/// Change-password page.
+/// Change-password page (Task 9 — lone card): the PR-1 ruled None-user
+/// shell-less rendering kept (no sidebar), but the body is now a single
+/// `card("Change password", …)` — the flash banners plus the change
+/// form. The three password fields compose INLINE on the field markup
+/// pattern (the Task-3 search-page precedent): the primitive `field()`
+/// renders only `<input id type>`, while these inputs must carry
+/// name/required/minlength for the native POST; extending the shared
+/// primitive (and every consumer) for one page's attributes is the
+/// worse shape, and this markup keeps the component's exact `.field`
+/// shape (label[for] above input, id-pairing). The hidden csrf_token
+/// follows the row-form pattern (app.js skips injection when the field
+/// exists; the middleware's form path verifies it) and `form_actions`
+/// supplies the primary submit (a bare button inside a form submits
+/// natively — no JS needed). No user text beyond the flash messages,
+/// which the flash helper escapes at composition (card bodies are raw
+/// slots).
 pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<String> {
-    let body = format!(
-        r#"<h1>Change password</h1>
-{}
-<form method="post" action="/password">
-  <label>Current password</label><input type="password" name="old" required>
-  <label>New password (min 20 chars)</label><input type="password" name="new" required minlength="20">
-  <label>Repeat new password</label><input type="password" name="repeat" required minlength="20">
-  <button type="submit">Change</button>
+    let csrf_esc = html_escape(csrf);
+    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
+    let card_body = format!(
+        r#"{flashes}<form method="post" action="/password">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="pw-old">Current password</label>
+    <input id="pw-old" type="password" name="old" required>
+  </div>
+  <div class="field">
+    <label for="pw-new">New password (min 20 chars)</label>
+    <input id="pw-new" type="password" name="new" required minlength="20">
+  </div>
+  <div class="field">
+    <label for="pw-repeat">Repeat new password</label>
+    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
+  </div>
+  {actions}
 </form>"#,
-        flash(ok, err)
+        flashes = flash(ok, err),
     );
+    let body = mycelium_ui::render::render(mycelium_ui::card("Change password", card_body));
     layout("Password", None, csrf, "/password", body)
 }
 

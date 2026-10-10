@@ -158,6 +158,15 @@ async fn full_web_flow() {
 
     // 5b. Change the password (forced flow) — invalidates the session.
     //    CSRF comes from the /password page (the only reachable page).
+    //    Task 9 pin: the page renders as a lone card (card__header).
+    let pw_page = client
+        .get(format!("{base}/password"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let pw_html = pw_page.text().await.unwrap();
+    assert!(pw_html.contains("card__header"), "{pw_html}");
     let csrf = csrf_from_page(&client, &format!("{base}/password"), &cookie).await;
     let new_password = "new admin password 20 chars!";
     let change = client
