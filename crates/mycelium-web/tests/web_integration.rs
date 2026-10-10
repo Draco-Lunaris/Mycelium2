@@ -1048,6 +1048,163 @@ async fn skills_scoped_delete_round_trip() {
     shutdown.cancel();
 }
 
+/// Search page (Task 3): the scope-chip row filters the merged results
+/// by scope; an unknown scope falls back to the unfiltered list with
+/// "All" active (Task 1's pattern); the query — user input — is escaped
+/// wherever it renders (input value attribute, count line, chip hrefs).
+/// The lowercase "your bundle" / capital "Your bundle" split is
+/// load-bearing: row chips carry the existing lowercase scope labels,
+/// the chip row the capital ones, so the library-scope negative
+/// assertion can hold (no lowercase "your bundle" anywhere else on
+/// the page — the placeholder included).
+#[tokio::test]
+async fn search_scope_chips() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // A user-bundle concept the "note" query hits (title + body both
+    // carry the token).
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+    let create = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/notes/search-note.md"),
+            (
+                "markdown",
+                "---\ntype: Note\ntitle: Notebook basics\n---\n\nA note about note-taking.",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // Search: scope chips filter by scope; unknown scope = all.
+    let s = client
+        .get(format!("{base}/search?q=note&scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(s.status(), 200);
+    let html = s.text().await.unwrap();
+    assert!(html.contains("chip--accent"), "active scope chip: {html}");
+    assert!(html.contains("your bundle"), "user-scoped result: {html}");
+    // The user chip is the active one (exact span, Task 1's pattern).
+    assert!(
+        html.contains(
+            r#"<a class="chip chip--accent" href="/search?q=note&scope=user">Your bundle</a>"#
+        ),
+        "user scope chip active: {html}"
+    );
+    // The count line names the (escaped) query.
+    assert!(
+        html.contains(r#"results for "note""#),
+        "result-count line: {html}"
+    );
+    let s2 = client
+        .get(format!("{base}/search?q=note&scope=library"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let h2 = s2.text().await.unwrap();
+    assert!(
+        !h2.contains("your bundle"),
+        "library scope hides user results: {h2}"
+    );
+    // Library scope in a fresh boot has no hits: the empty state.
+    assert!(h2.contains("No results"), "empty state heading: {h2}");
+    assert!(
+        h2.contains("Try a different search or scope."),
+        "empty state body: {h2}"
+    );
+
+    // Unknown scope: unfiltered, "All" active (Task 1's fallback).
+    let s3 = client
+        .get(format!("{base}/search?q=note&scope=bogus"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(s3.status(), 200);
+    let h3 = s3.text().await.unwrap();
+    assert!(
+        h3.contains(r#"<a class="chip chip--accent" href="/search?q=note">All</a>"#),
+        "unknown scope activates the All chip: {h3}"
+    );
+    assert!(
+        h3.contains("your bundle"),
+        "unknown scope shows all results: {h3}"
+    );
+
+    // The query row: plain GET form, primary submit, query echoed into
+    // the value attribute.
+    assert!(
+        html.contains(r#"<form method="get" action="/search">"#),
+        "query form: {html}"
+    );
+    assert!(html.contains(r#"name="q""#), "query input name: {html}");
+    assert!(
+        html.contains(r#"value="note""#),
+        "query echoed into the value attribute: {html}"
+    );
+    assert!(
+        html.contains(r#"class="btn btn--primary">Search<"#),
+        "primary submit button: {html}"
+    );
+
+    // Hostile query (`"><script>alert(1)</script>`, percent-encoded in
+    // the URL): escaped in the value attribute and the count line,
+    // percent-encoded in the chip hrefs — never raw markup (the
+    // raw-slot contract: query text is user input).
+    let hostile = client
+        .get(format!(
+            "{base}/search?q=%22%3E%3Cscript%3Ealert(1)%3C/script%3E&scope=user"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile.status(), 200);
+    let hx = hostile.text().await.unwrap();
+    assert!(
+        hx.contains(r#"value="&quot;&gt;&lt;script&gt;"#),
+        "value attribute escapes the breakout attempt: {hx}"
+    );
+    assert!(
+        !hx.contains("<script>alert"),
+        "hostile query must never render as markup: {hx}"
+    );
+    assert!(
+        hx.contains("%3Cscript%3E"),
+        "chip hrefs percent-encode the query: {hx}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

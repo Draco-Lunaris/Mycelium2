@@ -1190,27 +1190,41 @@ pub async fn home(
     pages::home_page(&user, &csrf, &entries, &broken, type_filter, None, None).into_response()
 }
 
-/// GET /search — search page.
+/// GET /search — search page, with an optional `?scope=` filter
+/// (mockup 05's scope chips): a value naming a real scope
+/// (`user|skills|library`) narrows the merged results to that scope;
+/// an absent or unknown value renders the unfiltered list with "All"
+/// active (Task 1's unknown-filter fallback — never an error).
 pub async fn search_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
-    Query(params): Query<SearchParams>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    if params.q.is_empty() {
-        return pages::search_page(&user, &csrf, "", &[]).into_response();
+    let query = params.get("q").map(String::as_str).unwrap_or("");
+    // The scope filter only applies when it names a real scope;
+    // anything else renders the unfiltered list.
+    let scope = match params.get("scope") {
+        Some(s) if matches!(s.as_str(), "user" | "skills" | "library") => Some(s.as_str()),
+        _ => None,
+    };
+    if query.is_empty() {
+        return pages::search_page(&user, &csrf, "", scope, &[]).into_response();
     }
-    let terms = params
-        .q
+    let terms = query
         .split_whitespace()
         .map(|t| t.to_string())
         .collect::<Vec<_>>();
-    let mut query = SearchQuery::new(terms);
-    query.include_global = true; // web default: bundle + global shelves
-    let results = search_all_scopes(&state, &user, &query, true).await;
+    let mut search = SearchQuery::new(terms);
+    search.include_global = true; // web default: bundle + global shelves
+    let mut results = search_all_scopes(&state, &user, &search, true).await;
+    // Server-side scope filter: the page renders what the chips promise.
+    if let Some(scope) = scope {
+        results.retain(|r| r.scope == scope);
+    }
     crate::state::Metrics::inc(&state.metrics.searches_total);
-    pages::search_page(&user, &csrf, &params.q, &results).into_response()
+    pages::search_page(&user, &csrf, query, scope, &results).into_response()
 }
 
 /// GET /graph — graph page.

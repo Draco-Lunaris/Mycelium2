@@ -504,54 +504,136 @@ fn strip_frontmatter_block(markdown: &str) -> String {
     markdown.to_string()
 }
 
-/// Search page.
+/// Search page (Task 3 rebuild — mockup 05): the query row, the
+/// scope-chip filter, and the merged cross-scope result list.
+///
+/// `scope` is the ACTIVE chip — the handler has already validated it
+/// (`user|skills|library`; an absent or unknown value arrives as `None`
+/// and renders "All" active, Task 1's unknown-filter fallback) and has
+/// already narrowed `results` to that scope.
+///
+/// Body order: page header, the query row (a plain GET form — a
+/// `field`-shaped input carrying the query in its value attribute plus
+/// the primary submit, no script), the scope chips (GET links
+/// `?q=…&scope=…`, the active one accented), then the count line and
+/// the result list — or the empty state when a query returned nothing.
+/// With no query at all the page stops at the query row.
+///
+/// Escaping: the query is user input — `html_escape` wherever it
+/// renders as text (the value attribute, the count line) and
+/// `urlencoding_encode` inside the chip hrefs; result titles and
+/// snippets are escaped at composition, concept paths are
+/// percent-encoded into hrefs, and every chip label is a fixed literal
+/// (the chip component escapes its text anyway). The lowercase row
+/// labels ("your bundle", "global skills", "library") keep the
+/// existing scope-label logic; the chip row carries the mockup's
+/// capitalized labels ("Your bundle", "Skills", "Books") — the casing
+/// split is deliberate so a scope-filtered page can assert on the
+/// lowercase row labels without matching the chip row.
 pub fn search_page(
     user: &SessionUser,
     csrf: &str,
     query: &str,
+    scope: Option<&str>,
     results: &[crate::api::ScopedResult],
 ) -> Html<String> {
-    let rows = results
-        .iter()
-        .map(|r| {
-            // Scope-aware links: user bundle and library/skills concepts
-            // open in the right viewer.
-            let (href, label) = match r.scope {
-                "library" => (
-                    format!(
-                        "/concept?path={}&scope=library",
-                        urlencoding_encode(&r.concept_path)
-                    ),
-                    "library",
-                ),
-                "skills" => (
-                    format!(
-                        "/concept?path={}&scope=skills",
-                        urlencoding_encode(&r.concept_path)
-                    ),
-                    "global skills",
-                ),
-                _ => (
-                    format!("/concept?path={}", urlencoding_encode(&r.concept_path)),
-                    "your bundle",
-                ),
-            };
-            format!(
-                r#"<li><a href="{href}">{}</a> <span class="muted">({label}, score {:.1})</span><br><span class="muted">{}</span></li>"#,
-                html_escape(&r.title),
-                r.score,
-                html_escape(&r.snippet)
-            )
-        })
-        .collect::<String>();
-    let body = format!(
-        r#"<h1>Search</h1>
-<form method="get" action="/search">
-  <input name="q" value="{}" placeholder="Search your bundle and global shelves" autofocus>
-  <button type="submit">Search</button>
-</form>
-<ul>{rows}</ul>"#,
+    let queried = !query.is_empty();
+    // Query row: plain GET form. The input re-carries the query
+    // (escaped into the value attribute) so a refinement keeps the
+    // text; the field shape gives it the label-above-input styling and
+    // the primary submit needs no script.
+    let query_row = format!(
+        r#"<form method="get" action="/search">
+  <div class="field">
+    <label for="search-q">Query</label>
+    <input id="search-q" type="text" name="q" value="{}" placeholder="Search across bundle, skills, and books" autofocus>
+  </div>
+  <button type="submit" class="btn btn--primary">Search</button>
+</form>"#,
         html_escape(query)
+    );
+    // Scope chips: GET links that re-run the query narrowed to one
+    // scope — "All" drops the scope param. The active chip mirrors the
+    // scope the handler kept (None → "All").
+    let chips = if queried {
+        let enc = urlencoding_encode(query);
+        let chip = |label: &str, href: String, active: bool| {
+            format!(
+                r#"<a class="chip{}" href="{}">{}</a>"#,
+                if active { " chip--accent" } else { "" },
+                href,
+                html_escape(label)
+            )
+        };
+        let mut chips = vec![chip("All", format!("/search?q={enc}"), scope.is_none())];
+        for (param, label) in [
+            ("user", "Your bundle"),
+            ("skills", "Skills"),
+            ("library", "Books"),
+        ] {
+            chips.push(chip(
+                label,
+                format!("/search?q={enc}&scope={param}"),
+                scope == Some(param),
+            ));
+        }
+        format!(r#"<p class="scope-chips">{}</p>"#, chips.join(" "))
+    } else {
+        String::new()
+    };
+    // Count + results — only for a query that ran. Zero hits render
+    // the empty state instead of an empty list.
+    let content = if !queried {
+        String::new()
+    } else if results.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No results",
+            "Try a different search or scope.",
+        ))
+    } else {
+        let rows = results
+            .iter()
+            .map(|r| {
+                // Scope-aware links + labels (the existing routing
+                // logic): user bundle, global skills, and library
+                // concepts open in the right viewer.
+                let (href, label) = match r.scope {
+                    "library" => (
+                        format!(
+                            "/concept?path={}&scope=library",
+                            urlencoding_encode(&r.concept_path)
+                        ),
+                        "library",
+                    ),
+                    "skills" => (
+                        format!(
+                            "/concept?path={}&scope=skills",
+                            urlencoding_encode(&r.concept_path)
+                        ),
+                        "global skills",
+                    ),
+                    _ => (
+                        format!("/concept?path={}", urlencoding_encode(&r.concept_path)),
+                        "your bundle",
+                    ),
+                };
+                format!(
+                    r#"<li><a href="{href}">{}</a> {}<br><span class="muted">{}</span></li>"#,
+                    html_escape(&r.title),
+                    mycelium_ui::render::render(mycelium_ui::chip(label, "neutral")),
+                    html_escape(&r.snippet)
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<p class="muted">{} results for "{}"</p><ul>{rows}</ul>"#,
+            results.len(),
+            html_escape(query)
+        )
+    };
+    let body = format!(
+        "{}{query_row}{chips}{content}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Search", String::new()))
     );
     layout("Search", Some(user), csrf, "/search", body)
 }
