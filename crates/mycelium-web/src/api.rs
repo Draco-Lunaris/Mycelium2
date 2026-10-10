@@ -1123,13 +1123,33 @@ pub async fn concept_delete(
 /// One shelf's browse data: (name, is_global_read, books as (slug, title)).
 pub type ShelfBrowse = (String, bool, Vec<(String, String)>);
 
-/// GET /books — browse global bookshelves. Users see global-read
-/// shelves; admins see all. Each shelf lists its books (from the DB),
-/// each book linking to its catalog hub.
+/// One selected-shelf chapter row for the Books page: the book it
+/// belongs to, its 1-based chapter number (parsed from the catalog
+/// concept path), the passage anchor (the concept path's stem — the
+/// REAL anchor ingest wrote, anchored and plain books alike), and the
+/// chapter's title. The handler gathers; the page composes (this PR's
+/// architecture), so the row crosses the boundary as plain data.
+pub struct ChapterRow {
+    pub book_slug: String,
+    pub index: u32,
+    pub anchor: String,
+    pub title: String,
+}
+
+/// GET /books — browse bookshelves (mockup 07). Users see global-read
+/// shelves; admins all. `?shelf=` selects a shelf (only a name the
+/// page shows — a visible row; anything else is the unselected view,
+/// the unknown-filter fallback), `?book=` narrows the chapter list to
+/// one book on the selected shelf, and `?passage=` resolves a
+/// `book://slug#anchor` resource server-side through the same gates
+/// and extraction as GET /api/v1/passages (resolve_passage) — a
+/// resolution failure renders as the page's warning banner, never a
+/// 500 (RF 4).
 pub async fn books_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let shelves = state
@@ -1146,7 +1166,100 @@ pub async fn books_view(
         let books = state.store.books_on_shelf(id).await.unwrap_or_default();
         shelf_data.push((name, is_global, books));
     }
-    pages::books_page(&user, &csrf, &shelf_data).into_response()
+    // ?shelf= selects only a shelf the page will show (a visible row;
+    // anything else is the unselected view — the unknown-filter
+    // fallback); ?book= narrows to one book ON the selected shelf.
+    let selected_shelf_books: Option<(&str, &[(String, String)])> =
+        params.get("shelf").and_then(|wanted| {
+            shelf_data
+                .iter()
+                .find(|(name, _, _)| name.as_str() == wanted.as_str())
+                .map(|(name, _, books)| (name.as_str(), books.as_slice()))
+        });
+    let selected_shelf: Option<String> = selected_shelf_books.map(|(name, _)| name.to_string());
+    let selected_book: Option<String> = selected_shelf_books.and_then(|(_, books)| {
+        params
+            .get("book")
+            .and_then(|wanted| {
+                books
+                    .iter()
+                    .find(|(slug, _)| slug.as_str() == wanted.as_str())
+            })
+            .map(|(slug, _)| slug.to_string())
+    });
+    // The selected shelf's chapter list: the library-namespace catalog
+    // concepts under `/<slug>/` — `ch-<n>-<anchor>.md` children with a
+    // 1-based index (the hub `book.md` and any non-chapter file stay
+    // out; the anchor is the file stem — the REAL anchor ingest wrote,
+    // the passage link carries it verbatim). Narrowed to the selected
+    // book when `?book=` names one; ordered by book slug then chapter
+    // index for deterministic output (list_prefix is path-ordered, so
+    // ch-10 would sort before ch-2 without the index re-sort).
+    let mut chapters: Vec<ChapterRow> = Vec::new();
+    if let Some((_, books)) = selected_shelf_books {
+        let cs = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        );
+        for (slug, _title) in books {
+            if selected_book.as_deref().is_some_and(|b| b != slug.as_str()) {
+                continue;
+            }
+            let prefix = format!("/{slug}/");
+            for entry in cs.list_prefix(&prefix).await.unwrap_or_default() {
+                let Some(stem) = entry
+                    .path
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|file| file.strip_suffix(".md"))
+                else {
+                    continue;
+                };
+                let Some(rest) = stem.strip_prefix("ch-") else {
+                    continue;
+                };
+                let Some((n, _tail)) = rest.split_once('-') else {
+                    continue;
+                };
+                let Ok(index) = n.parse::<u32>() else {
+                    continue;
+                };
+                if index == 0 {
+                    continue; // anchors are 1-based; zero is invalid
+                }
+                chapters.push(ChapterRow {
+                    book_slug: slug.clone(),
+                    index,
+                    anchor: stem.to_string(),
+                    title: entry.title,
+                });
+            }
+        }
+        chapters
+            .sort_by(|a, b| (a.book_slug.as_str(), a.index).cmp(&(b.book_slug.as_str(), b.index)));
+    }
+    // ?passage= — a `book://slug#anchor` resource resolved server-side
+    // through the shared gates + extraction; the page renders the
+    // passage or the resolution error as its warning banner (200 — RF 4).
+    let (passage_html, passage_err) = match params.get("passage") {
+        Some(resource) => match resolve_passage(&state, &user, resource).await {
+            Ok(passage) => (Some(pages::build_passage_html(&passage.text)), None),
+            Err((_status, message)) => (None, Some(message)),
+        },
+        None => (None, None),
+    };
+    pages::books_page(
+        &user,
+        &csrf,
+        &shelf_data,
+        selected_shelf.as_deref(),
+        selected_book.as_deref(),
+        &chapters,
+        passage_html,
+        passage_err.as_deref(),
+    )
+    .into_response()
 }
 
 /// GET / — Browse: the user's bundle listing (mockup 01), with an
@@ -1991,16 +2104,29 @@ pub struct PassageParams {
     pub resource: String,
 }
 
-/// GET /api/v1/passages?resource=book://slug#anchor — read a passage
-/// from the shared library stacks. Global-read bookshelves are
-/// readable by all users; admin-private ones by admins only.
-pub async fn api_passage(
-    State(state): State<AppState>,
-    user: SessionUser,
-    Query(params): Query<PassageParams>,
-) -> Response {
-    let Some(book_ref) = mycelium_core::library::parse_book_ref(&params.resource) else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid book:// resource");
+/// A passage resolution failure: the HTTP status + message the API
+/// endpoint reports. The Books page renders the message as its
+/// warning banner (RF 4) — same gates, same wording, different
+/// surface.
+type PassageResolveError = (StatusCode, String);
+
+/// Resolve a `book://<slug>#<anchor>` resource for `user`: the book
+/// must exist, its shelf must be global-read (or the requester is an
+/// admin), and the passage must extract from the shared stacks
+/// (admin-configurable cap, pre-clamped). The ONE resolution path
+/// behind both GET /api/v1/passages (reports the status) and the Books
+/// page's `?passage=` reader pane (renders the message as a banner) —
+/// the visibility gates and extraction are shared, never forked.
+async fn resolve_passage(
+    state: &AppState,
+    user: &SessionUser,
+    resource: &str,
+) -> Result<mycelium_core::library::Passage, PassageResolveError> {
+    let Some(book_ref) = mycelium_core::library::parse_book_ref(resource) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid book:// resource".to_string(),
+        ));
     };
     // The book must exist and its shelf must be global-read (or the
     // requester is an admin).
@@ -2010,7 +2136,7 @@ pub async fn api_passage(
         .await
         .unwrap_or(None)
     else {
-        return error_response(StatusCode::NOT_FOUND, "book not found");
+        return Err((StatusCode::NOT_FOUND, "book not found".to_string()));
     };
     let shelf_row: Option<(i64,)> =
         sqlx::query_as("SELECT is_global_read FROM bookshelves WHERE id = ?")
@@ -2020,10 +2146,13 @@ pub async fn api_passage(
             .ok()
             .flatten();
     let Some((is_global,)) = shelf_row else {
-        return error_response(StatusCode::NOT_FOUND, "bookshelf not found");
+        return Err((StatusCode::NOT_FOUND, "bookshelf not found".to_string()));
     };
     if is_global == 0 && user.role != Role::Admin {
-        return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "bookshelf is not global-read".to_string(),
+        ));
     }
     // Read the stack text and extract the passage (admin-configurable
     // cap, pre-clamped).
@@ -2032,22 +2161,31 @@ pub async fn api_passage(
             .await
         {
             Ok(t) => t,
-            Err(_) => return error_response(StatusCode::NOT_FOUND, "book text unavailable"),
+            Err(_) => {
+                return Err((StatusCode::NOT_FOUND, "book text unavailable".to_string()));
+            }
         };
     let cap = state.security_config().await.passage_max_chars;
-    match mycelium_core::library::extract_passage_capped(
-        &book_ref.slug,
-        &book_ref.anchor,
-        &text,
-        cap,
-    ) {
+    mycelium_core::library::extract_passage_capped(&book_ref.slug, &book_ref.anchor, &text, cap)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+/// GET /api/v1/passages?resource=book://slug#anchor — read a passage
+/// from the shared library stacks. Global-read bookshelves are
+/// readable by all users; admin-private ones by admins only.
+pub async fn api_passage(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(params): Query<PassageParams>,
+) -> Response {
+    match resolve_passage(&state, &user, &params.resource).await {
         Ok(passage) => Json(serde_json::json!({
             "slug": passage.slug,
             "anchor": passage.anchor,
             "text": passage.text,
         }))
         .into_response(),
-        Err(e) => error_response(StatusCode::NOT_FOUND, &e.to_string()),
+        Err((status, message)) => error_response(status, &message),
     }
 }
 

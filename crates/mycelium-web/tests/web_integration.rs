@@ -1205,6 +1205,345 @@ async fn search_scope_chips() {
     shutdown.cancel();
 }
 
+/// The book the Books-page test ingests — ingest_integration.rs's text,
+/// so the `# Chapter One` heading yields the same `ch-1-chapter-one`
+/// anchor its passage URLs established.
+const BOOK: &str = "\
+# Chapter One
+
+Intro text about zebras.
+
+## Section 1.1
+
+Details one.
+
+## Section 1.2
+
+Details two.
+
+# Chapter Two
+
+Second chapter text.
+";
+
+/// Build a multipart body with a csrf_token field (browser-style: the
+/// token rides as a form field, not a header) — ingest_integration.rs's
+/// helper, replicated minimally for the Books-page test's upload.
+fn multipart_body(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file: Option<(&str, &str, &str)>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    if let Some((name, filename, contents)) = file {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"Content-Type: text/markdown\r\n\r\n");
+        body.extend_from_slice(contents.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Books page (Task 4 — mockup 07): the shelves table with the
+/// books-count column (RF 3), the selected shelf's chapter list, the
+/// passage reader pane, and the missing-passage warning banner (RF 4 —
+/// 200 + banner, never a 500).
+///
+/// The ingested book is created through the existing multipart upload
+/// path (`POST /api/v1/ingest`, replicating ingest_integration.rs's
+/// boot/upload pattern — no book exists in a fresh boot, so the test
+/// ingests one here first; the slug `my-book` + `%23`-escaped `#`
+/// mirror that file's established anchor shape).
+#[tokio::test]
+async fn books_count_and_passage_reader() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login as admin.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // Two global-read shelves: one to hold the ingested book, one left
+    // empty — the empty one pins the "0" count cell (the brief's RF-3
+    // arm: "empty shelves render 0").
+    for name in ["Public Shelf", "Empty Shelf"] {
+        let create = client
+            .post(format!("{base}/admin/bookshelves"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[("name", name), ("global", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 303);
+    }
+
+    // Ingest a book onto Public Shelf (multipart; csrf_token rides as a
+    // form field — the browser path). Ingest runs inline, so the catalog
+    // (hub + chapter concepts) exists once the upload returns.
+    let boundary = "booksboundary01";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let upload = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 202);
+    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    assert_eq!(
+        upload_json["status"], "done",
+        "ingest ran inline: {upload_json}"
+    );
+
+    // 1. The shelves table: visibility chip, the count column (RF 3 —
+    //    the count must match the SQL book listing: 0 and 1), and the
+    //    per-row Browse link (?shelf=).
+    let b = client
+        .get(format!("{base}/books"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b.status(), 200);
+    let html = b.text().await.unwrap();
+    assert!(html.contains("Books"), "{html}");
+    // count column present (empty shelves render "0")
+    assert!(
+        html.contains(r#"<td data-label="Books">0</td>"#) || html.contains(">0<"),
+        "count column: {html}"
+    );
+    // ...and the real count for the shelf that holds the book (hedged
+    // like the brief's own zero arm — either serialization passes).
+    assert!(
+        html.contains(r#"<td data-label="Books">1</td>"#) || html.contains(">1<"),
+        "one-book shelf count: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--accent">global-read</span>"#),
+        "global-read visibility chip: {html}"
+    );
+    assert!(
+        html.contains(r#"<a href="/books?shelf=Public%20Shelf">Browse</a>"#),
+        "shelf row Browse link: {html}"
+    );
+
+    // 2. A selected shelf renders the chapter list: numbered rows of
+    //    the shelf's books' chapters, each linking its passage
+    //    (?shelf=…&passage=book://slug#ch-n-slug, %23-escaped #).
+    let s = client
+        .get(format!("{base}/books?shelf=Public%20Shelf"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(s.status(), 200);
+    let sh = s.text().await.unwrap();
+    assert!(
+        sh.contains(r#"<ol class="chapter-list">"#),
+        "chapter list: {sh}"
+    );
+    assert!(sh.contains("Chapter One"), "chapter title row: {sh}");
+    assert!(sh.contains("Chapter Two"), "second chapter row: {sh}");
+    assert!(
+        sh.contains(r#"passage=book://my-book%23ch-1-chapter-one"#),
+        "chapter row passage link: {sh}"
+    );
+
+    // 3. Passage: reuse the ingest test's established anchor shape
+    //    (ingest_integration.rs: my-book, %23-escaped #). The reader
+    //    pane renders the extracted chapter (heading + body); chapter
+    //    1's passage must not leak chapter 2's text.
+    let p = client
+        .get(format!(
+            "{base}/books?passage=book://my-book%23ch-1-chapter-one"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p.status(), 200);
+    let ph = p.text().await.unwrap();
+    assert!(ph.contains("reader"), "passage reader pane: {ph}");
+    assert!(
+        ph.contains(r#"<div class="reader-pane">"#),
+        "reader pane class: {ph}"
+    );
+    assert!(ph.contains("Chapter One"), "passage heading: {ph}");
+    assert!(
+        ph.contains("Intro text about zebras."),
+        "passage body: {ph}"
+    );
+    assert!(
+        !ph.contains("Second chapter"),
+        "chapter 1 passage must not leak chapter 2: {ph}"
+    );
+
+    // 4. Missing anchor → not-found banner, not a 500 (RF 4).
+    let missing = client
+        .get(format!("{base}/books?passage=book://nope%23ch-99-x"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 200);
+    let mh = missing.text().await.unwrap();
+    assert!(
+        mh.contains("banner--warning") || mh.contains("not found"),
+        "missing passage banner: {mh}"
+    );
+
+    // 5. Visibility-gate parity with /api/v1/passages: a private-shelf
+    //    passage is admin-only — a non-admin gets the warning banner
+    //    (never the text, never a 500), while the global-read book's
+    //    passage reads fine through the same page.
+    let create_private = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("name", "Secret Shelf"), ("global", "0")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_private.status(), 303);
+    let secret_body = multipart_body(
+        "secretboundary7",
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "Secret Shelf"),
+            ("slug", "secret-book"),
+            ("title", "Secret Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let secret_upload = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            "multipart/form-data; boundary=secretboundary7",
+        )
+        .body(secret_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(secret_upload.status(), 202);
+    let create_user = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mallory"),
+            ("email", "mallory@example.com"),
+            ("password", "mallory password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), 200);
+    let login_mallory = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "mallory"),
+            ("password", "mallory password 20 chars"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let mallory_cookie = login_mallory
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let denied = client
+        .get(format!(
+            "{base}/books?passage=book://secret-book%23ch-1-chapter-one"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        200,
+        "private-shelf denial renders the page with a banner, not a 403/500"
+    );
+    let dh = denied.text().await.unwrap();
+    assert!(
+        dh.contains("banner--warning"),
+        "private-shelf denial banner: {dh}"
+    );
+    assert!(
+        !dh.contains("Intro text about zebras."),
+        "denied passage must not leak text: {dh}"
+    );
+    let allowed = client
+        .get(format!(
+            "{base}/books?passage=book://my-book%23ch-1-chapter-one"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+    let ah = allowed.text().await.unwrap();
+    assert!(
+        ah.contains(r#"<div class="reader-pane">"#),
+        "global-read passage reads for non-admins: {ah}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

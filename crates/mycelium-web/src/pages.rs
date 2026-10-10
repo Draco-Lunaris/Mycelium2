@@ -740,44 +740,132 @@ pub fn skills_page(
     layout("Skills", Some(user), csrf, "/skills", body)
 }
 
-/// Books browse page: shelves with their books. Each book links to its
-/// catalog hub (library scope concept viewer).
+/// Books page (Task 4 rebuild — mockup 07): the shelves table with the
+/// books-count column, the selected shelf's chapter list, and the
+/// passage reader pane — all server-rendered, no script.
+///
+/// Body order: breadcrumb (Books → shelf → book once a shelf is
+/// selected — the concept editor's pattern), the page header, the
+/// passage warning banner (RF 4 — a resolution failure renders
+/// in-page as a banner, never a 500), the shelves `data_table` (Shelf,
+/// Visibility chip, Books count, the row's Browse link), the selected
+/// shelf's chapter list (`<ol class="chapter-list">` of numbered rows,
+/// each linking `?shelf=…&passage=book://slug%23anchor`), then the
+/// reader pane (class `reader-pane`, the passage's server-composed
+/// HTML interpolated raw — trusted markup from escaped fragments).
+///
+/// Escaping: `data_table` cells and the reader pane are raw-markup
+/// slots — shelf names, book titles, and chapter titles are
+/// `html_escape`d at composition (the Task-1 contract), href values
+/// percent-encoded via [`urlencoding_encode`]. The passage query
+/// value keeps its `book://` scheme literal with only the slug and
+/// anchor percent-encoded (`#` → `%23`, so the resource string stays
+/// ONE query value); `chapters` arrives as plain data from the
+/// handler (this PR's gather/compose split), carrying each row's
+/// per-book chapter number and the catalog's REAL anchor.
+#[allow(clippy::too_many_arguments)]
 pub fn books_page(
     user: &SessionUser,
     csrf: &str,
     shelves: &[crate::api::ShelfBrowse],
+    selected_shelf: Option<&str>,
+    selected_book: Option<&str>,
+    chapters: &[crate::api::ChapterRow],
+    passage_html: Option<String>,
+    passage_err: Option<&str>,
 ) -> Html<String> {
-    let sections = shelves
+    // Breadcrumb: Books → shelf → book (the shelf crumb keeps the
+    // selection; the book crumb is the leaf).
+    let shelf_href = selected_shelf.map(|s| format!("/books?shelf={}", urlencoding_encode(s)));
+    let mut crumbs: Vec<(&str, Option<&str>)> = vec![("Books", Some("/books"))];
+    if let Some(shelf) = selected_shelf {
+        crumbs.push((shelf, shelf_href.as_deref()));
+    }
+    if let Some(book) = selected_book {
+        crumbs.push((book, None));
+    }
+    let breadcrumb = if crumbs.len() > 1 {
+        mycelium_ui::render::render(mycelium_ui::breadcrumb(&crumbs))
+    } else {
+        String::new()
+    };
+    // Shelves table: the count column is the SQL book listing's length
+    // (RF 3 — the count must match what the row's Browse link opens).
+    let rows: Vec<Vec<String>> = shelves
         .iter()
         .map(|(name, is_global, books)| {
-            let visibility = if *is_global { "global-read" } else { "admin-private" };
-            let rows = if books.is_empty() {
-                r#"<p class="muted">No books yet.</p>"#.to_string()
+            let vis_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if *is_global { "global-read" } else { "private" },
+                if *is_global { "accent" } else { "neutral" },
+            ));
+            let browse = format!(
+                r#"<a href="/books?shelf={}">Browse</a>"#,
+                urlencoding_encode(name)
+            );
+            vec![html_escape(name), vis_chip, books.len().to_string(), browse]
+        })
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Shelf", "Visibility", "Books", ""],
+        &rows,
+    ));
+    // The selected shelf's chapters, one numbered row per chapter.
+    // `value` keeps the row's number the chapter's REAL index, so a
+    // narrowed (`?book=`) or multi-book list stays per-book correct.
+    let chapters_section = selected_shelf
+        .map(|shelf| {
+            let shelf_enc = urlencoding_encode(shelf);
+            let list = if chapters.is_empty() {
+                mycelium_ui::render::render(mycelium_ui::empty_state(
+                    "No chapters",
+                    "This shelf holds no ingested books yet.",
+                ))
             } else {
-                let items = books
+                let items = chapters
                     .iter()
-                    .map(|(slug, title)| {
+                    .map(|ch| {
+                        let href = format!(
+                            "/books?shelf={shelf_enc}&passage=book://{}%23{}",
+                            urlencoding_encode(&ch.book_slug),
+                            urlencoding_encode(&ch.anchor)
+                        );
                         format!(
-                            r#"<li><a href="/concept?path=/{slug}/book.md&scope=library">{}</a> <span class="muted">({slug})</span></li>"#,
-                            html_escape(title)
+                            r#"<li value="{}"><a href="{}">{}</a></li>"#,
+                            ch.index,
+                            href,
+                            html_escape(&ch.title)
                         )
                     })
                     .collect::<String>();
-                format!("<ul>{items}</ul>")
+                format!(r#"<ol class="chapter-list">{items}</ol>"#)
             };
-            format!(
-                r#"<h2>{}</h2>
-<p class="muted">{visibility}</p>
-{rows}"#,
-                html_escape(name)
-            )
+            format!("<h2>Chapters</h2>{list}")
         })
-        .collect::<String>();
-    let body = format!(
-        r#"<h1>Bookshelves</h1>
-{sections}"#
-    );
+        .unwrap_or_default();
+    // The reader pane: trusted server-composed markup (escaped
+    // fragments — build_passage_html), interpolated raw. A resolution
+    // failure renders the warning banner instead (RF 4 — 200 + banner).
+    let reader = passage_html
+        .map(|html| format!(r#"<div class="reader-pane">{html}</div>"#))
+        .unwrap_or_default();
+    let warning = passage_err
+        .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
+        .unwrap_or_default();
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("Books", String::new()));
+    let body = format!("{breadcrumb}{header}{warning}{table}{chapters_section}{reader}");
     layout("Books", Some(user), csrf, "/books", body)
+}
+
+/// Build the Books page's passage-reader HTML from an extracted
+/// passage's markdown: the same deliberately minimal server-side
+/// conversion as the editor preview — [`render_minimal_body`]'s
+/// blank-line paragraphs + `#`/`##`/`###` headings, every fragment
+/// html-escaped BEFORE composition (escape-then-compose, the spec's
+/// body-interpolation contract — hostile book text can never become
+/// executable markup). The reader pane interpolates the result raw:
+/// trusted server-composed markup.
+pub fn build_passage_html(passage_text: &str) -> String {
+    render_minimal_body(passage_text)
 }
 
 /// Chat page: talk to the librarian agent (the same agent behind the

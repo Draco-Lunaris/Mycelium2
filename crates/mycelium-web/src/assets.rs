@@ -405,6 +405,10 @@ body.chat-page main {
   border: 1px solid var(--color-border); border-radius: var(--radius-card);
 }
 
+/* Books passage reader (Task 4): the reading card — wider than the
+   editor preview (46rem) for long-form text. */
+.reader-pane { padding: var(--gap-3); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-card); max-width: 46rem; }
+
 /* ConfirmDialog: native <dialog>, dimmed backdrop ~70% (spec §5 band). */
 .modal {
   width: min(440px, calc(100vw - 2 * var(--gap-4)));
@@ -1031,7 +1035,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "12";
+pub const ASSETS_VERSION: &str = "13";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
