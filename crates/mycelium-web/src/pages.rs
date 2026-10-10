@@ -639,14 +639,22 @@ pub fn search_page(
 }
 
 /// Graph page (loads graph.js for the force-directed visualization).
+/// Mockup 06: PageHeader above the full-height panel; the type legend
+/// (`#graph-legend`, bottom-left overlay — populated client-side from
+/// the loaded data) and the node info card (`#graph-info`, top-right
+/// overlay) anchor to the `position: relative` `#graph-wrap`; the
+/// usage hint sits under the panel.
 pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<h1>Graph</h1>
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("Graph", String::new()));
+    let body = format!(
+        r#"{header}
 <div id="graph-wrap">
   <div id="graph-info" hidden></div>
   <div id="graph"></div>
+  <div id="graph-legend" class="graph-legend" hidden></div>
 </div>
-<div class="muted" id="graph-legend">drag nodes to rearrange · scroll to zoom · drag background to pan · click a node to open</div>"#
-        .to_string();
+<div class="graph-hint">drag nodes to rearrange · scroll to zoom · drag background to pan · click a node to open</div>"#
+    );
     layout_full(
         "Graph",
         Some(user),

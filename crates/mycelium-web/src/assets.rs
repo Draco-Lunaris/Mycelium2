@@ -91,28 +91,51 @@ button.danger { background: var(--danger); color: #fff; }
 pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: auto; }
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
 
-/* Graph — full-viewport interactive layout (body.graph-page) */
+/* Graph — full-viewport interactive layout (body.graph-page), mockup 06:
+   PageHeader above the panel; the type legend (bottom-left) and the node
+   info card (top-right) overlay the panel; the usage hint sits beneath. */
 body.graph-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
 body.graph-page main {
   display: flex; flex-direction: column; flex: 1;
   max-width: none; width: 100%; margin: 0; padding: 0 1.2rem;
   min-height: 0;
 }
-body.graph-page h1 { margin: .8rem 0 .4rem; }
+body.graph-page .page-header { margin: .8rem 0 .4rem; }
 #graph-wrap { position: relative; flex: 1; min-height: 0; }
 #graph {
-  width: 100%; height: 100%; background: var(--panel);
-  border-radius: 6px; overflow: hidden; cursor: grab; touch-action: none;
+  width: 100%; height: 100%; background: var(--color-surface);
+  border-radius: var(--radius-card); overflow: hidden; cursor: grab; touch-action: none;
 }
 #graph.dragging { cursor: grabbing; }
 #graph-info {
   position: absolute; top: .6rem; right: .6rem; z-index: 2;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-  padding: .6rem .8rem; max-width: 22rem; font-size: .9rem;
+  background: var(--color-bg-page); border: 1px solid var(--color-border);
+  border-radius: var(--radius-card); padding: .6rem .8rem; max-width: 22rem;
+  font-size: var(--text-body); color: var(--color-text-body);
   box-shadow: 0 2px 8px rgba(0,0,0,.3);
 }
+#graph-info h3 {
+  margin: 0 0 .3rem; color: var(--color-text-heading);
+  font-size: var(--text-body); font-weight: 600;
+}
+#graph-info .gi-meta { display: flex; align-items: center; gap: var(--gap-2); margin-bottom: .2rem; }
+#graph-info .gi-path { font-family: ui-monospace, monospace; font-size: var(--text-caption); }
 #graph-info a { display: block; margin-top: .3rem; }
-#graph-legend { margin: .4rem 0 .8rem; font-size: .85rem; }
+.graph-legend {
+  position: absolute; bottom: .6rem; left: .6rem; z-index: 2;
+  background: var(--color-bg-page); border: 1px solid var(--color-border);
+  border-radius: var(--radius-control); padding: .4rem .6rem;
+  font-size: var(--text-caption); display: flex; flex-direction: column; gap: 2px;
+}
+/* display:flex above would override the UA's [hidden] rule — restore it. */
+.graph-legend[hidden] { display: none; }
+.graph-legend .row { display: flex; align-items: center; gap: var(--gap-2); }
+.graph-legend .dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--dot, var(--color-accent)); flex: 0 0 auto;
+}
+.graph-legend .dot--orphan { background: transparent; border: 1px solid var(--color-danger); }
+.graph-hint { font-size: var(--text-caption); color: var(--color-text-body); margin: .2rem 0 .4rem; }
 
 /* Librarian chat — full-viewport layout (body.chat-page) */
 body.chat-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
@@ -515,10 +538,12 @@ pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fe
 
 pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes (the
 // layout re-settles around them, d3-style), wheel-zoom, background-pan,
-// click-to-open, hover info panel, per-type palette + legend (v1).
+// click-to-open, hover info panel, per-type palette + legend (v8 token
+// restyle, mockup 06 — the layout algorithm itself is unchanged).
 (function () {
   var el = document.getElementById("graph");
   var info = document.getElementById("graph-info");
+  var legend = document.getElementById("graph-legend");
   if (!el) return;
 
   fetch("/api/v1/graph")
@@ -526,8 +551,20 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     .then(function (data) { render(data); })
     .catch(function (e) { el.textContent = "graph load failed: " + e; });
 
-  // v1's palette, assigned to concept types in first-seen order.
-  var PALETTE = ["#64c8ff", "#a78bfa", "#34d399", "#fbbf24", "#f87171", "#f472b6", "#2dd4bf", "#a3e635"];
+  // Type → color mapping (v8 tokens, pinned hexes sampled 2026-10-08):
+  // types in first-seen order (v1 semantics) draw from the readable token
+  // tones — accent mint first (a single-type bundle reads as mockup 06's
+  // mint nodes), then the heading/body/label grays, ordered to maximize
+  // adjacent-pair separation. Fixed order; wraps past slot 4 (v1 cycled
+  // past 8). Type identity is never color-alone: every node carries a
+  // text label, the legend repeats the mapping, and the info card names
+  // the type as a chip.
+  var PALETTE = ["#8FD3A8", "#E4E9E5", "#9AA69F", "#C9D2CC"];
+  var EDGE = "#8FD3A8";    // accent — mockup 06's graph edges
+  var EDGE_FADE = "0.4";   // recessive: relationships sit behind nodes
+  var STROKE = "#171B19";  // panel surface — a node's rim ring
+  var ORPHAN = "#F2978A";  // danger — the unlinked-node highlight ring
+  var LABEL = "#C9D2CC";   // label text token
 
   function render(data) {
     var nodes = data.nodes.map(function (n) {
@@ -541,6 +578,13 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       return { source: byId[e.from], target: byId[e.to] };
     }).filter(function (l) { return l.source && l.target; });
     links.forEach(function (l) { l.source.degree++; l.target.degree++; });
+
+    // In/out link counts for the info card (from the loaded edges).
+    var inCount = {}, outCount = {};
+    links.forEach(function (l) {
+      outCount[l.source.id] = (outCount[l.source.id] || 0) + 1;
+      inCount[l.target.id] = (inCount[l.target.id] || 0) + 1;
+    });
 
     // Type colors: palette order by first-seen type (v1 semantics).
     var typeColors = {};
@@ -564,7 +608,8 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 
     var lines = links.map(function (l) {
       var line = document.createElementNS(svgNS, "line");
-      line.setAttribute("stroke", "#2a3140");
+      line.setAttribute("stroke", EDGE);
+      line.setAttribute("stroke-opacity", EDGE_FADE);
       edgeGroup.appendChild(line); return line;
     });
     var circles = nodes.map(function (n) {
@@ -572,14 +617,14 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       var c = document.createElementNS(svgNS, "circle");
       c.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2));
       c.setAttribute("fill", typeColors[n.type]);
-      c.setAttribute("stroke", "#1a1b26"); c.setAttribute("stroke-width", "1");
+      c.setAttribute("stroke", STROKE); c.setAttribute("stroke-width", "1");
       c.style.cursor = "grab";
       // Orphan highlight (v1): unlinked nodes get a red ring.
       if (n.degree === 0) {
         var ring = document.createElementNS(svgNS, "circle");
         ring.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2) + 3);
         ring.setAttribute("fill", "none");
-        ring.setAttribute("stroke", "#ef4444");
+        ring.setAttribute("stroke", ORPHAN);
         ring.setAttribute("stroke-width", "1.5");
         ring.setAttribute("opacity", "0.8");
         g.appendChild(ring);
@@ -597,53 +642,63 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     });
     var labels = nodes.map(function (n) {
       var t = document.createElementNS(svgNS, "text");
-      t.setAttribute("fill", "#a9b1d6"); t.setAttribute("font-size", "10");
+      t.setAttribute("fill", LABEL); t.setAttribute("font-size", "10");
       t.setAttribute("text-anchor", "middle");
       t.setAttribute("pointer-events", "none");
       t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "\u2026" : n.title;
       labelGroup.appendChild(t); return t;
     });
 
-    // Legend (v1): type swatches + orphan marker, top-left.
-    var legend = document.createElement("div");
-    legend.style.cssText =
-      "position:absolute;top:.6rem;left:.6rem;z-index:2;background:rgba(26,27,38,.85);" +
-      "border:1px solid #2a3140;border-radius:6px;padding:.5rem .7rem;font-size:.8rem;";
-    Object.keys(typeColors).forEach(function (t) {
-      var row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;";
-      var sw = document.createElement("span");
-      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;background:" + typeColors[t] + ";";
-      var name = document.createElement("span");
-      name.style.color = "#a9b1d6";
-      name.textContent = t;
-      row.appendChild(sw); row.appendChild(name);
-      legend.appendChild(row);
-    });
-    if (nodes.some(function (n) { return n.degree === 0; })) {
-      var row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;border-top:1px solid #2a3140;padding-top:.25rem;";
-      var sw = document.createElement("span");
-      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;border:1px solid #ef4444;";
-      var name = document.createElement("span");
-      name.style.color = "#a9b1d6";
-      name.textContent = "orphan (unlinked)";
-      row.appendChild(sw); row.appendChild(name);
-      legend.appendChild(row);
+    // Legend (mockup 06): one dot + label per type present in the
+    // loaded data, built into the page's #graph-legend overlay; the
+    // orphan marker explains the danger ring when unlinked nodes exist.
+    // Static styling lives in style.css (.row/.dot classes); only the
+    // data-driven dot color rides a --dot custom property.
+    if (legend) {
+      Object.keys(typeColors).forEach(function (t) {
+        var row = document.createElement("div");
+        row.className = "row";
+        var sw = document.createElement("span");
+        sw.className = "dot";
+        sw.style.setProperty("--dot", typeColors[t]);
+        var name = document.createElement("span");
+        name.textContent = t;
+        row.appendChild(sw); row.appendChild(name);
+        legend.appendChild(row);
+      });
+      if (nodes.some(function (n) { return n.degree === 0; })) {
+        var row = document.createElement("div");
+        row.className = "row";
+        var sw = document.createElement("span");
+        sw.className = "dot dot--orphan";
+        var name = document.createElement("span");
+        name.textContent = "orphan (unlinked)";
+        row.appendChild(sw); row.appendChild(name);
+        legend.appendChild(row);
+      }
+      if (legend.firstChild) legend.hidden = false;
     }
-    el.appendChild(legend);
 
+    // Node info card (mockup 06): title, type chip, in/out link counts,
+    // path, and the open link \u2014 DOM-built (no innerHTML with data).
     function showInfo(n) {
       if (!info) return;
       info.hidden = false;
       info.innerHTML = "";
-      var b = document.createElement("b"); b.textContent = n.title;
-      info.appendChild(b);
-      var type = document.createElement("div");
-      type.textContent = (n.type ? n.type : "concept") + " \u00b7 " + n.degree + " link" + (n.degree === 1 ? "" : "s");
-      info.appendChild(type);
+      var h = document.createElement("h3"); h.textContent = n.title;
+      info.appendChild(h);
+      var meta = document.createElement("div");
+      meta.className = "gi-meta";
+      var chip = document.createElement("span");
+      chip.className = "chip chip--neutral";
+      chip.textContent = n.type ? n.type : "concept";
+      meta.appendChild(chip);
+      var counts = document.createElement("span");
+      counts.textContent = (inCount[n.id] || 0) + " in \u00b7 " + (outCount[n.id] || 0) + " out";
+      meta.appendChild(counts);
+      info.appendChild(meta);
       var path = document.createElement("div");
-      path.style.fontFamily = "monospace"; path.textContent = n.id;
+      path.className = "gi-path"; path.textContent = n.id;
       info.appendChild(path);
       var a = document.createElement("a");
       a.href = "/concept?path=" + encodeURIComponent(n.id);
@@ -1035,7 +1090,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "13";
+pub const ASSETS_VERSION: &str = "14";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -1188,7 +1243,8 @@ mod tests {
             "body.graph-page",
             "#graph-wrap",
             "#graph-info",
-            "#graph-legend",
+            ".graph-legend",
+            ".graph-hint",
             "body.chat-page",
             ".chat-shell",
             ".chat-log",

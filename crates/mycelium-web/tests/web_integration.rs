@@ -1648,6 +1648,65 @@ async fn books_count_and_passage_reader() {
     shutdown.cancel();
 }
 
+/// Graph page (mockup 06, Task 5): the PageHeader conversion, the
+/// type-legend overlay container (populated client-side by graph.js
+/// from the loaded data), the node info-card container, and the usage
+/// hint line — the custom force-layout kept, restyled to the v8 tokens.
+#[tokio::test]
+async fn graph_legend_info_hint() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Graph: legend + info card + hint present.
+    let g = client
+        .get(format!("{base}/graph"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(g.status(), 200);
+    let gh = g.text().await.unwrap();
+    assert!(gh.contains("graph-legend"), "{gh}");
+    assert!(gh.contains("graph-info"), "{gh}");
+    assert!(gh.contains("drag nodes"), "usage hint: {gh}");
+    // The restyle's pins: PageHeader replaces the bare <h1>Graph</h1>,
+    // the legend is the class-styled overlay container (its id moved
+    // off the hint line), and the hint carries .graph-hint.
+    assert!(
+        gh.contains(r#"<header class="page-header"><h1>Graph</h1>"#),
+        "page-header conversion: {gh}"
+    );
+    assert!(
+        gh.contains(r#"id="graph-legend" class="graph-legend""#),
+        "legend container: {gh}"
+    );
+    assert!(gh.contains(r#"class="graph-hint""#), "hint class: {gh}");
+    // The full-viewport panel keeps its layout contract.
+    assert!(gh.contains(r#"<div id="graph-wrap">"#), "{gh}");
+    assert!(gh.contains(r#"<div id="graph-info" hidden>"#), "{gh}");
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client
