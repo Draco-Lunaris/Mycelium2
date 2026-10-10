@@ -18,7 +18,10 @@
 //! EVENT wiring only (submit binding, Enter-to-send, auto-grow); the
 //! transport — the POST `/api/v1/chat/stream` + the SSE pump — and the
 //! log's DOM rendering stay in chat.js, exposed here as
-//! `window.myceliumChatSend(message)`. The streaming shape
+//! `window.myceliumChatSend(message) -> bool`: `true` = the transport
+//! accepted the message, `false` = it refused (busy) — the island
+//! clears the composer only on `true`, so input typed while the
+//! librarian streams stays in the textarea. The streaming shape
 //! (tool-progress events, pending state) is what the chat_stream
 //! integration suite pins server-side and what the UI must keep.
 //!
@@ -35,20 +38,28 @@ use wasm_bindgen_futures::JsFuture;
 
 /// Hand a composed message to chat.js's transport helper
 /// (`window.myceliumChatSend`): the Task-7 split keeps the SSE fetch +
-/// pump + log DOM in chat.js and only the event wiring here. Absent
-/// helper (chat.js failed to load) → the send is a no-op.
-fn chat_send(msg: &str) {
+/// pump + log DOM in chat.js and only the event wiring here. Returns
+/// the transport's verdict — `true` when the message was accepted
+/// (logged + the fetch kicked off), `false` when it was refused
+/// (busy, or empty after trim) or the helper is absent (chat.js
+/// failed to load). The composer clears the textarea only on `true`,
+/// preserving the pre-split busy-gate behavior: input typed while
+/// the librarian streams stays put.
+fn chat_send(msg: &str) -> bool {
     let Some(window) = web_sys::window() else {
-        return;
+        return false;
     };
     let target = JsValue::from(window);
     let helper = js_sys::Reflect::get(&target, &JsValue::from_str("myceliumChatSend"));
     if let Ok(f) = helper {
         if f.is_function() {
             let send = f.unchecked_into::<js_sys::Function>();
-            let _ = send.call1(&JsValue::NULL, &JsValue::from_str(msg));
+            if let Ok(result) = send.call1(&JsValue::NULL, &JsValue::from_str(msg)) {
+                return result.as_bool().unwrap_or(false);
+            }
         }
     }
+    false
 }
 
 /// Auto-grow the composer textarea to its content, capped at 160px
@@ -134,9 +145,19 @@ fn copy_now(value_id: &str) {
 /// the ids/classes chat.js's surviving code and the page CSS depend on
 /// (`chat-form`, `chat-input-bar`, `chat-input`, `button[type=submit]`).
 /// Event wiring attaches on hydrate: submit → preventDefault → hand the
-/// trimmed message to chat.js's `window.myceliumChatSend`; Enter sends
-/// and Shift+Enter inserts a newline (via `requestSubmit`, so the
-/// `required` validation gate still applies); the textarea auto-grows.
+/// trimmed message to chat.js's `window.myceliumChatSend`, clearing
+/// the textarea only when the helper reports acceptance (`false` =
+/// refused — busy — or chat.js absent; input typed while the
+/// librarian streams stays put); Enter sends and Shift+Enter inserts
+/// a newline (via `requestSubmit`, so the `required` validation gate
+/// still applies); the textarea auto-grows.
+///
+/// Degradation edge: if chat.js loads but hydration fails, a submit
+/// falls back to the form's native GET submit — the textarea carries
+/// no `name`, so the navigation drops the message rather than echoing
+/// it into a query string. Acceptable because hydration failure is
+/// already a broken-page case (without the bundle the composer is an
+/// inert form either way).
 #[island]
 pub fn ChatComposer(#[prop(into)] placeholder: String) -> impl IntoView {
     view! {
@@ -152,8 +173,7 @@ pub fn ChatComposer(#[prop(into)] placeholder: String) -> impl IntoView {
                 return;
             };
             let msg = input.value().trim().to_string();
-            if !msg.is_empty() {
-                chat_send(&msg);
+            if !msg.is_empty() && chat_send(&msg) {
                 input.set_value("");
             }
         }>

@@ -851,7 +851,12 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 /// Task-7 split: the composer's EVENT wiring (submit binding,
 /// Enter-to-send, textarea auto-grow) lives in the chat_composer
 /// hydration island (mycelium-ui `islands.rs`), which hands each send
-/// to `window.myceliumChatSend` below. What stays here is what the
+/// to `window.myceliumChatSend` below — the helper returns `true`
+/// when the transport accepted the message, `false` when it refused
+/// (busy, or empty after trim); the island clears the composer only
+/// on `true`, so input typed while the librarian streams stays in
+/// the textarea (the pre-split busy-gate behavior). What stays here
+/// is what the
 /// chat-stream integration suite pins: the POST /api/v1/chat/stream
 /// transport (form-encoded message + the CSRF header from the page's
 /// meta — app.js's same token source), the SSE pump (tool progress →
@@ -976,8 +981,11 @@ pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management f
     busy = state;
     if (sendBtn) sendBtn.disabled = state;
   }
+  // Returns true when the transport accepted the message (logged +
+  // fetch kicked off), false when it refused (busy). The composer
+  // island clears the textarea only on true.
   function send(msg) {
-    if (busy) return;
+    if (busy) return false;
     addMsg(msg, "user");
     setBusy(true);
     var pending = addMsg("The librarian is thinking…", "librarian pending");
@@ -1051,12 +1059,17 @@ pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management f
       setBusy(false);
       addMsg(err.message || "request failed", "error");
     });
+    return true;
   }
   // The composer island's entry point (Task 7): each trimmed message
-  // arrives here; without the hydrate bundle this is never called.
+  // arrives here. Returns the transport's verdict — false when busy
+  // or empty after trim — so the island clears the composer only on
+  // acceptance and typed-during-streaming input stays put. Without
+  // the hydrate bundle this is never called.
   window.myceliumChatSend = function (msg) {
     var m = String(msg || "").trim();
-    if (m) send(m);
+    if (!m) return false;
+    return send(m);
   };
 })();
 "#;
@@ -1112,6 +1125,14 @@ pub const CONFIRM_JS: &str = r#"// Confirm dialogs: [data-confirm-dialog] trigge
 /// component` names the export). Hand-vendored: regenerate only when
 /// the leptos island protocol changes — the per-island exports
 /// themselves are regenerated with the wasm bundle.
+///
+/// Dropped upstream behaviors (deliberate): this traversal does NOT
+/// support islands that take `children` props (upstream threads a
+/// leptos-children on-hydrate callback through the walk — the repo's
+/// islands take only serialized props) and does NOT await async
+/// (thenable) exports — an `#[island(lazy)]` would mis-hydrate here.
+/// A future island needing either must grow this script, not just
+/// the island.
 pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bundle, then walk the
 // page's <leptos-island> roots and call each island's exported wasm
 // hydrate function (data-component names the export). Deferred to
@@ -1122,7 +1143,10 @@ pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bun
 (function () {
   function start() {
     var tag = document.querySelector('script[type="module"][src^="/assets/mycelium_ui.js"]');
-    if (!tag) return;
+    if (!tag) {
+      console.warn("islands.js: no hydrate bundle module tag on this page — islands stay server-rendered");
+      return;
+    }
     var src = tag.getAttribute("src");
     var wasmUrl = src.replace("mycelium_ui.js", "mycelium_ui_bg.wasm");
     import(src).then(function (mod) {
@@ -1131,7 +1155,11 @@ pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bun
           if (node.nodeType === Node.ELEMENT_NODE) {
             if (node.tagName.toLowerCase() === "leptos-island") {
               var id = node.dataset.component;
-              if (id && mod[id]) mod[id](node);
+              if (id && mod[id]) {
+                mod[id](node);
+              } else {
+                console.warn("islands.js: no exported hydrate function for island '" + id + "' — stale bundle?");
+              }
             }
             var children = node.children;
             for (var i = 0; i < children.length; i++) traverse(children[i]);
@@ -1165,7 +1193,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "16";
+pub const ASSETS_VERSION: &str = "17";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

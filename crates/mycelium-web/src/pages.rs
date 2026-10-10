@@ -1377,4 +1377,57 @@ mod tests {
             "mycelium-ui and mycelium-web asset versions must bump together"
         );
     }
+
+    /// Task-7 fix pin: artifact-vs-markup lockstep. The checked-in
+    /// hydrate bundle (`crates/mycelium-web/assets/mycelium_ui.js`,
+    /// the wasm-bindgen wrapper) exports one hydrate function per
+    /// island (`export function <Name>_<hash>(el)`); the SSR roots
+    /// carry the same name in `data-component="..."`. Every exported
+    /// name must appear in the rendered island markup — a one-sided
+    /// bundle regeneration (stale artifact, changed island signature)
+    /// ships islands the traversal script can't hydrate, and this
+    /// fails instead. Parses the wrapper with the bindgen emission
+    /// shape (`export function {Name}_{digits}(el)`); the SSR roots
+    /// come from the mycelium-ui island wrappers (the same fns the
+    /// pages render).
+    #[test]
+    fn hydrate_bundle_exports_match_island_roots() {
+        let wrapper = include_str!("../assets/mycelium_ui.js");
+        let mut exported = Vec::new();
+        let mut scan = 0usize;
+        while let Some(rel) = wrapper[scan..].find("export function ") {
+            let start = scan + rel + "export function ".len();
+            let rest = &wrapper[start..];
+            let end = rest.find('(').expect("export must open its args");
+            let name = rest[..end].trim();
+            // Only the per-island hydrate exports: <Component>_<hash>.
+            if name.contains('_')
+                && name
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count()
+                    > 0
+            {
+                exported.push(name.to_string());
+            }
+            scan = start + end;
+        }
+        assert!(
+            !exported.is_empty(),
+            "no island hydrate exports found in the checked-in bundle"
+        );
+        let rendered = [
+            mycelium_ui::render::render(mycelium_ui::chat_composer("x")),
+            mycelium_ui::render::render(mycelium_ui::copy_button("y")),
+        ]
+        .join("\n");
+        for name in &exported {
+            assert!(
+                rendered.contains(&format!(r#"data-component="{name}""#)),
+                "bundle exports hydrate fn {name} but no SSR island root carries it — \
+                 regenerate the bundle or the island changed under it"
+            );
+        }
+    }
 }
