@@ -899,6 +899,155 @@ async fn editor_breadcrumb_preview_hostile() {
     shutdown.cancel();
 }
 
+/// Review fix (Task 2, Important): the skills-scoped delete path pinned
+/// by a positive round trip. The skills editor must render the hidden
+/// `scope` field in BOTH delete surfaces (the no-script fallback form
+/// and the shared confirm dialog), and POST /concept/delete with
+/// scope=skills must delete from the GLOBAL SKILLS shelf — proven by a
+/// same-path twin concept in the admin's private bundle that must
+/// survive (a dropped scope field would misroute the delete into the
+/// user bundle and kill the twin).
+#[tokio::test]
+async fn skills_scoped_delete_round_trip() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("myc2_session="));
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // (a) Create a global skills concept (the admin-only scope).
+    let create = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/skills-scope-test.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Skills Scope Test\n---\n\nbody",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // Negative-control twin: the SAME path in the admin's private
+    // bundle — the scoped delete must not touch it.
+    let twin = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/skills-scope-test.md"),
+            (
+                "markdown",
+                "---\ntype: Note\ntitle: Private Twin\n---\n\nbody",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(twin.status(), 303);
+
+    // (b) The skills editor (admin → editable): the hidden scope field
+    //     is present in BOTH delete surfaces.
+    let editor = client
+        .get(format!(
+            "{base}/concept?path=/skills-scope-test.md&scope=skills"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(editor.status(), 200);
+    let html = editor.text().await.unwrap();
+    assert!(html.contains("(global skills)"), "scope note: {html}");
+    // The no-script fallback form (the first /concept/delete form in
+    // the body — the header actions precede the dialog).
+    let form_lit = r#"<form method="post" action="/concept/delete">"#;
+    let start = html.find(form_lit).expect("delete fallback form");
+    let form_end = start + html[start..].find("</form>").expect("form closes");
+    let del_form = &html[start..form_end];
+    assert!(
+        del_form.contains(r#"<input type="hidden" name="scope" value="skills">"#),
+        "fallback delete form must carry scope=skills: {del_form}"
+    );
+    assert!(
+        del_form.contains(r#"<input type="hidden" name="path" value="/skills-scope-test.md">"#),
+        "fallback delete form must carry the path: {del_form}"
+    );
+    // The shared confirm dialog (the second /concept/delete form).
+    let dlg_start = html.find("<dialog").expect("delete dialog: {html}");
+    let dlg_html = &html[dlg_start..];
+    assert!(
+        dlg_html.contains(r#"name="scope" value="skills""#),
+        "confirm dialog must carry scope=skills: {dlg_html}"
+    );
+
+    // (c) POST the delete exactly as the dialog/fallback form does:
+    //     303 → /skills (the handler's unconditional redirect), then
+    //     the authoritative checks.
+    let del = client
+        .post(format!("{base}/concept/delete"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/skills-scope-test.md"),
+            ("scope", "skills"),
+            ("csrf_token", csrf.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 303);
+    assert_eq!(del.headers().get("location").unwrap(), "/skills");
+
+    // The skills-scope view 404s: the global skills concept is gone.
+    let gone = client
+        .get(format!(
+            "{base}/concept?path=/skills-scope-test.md&scope=skills"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404, "skills concept must be gone");
+
+    // The private-bundle twin SURVIVES — the scoped delete must not
+    // have misrouted into the user bundle.
+    let twin_view = client
+        .get(format!("{base}/concept?path=/skills-scope-test.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(twin_view.status(), 200, "user-bundle twin must survive");
+    let twin_html = twin_view.text().await.unwrap();
+    assert!(twin_html.contains("Private Twin"), "{twin_html}");
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

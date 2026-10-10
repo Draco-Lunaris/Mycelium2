@@ -427,7 +427,7 @@ pub fn build_preview_html(markdown: &str) -> (String, Option<String>) {
             (out, None)
         }
         Err(e) => (
-            render_minimal_body(strip_frontmatter_block(markdown)),
+            render_minimal_body(&strip_frontmatter_block(markdown)),
             Some(e.to_string()),
         ),
     }
@@ -478,20 +478,30 @@ fn heading_of(line: &str) -> Option<(&'static str, &str)> {
 
 /// Strip a leading `---\n…\n---\n` frontmatter block. Used only on the
 /// parse-error path (where `Concept::parse` could not split it): a
-/// naive scan mirroring the core splitter's delimiter rule; without a
-/// closing `---` line nothing is stripped — the whole input previews.
-fn strip_frontmatter_block(markdown: &str) -> &str {
-    let Some(rest) = markdown.strip_prefix("---\n") else {
-        return markdown;
+/// naive scan mirroring the core splitter's rules — CRLF normalized to
+/// LF and a leading BOM stripped first (the same normalization
+/// concept.rs applies before splitting, so a CRLF/BOM document previews
+/// like its LF twin), then the opening `---\n` + closing `---`-line
+/// match; without a closing `---` line nothing is stripped — the whole
+/// input previews as typed. Owned: the normalization may copy.
+fn strip_frontmatter_block(markdown: &str) -> String {
+    let normalized = if markdown.contains("\r\n") {
+        markdown.replace("\r\n", "\n")
+    } else {
+        markdown.to_string()
+    };
+    let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
+    let Some(rest) = normalized.strip_prefix("---\n") else {
+        return markdown.to_string();
     };
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
         if line.trim_end() == "---" {
-            return &rest[offset + line.len()..];
+            return rest[offset + line.len()..].to_string();
         }
         offset += line.len();
     }
-    markdown
+    markdown.to_string()
 }
 
 /// Search page.
@@ -1105,6 +1115,34 @@ mod tests {
         assert!(
             html.contains("&lt;script&gt;"),
             "escaped form missing in the preview: {html}"
+        );
+    }
+
+    /// Review fix (Minor): the parse-error preview strips the
+    /// frontmatter block from CRLF and BOM documents too — the core
+    /// splitter normalizes both before splitting, and the strip path
+    /// mirrors it, so a broken-frontmatter CRLF/BOM document never
+    /// previews its frontmatter as visible prose.
+    #[test]
+    fn preview_strips_frontmatter_block_on_crlf_and_bom() {
+        // Missing `type` (parse error) in CRLF form: the preview must
+        // show the body, not the frontmatter block.
+        let crlf = "---\r\ntitle: No Type\r\n---\r\n\r\nBody text.\r\n";
+        let (preview, err) = build_preview_html(crlf);
+        assert!(err.is_some(), "missing type must fail parse: {err:?}");
+        assert!(preview.contains("Body text."), "{preview}");
+        assert!(
+            !preview.contains("title: No Type"),
+            "frontmatter block must strip on CRLF: {preview}"
+        );
+        // BOM-prefixed twin: identical behavior.
+        let bom = format!("\u{feff}{crlf}");
+        let (preview, err) = build_preview_html(&bom);
+        assert!(err.is_some(), "missing type must fail parse: {err:?}");
+        assert!(preview.contains("Body text."), "{preview}");
+        assert!(
+            !preview.contains("title: No Type"),
+            "frontmatter block must strip on BOM+CRLF: {preview}"
         );
     }
 
