@@ -27,7 +27,7 @@ use leptos::prelude::*;
 /// `assets_versions_lockstep` unit test (only that crate sees both
 /// constants), so a one-sided bump fails CI.
 #[cfg(feature = "ssr")]
-pub const ASSETS_VERSION: &str = "10";
+pub const ASSETS_VERSION: &str = "11";
 
 /// Minimal HTML escaping for the `format!`-composed head attributes
 /// (csrf token, title) — the html-escape equivalent mycelium-ui carries
@@ -169,15 +169,17 @@ fn sidebar(name: &str, user: Option<(&str, bool)>, active_path: &str) -> impl In
 /// top bar under 720px). The class names match the `.page-header` block
 /// in mycelium-web's assets stylesheet (the actions container is
 /// `.actions`, not a BEM modifier). The title goes into a `view!` TEXT
-/// position, where leptos escapes it; `actions` is caller-composed markup
-/// passed as a child (same contract as `card`'s body).
+/// position, where leptos escapes it; `actions` is a trusted-markup
+/// slot — caller-composed markup from escaped fragments, interpolated
+/// raw via `inner_html` (the caller owns escaping, same contract as
+/// `card`'s body and the shell's page body).
 #[cfg(feature = "ssr")]
 pub fn page_header(title: &str, actions: String) -> impl IntoView {
     let title = title.to_string();
     view! {
         <header class="page-header">
             <h1>{title}</h1>
-            <div class="actions">{actions}</div>
+            <div class="actions" inner_html=actions/>
         </header>
     }
 }
@@ -315,6 +317,14 @@ mod tests {
         assert!(html.contains("page-header"), "{html}");
         assert!(html.contains("Browse"), "{html}");
         assert!(!html.contains("style="), "{html}");
+        // The actions slot is a trusted-markup slot: composed markup
+        // passes through raw (the caller escapes user text first).
+        let actions = r#"<a class="btn btn--primary" href="/concept?new=1">New concept</a>"#;
+        let html = render(page_header("Browse", actions.to_string()));
+        assert!(
+            html.contains(actions),
+            "actions markup must stay raw: {html}"
+        );
     }
 
     #[test]

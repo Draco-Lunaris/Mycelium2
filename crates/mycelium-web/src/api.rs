@@ -1091,11 +1091,15 @@ pub async fn books_view(
     pages::books_page(&user, &csrf, &shelf_data).into_response()
 }
 
-/// GET / — home: the user's bundle listing.
+/// GET / — Browse: the user's bundle listing (mockup 01), with an
+/// optional `?type=` filter. A filter naming a type that has no
+/// concepts is unknown → the unfiltered list with the "All" chip
+/// active (Review Focus 2), never an error or an empty result.
 pub async fn home(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let master = match state.master_key_for(user.user_id).await {
@@ -1104,7 +1108,28 @@ pub async fn home(
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     let entries = cs.list().await.unwrap_or_default();
-    pages::home_page(&user, &csrf, &entries, None, None).into_response()
+    // Broken links, mirroring graph_data's walk: a concept whose body
+    // links to a path that is not in the bundle is flagged on its row.
+    let known: std::collections::HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let mut broken = std::collections::HashSet::new();
+    for entry in &entries {
+        if let Ok(concept) = cs.get(&entry.path).await {
+            for target in mycelium_core::links::scan_links(&concept.body) {
+                if !known.contains(&target) {
+                    broken.insert(entry.path.clone());
+                }
+            }
+        }
+    }
+    // The filter only applies when it names a type present in the
+    // bundle; anything else renders the unfiltered list.
+    let known_types: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.concept_type.as_str()).collect();
+    let type_filter = match params.get("type") {
+        Some(t) if known_types.contains(t.as_str()) => Some(t.as_str()),
+        _ => None,
+    };
+    pages::home_page(&user, &csrf, &entries, &broken, type_filter, None, None).into_response()
 }
 
 /// GET /search — search page.

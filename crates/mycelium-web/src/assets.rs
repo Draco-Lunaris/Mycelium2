@@ -235,6 +235,10 @@ body.chat-page main {
 .chip--danger { background: var(--color-danger-surface); color: var(--color-danger); }
 .chip--warning { background: var(--color-warning-surface); color: var(--color-warning); }
 
+/* Broken-links flag (Browse, mockup 01): the amber mini-badge a table
+   row carries when its concept links outside the bundle. */
+.flag--warning { color: var(--color-warning); background: var(--color-warning-surface); border-radius: var(--radius-pill); padding: 2px var(--gap-2); font-size: var(--text-caption); }
+
 /* Banners: leading icon = the first child (inline svg), space reserved by
    the flex gap; success reuses accent tints (spec §5 — no success token). */
 .banner {
@@ -1014,7 +1018,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "10";
+pub const ASSETS_VERSION: &str = "11";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

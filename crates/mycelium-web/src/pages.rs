@@ -129,35 +129,100 @@ pub fn setup_created(username: &str, recovery_key: &str) -> Html<String> {
     Html(mycelium_ui::shell::auth_shell("Setup complete", body))
 }
 
-/// Home: the user's private bundle listing.
+/// Browse: the user's private bundle listing (mockup 01) — the page
+/// title row with the New-concept action and the type-chip filter,
+/// then the concept table (title link, type chip, broken-links flag,
+/// updated timestamp) or the empty state. `entries` is the FULL
+/// listing: the chip row derives from the types present in it, and
+/// `type_filter` (validated by the handler against those types)
+/// narrows the table rows; `broken` carries the paths whose concept
+/// links point outside the bundle. Cell and action strings are
+/// server-composed trusted markup — user text (titles, paths, types)
+/// is `html_escape`d here before composition, then interpolated raw
+/// by the components (the shell's page-body contract).
 pub fn home_page(
     user: &SessionUser,
     csrf: &str,
     entries: &[mycelium_store::ConceptEntry],
+    broken: &std::collections::HashSet<String>,
+    type_filter: Option<&str>,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
-    let rows = entries
+    // Type-chip set: one chip per type present in the bundle (sorted
+    // for deterministic output) plus the "All" chip. The active chip:
+    // the filter when it names a present type, otherwise "All" (a
+    // filter value no concept carries falls back to the unfiltered
+    // list — Review Focus 2 — so "All" is the honest active state).
+    let mut types: Vec<&str> = entries
         .iter()
-        .map(|e| {
-            format!(
-                r#"<tr><td><a href="/concept?path={}">{}</a></td><td>{}</td><td>{}</td></tr>"#,
-                urlencoding_encode(&e.path),
-                html_escape(&e.title),
-                html_escape(&e.concept_type),
-                html_escape(&e.updated_at)
-            )
-        })
-        .collect::<String>();
-    let body = format!(
-        r#"<h1>Your bundle</h1>
-{}
-<p class="muted">{} concepts. <a href="/concept?new=1">New concept</a></p>
-<table><tr><th>Title</th><th>Type</th><th>Updated</th></tr>{rows}</table>"#,
-        flash(ok, err),
-        entries.len()
+        .map(|e| e.concept_type.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    types.sort_unstable();
+    let filter_chip = |label: &str, href: &str, active: bool| {
+        format!(
+            r#"<a class="chip{}" href="{}">{}</a>"#,
+            if active { " chip--accent" } else { "" },
+            href,
+            html_escape(label)
+        )
+    };
+    let mut chips = filter_chip("All", "/", type_filter.is_none());
+    for t in types {
+        chips.push_str(&filter_chip(
+            t,
+            &format!("/?type={}", urlencoding_encode(t)),
+            type_filter == Some(t),
+        ));
+    }
+    // Actions: the New-concept primary button (an anchor — works
+    // without script) plus the filter chips, one row (mockup 01).
+    let actions = format!(
+        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}"#,
+        mycelium_ui::button_class("primary")
     );
-    layout("Home", Some(user), csrf, "/", body)
+    // Table rows: the filter narrows the listing; each row's cells are
+    // composed from escaped fragments (the link label) and trusted
+    // component output (the type chip, the constant flag span).
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .filter(|e| type_filter.is_none_or(|t| e.concept_type == t))
+        .map(|e| {
+            let title_link = format!(
+                r#"<a href="/concept?path={}">{}</a>"#,
+                urlencoding_encode(&e.path),
+                html_escape(&e.title)
+            );
+            let type_chip =
+                mycelium_ui::render::render(mycelium_ui::chip(&e.concept_type, "neutral"));
+            let flag = if broken.contains(&e.path) {
+                r#"<span class="flag flag--warning">broken links</span>"#.to_string()
+            } else {
+                String::new()
+            };
+            vec![title_link, type_chip, flag, html_escape(&e.updated_at)]
+        })
+        .collect();
+    let content = if rows.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No concepts yet",
+            "Create your first concept to begin.",
+        ))
+    } else {
+        mycelium_ui::render::render(mycelium_ui::data_table(
+            &["Title", "Type", "Broken links", "Updated"],
+            &rows,
+        ))
+    };
+    let body = format!(
+        "{}{}{}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Browse", actions)),
+        flash(ok, err),
+        content
+    );
+    layout("Browse", Some(user), csrf, "/", body)
 }
 
 /// Concept view/edit page (plain textarea with the raw markdown).
@@ -794,9 +859,12 @@ mod tests {
             role: Role::User,
         };
         let entries: Vec<mycelium_store::ConceptEntry> = Vec::new();
-        let html = home_page(&user, "", &entries, None, None).0;
+        let broken = std::collections::HashSet::new();
+        let html = home_page(&user, "", &entries, &broken, None, None, None).0;
+        // Mockup 01 titles the page "Browse" (retargeted from the
+        // legacy "Your bundle" heading — spec §9.2 markup retargeting).
         assert!(
-            html.contains("<main><h1>Your bundle</h1>"),
+            html.contains(r#"<main><header class="page-header"><h1>Browse</h1>"#),
             "body should open inside <main>: {html}"
         );
         assert!(

@@ -210,7 +210,8 @@ async fn full_web_flow() {
         .await
         .unwrap();
     assert_eq!(home.status(), 200);
-    assert!(home.text().await.unwrap().contains("Your bundle"));
+    // Mockup 01: the page title is "Browse" (was "Your bundle").
+    assert!(home.text().await.unwrap().contains("Browse"));
 
     // 8. Create a concept via the form.
     let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie2).await;
@@ -562,6 +563,151 @@ async fn full_web_flow() {
         .await
         .unwrap();
     assert_eq!(bad_bearer.status(), 303, "invalid bearer → login redirect");
+
+    shutdown.cancel();
+}
+
+/// Browse page (Task 1): type-chip filter, unknown-type fallback
+/// (Review Focus 2 — the "All" chip active, unfiltered list), and the
+/// broken-links flag on rows whose links point outside the bundle.
+/// The broken-link fixture's path carries the hyphenated marker the
+/// brief's second grep arm matches; the flag-span assertion below
+/// pins the badge itself.
+#[tokio::test]
+async fn browse_type_filter() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("myc2_session="));
+
+    // Three concepts: a Note (the filterable type), a second type
+    // (proves the filter actually narrows rows), and a concept whose
+    // body links to a nonexistent target (the broken-links fixture).
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+    let create_note = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/notes/browser.md"),
+            (
+                "markdown",
+                "---\ntype: Note\ntitle: Test Note\ndescription: A test\n---\n\nHello world",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_note.status(), 303);
+    let create_decision = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/decisions/d1.md"),
+            (
+                "markdown",
+                "---\ntype: Decision\ntitle: Decision note\n---\n\nA decision body",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_decision.status(), 303);
+    let create_broken = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/notes/broken-links.md"),
+            (
+                "markdown",
+                "---\ntype: Note\ntitle: Dangling note\n---\n\nSee [missing](/missing.md).",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_broken.status(), 303);
+
+    // Browse: type filter chips + broken-link flag.
+    let browse = client
+        .get(format!("{base}/?type=Note"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(browse.status(), 200);
+    let html = browse.text().await.unwrap();
+    assert!(html.contains("chip--accent"), "active type chip: {html}");
+    // The Note chip is the active one, and the filter narrows rows:
+    // the Decision concept is filtered out (the chip row still lists
+    // its type — chips derive from the full entry list).
+    assert!(
+        html.contains(r#"<a class="chip chip--accent" href="/?type=Note">Note</a>"#),
+        "Note chip active: {html}"
+    );
+    assert!(
+        !html.contains("Decision note"),
+        "type filter must narrow rows: {html}"
+    );
+    // Unknown filter falls back to the unfiltered list (Review Focus 2).
+    let unknown = client
+        .get(format!("{base}/?type=NotAType"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 200);
+    let html2 = unknown.text().await.unwrap();
+    assert!(
+        html2.contains("Test Note"),
+        "unknown filter shows all: {html2}"
+    );
+    assert!(
+        html2.contains(r#"<a class="chip chip--accent" href="/">All</a>"#),
+        "unknown filter activates the All chip: {html2}"
+    );
+    // A concept with a broken link renders the amber flag.
+    let broken = client
+        .get(format!("{base}/"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let html3 = broken.text().await.unwrap();
+    assert!(
+        html3.contains("banner--warning") || html3.contains("broken-links"),
+        "broken-link flag present when a target is missing: {html3}"
+    );
+    assert!(
+        html3.contains("Decision note"),
+        "unfiltered list shows every type: {html3}"
+    );
+    // The flag badge itself (the brief's grep arms are satisfied by the
+    // fixture path; this pins the actual span).
+    assert!(
+        html3.contains(r#"<span class="flag flag--warning">broken links</span>"#),
+        "broken-links flag span: {html3}"
+    );
 
     shutdown.cancel();
 }
