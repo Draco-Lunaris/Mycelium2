@@ -1226,6 +1226,21 @@ Details two.
 Second chapter text.
 ";
 
+/// The second book the Books-page test ingests onto the SAME shelf —
+/// deliberately different chapter titles ("Alpha One"/"Alpha Two") so
+/// each book's chapter rows stay distinguishable in the `?book=`
+/// narrowing assertions ("Chapter One" is not a substring of either,
+/// so the narrowed-view negative is clean).
+const BOOK2: &str = "\
+# Alpha One
+
+Alpha book intro text.
+
+# Alpha Two
+
+Alpha second chapter text.
+";
+
 /// Build a multipart body with a csrf_token field (browser-style: the
 /// token rides as a form field, not a header) — ingest_integration.rs's
 /// helper, replicated minimally for the Books-page test's upload.
@@ -1351,15 +1366,18 @@ async fn books_count_and_passage_reader() {
     assert_eq!(b.status(), 200);
     let html = b.text().await.unwrap();
     assert!(html.contains("Books"), "{html}");
-    // count column present (empty shelves render "0")
+    // count column present (empty shelves render "0") — the exact cell
+    // form (review fix: no weak `>N<` fallback arm a serializer change
+    // could satisfy; the cell serializes attribute-then-content).
     assert!(
-        html.contains(r#"<td data-label="Books">0</td>"#) || html.contains(">0<"),
+        html.contains(r#"<td data-label="Books">0</td>"#),
         "count column: {html}"
     );
-    // ...and the real count for the shelf that holds the book (hedged
-    // like the brief's own zero arm — either serialization passes).
+    // ...and the real count for the shelf that holds the book (the same
+    // exact form; runs before the second upload below, when the shelf
+    // holds exactly one book).
     assert!(
-        html.contains(r#"<td data-label="Books">1</td>"#) || html.contains(">1<"),
+        html.contains(r#"<td data-label="Books">1</td>"#),
         "one-book shelf count: {html}"
     );
     assert!(
@@ -1391,6 +1409,92 @@ async fn books_count_and_passage_reader() {
     assert!(
         sh.contains(r#"passage=book://my-book%23ch-1-chapter-one"#),
         "chapter row passage link: {sh}"
+    );
+
+    // 2b. The ?book= narrowing, pinned end-to-end on a two-book shelf
+    //     (review fix): a second book on the SAME shelf, then the
+    //     un-narrowed interleave, the narrowed view, and the
+    //     unknown-book fallback.
+    let second_body = multipart_body(
+        "secondboundary2",
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "second-book"),
+            ("title", "Second Book"),
+        ],
+        Some(("file", "book2.md", BOOK2)),
+    );
+    let second_upload = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            "multipart/form-data; boundary=secondboundary2",
+        )
+        .body(second_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_upload.status(), 202);
+    // (a) Un-narrowed: BOTH books' chapters appear — the interleaved
+    //     behavior, pinned so a change to the narrowing can't silently
+    //     regress the un-narrowed path. The shelves table now counts
+    //     two books for this shelf (RF 3 at count 2).
+    let both = client
+        .get(format!("{base}/books?shelf=Public%20Shelf"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(both.status(), 200);
+    let bh = both.text().await.unwrap();
+    assert!(bh.contains("Chapter One"), "first book row: {bh}");
+    assert!(bh.contains("Alpha One"), "second book row: {bh}");
+    assert!(
+        bh.contains(r#"passage=book://second-book%23ch-1-alpha-one"#),
+        "second book passage link: {bh}"
+    );
+    assert!(
+        bh.contains(r#"<td data-label="Books">2</td>"#),
+        "two-book shelf count: {bh}"
+    );
+    // (b) Narrowed to the second book: ONLY its chapters — the first
+    //     book's rows and passage links are absent.
+    let narrowed = client
+        .get(format!(
+            "{base}/books?shelf=Public%20Shelf&book=second-book"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(narrowed.status(), 200);
+    let nh = narrowed.text().await.unwrap();
+    assert!(nh.contains("Alpha One"), "narrowed rows: {nh}");
+    assert!(
+        !nh.contains("Chapter One"),
+        "narrowing must hide the other book's chapters: {nh}"
+    );
+    assert!(
+        !nh.contains(r#"passage=book://my-book%23"#),
+        "narrowing must drop the other book's passage links: {nh}"
+    );
+    // (c) Unknown book: the un-narrowed list — both books' chapters
+    //     (the unknown-filter fallback, the ?type=/?scope= pattern).
+    let unknown_book = client
+        .get(format!(
+            "{base}/books?shelf=Public%20Shelf&book=no-such-book"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_book.status(), 200);
+    let uh = unknown_book.text().await.unwrap();
+    assert!(
+        uh.contains("Chapter One") && uh.contains("Alpha One"),
+        "unknown book keeps the un-narrowed list: {uh}"
     );
 
     // 3. Passage: reuse the ingest test's established anchor shape
