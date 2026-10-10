@@ -91,28 +91,51 @@ button.danger { background: var(--danger); color: #fff; }
 pre { background: var(--panel); padding: 1rem; border-radius: 6px; overflow-x: auto; }
 #graph { width: 100%; height: 34rem; background: var(--panel); border-radius: 6px; }
 
-/* Graph — full-viewport interactive layout (body.graph-page) */
+/* Graph — full-viewport interactive layout (body.graph-page), mockup 06:
+   PageHeader above the panel; the type legend (bottom-left) and the node
+   info card (top-right) overlay the panel; the usage hint sits beneath. */
 body.graph-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
 body.graph-page main {
   display: flex; flex-direction: column; flex: 1;
   max-width: none; width: 100%; margin: 0; padding: 0 1.2rem;
   min-height: 0;
 }
-body.graph-page h1 { margin: .8rem 0 .4rem; }
+body.graph-page .page-header { margin: .8rem 0 .4rem; }
 #graph-wrap { position: relative; flex: 1; min-height: 0; }
 #graph {
-  width: 100%; height: 100%; background: var(--panel);
-  border-radius: 6px; overflow: hidden; cursor: grab; touch-action: none;
+  width: 100%; height: 100%; background: var(--color-surface);
+  border-radius: var(--radius-card); overflow: hidden; cursor: grab; touch-action: none;
 }
 #graph.dragging { cursor: grabbing; }
 #graph-info {
   position: absolute; top: .6rem; right: .6rem; z-index: 2;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-  padding: .6rem .8rem; max-width: 22rem; font-size: .9rem;
+  background: var(--color-bg-page); border: 1px solid var(--color-border);
+  border-radius: var(--radius-card); padding: .6rem .8rem; max-width: 22rem;
+  font-size: var(--text-body); color: var(--color-text-body);
   box-shadow: 0 2px 8px rgba(0,0,0,.3);
 }
+#graph-info h3 {
+  margin: 0 0 .3rem; color: var(--color-text-heading);
+  font-size: var(--text-body); font-weight: 600;
+}
+#graph-info .gi-meta { display: flex; align-items: center; gap: var(--gap-2); margin-bottom: .2rem; }
+#graph-info .gi-path { font-family: ui-monospace, monospace; font-size: var(--text-caption); }
 #graph-info a { display: block; margin-top: .3rem; }
-#graph-legend { margin: .4rem 0 .8rem; font-size: .85rem; }
+.graph-legend {
+  position: absolute; bottom: .6rem; left: .6rem; z-index: 2;
+  background: var(--color-bg-page); border: 1px solid var(--color-border);
+  border-radius: var(--radius-control); padding: .4rem .6rem;
+  font-size: var(--text-caption); display: flex; flex-direction: column; gap: 2px;
+}
+/* display:flex above would override the UA's [hidden] rule — restore it. */
+.graph-legend[hidden] { display: none; }
+.graph-legend .row { display: flex; align-items: center; gap: var(--gap-2); }
+.graph-legend .dot {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--dot, var(--color-accent)); flex: 0 0 auto;
+}
+.graph-legend .dot--orphan { background: transparent; border: 1px solid var(--color-danger); }
+.graph-hint { font-size: var(--text-caption); color: var(--color-text-body); margin: .2rem 0 .4rem; }
 
 /* Librarian chat — full-viewport layout (body.chat-page) */
 body.chat-page { display: flex; flex-direction: row; height: 100vh; height: 100dvh; }
@@ -179,6 +202,42 @@ body.chat-page main {
   align-self: flex-start; background: rgba(247,118,142,.12);
   border: 1px solid var(--danger); color: var(--danger);
 }
+/* Islands (Task 7): the leptos-island root is a pure hydration marker
+   (never a layout box — display:contents keeps the composer's flex
+   row and the minted banner's inline flow exactly as without it). */
+leptos-island { display: contents; }
+/* Copy button (keys minted banner): a quiet pill beside the
+   shown-once secret. */
+.copy-button {
+  display: inline-flex; align-items: center;
+  margin: 0 0 0 var(--gap-2); padding: 0.15rem 0.7rem;
+  background: var(--color-chip-surface); color: var(--color-text-body);
+  border: 1px solid var(--color-border); border-radius: var(--radius-pill);
+  font-size: var(--text-caption); font-weight: 400; cursor: pointer;
+}
+.copy-button:hover { border-color: var(--color-accent); }
+
+/* Keys page (Task 8, mockup 09): the mint form sits compact in the
+   page header's actions slot (inline label + input + primary button);
+   the shown-once value row keeps the key selectable beside its copy
+   button (the value stays plain text — copy is enhancement, never the
+   only path). */
+.mint-form {
+  display: flex; align-items: center; gap: var(--gap-2); margin: 0;
+}
+.mint-form label {
+  display: inline; margin: 0;
+  color: var(--color-text-label); font-size: var(--text-caption);
+  white-space: nowrap;
+}
+.mint-form input { width: 12rem; min-height: 38px; }
+.mint-form button { margin: 0; }
+.shown-once { margin: 0; word-break: break-all; }
+.shown-once code {
+  background: var(--color-chip-surface); color: var(--color-text-body);
+  border: 1px solid var(--color-border); border-radius: var(--radius-control);
+  padding: 0.25rem 0.5rem; font-size: var(--text-body);
+}
 
 /* --- Components (Tasks 4-6) — token-only, no raw literals ----------- */
 
@@ -234,6 +293,10 @@ body.chat-page main {
 .chip--neutral { background: var(--color-chip-surface-alt); color: var(--color-text-label); }
 .chip--danger { background: var(--color-danger-surface); color: var(--color-danger); }
 .chip--warning { background: var(--color-warning-surface); color: var(--color-warning); }
+
+/* Broken-links flag (Browse, mockup 01): the amber mini-badge a table
+   row carries when its concept links outside the bundle. */
+.flag--warning { color: var(--color-warning); background: var(--color-warning-surface); border-radius: var(--radius-pill); padding: 2px var(--gap-2); font-size: var(--text-caption); }
 
 /* Banners: leading icon = the first child (inline svg), space reserved by
    the flex gap; success reuses accent tints (spec §5 — no success token). */
@@ -318,6 +381,16 @@ body.chat-page main {
   }
 }
 
+/* Keys page (Task 8): revoked rows dim — data_table owns the <tr>, so
+   every cell of a revoked row wraps its content in this class (the row
+   state rides on the composed cell markup, dimming the whole visible
+   row). */
+.row--revoked { opacity: 0.6; }
+
+/* Skills hub groups (Task 6): companions and script labels indented
+   beneath their nested skill's hub row. */
+.group-indent { padding-left: var(--gap-4); }
+
 .stat {
   background: var(--color-surface); border: 1px solid var(--color-border);
   border-radius: var(--radius-card); padding: var(--gap-4);
@@ -387,6 +460,23 @@ body.chat-page main {
 @media (max-width: 720px) {
   .page-header { flex-wrap: wrap; }
 }
+
+/* Concept editor (Task 2): source/preview grid — two equal columns,
+   one under 720px (the shell's breakpoint); the preview pane is fully
+   server-rendered from escaped fragments (static, no client script). */
+.editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-4); }
+@media (max-width: 720px) {
+  .editor-grid { grid-template-columns: 1fr; }
+}
+.editor-pane textarea { min-height: 24rem; font-family: ui-monospace, monospace; }
+.editor-preview {
+  padding: var(--gap-3); background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--radius-card);
+}
+
+/* Books passage reader (Task 4): the reading card — wider than the
+   editor preview (46rem) for long-form text. */
+.reader-pane { padding: var(--gap-3); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-card); max-width: 46rem; }
 
 /* ConfirmDialog: native <dialog>, dimmed backdrop ~70% (spec §5 band). */
 .modal {
@@ -494,10 +584,12 @@ pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fe
 
 pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: drag nodes (the
 // layout re-settles around them, d3-style), wheel-zoom, background-pan,
-// click-to-open, hover info panel, per-type palette + legend (v1).
+// click-to-open, hover info panel, per-type palette + legend (v8 token
+// restyle, mockup 06 — the layout algorithm itself is unchanged).
 (function () {
   var el = document.getElementById("graph");
   var info = document.getElementById("graph-info");
+  var legend = document.getElementById("graph-legend");
   if (!el) return;
 
   fetch("/api/v1/graph")
@@ -505,8 +597,20 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     .then(function (data) { render(data); })
     .catch(function (e) { el.textContent = "graph load failed: " + e; });
 
-  // v1's palette, assigned to concept types in first-seen order.
-  var PALETTE = ["#64c8ff", "#a78bfa", "#34d399", "#fbbf24", "#f87171", "#f472b6", "#2dd4bf", "#a3e635"];
+  // Type → color mapping (v8 tokens, pinned hexes sampled 2026-10-08):
+  // types in first-seen order (v1 semantics) draw from the readable token
+  // tones — accent mint first (a single-type bundle reads as mockup 06's
+  // mint nodes), then the heading/body/label grays, ordered to maximize
+  // adjacent-pair separation. Fixed order; wraps past slot 4 (v1 cycled
+  // past 8). Type identity is never color-alone: every node carries a
+  // text label, the legend repeats the mapping, and the info card names
+  // the type as a chip.
+  var PALETTE = ["#8FD3A8", "#E4E9E5", "#9AA69F", "#C9D2CC"];
+  var EDGE = "#8FD3A8";    // accent — mockup 06's graph edges
+  var EDGE_FADE = "0.4";   // recessive: relationships sit behind nodes
+  var STROKE = "#171B19";  // panel surface — a node's rim ring
+  var ORPHAN = "#F2978A";  // danger — the unlinked-node highlight ring
+  var LABEL = "#C9D2CC";   // label text token
 
   function render(data) {
     var nodes = data.nodes.map(function (n) {
@@ -520,6 +624,13 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       return { source: byId[e.from], target: byId[e.to] };
     }).filter(function (l) { return l.source && l.target; });
     links.forEach(function (l) { l.source.degree++; l.target.degree++; });
+
+    // In/out link counts for the info card (from the loaded edges).
+    var inCount = {}, outCount = {};
+    links.forEach(function (l) {
+      outCount[l.source.id] = (outCount[l.source.id] || 0) + 1;
+      inCount[l.target.id] = (inCount[l.target.id] || 0) + 1;
+    });
 
     // Type colors: palette order by first-seen type (v1 semantics).
     var typeColors = {};
@@ -543,7 +654,8 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 
     var lines = links.map(function (l) {
       var line = document.createElementNS(svgNS, "line");
-      line.setAttribute("stroke", "#2a3140");
+      line.setAttribute("stroke", EDGE);
+      line.setAttribute("stroke-opacity", EDGE_FADE);
       edgeGroup.appendChild(line); return line;
     });
     var circles = nodes.map(function (n) {
@@ -551,14 +663,14 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
       var c = document.createElementNS(svgNS, "circle");
       c.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2));
       c.setAttribute("fill", typeColors[n.type]);
-      c.setAttribute("stroke", "#1a1b26"); c.setAttribute("stroke-width", "1");
+      c.setAttribute("stroke", STROKE); c.setAttribute("stroke-width", "1");
       c.style.cursor = "grab";
       // Orphan highlight (v1): unlinked nodes get a red ring.
       if (n.degree === 0) {
         var ring = document.createElementNS(svgNS, "circle");
         ring.setAttribute("r", Math.max(5, 4 + Math.sqrt(n.degree) * 2) + 3);
         ring.setAttribute("fill", "none");
-        ring.setAttribute("stroke", "#ef4444");
+        ring.setAttribute("stroke", ORPHAN);
         ring.setAttribute("stroke-width", "1.5");
         ring.setAttribute("opacity", "0.8");
         g.appendChild(ring);
@@ -576,53 +688,63 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
     });
     var labels = nodes.map(function (n) {
       var t = document.createElementNS(svgNS, "text");
-      t.setAttribute("fill", "#a9b1d6"); t.setAttribute("font-size", "10");
+      t.setAttribute("fill", LABEL); t.setAttribute("font-size", "10");
       t.setAttribute("text-anchor", "middle");
       t.setAttribute("pointer-events", "none");
       t.textContent = n.title.length > 24 ? n.title.slice(0, 23) + "\u2026" : n.title;
       labelGroup.appendChild(t); return t;
     });
 
-    // Legend (v1): type swatches + orphan marker, top-left.
-    var legend = document.createElement("div");
-    legend.style.cssText =
-      "position:absolute;top:.6rem;left:.6rem;z-index:2;background:rgba(26,27,38,.85);" +
-      "border:1px solid #2a3140;border-radius:6px;padding:.5rem .7rem;font-size:.8rem;";
-    Object.keys(typeColors).forEach(function (t) {
-      var row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;";
-      var sw = document.createElement("span");
-      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;background:" + typeColors[t] + ";";
-      var name = document.createElement("span");
-      name.style.color = "#a9b1d6";
-      name.textContent = t;
-      row.appendChild(sw); row.appendChild(name);
-      legend.appendChild(row);
-    });
-    if (nodes.some(function (n) { return n.degree === 0; })) {
-      var row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:.4rem;margin:.15rem 0;border-top:1px solid #2a3140;padding-top:.25rem;";
-      var sw = document.createElement("span");
-      sw.style.cssText = "width:.6rem;height:.6rem;border-radius:50%;border:1px solid #ef4444;";
-      var name = document.createElement("span");
-      name.style.color = "#a9b1d6";
-      name.textContent = "orphan (unlinked)";
-      row.appendChild(sw); row.appendChild(name);
-      legend.appendChild(row);
+    // Legend (mockup 06): one dot + label per type present in the
+    // loaded data, built into the page's #graph-legend overlay; the
+    // orphan marker explains the danger ring when unlinked nodes exist.
+    // Static styling lives in style.css (.row/.dot classes); only the
+    // data-driven dot color rides a --dot custom property.
+    if (legend) {
+      Object.keys(typeColors).forEach(function (t) {
+        var row = document.createElement("div");
+        row.className = "row";
+        var sw = document.createElement("span");
+        sw.className = "dot";
+        sw.style.setProperty("--dot", typeColors[t]);
+        var name = document.createElement("span");
+        name.textContent = t;
+        row.appendChild(sw); row.appendChild(name);
+        legend.appendChild(row);
+      });
+      if (nodes.some(function (n) { return n.degree === 0; })) {
+        var row = document.createElement("div");
+        row.className = "row";
+        var sw = document.createElement("span");
+        sw.className = "dot dot--orphan";
+        var name = document.createElement("span");
+        name.textContent = "orphan (unlinked)";
+        row.appendChild(sw); row.appendChild(name);
+        legend.appendChild(row);
+      }
+      if (legend.firstChild) legend.hidden = false;
     }
-    el.appendChild(legend);
 
+    // Node info card (mockup 06): title, type chip, in/out link counts,
+    // path, and the open link \u2014 DOM-built (no innerHTML with data).
     function showInfo(n) {
       if (!info) return;
       info.hidden = false;
       info.innerHTML = "";
-      var b = document.createElement("b"); b.textContent = n.title;
-      info.appendChild(b);
-      var type = document.createElement("div");
-      type.textContent = (n.type ? n.type : "concept") + " \u00b7 " + n.degree + " link" + (n.degree === 1 ? "" : "s");
-      info.appendChild(type);
+      var h = document.createElement("h3"); h.textContent = n.title;
+      info.appendChild(h);
+      var meta = document.createElement("div");
+      meta.className = "gi-meta";
+      var chip = document.createElement("span");
+      chip.className = "chip chip--neutral";
+      chip.textContent = n.type ? n.type : "concept";
+      meta.appendChild(chip);
+      var counts = document.createElement("span");
+      counts.textContent = (inCount[n.id] || 0) + " in \u00b7 " + (outCount[n.id] || 0) + " out";
+      meta.appendChild(counts);
+      info.appendChild(meta);
       var path = document.createElement("div");
-      path.style.fontFamily = "monospace"; path.textContent = n.id;
+      path.className = "gi-path"; path.textContent = n.id;
       info.appendChild(path);
       var a = document.createElement("a");
       a.href = "/concept?path=" + encodeURIComponent(n.id);
@@ -751,13 +873,33 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 "##;
 
 /// The chat page's client logic (external asset — CSP-safe: the site
-/// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline scripts are blocked;
-/// /assets/chat.js loads under 'self').
-pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/chat/stream (SSE).
+/// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline
+/// scripts are blocked; /assets/chat.js loads under 'self').
+///
+/// Task-7 split: the composer's EVENT wiring (submit binding,
+/// Enter-to-send, textarea auto-grow) lives in the chat_composer
+/// hydration island (mycelium-ui `islands.rs`), which hands each send
+/// to `window.myceliumChatSend` below — the helper returns `true`
+/// when the transport accepted the message, `false` when it refused
+/// (busy, or empty after trim); the island clears the composer only
+/// on `true`, so input typed while the librarian streams stays in
+/// the textarea (the pre-split busy-gate behavior). What stays here
+/// is what the
+/// chat-stream integration suite pins: the POST /api/v1/chat/stream
+/// transport (form-encoded message + the CSRF header from the page's
+/// meta — app.js's same token source), the SSE pump (tool progress →
+/// the pending message, done → the reply, error → the error message),
+/// the busy gate, and the log's DOM structure (addMsg + the XSS-safe
+/// markdown renderer). Without the hydrate bundle the composer is an
+/// inert form and the helper is never called — the page degrades to
+/// SSR-only.
+pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management for
+// /api/v1/chat/stream. The chat_composer hydration island owns the
+// composer's event wiring and calls window.myceliumChatSend; this file
+// owns the fetch, the SSE pump, and the log rendering.
 (function () {
   var log = document.getElementById("chat-log");
   var form = document.getElementById("chat-form");
-  var input = document.getElementById("chat-input");
   var sendBtn = form ? form.querySelector("button[type=submit]") : null;
   var busy = false;
   function addMsg(text, who) {
@@ -867,26 +1009,12 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
     busy = state;
     if (sendBtn) sendBtn.disabled = state;
   }
-  // Auto-grow the textarea to its content (capped by CSS max-height).
-  function autoGrow() {
-    input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 160) + "px";
-  }
-  input.addEventListener("input", autoGrow);
-  // Enter sends; Shift+Enter inserts a newline.
-  input.addEventListener("keydown", function (ev) {
-    if (ev.key === "Enter" && !ev.shiftKey) {
-      ev.preventDefault();
-      form.requestSubmit();
-    }
-  });
-  form.addEventListener("submit", function (ev) {
-    ev.preventDefault();
-    if (busy) return;
-    var msg = input.value.trim();
-    if (!msg) return;
+  // Returns true when the transport accepted the message (logged +
+  // fetch kicked off), false when it refused (busy). The composer
+  // island clears the textarea only on true.
+  function send(msg) {
+    if (busy) return false;
     addMsg(msg, "user");
-    input.value = "";
     setBusy(true);
     var pending = addMsg("The librarian is thinking…", "librarian pending");
     var steps = [];
@@ -959,7 +1087,18 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
       setBusy(false);
       addMsg(err.message || "request failed", "error");
     });
-  });
+    return true;
+  }
+  // The composer island's entry point (Task 7): each trimmed message
+  // arrives here. Returns the transport's verdict — false when busy
+  // or empty after trim — so the island clears the composer only on
+  // acceptance and typed-during-streaming input stays put. Without
+  // the hydrate bundle this is never called.
+  window.myceliumChatSend = function (msg) {
+    var m = String(msg || "").trim();
+    if (!m) return false;
+    return send(m);
+  };
 })();
 "#;
 
@@ -998,6 +1137,74 @@ pub const CONFIRM_JS: &str = r#"// Confirm dialogs: [data-confirm-dialog] trigge
 })();
 "#;
 
+/// The islands traversal script (external asset — CSP-safe like
+/// chat.js). Adapted from leptos's own `island_script.js` (islands
+/// mode): leptos's SSR helper would inline it, but the site CSP
+/// blocks inline scripts, so it ships as an external classic script
+/// (classic scripts run at parse time; the hydrate module they load
+/// executes deferred, after chat.js has exposed its transport). It
+/// finds the page's hydrate-bundle module tag (the shell emits it
+/// only on island pages), derives the cache-busted `.wasm` URL from
+/// its `src` — the wasm-bindgen wrapper's own default would resolve
+/// the wasm WITHOUT the `?v=` query, a stale-cache hazard on version
+/// bumps — initializes the module (which runs the wasm entry,
+/// `hydrate_islands`), then walks the `<leptos-island>` roots and
+/// calls each island's exported wasm hydrate function (`data-
+/// component` names the export). Hand-vendored: regenerate only when
+/// the leptos island protocol changes — the per-island exports
+/// themselves are regenerated with the wasm bundle.
+///
+/// Dropped upstream behaviors (deliberate): this traversal does NOT
+/// support islands that take `children` props (upstream threads a
+/// leptos-children on-hydrate callback through the walk — the repo's
+/// islands take only serialized props) and does NOT await async
+/// (thenable) exports — an `#[island(lazy)]` would mis-hydrate here.
+/// A future island needing either must grow this script, not just
+/// the island.
+pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bundle, then walk the
+// page's <leptos-island> roots and call each island's exported wasm
+// hydrate function (data-component names the export). Deferred to
+// DOMContentLoaded because this classic script runs at parse time,
+// BEFORE the module tag below it has been parsed; module scripts
+// execute before DOMContentLoaded, so chat.js's transport helper is
+// available by the time any island sends.
+(function () {
+  function start() {
+    var tag = document.querySelector('script[type="module"][src^="/assets/mycelium_ui.js"]');
+    if (!tag) {
+      console.warn("islands.js: no hydrate bundle module tag on this page — islands stay server-rendered");
+      return;
+    }
+    var src = tag.getAttribute("src");
+    var wasmUrl = src.replace("mycelium_ui.js", "mycelium_ui_bg.wasm");
+    import(src).then(function (mod) {
+      mod.default({ module_or_path: wasmUrl }).then(function () {
+        function traverse(node) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.tagName.toLowerCase() === "leptos-island") {
+              var id = node.dataset.component;
+              if (id && mod[id]) {
+                mod[id](node);
+              } else {
+                console.warn("islands.js: no exported hydrate function for island '" + id + "' — stale bundle?");
+              }
+            }
+            var children = node.children;
+            for (var i = 0; i < children.length; i++) traverse(children[i]);
+          }
+        }
+        traverse(document.body);
+      });
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+"#;
+
 /// The mycelium-ui hydrate bundle's JS wrapper — wasm-bindgen output
 /// (`--target web`), NOT hand-written: do not edit. It fetches its
 /// sibling `mycelium_ui_bg.wasm` by filename, so the pair's names are
@@ -1014,7 +1221,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "10";
+pub const ASSETS_VERSION: &str = "19";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -1031,6 +1238,7 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("graph.js", GRAPH_JS),
         ("chat.js", CHAT_JS),
         ("confirm.js", CONFIRM_JS),
+        ("islands.js", ISLANDS_JS),
         // The hydrate bundle is a bindgen output pair — the JS wrapper
         // fetches `mycelium_ui_bg.wasm` by filename, so both names are
         // load-bearing. The wasm is written separately after the loop
@@ -1066,6 +1274,7 @@ mod tests {
         assert!(dir.path().join("graph.js").exists());
         assert!(dir.path().join("chat.js").exists());
         assert!(dir.path().join("confirm.js").exists());
+        assert!(dir.path().join("islands.js").exists());
         // Same version: does not overwrite (admin customization safe).
         std::fs::write(dir.path().join("style.css"), "custom").unwrap();
         scaffold_defaults(dir.path()).unwrap();
@@ -1167,7 +1376,8 @@ mod tests {
             "body.graph-page",
             "#graph-wrap",
             "#graph-info",
-            "#graph-legend",
+            ".graph-legend",
+            ".graph-hint",
             "body.chat-page",
             ".chat-shell",
             ".chat-log",

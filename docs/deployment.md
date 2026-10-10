@@ -169,8 +169,10 @@ delivers a regenerated bundle to existing deployments; delete the
 separate Dockerfile stage — the image ships the bundle through the
 same scaffold. `serve_asset` serves the `.wasm` as
 `application/wasm`, and the site CSP carries `'wasm-unsafe-eval'`
-(WASM modules compile at runtime). No page loads the bundle yet —
-island hydration lands with the follow-up UI work.
+(WASM modules compile at runtime). The chat and API-keys pages load the
+bundle (a `<script type="module">` tag) plus the `islands.js`
+traversal script, which initializes the wasm and walks the page's
+`<leptos-island>` roots; every other page fetches neither.
 
 Regenerate the bundle whenever `crates/mycelium-ui`'s island code
 changes (requires the `wasm32-unknown-unknown` rustup target):

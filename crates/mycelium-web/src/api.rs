@@ -814,15 +814,23 @@ pub async fn concept_submit(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let concept = match Concept::parse(&canonical, &form.markdown) {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
+            // Re-render the editor with the edit preserved in the
+            // textarea: the warning banner carries the parser's own
+            // message (the preview builder re-parses with the same
+            // `Concept::parse`, so its error is exactly what the save
+            // was rejected with).
             let csrf = pages::current_csrf(&state, &session).await;
-            return pages::concept_page(
+            let (preview, frontmatter_error) = pages::build_preview_html(&form.markdown);
+            return pages::concept_editor(
                 &user,
                 &csrf,
                 &canonical,
                 &form.markdown,
-                None,
-                Some(&e.to_string()),
+                preview,
+                frontmatter_error.as_deref(),
+                form.scope.as_deref(),
+                true,
             )
             .into_response();
         }
@@ -846,14 +854,20 @@ pub async fn concept_submit(
                 ))
                 .into_response(),
                 Err(e) => {
+                    // A store failure re-renders the editor with the
+                    // edit preserved; the message rides the warning
+                    // banner (the page's single error slot).
                     let csrf = pages::current_csrf(&state, &session).await;
-                    pages::concept_page(
+                    let (preview, _) = pages::build_preview_html(&form.markdown);
+                    pages::concept_editor(
                         &user,
                         &csrf,
                         &canonical,
                         &form.markdown,
-                        None,
+                        preview,
                         Some(&e.to_string()),
+                        Some("skills"),
+                        true,
                     )
                     .into_response()
                 }
@@ -875,14 +889,20 @@ pub async fn concept_submit(
                 ))
                 .into_response(),
                 Err(e) => {
+                    // A store failure re-renders the editor with the
+                    // edit preserved; the message rides the warning
+                    // banner (the page's single error slot).
                     let csrf = pages::current_csrf(&state, &session).await;
-                    pages::concept_page(
+                    let (preview, _) = pages::build_preview_html(&form.markdown);
+                    pages::concept_editor(
                         &user,
                         &csrf,
                         &canonical,
                         &form.markdown,
-                        None,
+                        preview,
                         Some(&e.to_string()),
+                        None,
+                        true,
                     )
                     .into_response()
                 }
@@ -926,8 +946,20 @@ pub async fn concept_view(
             }
             _ => "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
         };
-        return pages::new_concept_page_with(&user, &csrf, template, query.scope.as_deref())
-            .into_response();
+        // New-concept editor: empty path + the scope's template, the
+        // same concept_editor fn (no delete — nothing is saved yet).
+        let (preview, _) = pages::build_preview_html(template);
+        return pages::concept_editor(
+            &user,
+            &csrf,
+            "",
+            template,
+            preview,
+            None,
+            query.scope.as_deref(),
+            true,
+        )
+        .into_response();
     }
     let Some(path) = query.path else {
         return Redirect::to("/").into_response();
@@ -946,8 +978,16 @@ pub async fn concept_view(
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let editable = user.role == Role::Admin;
-                    pages::concept_page_scoped(
-                        &user, &csrf, &canonical, &markdown, editable, "skills",
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &markdown,
+                        preview,
+                        None,
+                        Some("skills"),
+                        editable,
                     )
                     .into_response()
                 }
@@ -988,8 +1028,16 @@ pub async fn concept_view(
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
-                    pages::concept_page_scoped(
-                        &user, &csrf, &canonical, &markdown, false, "library",
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &markdown,
+                        preview,
+                        None,
+                        Some("library"),
+                        false,
                     )
                     .into_response()
                 }
@@ -1006,11 +1054,21 @@ pub async fn concept_view(
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
-                    pages::concept_page(&user, &csrf, &canonical, &markdown, None, None)
-                        .into_response()
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user, &csrf, &canonical, &markdown, preview, None, None, true,
+                    )
+                    .into_response()
                 }
                 Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
-                    pages::new_concept_page(&user, &csrf, None).into_response()
+                    // Unknown path → the new-concept editor seeded with
+                    // the default Note template (the legacy
+                    // new_concept_page behavior).
+                    let template =
+                        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n";
+                    let (preview, _) = pages::build_preview_html(template);
+                    pages::concept_editor(&user, &csrf, "", template, preview, None, None, true)
+                        .into_response()
                 }
                 Err(_) => pages::not_found().into_response(),
             }
@@ -1065,13 +1123,33 @@ pub async fn concept_delete(
 /// One shelf's browse data: (name, is_global_read, books as (slug, title)).
 pub type ShelfBrowse = (String, bool, Vec<(String, String)>);
 
-/// GET /books — browse global bookshelves. Users see global-read
-/// shelves; admins see all. Each shelf lists its books (from the DB),
-/// each book linking to its catalog hub.
+/// One selected-shelf chapter row for the Books page: the book it
+/// belongs to, its 1-based chapter number (parsed from the catalog
+/// concept path), the passage anchor (the concept path's stem — the
+/// REAL anchor ingest wrote, anchored and plain books alike), and the
+/// chapter's title. The handler gathers; the page composes (this PR's
+/// architecture), so the row crosses the boundary as plain data.
+pub struct ChapterRow {
+    pub book_slug: String,
+    pub index: u32,
+    pub anchor: String,
+    pub title: String,
+}
+
+/// GET /books — browse bookshelves (mockup 07). Users see global-read
+/// shelves; admins all. `?shelf=` selects a shelf (only a name the
+/// page shows — a visible row; anything else is the unselected view,
+/// the unknown-filter fallback), `?book=` narrows the chapter list to
+/// one book on the selected shelf, and `?passage=` resolves a
+/// `book://slug#anchor` resource server-side through the same gates
+/// and extraction as GET /api/v1/passages (resolve_passage) — a
+/// resolution failure renders as the page's warning banner, never a
+/// 500 (RF 4).
 pub async fn books_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let shelves = state
@@ -1088,14 +1166,111 @@ pub async fn books_view(
         let books = state.store.books_on_shelf(id).await.unwrap_or_default();
         shelf_data.push((name, is_global, books));
     }
-    pages::books_page(&user, &csrf, &shelf_data).into_response()
+    // ?shelf= selects only a shelf the page will show (a visible row;
+    // anything else is the unselected view — the unknown-filter
+    // fallback); ?book= narrows to one book ON the selected shelf.
+    let selected_shelf_books: Option<(&str, &[(String, String)])> =
+        params.get("shelf").and_then(|wanted| {
+            shelf_data
+                .iter()
+                .find(|(name, _, _)| name.as_str() == wanted.as_str())
+                .map(|(name, _, books)| (name.as_str(), books.as_slice()))
+        });
+    let selected_shelf: Option<String> = selected_shelf_books.map(|(name, _)| name.to_string());
+    let selected_book: Option<String> = selected_shelf_books.and_then(|(_, books)| {
+        params
+            .get("book")
+            .and_then(|wanted| {
+                books
+                    .iter()
+                    .find(|(slug, _)| slug.as_str() == wanted.as_str())
+            })
+            .map(|(slug, _)| slug.to_string())
+    });
+    // The selected shelf's chapter list: the library-namespace catalog
+    // concepts under `/<slug>/` — `ch-<n>-<anchor>.md` children with a
+    // 1-based index (the hub `book.md` and any non-chapter file stay
+    // out; the anchor is the file stem — the REAL anchor ingest wrote,
+    // the passage link carries it verbatim). Narrowed to the selected
+    // book when `?book=` names one; ordered by book slug then chapter
+    // index for deterministic output (list_prefix is path-ordered, so
+    // ch-10 would sort before ch-2 without the index re-sort).
+    let mut chapters: Vec<ChapterRow> = Vec::new();
+    if let Some((_, books)) = selected_shelf_books {
+        let cs = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        );
+        for (slug, _title) in books {
+            if selected_book.as_deref().is_some_and(|b| b != slug.as_str()) {
+                continue;
+            }
+            let prefix = format!("/{slug}/");
+            for entry in cs.list_prefix(&prefix).await.unwrap_or_default() {
+                let Some(stem) = entry
+                    .path
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|file| file.strip_suffix(".md"))
+                else {
+                    continue;
+                };
+                let Some(rest) = stem.strip_prefix("ch-") else {
+                    continue;
+                };
+                let Some((n, _tail)) = rest.split_once('-') else {
+                    continue;
+                };
+                let Ok(index) = n.parse::<u32>() else {
+                    continue;
+                };
+                if index == 0 {
+                    continue; // anchors are 1-based; zero is invalid
+                }
+                chapters.push(ChapterRow {
+                    book_slug: slug.clone(),
+                    index,
+                    anchor: stem.to_string(),
+                    title: entry.title,
+                });
+            }
+        }
+        chapters
+            .sort_by(|a, b| (a.book_slug.as_str(), a.index).cmp(&(b.book_slug.as_str(), b.index)));
+    }
+    // ?passage= — a `book://slug#anchor` resource resolved server-side
+    // through the shared gates + extraction; the page renders the
+    // passage or the resolution error as its warning banner (200 — RF 4).
+    let (passage_html, passage_err) = match params.get("passage") {
+        Some(resource) => match resolve_passage(&state, &user, resource).await {
+            Ok(passage) => (Some(pages::build_passage_html(&passage.text)), None),
+            Err((_status, message)) => (None, Some(message)),
+        },
+        None => (None, None),
+    };
+    pages::books_page(
+        &user,
+        &csrf,
+        &shelf_data,
+        selected_shelf.as_deref(),
+        selected_book.as_deref(),
+        &chapters,
+        passage_html,
+        passage_err.as_deref(),
+    )
+    .into_response()
 }
 
-/// GET / — home: the user's bundle listing.
+/// GET / — Browse: the user's bundle listing (mockup 01), with an
+/// optional `?type=` filter. A filter naming a type that has no
+/// concepts is unknown → the unfiltered list with the "All" chip
+/// active (Review Focus 2), never an error or an empty result.
 pub async fn home(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let master = match state.master_key_for(user.user_id).await {
@@ -1104,30 +1279,65 @@ pub async fn home(
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     let entries = cs.list().await.unwrap_or_default();
-    pages::home_page(&user, &csrf, &entries, None, None).into_response()
+    // Broken links, mirroring graph_data's walk: a concept whose body
+    // links to a path that is not in the bundle is flagged on its row.
+    let known: std::collections::HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let mut broken = std::collections::HashSet::new();
+    for entry in &entries {
+        if let Ok(concept) = cs.get(&entry.path).await {
+            for target in mycelium_core::links::scan_links(&concept.body) {
+                if !known.contains(&target) {
+                    broken.insert(entry.path.clone());
+                }
+            }
+        }
+    }
+    // The filter only applies when it names a type present in the
+    // bundle; anything else renders the unfiltered list.
+    let known_types: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.concept_type.as_str()).collect();
+    let type_filter = match params.get("type") {
+        Some(t) if known_types.contains(t.as_str()) => Some(t.as_str()),
+        _ => None,
+    };
+    pages::home_page(&user, &csrf, &entries, &broken, type_filter, None, None).into_response()
 }
 
-/// GET /search — search page.
+/// GET /search — search page, with an optional `?scope=` filter
+/// (mockup 05's scope chips): a value naming a real scope
+/// (`user|skills|library`) narrows the merged results to that scope;
+/// an absent or unknown value renders the unfiltered list with "All"
+/// active (Task 1's unknown-filter fallback — never an error).
 pub async fn search_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
-    Query(params): Query<SearchParams>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    if params.q.is_empty() {
-        return pages::search_page(&user, &csrf, "", &[]).into_response();
+    let query = params.get("q").map(String::as_str).unwrap_or("");
+    // The scope filter only applies when it names a real scope;
+    // anything else renders the unfiltered list.
+    let scope = match params.get("scope") {
+        Some(s) if matches!(s.as_str(), "user" | "skills" | "library") => Some(s.as_str()),
+        _ => None,
+    };
+    if query.is_empty() {
+        return pages::search_page(&user, &csrf, "", scope, &[]).into_response();
     }
-    let terms = params
-        .q
+    let terms = query
         .split_whitespace()
         .map(|t| t.to_string())
         .collect::<Vec<_>>();
-    let mut query = SearchQuery::new(terms);
-    query.include_global = true; // web default: bundle + global shelves
-    let results = search_all_scopes(&state, &user, &query, true).await;
+    let mut search = SearchQuery::new(terms);
+    search.include_global = true; // web default: bundle + global shelves
+    let mut results = search_all_scopes(&state, &user, &search, true).await;
+    // Server-side scope filter: the page renders what the chips promise.
+    if let Some(scope) = scope {
+        results.retain(|r| r.scope == scope);
+    }
     crate::state::Metrics::inc(&state.metrics.searches_total);
-    pages::search_page(&user, &csrf, &params.q, &results).into_response()
+    pages::search_page(&user, &csrf, query, scope, &results).into_response()
 }
 
 /// GET /graph — graph page.
@@ -1894,16 +2104,29 @@ pub struct PassageParams {
     pub resource: String,
 }
 
-/// GET /api/v1/passages?resource=book://slug#anchor — read a passage
-/// from the shared library stacks. Global-read bookshelves are
-/// readable by all users; admin-private ones by admins only.
-pub async fn api_passage(
-    State(state): State<AppState>,
-    user: SessionUser,
-    Query(params): Query<PassageParams>,
-) -> Response {
-    let Some(book_ref) = mycelium_core::library::parse_book_ref(&params.resource) else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid book:// resource");
+/// A passage resolution failure: the HTTP status + message the API
+/// endpoint reports. The Books page renders the message as its
+/// warning banner (RF 4) — same gates, same wording, different
+/// surface.
+type PassageResolveError = (StatusCode, String);
+
+/// Resolve a `book://<slug>#<anchor>` resource for `user`: the book
+/// must exist, its shelf must be global-read (or the requester is an
+/// admin), and the passage must extract from the shared stacks
+/// (admin-configurable cap, pre-clamped). The ONE resolution path
+/// behind both GET /api/v1/passages (reports the status) and the Books
+/// page's `?passage=` reader pane (renders the message as a banner) —
+/// the visibility gates and extraction are shared, never forked.
+async fn resolve_passage(
+    state: &AppState,
+    user: &SessionUser,
+    resource: &str,
+) -> Result<mycelium_core::library::Passage, PassageResolveError> {
+    let Some(book_ref) = mycelium_core::library::parse_book_ref(resource) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid book:// resource".to_string(),
+        ));
     };
     // The book must exist and its shelf must be global-read (or the
     // requester is an admin).
@@ -1913,7 +2136,7 @@ pub async fn api_passage(
         .await
         .unwrap_or(None)
     else {
-        return error_response(StatusCode::NOT_FOUND, "book not found");
+        return Err((StatusCode::NOT_FOUND, "book not found".to_string()));
     };
     let shelf_row: Option<(i64,)> =
         sqlx::query_as("SELECT is_global_read FROM bookshelves WHERE id = ?")
@@ -1923,10 +2146,13 @@ pub async fn api_passage(
             .ok()
             .flatten();
     let Some((is_global,)) = shelf_row else {
-        return error_response(StatusCode::NOT_FOUND, "bookshelf not found");
+        return Err((StatusCode::NOT_FOUND, "bookshelf not found".to_string()));
     };
     if is_global == 0 && user.role != Role::Admin {
-        return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "bookshelf is not global-read".to_string(),
+        ));
     }
     // Read the stack text and extract the passage (admin-configurable
     // cap, pre-clamped).
@@ -1935,22 +2161,31 @@ pub async fn api_passage(
             .await
         {
             Ok(t) => t,
-            Err(_) => return error_response(StatusCode::NOT_FOUND, "book text unavailable"),
+            Err(_) => {
+                return Err((StatusCode::NOT_FOUND, "book text unavailable".to_string()));
+            }
         };
     let cap = state.security_config().await.passage_max_chars;
-    match mycelium_core::library::extract_passage_capped(
-        &book_ref.slug,
-        &book_ref.anchor,
-        &text,
-        cap,
-    ) {
+    mycelium_core::library::extract_passage_capped(&book_ref.slug, &book_ref.anchor, &text, cap)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+/// GET /api/v1/passages?resource=book://slug#anchor — read a passage
+/// from the shared library stacks. Global-read bookshelves are
+/// readable by all users; admin-private ones by admins only.
+pub async fn api_passage(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(params): Query<PassageParams>,
+) -> Response {
+    match resolve_passage(&state, &user, &params.resource).await {
         Ok(passage) => Json(serde_json::json!({
             "slug": passage.slug,
             "anchor": passage.anchor,
             "text": passage.text,
         }))
         .into_response(),
-        Err(e) => error_response(StatusCode::NOT_FOUND, &e.to_string()),
+        Err((status, message)) => error_response(status, &message),
     }
 }
 

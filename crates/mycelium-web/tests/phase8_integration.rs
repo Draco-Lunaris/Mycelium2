@@ -232,7 +232,12 @@ async fn global_bookshelves_browse_search_and_skills() {
     let mallory_cookie = cookie_from(&login_mallory);
     let mallory_csrf = csrf_from_page(&client, &format!("{base}/"), &mallory_cookie).await;
 
-    // 5. Browse page: mallory sees ONLY the global-read shelf.
+    // 5. Books page: mallory sees ONLY the global-read shelf. (Task 4
+    //    rebuild: the unselected view is the shelves table — name,
+    //    visibility chip, books count; book slugs surface in the
+    //    SELECTED shelf's chapter list, so the slug assertions target
+    //    the `?shelf=` view, and selecting a shelf the user cannot see
+    //    falls back to the unselected view.)
     let browse = client
         .get(format!("{base}/books"))
         .header("cookie", &mallory_cookie)
@@ -242,14 +247,46 @@ async fn global_bookshelves_browse_search_and_skills() {
     assert_eq!(browse.status(), 200);
     let browse_html = browse.text().await.unwrap();
     assert!(browse_html.contains("Public Shelf"));
-    assert!(browse_html.contains("public-book"));
     assert!(
         !browse_html.contains("Secret Shelf"),
         "private shelf must not appear for users"
     );
+    // The selected view lists the public book's chapters — its slug
+    // rides the passage links — and never the private book's.
+    let selected = client
+        .get(format!("{base}/books?shelf=Public%20Shelf"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), 200);
+    let selected_html = selected.text().await.unwrap();
     assert!(
-        !browse_html.contains("secret-book"),
+        selected_html.contains("public-book"),
+        "selected shelf lists the public book's chapters: {selected_html}"
+    );
+    assert!(
+        !selected_html.contains("secret-book"),
         "private-shelf book must not appear for users"
+    );
+    // Selecting a shelf mallory cannot see selects nothing (the
+    // unknown-filter fallback: the unselected view renders — no
+    // chapters, no private slugs).
+    let secret_select = client
+        .get(format!("{base}/books?shelf=Secret%20Shelf"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(secret_select.status(), 200);
+    let secret_select_html = secret_select.text().await.unwrap();
+    assert!(
+        !secret_select_html.contains("secret-book"),
+        "invisible shelf must not select for users"
+    );
+    assert!(
+        !secret_select_html.contains("chapter-list"),
+        "invisible shelf must not render a chapter list"
     );
     // Admin sees both.
     let admin_browse = client

@@ -4,6 +4,7 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use mycelium_auth::rbac::{Role, SessionUser};
+use mycelium_core::concept::Concept;
 
 use crate::middleware::SessionId;
 
@@ -22,7 +23,7 @@ pub fn layout(
     layout_with_scripts(title, user, csrf, active_path, body, &[])
 }
 
-/// Layout with extra script sources (e.g. graph.js).
+/// Layout with extra script sources (e.g. graph.js) — no module scripts.
 pub fn layout_with_scripts(
     title: &str,
     user: Option<&SessionUser>,
@@ -31,13 +32,15 @@ pub fn layout_with_scripts(
     body: String,
     extra_scripts: &[&str],
 ) -> Html<String> {
-    layout_full(title, user, csrf, active_path, body, extra_scripts, "")
+    layout_full(title, user, csrf, active_path, body, extra_scripts, &[], "")
 }
 
-/// Full-control layout: extra scripts + a body class (e.g. the chat
-/// page's full-viewport mode). Adapts the session user to the shell's
-/// primitive `(name, is_admin)` pair and delegates the whole document
-/// to `mycelium_ui::shell::shell`.
+/// Full-control layout: extra classic scripts + module scripts (the
+/// hydrate bundle) + a body class (e.g. the chat page's full-viewport
+/// mode). Adapts the session user to the shell's primitive
+/// `(name, is_admin)` pair and delegates the whole document to
+/// `mycelium_ui::shell::shell`.
+#[allow(clippy::too_many_arguments)]
 pub fn layout_full(
     title: &str,
     user: Option<&SessionUser>,
@@ -45,6 +48,7 @@ pub fn layout_full(
     active_path: &str,
     body: String,
     extra_scripts: &[&str],
+    module_scripts: &[&str],
     body_class: &str,
 ) -> Html<String> {
     let user = user.map(|u| (u.username.as_str(), u.role == Role::Admin));
@@ -55,6 +59,7 @@ pub fn layout_full(
         active_path,
         body,
         extra_scripts,
+        module_scripts,
         body_class,
     ))
 }
@@ -129,127 +134,213 @@ pub fn setup_created(username: &str, recovery_key: &str) -> Html<String> {
     Html(mycelium_ui::shell::auth_shell("Setup complete", body))
 }
 
-/// Home: the user's private bundle listing.
+/// Browse: the user's private bundle listing (mockup 01) — the page
+/// title row with the New-concept action and the type-chip filter,
+/// then the concept table (title link, type chip, broken-links flag,
+/// updated timestamp) or the empty state. `entries` is the FULL
+/// listing: the chip row derives from the types present in it, and
+/// `type_filter` (validated by the handler against those types)
+/// narrows the table rows; `broken` carries the paths whose concept
+/// links point outside the bundle. Cell and action strings are
+/// server-composed trusted markup — user text (titles, paths, types)
+/// is `html_escape`d here before composition, then interpolated raw
+/// by the components (the shell's page-body contract).
 pub fn home_page(
     user: &SessionUser,
     csrf: &str,
     entries: &[mycelium_store::ConceptEntry],
+    broken: &std::collections::HashSet<String>,
+    type_filter: Option<&str>,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
-    let rows = entries
+    // Type-chip set: one chip per type present in the bundle (sorted
+    // for deterministic output) plus the "All" chip. The active chip:
+    // the filter when it names a present type, otherwise "All" (a
+    // filter value no concept carries falls back to the unfiltered
+    // list — Review Focus 2 — so "All" is the honest active state).
+    let mut types: Vec<&str> = entries
         .iter()
+        .map(|e| e.concept_type.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    types.sort_unstable();
+    let filter_chip = |label: &str, href: &str, active: bool| {
+        format!(
+            r#"<a class="chip{}" href="{}">{}</a>"#,
+            if active { " chip--accent" } else { "" },
+            href,
+            html_escape(label)
+        )
+    };
+    let mut chips = filter_chip("All", "/", type_filter.is_none());
+    for t in types {
+        chips.push_str(&filter_chip(
+            t,
+            &format!("/?type={}", urlencoding_encode(t)),
+            type_filter == Some(t),
+        ));
+    }
+    // Actions: the New-concept primary button (an anchor — works
+    // without script) plus the filter chips, one row (mockup 01).
+    let actions = format!(
+        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}"#,
+        mycelium_ui::button_class("primary")
+    );
+    // Table rows: the filter narrows the listing; each row's cells are
+    // composed from escaped fragments (the link label) and trusted
+    // component output (the type chip, the constant flag span).
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .filter(|e| type_filter.is_none_or(|t| e.concept_type == t))
         .map(|e| {
-            format!(
-                r#"<tr><td><a href="/concept?path={}">{}</a></td><td>{}</td><td>{}</td></tr>"#,
+            let title_link = format!(
+                r#"<a href="/concept?path={}">{}</a>"#,
                 urlencoding_encode(&e.path),
-                html_escape(&e.title),
-                html_escape(&e.concept_type),
-                html_escape(&e.updated_at)
-            )
+                html_escape(&e.title)
+            );
+            let type_chip =
+                mycelium_ui::render::render(mycelium_ui::chip(&e.concept_type, "neutral"));
+            let flag = if broken.contains(&e.path) {
+                r#"<span class="flag flag--warning">broken links</span>"#.to_string()
+            } else {
+                String::new()
+            };
+            vec![title_link, type_chip, flag, html_escape(&e.updated_at)]
         })
-        .collect::<String>();
+        .collect();
+    let content = if rows.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No concepts yet",
+            "Create your first concept to begin.",
+        ))
+    } else {
+        mycelium_ui::render::render(mycelium_ui::data_table(
+            &["Title", "Type", "Broken links", "Updated"],
+            &rows,
+        ))
+    };
     let body = format!(
-        r#"<h1>Your bundle</h1>
-{}
-<p class="muted">{} concepts. <a href="/concept?new=1">New concept</a></p>
-<table><tr><th>Title</th><th>Type</th><th>Updated</th></tr>{rows}</table>"#,
+        "{}{}{}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Browse", actions)),
         flash(ok, err),
-        entries.len()
+        content
     );
-    layout("Home", Some(user), csrf, "/", body)
+    layout("Browse", Some(user), csrf, "/", body)
 }
 
-/// Concept view/edit page (plain textarea with the raw markdown).
-pub fn concept_page(
+/// The concept editor/viewer (Task 2 rebuild — the one page fn the
+/// three legacy editors collapsed into): breadcrumb, page header with
+/// Save + Delete (the keys page's confirm-dialog pattern), the
+/// frontmatter warning banner, and the two-pane body — the markdown
+/// source textarea beside the static, server-rendered preview.
+///
+/// Escaping: `markdown` round-trips through [`textarea_escape`] into
+/// the textarea; `preview_html` is a TRUSTED-markup slot — it is
+/// built by [`build_preview_html`] from html-escaped fragments only
+/// (escape-then-compose, the spec's body-interpolation contract), so
+/// it is interpolated raw here. All other user text (path, scope, the
+/// banner message) is escaped at composition.
+///
+/// `editable=false` renders the read-only viewer (library always;
+/// global skills for non-admins). An empty `path` renders the
+/// new-concept form (path input + template, no delete — nothing is
+/// saved yet). `scope` keeps the write aimed at the right store (the
+/// hidden form field, and the delete form + dialog carry it too) and
+/// shows a muted scope note in the header actions.
+#[allow(clippy::too_many_arguments)]
+pub fn concept_editor(
     user: &SessionUser,
     csrf: &str,
     path: &str,
     markdown: &str,
-    ok: Option<&str>,
-    err: Option<&str>,
-) -> Html<String> {
-    let body = format!(
-        r#"<h1>{}</h1>
-{}
-<form method="post" action="/concept">
-  <input type="hidden" name="path" value="{}">
-  <label>Markdown (frontmatter + body)</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Save</button>
-  <button type="submit" name="delete" value="1" class="danger" formaction="/concept/delete">Delete</button>
-</form>"#,
-        html_escape(path),
-        flash(ok, err),
-        html_escape(path),
-        textarea_escape(markdown)
-    );
-    layout("Concept", Some(user), csrf, "/concept", body)
-}
-
-/// Concept view page for a scoped store (library catalogs, global
-/// skills). `editable` controls whether the save/delete form renders
-/// (library: never; global skills: admins only).
-pub fn concept_page_scoped(
-    user: &SessionUser,
-    csrf: &str,
-    path: &str,
-    markdown: &str,
+    preview_html: String,
+    frontmatter_error: Option<&str>,
+    scope: Option<&str>,
     editable: bool,
-    scope: &str,
 ) -> Html<String> {
+    let is_new = path.is_empty();
+    let title: &str = if is_new { "New concept" } else { path };
+    // Breadcrumb: Browse → this concept (a plain label, no href).
+    let breadcrumb = mycelium_ui::render::render(mycelium_ui::breadcrumb(&[
+        ("Browse", Some("/")),
+        (title, None),
+    ]));
+    // Header actions: a muted scope note, then Save (+ Delete when a
+    // concept is saved). The Delete trigger sits inside its own
+    // per-item form (hidden csrf + path + scope): without script,
+    // clicking it POSTs /concept/delete directly; with confirm.js, the
+    // click is intercepted and the shared dialog opens instead.
     let scope_note = match scope {
-        "library" => " <span class=\"muted\">(library — read-only)</span>",
-        "skills" => " <span class=\"muted\">(global skills)</span>",
+        Some("library") => r#"<span class="muted">(library — read-only)</span>"#,
+        Some("skills") => r#"<span class="muted">(global skills)</span>"#,
         _ => "",
     };
-    let form = if editable {
-        format!(
-            r#"<form method="post" action="/concept">
-  <input type="hidden" name="path" value="{}">
-  <input type="hidden" name="scope" value="{scope}">
-  <label>Markdown (frontmatter + body)</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Save</button>
-  <button type="submit" name="delete" value="1" class="danger" formaction="/concept/delete">Delete</button>
-</form>"#,
-            html_escape(path),
-            textarea_escape(markdown)
+    let show_delete = editable && !is_new;
+    let (actions, dialog, confirm_script) = if show_delete {
+        let mut delete_fields = format!(
+            r#"<input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="path" value="{}">"#,
+            html_escape(csrf),
+            html_escape(path)
+        );
+        if let Some(s) = scope {
+            delete_fields.push_str(&format!(
+                r#"<input type="hidden" name="scope" value="{}">"#,
+                html_escape(s)
+            ));
+        }
+        let delete_form = format!(
+            r#"<form method="post" action="/concept/delete">{delete_fields}<button type="submit" class="btn btn--danger" data-confirm-dialog="delete">Delete</button></form>"#
+        );
+        // One shared dialog: the path (and scope) are server-rendered
+        // into its hidden fields — one concept per page — so confirm.js
+        // needs no per-trigger copying. The hidden values render
+        // through leptos attribute positions (escaped there).
+        let mut dialog_fields = vec![
+            ("path".to_string(), path.to_string()),
+            ("csrf_token".to_string(), csrf.to_string()),
+        ];
+        if let Some(s) = scope {
+            dialog_fields.push(("scope".to_string(), s.to_string()));
+        }
+        let dialog = mycelium_ui::render::render(mycelium_ui::confirm_dialog(
+            "delete",
+            "Delete this concept?",
+            "This cannot be undone.",
+            "Delete",
+            "danger",
+            "/concept/delete",
+            &dialog_fields,
+        ));
+        (
+            format!(
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>{delete_form}"#
+            ),
+            dialog,
+            true,
+        )
+    } else if editable {
+        // New concept: Save only — nothing is saved to delete yet.
+        (
+            format!(
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>"#
+            ),
+            String::new(),
+            false,
         )
     } else {
-        format!(
-            r#"<label>Markdown (read-only)</label>
-<textarea readonly spellcheck="false">{}</textarea>"#,
-            textarea_escape(markdown)
-        )
+        (scope_note.to_string(), String::new(), false)
     };
-    let body = format!(
-        r#"<h1>{}{scope_note}</h1>
-{form}"#,
-        html_escape(path)
-    );
-    layout("Concept", Some(user), csrf, "/concept", body)
-}
-
-/// New-concept page.
-pub fn new_concept_page(user: &SessionUser, csrf: &str, err: Option<&str>) -> Html<String> {
-    let _ = err; // parse errors surface on submit instead
-    new_concept_page_with(
-        user,
-        csrf,
-        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
-        None,
-    )
-}
-
-/// New-concept page with a custom template and target scope. The form
-/// posts back with the scope so the write lands in the right store.
-pub fn new_concept_page_with(
-    user: &SessionUser,
-    csrf: &str,
-    template: &str,
-    scope: Option<&str>,
-) -> Html<String> {
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(title, actions));
+    let warning = frontmatter_error
+        .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
+        .unwrap_or_default();
+    // The source pane: the save form posts /concept with the path,
+    // scope, csrf, and markdown; the hidden csrf_token keeps the
+    // native form path working without app.js. The Save button lives
+    // in the header and submits this form via the HTML5 `form=`
+    // attribute (valid without script).
     let scope_input = scope
         .map(|s| {
             format!(
@@ -258,82 +349,316 @@ pub fn new_concept_page_with(
             )
         })
         .unwrap_or_default();
-    let body = format!(
-        r#"<h1>New concept</h1>
-<form method="post" action="/concept">
+    let path_input = if is_new {
+        r#"<label>Path (e.g. /notes/my-note.md)</label>
+  <input name="path" required pattern="/.*\.md" placeholder="/notes/my-note.md">"#
+            .to_string()
+    } else {
+        format!(
+            r#"<input type="hidden" name="path" value="{}">"#,
+            html_escape(path)
+        )
+    };
+    let pane = if editable {
+        format!(
+            r#"<form class="editor-pane" id="concept-editor-form" method="post" action="/concept">
+  {path_input}
   {scope_input}
-  <label>Path (e.g. /notes/my-note.md)</label>
-  <input name="path" required pattern="/.*\.md" placeholder="/notes/my-note.md">
-  <label>Markdown</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Create</button>
+  <input type="hidden" name="csrf_token" value="{}">
+  <label>Markdown (frontmatter + body)</label>
+  <textarea name="markdown" class="editor-source" spellcheck="false">{}</textarea>
 </form>"#,
-        html_escape(template)
+            html_escape(csrf),
+            textarea_escape(markdown)
+        )
+    } else {
+        format!(
+            r#"<div class="editor-pane">
+  <label>Markdown (read-only)</label>
+  <textarea class="editor-source" readonly spellcheck="false">{}</textarea>
+</div>"#,
+            textarea_escape(markdown)
+        )
+    };
+    let body = format!(
+        "{breadcrumb}{header}{warning}\
+<div class=\"editor-grid\">{pane}<div class=\"editor-preview\">{preview_html}</div></div>{dialog}"
     );
-    layout("New concept", Some(user), csrf, "/concept", body)
+    let page_title = if is_new { "New concept" } else { "Concept" };
+    let scripts: &[&str] = if confirm_script {
+        &["/assets/confirm.js"]
+    } else {
+        &[]
+    };
+    layout_with_scripts(page_title, Some(user), csrf, "/concept", body, scripts)
 }
 
-/// Search page.
+/// Build the editor's static preview pane from the concept's markdown.
+/// Returns `(preview_html, frontmatter_error)`: the preview is composed
+/// from html-escaped fragments ONLY (escape-then-compose — the spec's
+/// body-interpolation contract), and `frontmatter_error` carries
+/// [`Concept::parse`]'s own message — the exact parser the save path
+/// and `ConceptStore::get` validate with, so the banner's wording is
+/// always the error a save would reject with (error parity).
+///
+/// Renderer choice (per the brief): no markdown→HTML library and no
+/// client script are in scope for this pane, so the body goes through
+/// a deliberately minimal server-side conversion —
+/// [`render_minimal_body`]: blank-line paragraphs plus `#`/`##`/`###`
+/// headings, every fragment escaped. A parse error means there is no
+/// frontmatter to feature, so the pane minimally renders the raw
+/// content (frontmatter block stripped when a closing `---` line
+/// exists) and the warning banner explains the rest.
+pub fn build_preview_html(markdown: &str) -> (String, Option<String>) {
+    match Concept::parse("/preview.md", markdown) {
+        Ok(concept) => {
+            let mut out = String::new();
+            if let Some(title) = &concept.frontmatter.title
+                && !title.is_empty()
+            {
+                out.push_str(&format!("<h2>{}</h2>", html_escape(title)));
+            }
+            out.push_str(&mycelium_ui::render::render(mycelium_ui::chip(
+                &concept.frontmatter.concept_type,
+                "neutral",
+            )));
+            if let Some(description) = &concept.frontmatter.description
+                && !description.is_empty()
+            {
+                out.push_str(&format!("<p>{}</p>", html_escape(description)));
+            }
+            out.push_str(&render_minimal_body(&concept.body));
+            (out, None)
+        }
+        Err(e) => (
+            render_minimal_body(&strip_frontmatter_block(markdown)),
+            Some(e.to_string()),
+        ),
+    }
+}
+
+/// Minimal markdown→HTML for the preview pane: the body splits on blank
+/// lines into `<p>` paragraphs; a line starting `# `/`## `/`### `
+/// renders as `<h2>`/`<h3>`/`<h4>` (prefix stripped). Every fragment is
+/// html-escaped BEFORE composition — hostile markup can never become
+/// executable HTML here.
+fn render_minimal_body(body: &str) -> String {
+    fn flush(out: &mut String, para: &mut Vec<&str>) {
+        if para.is_empty() {
+            return;
+        }
+        out.push_str(&format!("<p>{}</p>", html_escape(&para.join("\n"))));
+        para.clear();
+    }
+    let mut out = String::new();
+    let mut para: Vec<&str> = Vec::new();
+    for line in body.split('\n') {
+        if let Some((tag, rest)) = heading_of(line) {
+            flush(&mut out, &mut para);
+            out.push_str(&format!("<{tag}>{}</{tag}>", html_escape(rest)));
+        } else if line.trim().is_empty() {
+            flush(&mut out, &mut para);
+        } else {
+            para.push(line);
+        }
+    }
+    flush(&mut out, &mut para);
+    out
+}
+
+/// `# `/`## `/`### ` → (`h2`|`h3`|`h4`, rest-of-line); every other line
+/// is paragraph text (longer heading runs like `#### ` stay prose).
+fn heading_of(line: &str) -> Option<(&'static str, &str)> {
+    if let Some(rest) = line.strip_prefix("### ") {
+        Some(("h4", rest))
+    } else if let Some(rest) = line.strip_prefix("## ") {
+        Some(("h3", rest))
+    } else if let Some(rest) = line.strip_prefix("# ") {
+        Some(("h2", rest))
+    } else {
+        None
+    }
+}
+
+/// Strip a leading `---\n…\n---\n` frontmatter block. Used only on the
+/// parse-error path (where `Concept::parse` could not split it): a
+/// naive scan mirroring the core splitter's rules — CRLF normalized to
+/// LF and a leading BOM stripped first (the same normalization
+/// concept.rs applies before splitting, so a CRLF/BOM document previews
+/// like its LF twin), then the opening `---\n` + closing `---`-line
+/// match; without a closing `---` line nothing is stripped — the whole
+/// input previews as typed. Owned: the normalization may copy.
+fn strip_frontmatter_block(markdown: &str) -> String {
+    let normalized = if markdown.contains("\r\n") {
+        markdown.replace("\r\n", "\n")
+    } else {
+        markdown.to_string()
+    };
+    let normalized = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
+    let Some(rest) = normalized.strip_prefix("---\n") else {
+        return markdown.to_string();
+    };
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return rest[offset + line.len()..].to_string();
+        }
+        offset += line.len();
+    }
+    markdown.to_string()
+}
+
+/// Search page (Task 3 rebuild — mockup 05): the query row, the
+/// scope-chip filter, and the merged cross-scope result list.
+///
+/// `scope` is the ACTIVE chip — the handler has already validated it
+/// (`user|skills|library`; an absent or unknown value arrives as `None`
+/// and renders "All" active, Task 1's unknown-filter fallback) and has
+/// already narrowed `results` to that scope.
+///
+/// Body order: page header, the query row (a plain GET form — a
+/// `field`-shaped input carrying the query in its value attribute plus
+/// the primary submit, no script), the scope chips (GET links
+/// `?q=…&scope=…`, the active one accented), then the count line and
+/// the result list — or the empty state when a query returned nothing.
+/// With no query at all the page stops at the query row.
+///
+/// Escaping: the query is user input — `html_escape` wherever it
+/// renders as text (the value attribute, the count line) and
+/// `urlencoding_encode` inside the chip hrefs; result titles and
+/// snippets are escaped at composition, concept paths are
+/// percent-encoded into hrefs, and every chip label is a fixed literal
+/// (the chip component escapes its text anyway). The lowercase row
+/// labels ("your bundle", "global skills", "library") keep the
+/// existing scope-label logic; the chip row carries the mockup's
+/// capitalized labels ("Your bundle", "Skills", "Books") — the casing
+/// split is deliberate so a scope-filtered page can assert on the
+/// lowercase row labels without matching the chip row.
 pub fn search_page(
     user: &SessionUser,
     csrf: &str,
     query: &str,
+    scope: Option<&str>,
     results: &[crate::api::ScopedResult],
 ) -> Html<String> {
-    let rows = results
-        .iter()
-        .map(|r| {
-            // Scope-aware links: user bundle and library/skills concepts
-            // open in the right viewer.
-            let (href, label) = match r.scope {
-                "library" => (
-                    format!(
-                        "/concept?path={}&scope=library",
-                        urlencoding_encode(&r.concept_path)
-                    ),
-                    "library",
-                ),
-                "skills" => (
-                    format!(
-                        "/concept?path={}&scope=skills",
-                        urlencoding_encode(&r.concept_path)
-                    ),
-                    "global skills",
-                ),
-                _ => (
-                    format!("/concept?path={}", urlencoding_encode(&r.concept_path)),
-                    "your bundle",
-                ),
-            };
-            format!(
-                r#"<li><a href="{href}">{}</a> <span class="muted">({label}, score {:.1})</span><br><span class="muted">{}</span></li>"#,
-                html_escape(&r.title),
-                r.score,
-                html_escape(&r.snippet)
-            )
-        })
-        .collect::<String>();
-    let body = format!(
-        r#"<h1>Search</h1>
-<form method="get" action="/search">
-  <input name="q" value="{}" placeholder="Search your bundle and global shelves" autofocus>
-  <button type="submit">Search</button>
-</form>
-<ul>{rows}</ul>"#,
+    let queried = !query.is_empty();
+    // Query row: plain GET form. The input re-carries the query
+    // (escaped into the value attribute) so a refinement keeps the
+    // text; the field shape gives it the label-above-input styling and
+    // the primary submit needs no script.
+    let query_row = format!(
+        r#"<form method="get" action="/search">
+  <div class="field">
+    <label for="search-q">Query</label>
+    <input id="search-q" type="text" name="q" value="{}" placeholder="Search across bundle, skills, and books" autofocus>
+  </div>
+  <button type="submit" class="btn btn--primary">Search</button>
+</form>"#,
         html_escape(query)
+    );
+    // Scope chips: GET links that re-run the query narrowed to one
+    // scope — "All" drops the scope param. The active chip mirrors the
+    // scope the handler kept (None → "All").
+    let chips = if queried {
+        let enc = urlencoding_encode(query);
+        let chip = |label: &str, href: String, active: bool| {
+            format!(
+                r#"<a class="chip{}" href="{}">{}</a>"#,
+                if active { " chip--accent" } else { "" },
+                href,
+                html_escape(label)
+            )
+        };
+        let mut chips = vec![chip("All", format!("/search?q={enc}"), scope.is_none())];
+        for (param, label) in [
+            ("user", "Your bundle"),
+            ("skills", "Skills"),
+            ("library", "Books"),
+        ] {
+            chips.push(chip(
+                label,
+                format!("/search?q={enc}&scope={param}"),
+                scope == Some(param),
+            ));
+        }
+        format!(r#"<p class="scope-chips">{}</p>"#, chips.join(" "))
+    } else {
+        String::new()
+    };
+    // Count + results — only for a query that ran. Zero hits render
+    // the empty state instead of an empty list.
+    let content = if !queried {
+        String::new()
+    } else if results.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No results",
+            "Try a different search or scope.",
+        ))
+    } else {
+        let rows = results
+            .iter()
+            .map(|r| {
+                // Scope-aware links + labels (the existing routing
+                // logic): user bundle, global skills, and library
+                // concepts open in the right viewer.
+                let (href, label) = match r.scope {
+                    "library" => (
+                        format!(
+                            "/concept?path={}&scope=library",
+                            urlencoding_encode(&r.concept_path)
+                        ),
+                        "library",
+                    ),
+                    "skills" => (
+                        format!(
+                            "/concept?path={}&scope=skills",
+                            urlencoding_encode(&r.concept_path)
+                        ),
+                        "global skills",
+                    ),
+                    _ => (
+                        format!("/concept?path={}", urlencoding_encode(&r.concept_path)),
+                        "your bundle",
+                    ),
+                };
+                format!(
+                    r#"<li><a href="{href}">{}</a> {}<br><span class="muted">{}</span></li>"#,
+                    html_escape(&r.title),
+                    mycelium_ui::render::render(mycelium_ui::chip(label, "neutral")),
+                    html_escape(&r.snippet)
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<p class="muted">{} results for "{}"</p><ul>{rows}</ul>"#,
+            results.len(),
+            html_escape(query)
+        )
+    };
+    let body = format!(
+        "{}{query_row}{chips}{content}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Search", String::new()))
     );
     layout("Search", Some(user), csrf, "/search", body)
 }
 
 /// Graph page (loads graph.js for the force-directed visualization).
+/// Mockup 06: PageHeader above the full-height panel; the type legend
+/// (`#graph-legend`, bottom-left overlay — populated client-side from
+/// the loaded data) and the node info card (`#graph-info`, top-right
+/// overlay) anchor to the `position: relative` `#graph-wrap`; the
+/// usage hint sits under the panel.
 pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<h1>Graph</h1>
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("Graph", String::new()));
+    let body = format!(
+        r#"{header}
 <div id="graph-wrap">
   <div id="graph-info" hidden></div>
   <div id="graph"></div>
+  <div id="graph-legend" class="graph-legend" hidden></div>
 </div>
-<div class="muted" id="graph-legend">drag nodes to rearrange · scroll to zoom · drag background to pan · click a node to open</div>"#
-        .to_string();
+<div class="graph-hint">drag nodes to rearrange · scroll to zoom · drag background to pan · click a node to open</div>"#
+    );
     layout_full(
         "Graph",
         Some(user),
@@ -341,15 +666,25 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
         "/graph",
         body,
         &["/assets/graph.js"],
+        &[],
         "graph-page",
     )
 }
 
-/// Skills page: private skills + global skills (read-only for users,
-/// editable by admins). Nested skills (`/<slug>/skill.md` hubs) render
-/// as one group: the hub row with companions and manifest script
-/// labels indented beneath it; legacy root-level skills stay flat
-/// rows exactly as before.
+/// Skills page (Task 6 rebuild): the PageHeader with the
+/// New-private-skill primary action, then two cards — "Your private
+/// skills" and "Global skills". Nested skills (`/<slug>/skill.md`
+/// hubs) render as one group per card: the hub row with companions
+/// and manifest script labels indented beneath it (`.group-indent`);
+/// legacy root-level skills stay flat rows. An empty section renders
+/// the empty state inside its card; the admin-only "New global
+/// skill" link stays below the global list (the card header's
+/// action slot lands in a later PR — the card is title-only here).
+///
+/// Escaping: the card bodies are trusted-markup slots composed from
+/// escaped fragments — entry titles `html_escape`d, hrefs
+/// percent-encoded via [`urlencoding_encode`], script paths
+/// `html_escape`d (the raw-slot contract: escape at composition).
 #[allow(clippy::too_many_arguments)]
 pub fn skills_page(
     user: &SessionUser,
@@ -369,8 +704,10 @@ pub fn skills_page(
         )
     };
     // One nested skill: hub row, then companions and manifest script
-    // labels indented beneath it. Scripts are label-only rows — raw
-    // payload files, not concepts, so they carry no link.
+    // labels indented beneath it (`group-indent` on the nested list —
+    // one class indents member rows and label rows alike). Scripts
+    // are label-only rows — raw payload files, not concepts, so they
+    // carry no link.
     let group_block = |g: &mycelium_store::SkillGroup, scripts: &[String], scope: &str| {
         let members = g
             .members
@@ -382,15 +719,23 @@ pub fn skills_page(
             .map(|p| format!(r#"<li class="muted">{}</li>"#, html_escape(p)))
             .collect::<String>();
         format!(
-            r#"<li>{}<ul>{members}{labels}</ul></li>"#,
+            r#"<li>{}<ul class="group-indent">{members}{labels}</ul></li>"#,
             entry_link(&g.hub, scope)
         )
     };
-    // One section: grouped blocks (slug order), then flat rows.
-    let list = |groups: &[mycelium_store::SkillGroup],
-                scripts: &[Vec<String>],
-                flat: &[mycelium_store::ConceptEntry],
-                scope: &str| {
+    // One section body: grouped blocks (slug order), then flat rows;
+    // an empty section renders the empty state instead of a bare
+    // list.
+    let section_body = |groups: &[mycelium_store::SkillGroup],
+                        scripts: &[Vec<String>],
+                        flat: &[mycelium_store::ConceptEntry],
+                        scope: &str| {
+        if groups.is_empty() && flat.is_empty() {
+            return mycelium_ui::render::render(mycelium_ui::empty_state(
+                "No skills yet",
+                "Create or install a skill to begin.",
+            ));
+        }
         let rows = groups
             .iter()
             .zip(scripts.iter())
@@ -402,142 +747,316 @@ pub fn skills_page(
             .collect::<String>();
         format!("<ul>{rows}</ul>")
     };
-    let global_section = if user.role == Role::Admin {
+    let global_list = section_body(global_groups, global_scripts, global_flat, "skills");
+    // The admin's create link stays below the global list (the
+    // existing conditional — users see none of it).
+    let global_body = if user.role == Role::Admin {
         format!(
-            r#"<h2>Global skills</h2>
-<ul>{}</ul>
-<p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#,
-            list(global_groups, global_scripts, global_flat, "skills")
+            r#"{global_list}<p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#
         )
     } else {
-        format!(
-            r#"<h2>Global skills</h2>
-<ul>{}</ul>"#,
-            list(global_groups, global_scripts, global_flat, "skills")
-        )
+        global_list
     };
+    // Actions: the New-private-skill primary button (an anchor —
+    // works without script).
+    let actions = format!(
+        r#"<a class="{}" href="/concept?new=1&scope=skills-private">New private skill</a>"#,
+        mycelium_ui::button_class("primary")
+    );
     let body = format!(
-        r#"<h1>Skills</h1>
-<h2>Your private skills</h2>
-<ul>{}</ul>
-<p><a href="/concept?new=1&scope=skills-private">New private skill</a></p>
-{global_section}"#,
-        list(private_groups, private_scripts, private_flat, "user"),
+        "{}{}{}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Skills", actions)),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Your private skills",
+            section_body(private_groups, private_scripts, private_flat, "user"),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card("Global skills", global_body)),
     );
     layout("Skills", Some(user), csrf, "/skills", body)
 }
 
-/// Books browse page: shelves with their books. Each book links to its
-/// catalog hub (library scope concept viewer).
+/// Books page (Task 4 rebuild — mockup 07): the shelves table with the
+/// books-count column, the selected shelf's chapter list, and the
+/// passage reader pane — all server-rendered, no script.
+///
+/// Body order: breadcrumb (Books → shelf → book once a shelf is
+/// selected — the concept editor's pattern), the page header, the
+/// passage warning banner (RF 4 — a resolution failure renders
+/// in-page as a banner, never a 500), the shelves `data_table` (Shelf,
+/// Visibility chip, Books count, the row's Browse link), the selected
+/// shelf's chapter list (`<ol class="chapter-list">` of numbered rows,
+/// each linking `?shelf=…&passage=book://slug%23anchor`), then the
+/// reader pane (class `reader-pane`, the passage's server-composed
+/// HTML interpolated raw — trusted markup from escaped fragments).
+///
+/// Escaping: `data_table` cells and the reader pane are raw-markup
+/// slots — shelf names, book titles, and chapter titles are
+/// `html_escape`d at composition (the Task-1 contract), href values
+/// percent-encoded via [`urlencoding_encode`]. The passage query
+/// value keeps its `book://` scheme literal with only the slug and
+/// anchor percent-encoded (`#` → `%23`, so the resource string stays
+/// ONE query value); `chapters` arrives as plain data from the
+/// handler (this PR's gather/compose split), carrying each row's
+/// per-book chapter number and the catalog's REAL anchor.
+#[allow(clippy::too_many_arguments)]
 pub fn books_page(
     user: &SessionUser,
     csrf: &str,
     shelves: &[crate::api::ShelfBrowse],
+    selected_shelf: Option<&str>,
+    selected_book: Option<&str>,
+    chapters: &[crate::api::ChapterRow],
+    passage_html: Option<String>,
+    passage_err: Option<&str>,
 ) -> Html<String> {
-    let sections = shelves
+    // Breadcrumb: Books → shelf → book (the shelf crumb keeps the
+    // selection; the book crumb is the leaf).
+    let shelf_href = selected_shelf.map(|s| format!("/books?shelf={}", urlencoding_encode(s)));
+    let mut crumbs: Vec<(&str, Option<&str>)> = vec![("Books", Some("/books"))];
+    if let Some(shelf) = selected_shelf {
+        crumbs.push((shelf, shelf_href.as_deref()));
+    }
+    if let Some(book) = selected_book {
+        crumbs.push((book, None));
+    }
+    let breadcrumb = if crumbs.len() > 1 {
+        mycelium_ui::render::render(mycelium_ui::breadcrumb(&crumbs))
+    } else {
+        String::new()
+    };
+    // Shelves table: the count column is the SQL book listing's length
+    // (RF 3 — the count must match what the row's Browse link opens).
+    let rows: Vec<Vec<String>> = shelves
         .iter()
         .map(|(name, is_global, books)| {
-            let visibility = if *is_global { "global-read" } else { "admin-private" };
-            let rows = if books.is_empty() {
-                r#"<p class="muted">No books yet.</p>"#.to_string()
+            let vis_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if *is_global { "global-read" } else { "private" },
+                if *is_global { "accent" } else { "neutral" },
+            ));
+            let browse = format!(
+                r#"<a href="/books?shelf={}">Browse</a>"#,
+                urlencoding_encode(name)
+            );
+            vec![html_escape(name), vis_chip, books.len().to_string(), browse]
+        })
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Shelf", "Visibility", "Books", ""],
+        &rows,
+    ));
+    // The selected shelf's chapters, one numbered row per chapter.
+    // `value` keeps the row's number the chapter's REAL index, so a
+    // narrowed (`?book=`) or multi-book list stays per-book correct.
+    let chapters_section = selected_shelf
+        .map(|shelf| {
+            let shelf_enc = urlencoding_encode(shelf);
+            let list = if chapters.is_empty() {
+                mycelium_ui::render::render(mycelium_ui::empty_state(
+                    "No chapters",
+                    "This shelf holds no ingested books yet.",
+                ))
             } else {
-                let items = books
+                let items = chapters
                     .iter()
-                    .map(|(slug, title)| {
+                    .map(|ch| {
+                        let href = format!(
+                            "/books?shelf={shelf_enc}&passage=book://{}%23{}",
+                            urlencoding_encode(&ch.book_slug),
+                            urlencoding_encode(&ch.anchor)
+                        );
                         format!(
-                            r#"<li><a href="/concept?path=/{slug}/book.md&scope=library">{}</a> <span class="muted">({slug})</span></li>"#,
-                            html_escape(title)
+                            r#"<li value="{}"><a href="{}">{}</a></li>"#,
+                            ch.index,
+                            href,
+                            html_escape(&ch.title)
                         )
                     })
                     .collect::<String>();
-                format!("<ul>{items}</ul>")
+                format!(r#"<ol class="chapter-list">{items}</ol>"#)
             };
-            format!(
-                r#"<h2>{}</h2>
-<p class="muted">{visibility}</p>
-{rows}"#,
-                html_escape(name)
-            )
+            format!("<h2>Chapters</h2>{list}")
         })
-        .collect::<String>();
-    let body = format!(
-        r#"<h1>Bookshelves</h1>
-{sections}"#
-    );
+        .unwrap_or_default();
+    // The reader pane: trusted server-composed markup (escaped
+    // fragments — build_passage_html), interpolated raw. A resolution
+    // failure renders the warning banner instead (RF 4 — 200 + banner).
+    let reader = passage_html
+        .map(|html| format!(r#"<div class="reader-pane">{html}</div>"#))
+        .unwrap_or_default();
+    let warning = passage_err
+        .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
+        .unwrap_or_default();
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("Books", String::new()));
+    let body = format!("{breadcrumb}{header}{warning}{table}{chapters_section}{reader}");
     layout("Books", Some(user), csrf, "/books", body)
+}
+
+/// Build the Books page's passage-reader HTML from an extracted
+/// passage's markdown: the same deliberately minimal server-side
+/// conversion as the editor preview — [`render_minimal_body`]'s
+/// blank-line paragraphs + `#`/`##`/`###` headings, every fragment
+/// html-escaped BEFORE composition (escape-then-compose, the spec's
+/// body-interpolation contract — hostile book text can never become
+/// executable markup). The reader pane interpolates the result raw:
+/// trusted server-composed markup.
+pub fn build_passage_html(passage_text: &str) -> String {
+    render_minimal_body(passage_text)
 }
 
 /// Chat page: talk to the librarian agent (the same agent behind the
 /// MCP tools). Full-viewport layout: the conversation log fills the
-/// screen and scrolls; the input is pinned to the bottom.
+/// screen and scrolls; the composer is the chat_composer hydration
+/// island (Task 7) — its SSR markup IS the form, and with the hydrate
+/// bundle the island owns the submit/Enter/auto-grow wiring, handing
+/// sends to chat.js's `window.myceliumChatSend` (SSE transport + log).
 pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<div class="chat-shell">
+    let composer = mycelium_ui::render::render(mycelium_ui::chat_composer(
+        "Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)",
+    ));
+    let body = format!(
+        r#"<div class="chat-shell">
   <div class="chat-intro">
     <h1>Librarian</h1>
     <p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
   </div>
   <div id="chat-log" class="chat-log" aria-live="polite"></div>
-  <form id="chat-form" class="chat-input-bar">
-    <textarea id="chat-input" rows="1" placeholder="Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)" required></textarea>
-    <button type="submit">Send</button>
-  </form>
+  {composer}
 </div>"#
-        .to_string();
+    );
     layout_full(
         "Librarian",
         Some(user),
         csrf,
         "/chat",
         body,
-        &["/assets/chat.js"],
+        &["/assets/chat.js", "/assets/islands.js"],
+        &["/assets/mycelium_ui.js"],
         "chat-page",
     )
 }
 
-/// Change-password page.
+/// Change-password page (Task 9 — lone card): the PR-1 ruled None-user
+/// shell-less rendering kept (no sidebar), but the body is now a single
+/// `card("Change password", …)` — the flash banners plus the change
+/// form. The three password fields compose INLINE on the field markup
+/// pattern (the Task-3 search-page precedent): the primitive `field()`
+/// renders only `<input id type>`, while these inputs must carry
+/// name/required/minlength for the native POST; extending the shared
+/// primitive (and every consumer) for one page's attributes is the
+/// worse shape, and this markup keeps the component's exact `.field`
+/// shape (label[for] above input, id-pairing). The hidden csrf_token
+/// follows the row-form pattern (app.js skips injection when the field
+/// exists; the middleware's form path verifies it) and `form_actions`
+/// supplies the primary submit (a bare button inside a form submits
+/// natively — no JS needed). No user text beyond the flash messages,
+/// which the flash helper escapes at composition (card bodies are raw
+/// slots).
 pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<String> {
-    let body = format!(
-        r#"<h1>Change password</h1>
-{}
-<form method="post" action="/password">
-  <label>Current password</label><input type="password" name="old" required>
-  <label>New password (min 20 chars)</label><input type="password" name="new" required minlength="20">
-  <label>Repeat new password</label><input type="password" name="repeat" required minlength="20">
-  <button type="submit">Change</button>
+    let csrf_esc = html_escape(csrf);
+    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
+    let card_body = format!(
+        r#"{flashes}<form method="post" action="/password">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="pw-old">Current password</label>
+    <input id="pw-old" type="password" name="old" required>
+  </div>
+  <div class="field">
+    <label for="pw-new">New password (min 20 chars)</label>
+    <input id="pw-new" type="password" name="new" required minlength="20">
+  </div>
+  <div class="field">
+    <label for="pw-repeat">Repeat new password</label>
+    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
+  </div>
+  {actions}
 </form>"#,
-        flash(ok, err)
+        flashes = flash(ok, err),
     );
+    let body = mycelium_ui::render::render(mycelium_ui::card("Change password", card_body));
     layout("Password", None, csrf, "/password", body)
 }
 
-/// API keys page.
+/// API keys page (Task 8 rebuild — mockup 09): the page header's actions
+/// slot carries the mint form (label input + primary Mint key button,
+/// with its own server-rendered hidden CSRF token — the row-form
+/// pattern); a successful mint renders the shown-once banner card (the
+/// key in `<code id="minted-key">` beside the copy-button island, plus
+/// the explanatory copy — the value stays selectable text); the keys
+/// `data_table` lists label, status chip (active = accent, revoked =
+/// neutral), created, last used, and the row action.
+///
+/// Revoked rows render dimmed instead of live: `data_table` owns the
+/// `<tr>`, so a revoked row's composed CELL markup carries the
+/// `row--revoked` class (every cell's content wraps in it, dimming the
+/// whole visible row), and the action cell shows plain "Revoked" text —
+/// no live button (revocation is idempotent; re-revoking buys nothing).
+/// Active rows keep PR-1's exact revoke pattern: a per-row form (hidden
+/// csrf + id) whose plain submit doubles as the confirm-dialog trigger
+/// (`data-confirm-dialog` + `data-key-id`) — without JS it POSTs
+/// /keys/revoke directly; with JS, confirm.js's preventDefault opens
+/// the one shared dialog and copies the trigger's `data-key-id` into
+/// the form's hidden id input.
+///
+/// Escaping: `data_table` cells and `card` bodies are raw-markup slots
+/// — key labels are `html_escape`d at composition, the hidden CSRF
+/// tokens are `html_escape`d, ids/dates are primitives (the token is
+/// server-generated `myc2-<hex>` — no escaping positions inside it).
 pub fn keys_page(
     user: &SessionUser,
     csrf: &str,
     keys: &[mycelium_auth::api_key::ApiKeyRecord],
     minted: Option<&str>,
 ) -> Html<String> {
-    let rows = keys
+    let csrf_esc = html_escape(csrf);
+    let rows: Vec<Vec<String>> = keys
         .iter()
         .map(|k| {
-            let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
+            let revoked = k.revoked_at.is_some();
+            // A revoked row's cells each wrap their content in the
+            // dimming class — the only channel data_table gives a row
+            // to carry state (cells are raw; the `<tr>` is not).
+            let wrap = |cell: String| {
+                if revoked {
+                    format!(r#"<span class="row--revoked">{cell}</span>"#)
+                } else {
+                    cell
+                }
+            };
+            let status_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if revoked { "revoked" } else { "active" },
+                if revoked { "neutral" } else { "accent" },
+            ));
             // The trigger is a plain submit inside its own row form:
             // without JS, clicking it POSTs /keys/revoke directly (the
             // server-rendered csrf_token is the security gate); with
-            // JS, confirm.js's preventDefault opens the dialog instead.
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td><form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form></td></tr>"#,
-                html_escape(&k.label),
-                status,
-                k.created_at.format("%Y-%m-%d"),
-                k.last_used_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
-                html_escape(csrf),
-                k.id,
-                k.id
-            )
+            // JS, confirm.js's preventDefault opens the dialog
+            // instead. A revoked row gets no trigger at all — dimmed
+            // "Revoked" text in its place.
+            let action = if revoked {
+                r#"<span class="row--revoked">Revoked</span>"#.to_string()
+            } else {
+                format!(
+                    r#"<form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form>"#,
+                    csrf_esc, k.id, k.id
+                )
+            };
+            vec![
+                wrap(html_escape(&k.label)),
+                wrap(status_chip),
+                wrap(k.created_at.format("%Y-%m-%d").to_string()),
+                wrap(k
+                    .last_used_at
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()),
+                action,
+            ]
         })
-        .collect::<String>();
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Label", "Status", "Created", "Last used", ""],
+        &rows,
+    ));
     // One revoke dialog per page: confirm.js opens it from any row's
     // trigger, copying that row's data-key-id into the form's hidden
     // id input. The form's own action + hidden fields (including the
@@ -554,30 +1073,36 @@ pub fn keys_page(
             ("csrf_token".to_string(), csrf.to_string()),
         ],
     ));
+    // The shown-once banner (Task 7's copy island rides here): the key
+    // value stays selectable text (its id anchors the island's copy
+    // target); without the hydrate bundle the button is inert. The
+    // `shown-once` class marks the value row (the e2e pin).
     let minted_html = minted
-        .map(|t| format!(r#"<div class="flash ok">New key (shown once): <code>{t}</code></div>"#))
+        .map(|t| {
+            let copy = mycelium_ui::render::render(mycelium_ui::copy_button("minted-key"));
+            let body = format!(
+                r#"<p>Copy this key now — it is shown only once and cannot be retrieved later.</p><p class="shown-once"><code id="minted-key">{t}</code>{copy}</p>"#
+            );
+            mycelium_ui::render::render(mycelium_ui::card("New key — shown once", body))
+        })
         .unwrap_or_default();
-    let body = format!(
-        r#"<h1>API keys</h1>
-{minted_html}
-<table><tr><th>Label</th><th>Status</th><th>Created</th><th>Last used</th><th></th></tr>{rows}</table>
-{dialog}
-<h2>Mint a key</h2>
-<form method="post" action="/keys">
-  <label>Label</label><input name="label" required>
-  <button type="submit">Mint</button>
-</form>"#,
-        rows = rows,
-        dialog = dialog,
-        minted_html = minted_html
+    // Actions slot: the mint form, compact in the title row (mockup 09
+    // — mint/create primary right). Its hidden csrf_token follows the
+    // row-form pattern (app.js skips injection when the field exists).
+    let actions = format!(
+        r#"<form method="post" action="/keys" class="mint-form"><input type="hidden" name="csrf_token" value="{csrf_esc}"><label for="mint-label">Label</label><input id="mint-label" name="label" required><button type="submit" class="btn btn--primary">Mint key</button></form>"#
     );
-    layout_with_scripts(
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("API keys", actions));
+    let body = format!("{header}{minted_html}{table}{dialog}");
+    layout_full(
         "API keys",
         Some(user),
         csrf,
         "/keys",
         body,
-        &["/assets/confirm.js"],
+        &["/assets/confirm.js", "/assets/islands.js"],
+        &["/assets/mycelium_ui.js"],
+        "",
     )
 }
 
@@ -794,9 +1319,12 @@ mod tests {
             role: Role::User,
         };
         let entries: Vec<mycelium_store::ConceptEntry> = Vec::new();
-        let html = home_page(&user, "", &entries, None, None).0;
+        let broken = std::collections::HashSet::new();
+        let html = home_page(&user, "", &entries, &broken, None, None, None).0;
+        // Mockup 01 titles the page "Browse" (retargeted from the
+        // legacy "Your bundle" heading — spec §9.2 markup retargeting).
         assert!(
-            html.contains("<main><h1>Your bundle</h1>"),
+            html.contains(r#"<main><header class="page-header"><h1>Browse</h1>"#),
             "body should open inside <main>: {html}"
         );
         assert!(
@@ -817,7 +1345,8 @@ mod tests {
     /// Review Focus 3: the concept editor round-trips user markdown
     /// through a textarea — a hostile `</textarea><script>` sequence must
     /// be neutralized (escaped, never executable markup), matching the
-    /// XSS integration-test posture.
+    /// XSS integration-test posture. (Rebuilt editor, Task 2: the same
+    /// guarantee through `concept_editor` + its preview builder.)
     #[test]
     fn concept_editor_neutralizes_textarea_breakout() {
         let user = SessionUser {
@@ -826,7 +1355,18 @@ mod tests {
             role: Role::User,
         };
         let hostile = "</textarea><script>alert(1)</script>";
-        let html = concept_page(&user, "", "/notes/x.md", hostile, None, None).0;
+        let (preview, fm_err) = build_preview_html(hostile);
+        let html = concept_editor(
+            &user,
+            "",
+            "/notes/x.md",
+            hostile,
+            preview,
+            fm_err.as_deref(),
+            None,
+            true,
+        )
+        .0;
         assert!(
             !html.contains("<script>alert(1)</script>"),
             "raw script tag leaked through the editor textarea: {html}"
@@ -834,6 +1374,69 @@ mod tests {
         assert!(
             html.contains("&lt;/textarea&gt;"),
             "escaped form missing: {html}"
+        );
+    }
+
+    /// Task 2: the preview pane renders hostile saved markdown ESCAPED.
+    /// The minimal renderer composes from html-escaped fragments only
+    /// (escape-then-compose, the spec's body-interpolation contract), so
+    /// a stored `<script>` can never become executable markup in the
+    /// preview — the in-module mirror of the
+    /// `editor_breadcrumb_preview_hostile` integration test.
+    #[test]
+    fn editor_preview_escapes_hostile_markdown() {
+        let user = SessionUser {
+            user_id: uuid::Uuid::new_v4(),
+            username: "test".to_string(),
+            role: Role::User,
+        };
+        let hostile =
+            "---\ntype: Note\ntitle: <script>alert(1)</script>\n---\n\n<script>alert(1)</script>\n";
+        let (preview, fm_err) = build_preview_html(hostile);
+        assert!(
+            fm_err.is_none(),
+            "hostile-but-valid frontmatter must parse: {fm_err:?}"
+        );
+        let html = concept_editor(&user, "", "/notes/x.md", hostile, preview, None, None, true).0;
+        assert!(
+            html.contains(r#"<div class="editor-preview">"#),
+            "preview pane present: {html}"
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw script tag leaked into the preview: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "escaped form missing in the preview: {html}"
+        );
+    }
+
+    /// Review fix (Minor): the parse-error preview strips the
+    /// frontmatter block from CRLF and BOM documents too — the core
+    /// splitter normalizes both before splitting, and the strip path
+    /// mirrors it, so a broken-frontmatter CRLF/BOM document never
+    /// previews its frontmatter as visible prose.
+    #[test]
+    fn preview_strips_frontmatter_block_on_crlf_and_bom() {
+        // Missing `type` (parse error) in CRLF form: the preview must
+        // show the body, not the frontmatter block.
+        let crlf = "---\r\ntitle: No Type\r\n---\r\n\r\nBody text.\r\n";
+        let (preview, err) = build_preview_html(crlf);
+        assert!(err.is_some(), "missing type must fail parse: {err:?}");
+        assert!(preview.contains("Body text."), "{preview}");
+        assert!(
+            !preview.contains("title: No Type"),
+            "frontmatter block must strip on CRLF: {preview}"
+        );
+        // BOM-prefixed twin: identical behavior.
+        let bom = format!("\u{feff}{crlf}");
+        let (preview, err) = build_preview_html(&bom);
+        assert!(err.is_some(), "missing type must fail parse: {err:?}");
+        assert!(preview.contains("Body text."), "{preview}");
+        assert!(
+            !preview.contains("title: No Type"),
+            "frontmatter block must strip on BOM+CRLF: {preview}"
         );
     }
 
@@ -847,5 +1450,58 @@ mod tests {
             mycelium_ui::ASSETS_VERSION,
             "mycelium-ui and mycelium-web asset versions must bump together"
         );
+    }
+
+    /// Task-7 fix pin: artifact-vs-markup lockstep. The checked-in
+    /// hydrate bundle (`crates/mycelium-web/assets/mycelium_ui.js`,
+    /// the wasm-bindgen wrapper) exports one hydrate function per
+    /// island (`export function <Name>_<hash>(el)`); the SSR roots
+    /// carry the same name in `data-component="..."`. Every exported
+    /// name must appear in the rendered island markup — a one-sided
+    /// bundle regeneration (stale artifact, changed island signature)
+    /// ships islands the traversal script can't hydrate, and this
+    /// fails instead. Parses the wrapper with the bindgen emission
+    /// shape (`export function {Name}_{digits}(el)`); the SSR roots
+    /// come from the mycelium-ui island wrappers (the same fns the
+    /// pages render).
+    #[test]
+    fn hydrate_bundle_exports_match_island_roots() {
+        let wrapper = include_str!("../assets/mycelium_ui.js");
+        let mut exported = Vec::new();
+        let mut scan = 0usize;
+        while let Some(rel) = wrapper[scan..].find("export function ") {
+            let start = scan + rel + "export function ".len();
+            let rest = &wrapper[start..];
+            let end = rest.find('(').expect("export must open its args");
+            let name = rest[..end].trim();
+            // Only the per-island hydrate exports: <Component>_<hash>.
+            if name.contains('_')
+                && name
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count()
+                    > 0
+            {
+                exported.push(name.to_string());
+            }
+            scan = start + end;
+        }
+        assert!(
+            !exported.is_empty(),
+            "no island hydrate exports found in the checked-in bundle"
+        );
+        let rendered = [
+            mycelium_ui::render::render(mycelium_ui::chat_composer("x")),
+            mycelium_ui::render::render(mycelium_ui::copy_button("y")),
+        ]
+        .join("\n");
+        for name in &exported {
+            assert!(
+                rendered.contains(&format!(r#"data-component="{name}""#)),
+                "bundle exports hydrate fn {name} but no SSR island root carries it — \
+                 regenerate the bundle or the island changed under it"
+            );
+        }
     }
 }

@@ -16,11 +16,14 @@ pub mod render {
     }
 }
 
+mod islands;
 mod layout;
 mod primitives;
 #[cfg(feature = "ssr")]
 pub mod shell;
 
+#[cfg(feature = "ssr")]
+pub use islands::{chat_composer, copy_button};
 #[cfg(feature = "ssr")]
 pub use layout::{
     breadcrumb, card, data_table, form_actions, nav_group, nav_item, stat_tile, tab_bar,
@@ -30,10 +33,12 @@ pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_s
 #[cfg(feature = "ssr")]
 pub use shell::{page_header, ASSETS_VERSION};
 
-/// Hydration entry: wasm-bindgen calls this on module start; it walks
-/// whatever <leptos-island> roots the page carries. Islands themselves
-/// are #[island] components added in PR 2 — the entry ships now so the
-/// hydrate build (Task 9's bundle) has its start function.
+/// Hydration entry: wasm-bindgen auto-runs this on module init; it
+/// sets up the reactive owner root that island hydration runs under.
+/// The islands live in `islands.rs` (`#[island]` components); the
+/// traversal script (`/assets/islands.js`, vendored in mycelium-web's
+/// `assets.rs`) initializes this module and walks the page's
+/// <leptos-island> roots.
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 fn start() {
