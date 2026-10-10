@@ -1707,6 +1707,142 @@ async fn graph_legend_info_hint() {
     shutdown.cancel();
 }
 
+/// Skills page (Task 6): the card conversion — PageHeader with the
+/// New-private-skill action, the "Your private skills" / "Global
+/// skills" cards, the empty-state fallback for an empty section, and
+/// hub grouping preserved: hub row + `group-indent` member rows +
+/// muted script-label rows (phase8 pins the scope-aware hrefs and
+/// the label-row markup end-to-end; this test pins the card body
+/// that wraps them).
+#[tokio::test]
+async fn skills_card_structure() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // Fresh boot: both sections empty — the cards render with the
+    // empty state (the page structure before any content exists).
+    let sk = client
+        .get(format!("{base}/skills"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let sh = sk.text().await.unwrap();
+    assert!(sh.contains("card__header"), "{sh}");
+    assert!(sh.contains("Global skills"), "{sh}");
+    assert!(sh.contains("No skills yet"), "empty section: {sh}");
+
+    // A private skill via the skills-private editor's own submit
+    // (concept_submit's default arm saves it to the user bundle).
+    let create = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/card-structure-private.md"),
+            ("scope", "skills-private"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Card Structure Private\n---\n\nsteps",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // A hub-grouped global skill: the hub (type: Skill, its manifest
+    // carrying one script file) plus a Note companion — the same
+    // shape phase8's grouped-skills fixtures use.
+    for (path, markdown) in [
+        (
+            "/card-group/skill.md",
+            "---\ntype: Skill\ntitle: card-group\nskill:\n  version: 1\n  files:\n    - {path: usage.md, role: reference}\n    - {path: scripts/run.sh, role: script}\n---\n\nhub body",
+        ),
+        (
+            "/card-group/usage.md",
+            "---\ntype: Note\ntitle: Usage\n---\n\nhow to use",
+        ),
+    ] {
+        let put = client
+            .post(format!("{base}/concept"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[("path", path), ("scope", "skills"), ("markdown", markdown)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 303, "seeding {path}");
+    }
+
+    // Skills: card structure, hub grouping preserved.
+    let sk = client
+        .get(format!("{base}/skills"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let sh = sk.text().await.unwrap();
+    assert!(sh.contains("card__header"), "{sh}");
+    assert!(sh.contains("Global skills"), "{sh}");
+    // The conversion pin (the graph test's pattern): PageHeader
+    // replaces the bare <h1>Skills</h1>.
+    assert!(
+        sh.contains(r#"<header class="page-header"><h1>Skills</h1>"#),
+        "page-header conversion: {sh}"
+    );
+    assert!(sh.contains("Your private skills"), "{sh}");
+    // The private card: the flat row links the user bundle.
+    assert!(
+        sh.contains(
+            r#"<a href="/concept?path=/card-structure-private.md&scope=user">Card Structure Private</a>"#
+        ),
+        "private flat row: {sh}"
+    );
+    // The global card: hub row, indented companion, muted script label.
+    assert!(
+        sh.contains(r#"<a href="/concept?path=/card-group/skill.md&scope=skills">card-group</a>"#),
+        "hub row: {sh}"
+    );
+    assert!(
+        sh.contains(
+            r#"<ul class="group-indent"><li><a href="/concept?path=/card-group/usage.md&scope=skills">Usage</a></li>"#
+        ),
+        "group-indent wraps the member rows: {sh}"
+    );
+    assert!(
+        sh.contains(r#"<li class="muted">scripts/run.sh</li>"#),
+        "muted script label: {sh}"
+    );
+    // Content replaced the empty state; the admin keeps both create
+    // links (phase8 pins the global one's user-side absence).
+    assert!(!sh.contains("No skills yet"), "{sh}");
+    assert!(sh.contains("New global skill"), "{sh}");
+    assert!(sh.contains("New private skill"), "{sh}");
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

@@ -345,6 +345,10 @@ body.chat-page main {
   }
 }
 
+/* Skills hub groups (Task 6): companions and script labels indented
+   beneath their nested skill's hub row. */
+.group-indent { padding-left: var(--gap-4); }
+
 .stat {
   background: var(--color-surface); border: 1px solid var(--color-border);
   border-radius: var(--radius-card); padding: var(--gap-4);
@@ -1090,7 +1094,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "14";
+pub const ASSETS_VERSION: &str = "15";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

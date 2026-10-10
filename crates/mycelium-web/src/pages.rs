@@ -666,11 +666,20 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
     )
 }
 
-/// Skills page: private skills + global skills (read-only for users,
-/// editable by admins). Nested skills (`/<slug>/skill.md` hubs) render
-/// as one group: the hub row with companions and manifest script
-/// labels indented beneath it; legacy root-level skills stay flat
-/// rows exactly as before.
+/// Skills page (Task 6 rebuild): the PageHeader with the
+/// New-private-skill primary action, then two cards — "Your private
+/// skills" and "Global skills". Nested skills (`/<slug>/skill.md`
+/// hubs) render as one group per card: the hub row with companions
+/// and manifest script labels indented beneath it (`.group-indent`);
+/// legacy root-level skills stay flat rows. An empty section renders
+/// the empty state inside its card; the admin-only "New global
+/// skill" link stays below the global list (the card header's
+/// action slot lands in a later PR — the card is title-only here).
+///
+/// Escaping: the card bodies are trusted-markup slots composed from
+/// escaped fragments — entry titles `html_escape`d, hrefs
+/// percent-encoded via [`urlencoding_encode`], script paths
+/// `html_escape`d (the raw-slot contract: escape at composition).
 #[allow(clippy::too_many_arguments)]
 pub fn skills_page(
     user: &SessionUser,
@@ -690,8 +699,10 @@ pub fn skills_page(
         )
     };
     // One nested skill: hub row, then companions and manifest script
-    // labels indented beneath it. Scripts are label-only rows — raw
-    // payload files, not concepts, so they carry no link.
+    // labels indented beneath it (`group-indent` on the nested list —
+    // one class indents member rows and label rows alike). Scripts
+    // are label-only rows — raw payload files, not concepts, so they
+    // carry no link.
     let group_block = |g: &mycelium_store::SkillGroup, scripts: &[String], scope: &str| {
         let members = g
             .members
@@ -703,15 +714,23 @@ pub fn skills_page(
             .map(|p| format!(r#"<li class="muted">{}</li>"#, html_escape(p)))
             .collect::<String>();
         format!(
-            r#"<li>{}<ul>{members}{labels}</ul></li>"#,
+            r#"<li>{}<ul class="group-indent">{members}{labels}</ul></li>"#,
             entry_link(&g.hub, scope)
         )
     };
-    // One section: grouped blocks (slug order), then flat rows.
-    let list = |groups: &[mycelium_store::SkillGroup],
-                scripts: &[Vec<String>],
-                flat: &[mycelium_store::ConceptEntry],
-                scope: &str| {
+    // One section body: grouped blocks (slug order), then flat rows;
+    // an empty section renders the empty state instead of a bare
+    // list.
+    let section_body = |groups: &[mycelium_store::SkillGroup],
+                        scripts: &[Vec<String>],
+                        flat: &[mycelium_store::ConceptEntry],
+                        scope: &str| {
+        if groups.is_empty() && flat.is_empty() {
+            return mycelium_ui::render::render(mycelium_ui::empty_state(
+                "No skills yet",
+                "Create or install a skill to begin.",
+            ));
+        }
         let rows = groups
             .iter()
             .zip(scripts.iter())
@@ -723,27 +742,30 @@ pub fn skills_page(
             .collect::<String>();
         format!("<ul>{rows}</ul>")
     };
-    let global_section = if user.role == Role::Admin {
+    let global_list = section_body(global_groups, global_scripts, global_flat, "skills");
+    // The admin's create link stays below the global list (the
+    // existing conditional — users see none of it).
+    let global_body = if user.role == Role::Admin {
         format!(
-            r#"<h2>Global skills</h2>
-<ul>{}</ul>
-<p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#,
-            list(global_groups, global_scripts, global_flat, "skills")
+            r#"{global_list}<p><a href="/concept?new=1&scope=skills">New global skill</a> (admin)</p>"#
         )
     } else {
-        format!(
-            r#"<h2>Global skills</h2>
-<ul>{}</ul>"#,
-            list(global_groups, global_scripts, global_flat, "skills")
-        )
+        global_list
     };
+    // Actions: the New-private-skill primary button (an anchor —
+    // works without script).
+    let actions = format!(
+        r#"<a class="{}" href="/concept?new=1&scope=skills-private">New private skill</a>"#,
+        mycelium_ui::button_class("primary")
+    );
     let body = format!(
-        r#"<h1>Skills</h1>
-<h2>Your private skills</h2>
-<ul>{}</ul>
-<p><a href="/concept?new=1&scope=skills-private">New private skill</a></p>
-{global_section}"#,
-        list(private_groups, private_scripts, private_flat, "user"),
+        "{}{}{}",
+        mycelium_ui::render::render(mycelium_ui::page_header("Skills", actions)),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Your private skills",
+            section_body(private_groups, private_scripts, private_flat, "user"),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card("Global skills", global_body)),
     );
     layout("Skills", Some(user), csrf, "/skills", body)
 }
