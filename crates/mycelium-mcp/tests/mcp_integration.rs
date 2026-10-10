@@ -187,8 +187,12 @@ async fn mint_key(client: &reqwest::Client, base: &str, cookie: &str, csrf: &str
         .unwrap();
     assert_eq!(mint.status(), 200);
     let html = mint.text().await.unwrap();
-    let code_start = html.find("<code>myc2-").expect("minted token shown");
-    let token_rest = &html[code_start + "<code>".len()..];
+    // The minted token sits in the shown-once banner's <code> element
+    // (Task 7 gave it the id the copy island targets).
+    let code_start = html
+        .find("<code id=\"minted-key\">")
+        .expect("minted token shown");
+    let token_rest = &html[code_start + "<code id=\"minted-key\">".len()..];
     let token_end = token_rest.find("</code>").unwrap();
     token_rest[..token_end].to_string()
 }

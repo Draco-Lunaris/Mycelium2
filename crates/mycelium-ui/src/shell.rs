@@ -27,7 +27,7 @@ use leptos::prelude::*;
 /// `assets_versions_lockstep` unit test (only that crate sees both
 /// constants), so a one-sided bump fails CI.
 #[cfg(feature = "ssr")]
-pub const ASSETS_VERSION: &str = "15";
+pub const ASSETS_VERSION: &str = "16";
 
 /// Minimal HTML escaping for the `format!`-composed head attributes
 /// (csrf token, title) — the html-escape equivalent mycelium-ui carries
@@ -188,9 +188,12 @@ pub fn page_header(title: &str, actions: String) -> impl IntoView {
 /// title, stylesheet), then the body — sidebar shell (brand lockup,
 /// grouped nav, user chip + logout; no sidebar at all without a user),
 /// the page body inside `<main>`, and the app.js + extra script tags at
-/// body end. A signed-in page's body class is prefixed with `shelled`
-/// (the flex-row layout hook); `None` user renders no nav — auth pages
-/// use `auth_shell`.
+/// body end: classic scripts first (`scripts`), then module scripts
+/// (`module_scripts` — the hydrate bundle; `type="module"` defers their
+/// execution until after the classic scripts, and the standing-guards
+/// scan accepts either attribute order). A signed-in page's body class
+/// is prefixed with `shelled` (the flex-row layout hook); `None` user
+/// renders no nav — auth pages use `auth_shell`.
 #[cfg(feature = "ssr")]
 #[allow(clippy::too_many_arguments)]
 pub fn shell(
@@ -200,6 +203,7 @@ pub fn shell(
     active_path: &str,
     body: String,
     scripts: &[&str],
+    module_scripts: &[&str],
     body_class: &str,
 ) -> String {
     let sidebar_html = match user {
@@ -215,6 +219,14 @@ pub fn shell(
         .iter()
         .map(|s| format!(r#"<script src="{s}?v={ASSETS_VERSION}"></script>"#))
         .collect::<String>();
+    // Module scripts (the hydrate bundle): `type="module"` first in
+    // the tag, `src` second — the guards scan accepts either order,
+    // and module deferral keeps them executing after the classic
+    // scripts above.
+    let module_script_tags = module_scripts
+        .iter()
+        .map(|s| format!(r#"<script type="module" src="{s}?v={ASSETS_VERSION}"></script>"#))
+        .collect::<String>();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -228,7 +240,7 @@ pub fn shell(
 <body class="{}">
 {}
 <main>{}</main>
-<script src="/assets/app.js?v={version}"></script>{extra_scripts}
+<script src="/assets/app.js?v={version}"></script>{extra_scripts}{module_script_tags}
 </body>
 </html>"#,
         escape(csrf),
@@ -279,7 +291,7 @@ mod tests {
     #[test]
     fn shell_renders_groups_and_active_state() {
         let user = Some(("echo", true));
-        let html = shell("Browse", user, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", user, "tok", "/", String::new(), &[], &[], "");
         assert!(html.contains("Knowledge"), "{html}");
         assert!(html.contains("Librarian"), "{html}");
         assert!(html.contains("Account"), "{html}");
@@ -294,13 +306,13 @@ mod tests {
     #[test]
     fn shell_hides_admin_group_for_non_admin() {
         let user = Some(("echo", false));
-        let html = shell("Browse", user, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", user, "tok", "/", String::new(), &[], &[], "");
         assert!(!html.contains("Admin"), "{html}");
     }
 
     #[test]
     fn shell_no_user_renders_no_nav() {
-        let html = shell("Browse", None, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", None, "tok", "/", String::new(), &[], &[], "");
         assert!(!html.contains("sidebar__group-label"), "{html}");
     }
 
@@ -336,7 +348,16 @@ mod tests {
             render(crate::primitives::field("f1", "A", "text", "", "")),
             render(crate::primitives::field("f2", "B", "text", "", ""))
         );
-        let html = shell("Browse", Some(("echo", false)), "tok", "/", body, &[], "");
+        let html = shell(
+            "Browse",
+            Some(("echo", false)),
+            "tok",
+            "/",
+            body,
+            &[],
+            &[],
+            "",
+        );
         assert!(html.matches("id=\"f1\"").count() == 1, "{html}");
         assert!(html.matches("id=\"f2\"").count() == 1, "{html}");
         assert!(html.matches("for=\"f1\"").count() == 1, "{html}");

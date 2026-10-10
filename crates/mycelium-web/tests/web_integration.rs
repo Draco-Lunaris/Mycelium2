@@ -526,10 +526,14 @@ async fn full_web_flow() {
         .await
         .unwrap();
     let mint_html = mint.text().await.unwrap();
-    // The minted token is inside <code>myc2-...</code> (the CSRF meta tag
-    // also contains myc2-csrf- earlier in the page — anchor on <code>).
-    let code_start = mint_html.find("<code>myc2-").expect("minted token shown");
-    let token_rest = &mint_html[code_start + "<code>".len()..];
+    // The minted token is inside <code id="minted-key">myc2-...</code>
+    // (the CSRF meta tag also contains myc2-csrf- earlier in the page —
+    // anchor on the minted <code> element; its id is the Task-7 copy
+    // island's target).
+    let code_start = mint_html
+        .find("<code id=\"minted-key\">")
+        .expect("minted token shown");
+    let token_rest = &mint_html[code_start + "<code id=\"minted-key\">".len()..];
     let token_end = token_rest.find("</code>").expect("token end");
     let api_token = token_rest[..token_end].to_string();
     assert!(api_token.starts_with("myc2-"));
@@ -1839,6 +1843,94 @@ async fn skills_card_structure() {
     assert!(!sh.contains("No skills yet"), "{sh}");
     assert!(sh.contains("New global skill"), "{sh}");
     assert!(sh.contains("New private skill"), "{sh}");
+
+    shutdown.cancel();
+}
+
+/// Task 7: the first hydration islands go live. Chat + keys load the
+/// hydrate bundle as a module script plus the islands.js traversal
+/// script (the standing-guards sweep's /chat and /keys legs then pin
+/// the type-first attribute order — the linked carry), and the keys
+/// minted banner carries the copy-button island with the key value
+/// still selectable text beside it (the SSR markup IS the no-JS
+/// degradation).
+#[tokio::test]
+async fn chat_and_keys_load_hydrate_bundle_and_copy_island() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Chat + keys load the hydrate bundle as a module script; guards
+    // scan accepts the type-first attribute order (linked carry).
+    let chat = client
+        .get(format!("{base}/chat"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), 200);
+    let ch = chat.text().await.unwrap();
+    assert!(
+        ch.contains(r#"<script type="module" src="/assets/mycelium_ui.js"#),
+        "{ch}"
+    );
+    assert!(ch.contains(r#"src="/assets/islands.js?v="#), "{ch}");
+    assert!(ch.contains("leptos-island"), "composer island root: {ch}");
+
+    let keys = client
+        .get(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keys.status(), 200);
+    let kh = keys.text().await.unwrap();
+    assert!(
+        kh.contains(r#"<script type="module" src="/assets/mycelium_ui.js"#),
+        "{kh}"
+    );
+
+    // Keys: the minted banner gains the copy-button island; the key
+    // value stays selectable text beside it (minting re-renders the
+    // page with the shown-once banner).
+    let csrf = csrf_from_page(&client, &format!("{base}/keys"), &cookie).await;
+    let mint = client
+        .post(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("label", "hydrate")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint.status(), 200);
+    let mh = mint.text().await.unwrap();
+    assert!(mh.contains("copy-button"), "copy island: {mh}");
+    assert!(
+        mh.contains(r#"id="minted-key""#),
+        "selectable key value: {mh}"
+    );
+    assert!(
+        mh.contains(r#"data-copy-target="minted-key""#),
+        "island points at the value element: {mh}"
+    );
 
     shutdown.cancel();
 }

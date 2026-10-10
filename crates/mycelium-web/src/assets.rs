@@ -202,6 +202,20 @@ body.chat-page main {
   align-self: flex-start; background: rgba(247,118,142,.12);
   border: 1px solid var(--danger); color: var(--danger);
 }
+/* Islands (Task 7): the leptos-island root is a pure hydration marker
+   (never a layout box — display:contents keeps the composer's flex
+   row and the minted banner's inline flow exactly as without it). */
+leptos-island { display: contents; }
+/* Copy button (keys minted banner): a quiet pill beside the
+   shown-once secret. */
+.copy-button {
+  display: inline-flex; align-items: center;
+  margin: 0 0 0 var(--gap-2); padding: 0.15rem 0.7rem;
+  background: var(--color-chip-surface); color: var(--color-text-body);
+  border: 1px solid var(--color-border); border-radius: var(--radius-pill);
+  font-size: var(--text-caption); font-weight: 400; cursor: pointer;
+}
+.copy-button:hover { border-color: var(--color-accent); }
 
 /* --- Components (Tasks 4-6) — token-only, no raw literals ----------- */
 
@@ -831,13 +845,28 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 "##;
 
 /// The chat page's client logic (external asset — CSP-safe: the site
-/// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline scripts are blocked;
-/// /assets/chat.js loads under 'self').
-pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/chat/stream (SSE).
+/// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline
+/// scripts are blocked; /assets/chat.js loads under 'self').
+///
+/// Task-7 split: the composer's EVENT wiring (submit binding,
+/// Enter-to-send, textarea auto-grow) lives in the chat_composer
+/// hydration island (mycelium-ui `islands.rs`), which hands each send
+/// to `window.myceliumChatSend` below. What stays here is what the
+/// chat-stream integration suite pins: the POST /api/v1/chat/stream
+/// transport (form-encoded message + the CSRF header from the page's
+/// meta — app.js's same token source), the SSE pump (tool progress →
+/// the pending message, done → the reply, error → the error message),
+/// the busy gate, and the log's DOM structure (addMsg + the XSS-safe
+/// markdown renderer). Without the hydrate bundle the composer is an
+/// inert form and the helper is never called — the page degrades to
+/// SSR-only.
+pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management for
+// /api/v1/chat/stream. The chat_composer hydration island owns the
+// composer's event wiring and calls window.myceliumChatSend; this file
+// owns the fetch, the SSE pump, and the log rendering.
 (function () {
   var log = document.getElementById("chat-log");
   var form = document.getElementById("chat-form");
-  var input = document.getElementById("chat-input");
   var sendBtn = form ? form.querySelector("button[type=submit]") : null;
   var busy = false;
   function addMsg(text, who) {
@@ -947,26 +976,9 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
     busy = state;
     if (sendBtn) sendBtn.disabled = state;
   }
-  // Auto-grow the textarea to its content (capped by CSS max-height).
-  function autoGrow() {
-    input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 160) + "px";
-  }
-  input.addEventListener("input", autoGrow);
-  // Enter sends; Shift+Enter inserts a newline.
-  input.addEventListener("keydown", function (ev) {
-    if (ev.key === "Enter" && !ev.shiftKey) {
-      ev.preventDefault();
-      form.requestSubmit();
-    }
-  });
-  form.addEventListener("submit", function (ev) {
-    ev.preventDefault();
+  function send(msg) {
     if (busy) return;
-    var msg = input.value.trim();
-    if (!msg) return;
     addMsg(msg, "user");
-    input.value = "";
     setBusy(true);
     var pending = addMsg("The librarian is thinking…", "librarian pending");
     var steps = [];
@@ -1039,7 +1051,13 @@ pub const CHAT_JS: &str = r#"// Librarian chat: stream the agent via /api/v1/cha
       setBusy(false);
       addMsg(err.message || "request failed", "error");
     });
-  });
+  }
+  // The composer island's entry point (Task 7): each trimmed message
+  // arrives here; without the hydrate bundle this is never called.
+  window.myceliumChatSend = function (msg) {
+    var m = String(msg || "").trim();
+    if (m) send(m);
+  };
 })();
 "#;
 
@@ -1078,6 +1096,59 @@ pub const CONFIRM_JS: &str = r#"// Confirm dialogs: [data-confirm-dialog] trigge
 })();
 "#;
 
+/// The islands traversal script (external asset — CSP-safe like
+/// chat.js). Adapted from leptos's own `island_script.js` (islands
+/// mode): leptos's SSR helper would inline it, but the site CSP
+/// blocks inline scripts, so it ships as an external classic script
+/// (classic scripts run at parse time; the hydrate module they load
+/// executes deferred, after chat.js has exposed its transport). It
+/// finds the page's hydrate-bundle module tag (the shell emits it
+/// only on island pages), derives the cache-busted `.wasm` URL from
+/// its `src` — the wasm-bindgen wrapper's own default would resolve
+/// the wasm WITHOUT the `?v=` query, a stale-cache hazard on version
+/// bumps — initializes the module (which runs the wasm entry,
+/// `hydrate_islands`), then walks the `<leptos-island>` roots and
+/// calls each island's exported wasm hydrate function (`data-
+/// component` names the export). Hand-vendored: regenerate only when
+/// the leptos island protocol changes — the per-island exports
+/// themselves are regenerated with the wasm bundle.
+pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bundle, then walk the
+// page's <leptos-island> roots and call each island's exported wasm
+// hydrate function (data-component names the export). Deferred to
+// DOMContentLoaded because this classic script runs at parse time,
+// BEFORE the module tag below it has been parsed; module scripts
+// execute before DOMContentLoaded, so chat.js's transport helper is
+// available by the time any island sends.
+(function () {
+  function start() {
+    var tag = document.querySelector('script[type="module"][src^="/assets/mycelium_ui.js"]');
+    if (!tag) return;
+    var src = tag.getAttribute("src");
+    var wasmUrl = src.replace("mycelium_ui.js", "mycelium_ui_bg.wasm");
+    import(src).then(function (mod) {
+      mod.default(wasmUrl).then(function () {
+        function traverse(node) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.tagName.toLowerCase() === "leptos-island") {
+              var id = node.dataset.component;
+              if (id && mod[id]) mod[id](node);
+            }
+            var children = node.children;
+            for (var i = 0; i < children.length; i++) traverse(children[i]);
+          }
+        }
+        traverse(document.body);
+      });
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+"#;
+
 /// The mycelium-ui hydrate bundle's JS wrapper — wasm-bindgen output
 /// (`--target web`), NOT hand-written: do not edit. It fetches its
 /// sibling `mycelium_ui_bg.wasm` by filename, so the pair's names are
@@ -1094,7 +1165,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "15";
+pub const ASSETS_VERSION: &str = "16";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -1111,6 +1182,7 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("graph.js", GRAPH_JS),
         ("chat.js", CHAT_JS),
         ("confirm.js", CONFIRM_JS),
+        ("islands.js", ISLANDS_JS),
         // The hydrate bundle is a bindgen output pair — the JS wrapper
         // fetches `mycelium_ui_bg.wasm` by filename, so both names are
         // load-bearing. The wasm is written separately after the loop
@@ -1146,6 +1218,7 @@ mod tests {
         assert!(dir.path().join("graph.js").exists());
         assert!(dir.path().join("chat.js").exists());
         assert!(dir.path().join("confirm.js").exists());
+        assert!(dir.path().join("islands.js").exists());
         // Same version: does not overwrite (admin customization safe).
         std::fs::write(dir.path().join("style.css"), "custom").unwrap();
         scaffold_defaults(dir.path()).unwrap();

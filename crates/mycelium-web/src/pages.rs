@@ -23,7 +23,7 @@ pub fn layout(
     layout_with_scripts(title, user, csrf, active_path, body, &[])
 }
 
-/// Layout with extra script sources (e.g. graph.js).
+/// Layout with extra script sources (e.g. graph.js) — no module scripts.
 pub fn layout_with_scripts(
     title: &str,
     user: Option<&SessionUser>,
@@ -32,13 +32,15 @@ pub fn layout_with_scripts(
     body: String,
     extra_scripts: &[&str],
 ) -> Html<String> {
-    layout_full(title, user, csrf, active_path, body, extra_scripts, "")
+    layout_full(title, user, csrf, active_path, body, extra_scripts, &[], "")
 }
 
-/// Full-control layout: extra scripts + a body class (e.g. the chat
-/// page's full-viewport mode). Adapts the session user to the shell's
-/// primitive `(name, is_admin)` pair and delegates the whole document
-/// to `mycelium_ui::shell::shell`.
+/// Full-control layout: extra classic scripts + module scripts (the
+/// hydrate bundle) + a body class (e.g. the chat page's full-viewport
+/// mode). Adapts the session user to the shell's primitive
+/// `(name, is_admin)` pair and delegates the whole document to
+/// `mycelium_ui::shell::shell`.
+#[allow(clippy::too_many_arguments)]
 pub fn layout_full(
     title: &str,
     user: Option<&SessionUser>,
@@ -46,6 +48,7 @@ pub fn layout_full(
     active_path: &str,
     body: String,
     extra_scripts: &[&str],
+    module_scripts: &[&str],
     body_class: &str,
 ) -> Html<String> {
     let user = user.map(|u| (u.username.as_str(), u.role == Role::Admin));
@@ -56,6 +59,7 @@ pub fn layout_full(
         active_path,
         body,
         extra_scripts,
+        module_scripts,
         body_class,
     ))
 }
@@ -662,6 +666,7 @@ pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
         "/graph",
         body,
         &["/assets/graph.js"],
+        &[],
         "graph-page",
     )
 }
@@ -900,27 +905,32 @@ pub fn build_passage_html(passage_text: &str) -> String {
 
 /// Chat page: talk to the librarian agent (the same agent behind the
 /// MCP tools). Full-viewport layout: the conversation log fills the
-/// screen and scrolls; the input is pinned to the bottom.
+/// screen and scrolls; the composer is the chat_composer hydration
+/// island (Task 7) — its SSR markup IS the form, and with the hydrate
+/// bundle the island owns the submit/Enter/auto-grow wiring, handing
+/// sends to chat.js's `window.myceliumChatSend` (SSE transport + log).
 pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let body = r#"<div class="chat-shell">
+    let composer = mycelium_ui::render::render(mycelium_ui::chat_composer(
+        "Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)",
+    ));
+    let body = format!(
+        r#"<div class="chat-shell">
   <div class="chat-intro">
     <h1>Librarian</h1>
     <p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
   </div>
   <div id="chat-log" class="chat-log" aria-live="polite"></div>
-  <form id="chat-form" class="chat-input-bar">
-    <textarea id="chat-input" rows="1" placeholder="Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)" required></textarea>
-    <button type="submit">Send</button>
-  </form>
+  {composer}
 </div>"#
-        .to_string();
+    );
     layout_full(
         "Librarian",
         Some(user),
         csrf,
         "/chat",
         body,
-        &["/assets/chat.js"],
+        &["/assets/chat.js", "/assets/islands.js"],
+        &["/assets/mycelium_ui.js"],
         "chat-page",
     )
 }
@@ -985,8 +995,16 @@ pub fn keys_page(
             ("csrf_token".to_string(), csrf.to_string()),
         ],
     ));
+    // The shown-once banner gains the copy-button island (Task 7): the
+    // key value stays selectable text (its id anchors the island's
+    // copy target); without the bundle the button is inert.
     let minted_html = minted
-        .map(|t| format!(r#"<div class="flash ok">New key (shown once): <code>{t}</code></div>"#))
+        .map(|t| {
+            let copy = mycelium_ui::render::render(mycelium_ui::copy_button("minted-key"));
+            format!(
+                r#"<div class="flash ok">New key (shown once): <code id="minted-key">{t}</code>{copy}</div>"#
+            )
+        })
         .unwrap_or_default();
     let body = format!(
         r#"<h1>API keys</h1>
@@ -1002,13 +1020,15 @@ pub fn keys_page(
         dialog = dialog,
         minted_html = minted_html
     );
-    layout_with_scripts(
+    layout_full(
         "API keys",
         Some(user),
         csrf,
         "/keys",
         body,
-        &["/assets/confirm.js"],
+        &["/assets/confirm.js", "/assets/islands.js"],
+        &["/assets/mycelium_ui.js"],
+        "",
     )
 }
 
