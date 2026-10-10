@@ -951,34 +951,86 @@ pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<St
     layout("Password", None, csrf, "/password", body)
 }
 
-/// API keys page.
+/// API keys page (Task 8 rebuild — mockup 09): the page header's actions
+/// slot carries the mint form (label input + primary Mint key button,
+/// with its own server-rendered hidden CSRF token — the row-form
+/// pattern); a successful mint renders the shown-once banner card (the
+/// key in `<code id="minted-key">` beside the copy-button island, plus
+/// the explanatory copy — the value stays selectable text); the keys
+/// `data_table` lists label, status chip (active = accent, revoked =
+/// neutral), created, last used, and the row action.
+///
+/// Revoked rows render dimmed instead of live: `data_table` owns the
+/// `<tr>`, so a revoked row's composed CELL markup carries the
+/// `row--revoked` class (every cell's content wraps in it, dimming the
+/// whole visible row), and the action cell shows plain "Revoked" text —
+/// no live button (revocation is idempotent; re-revoking buys nothing).
+/// Active rows keep PR-1's exact revoke pattern: a per-row form (hidden
+/// csrf + id) whose plain submit doubles as the confirm-dialog trigger
+/// (`data-confirm-dialog` + `data-key-id`) — without JS it POSTs
+/// /keys/revoke directly; with JS, confirm.js's preventDefault opens
+/// the one shared dialog and copies the trigger's `data-key-id` into
+/// the form's hidden id input.
+///
+/// Escaping: `data_table` cells and `card` bodies are raw-markup slots
+/// — key labels are `html_escape`d at composition, the hidden CSRF
+/// tokens are `html_escape`d, ids/dates are primitives (the token is
+/// server-generated `myc2-<hex>` — no escaping positions inside it).
 pub fn keys_page(
     user: &SessionUser,
     csrf: &str,
     keys: &[mycelium_auth::api_key::ApiKeyRecord],
     minted: Option<&str>,
 ) -> Html<String> {
-    let rows = keys
+    let csrf_esc = html_escape(csrf);
+    let rows: Vec<Vec<String>> = keys
         .iter()
         .map(|k| {
-            let status = if k.revoked_at.is_some() { "revoked" } else { "active" };
+            let revoked = k.revoked_at.is_some();
+            // A revoked row's cells each wrap their content in the
+            // dimming class — the only channel data_table gives a row
+            // to carry state (cells are raw; the `<tr>` is not).
+            let wrap = |cell: String| {
+                if revoked {
+                    format!(r#"<span class="row--revoked">{cell}</span>"#)
+                } else {
+                    cell
+                }
+            };
+            let status_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if revoked { "revoked" } else { "active" },
+                if revoked { "neutral" } else { "accent" },
+            ));
             // The trigger is a plain submit inside its own row form:
             // without JS, clicking it POSTs /keys/revoke directly (the
             // server-rendered csrf_token is the security gate); with
-            // JS, confirm.js's preventDefault opens the dialog instead.
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-<td><form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form></td></tr>"#,
-                html_escape(&k.label),
-                status,
-                k.created_at.format("%Y-%m-%d"),
-                k.last_used_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
-                html_escape(csrf),
-                k.id,
-                k.id
-            )
+            // JS, confirm.js's preventDefault opens the dialog
+            // instead. A revoked row gets no trigger at all — dimmed
+            // "Revoked" text in its place.
+            let action = if revoked {
+                r#"<span class="row--revoked">Revoked</span>"#.to_string()
+            } else {
+                format!(
+                    r#"<form method="post" action="/keys/revoke"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><button type="submit" class="btn btn--danger" data-confirm-dialog="revoke" data-key-id="{}">Revoke</button></form>"#,
+                    csrf_esc, k.id, k.id
+                )
+            };
+            vec![
+                wrap(html_escape(&k.label)),
+                wrap(status_chip),
+                wrap(k.created_at.format("%Y-%m-%d").to_string()),
+                wrap(k
+                    .last_used_at
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()),
+                action,
+            ]
         })
-        .collect::<String>();
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Label", "Status", "Created", "Last used", ""],
+        &rows,
+    ));
     // One revoke dialog per page: confirm.js opens it from any row's
     // trigger, copying that row's data-key-id into the form's hidden
     // id input. The form's own action + hidden fields (including the
@@ -995,31 +1047,27 @@ pub fn keys_page(
             ("csrf_token".to_string(), csrf.to_string()),
         ],
     ));
-    // The shown-once banner gains the copy-button island (Task 7): the
-    // key value stays selectable text (its id anchors the island's
-    // copy target); without the bundle the button is inert.
+    // The shown-once banner (Task 7's copy island rides here): the key
+    // value stays selectable text (its id anchors the island's copy
+    // target); without the hydrate bundle the button is inert. The
+    // `shown-once` class marks the value row (the e2e pin).
     let minted_html = minted
         .map(|t| {
             let copy = mycelium_ui::render::render(mycelium_ui::copy_button("minted-key"));
-            format!(
-                r#"<div class="flash ok">New key (shown once): <code id="minted-key">{t}</code>{copy}</div>"#
-            )
+            let body = format!(
+                r#"<p>Copy this key now — it is shown only once and cannot be retrieved later.</p><p class="shown-once"><code id="minted-key">{t}</code>{copy}</p>"#
+            );
+            mycelium_ui::render::render(mycelium_ui::card("New key — shown once", body))
         })
         .unwrap_or_default();
-    let body = format!(
-        r#"<h1>API keys</h1>
-{minted_html}
-<table><tr><th>Label</th><th>Status</th><th>Created</th><th>Last used</th><th></th></tr>{rows}</table>
-{dialog}
-<h2>Mint a key</h2>
-<form method="post" action="/keys">
-  <label>Label</label><input name="label" required>
-  <button type="submit">Mint</button>
-</form>"#,
-        rows = rows,
-        dialog = dialog,
-        minted_html = minted_html
+    // Actions slot: the mint form, compact in the title row (mockup 09
+    // — mint/create primary right). Its hidden csrf_token follows the
+    // row-form pattern (app.js skips injection when the field exists).
+    let actions = format!(
+        r#"<form method="post" action="/keys" class="mint-form"><input type="hidden" name="csrf_token" value="{csrf_esc}"><label for="mint-label">Label</label><input id="mint-label" name="label" required><button type="submit" class="btn btn--primary">Mint key</button></form>"#
     );
+    let header = mycelium_ui::render::render(mycelium_ui::page_header("API keys", actions));
+    let body = format!("{header}{minted_html}{table}{dialog}");
     layout_full(
         "API keys",
         Some(user),

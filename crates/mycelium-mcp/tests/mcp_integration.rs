@@ -674,7 +674,13 @@ async fn mcp_full_flow() {
         .unwrap();
     let html = page.text().await.unwrap();
     // Find the revoke trigger's key id (the most recently minted key's
-    // row — the confirm dialog's trigger carries data-key-id).
+    // row — the confirm dialog's trigger carries data-key-id). Marker
+    // re-verified against the Task-8 keys restyle and kept: the keys
+    // data_table renders rows in creation order (ASC), only ACTIVE rows
+    // carry a data-key-id trigger (revoked rows render dimmed "Revoked"
+    // text — no trigger), and neither the confirm dialog nor the
+    // minted banner carries one — so the LAST occurrence is the newest
+    // active key, which is token2's row.
     let revoke_marker = "data-key-id=\"";
     let mut revoke_id = None;
     let mut search_from = 0;

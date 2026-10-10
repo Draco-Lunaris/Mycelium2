@@ -1935,6 +1935,114 @@ async fn chat_and_keys_load_hydrate_bundle_and_copy_island() {
     shutdown.cancel();
 }
 
+/// Task 8: the keys page restyle — the minted banner is a shown-once
+/// card (the `shown-once` class marks the value row) carrying the copy
+/// island beside the still-selectable key value, and a revoked key's
+/// row renders dimmed: `row--revoked` rides on the row's pre-composed
+/// cell content (data_table owns the `<tr>`, so the cells carry the row
+/// state) with "Revoked" text in the action cell instead of a live
+/// Revoke button.
+#[tokio::test]
+async fn keys_shown_once_banner_and_revoked_row() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/keys"), &cookie).await;
+
+    // Mint a key: the response re-renders with the shown-once banner
+    // card — the copy island beside the selectable key value.
+    let mint = client
+        .post(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("label", "e2e-key")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint.status(), 200);
+    let mh = mint.text().await.unwrap();
+    assert!(mh.contains("shown-once"), "shown-once card: {mh}");
+    assert!(
+        mh.contains("copy-button"),
+        "copy island on minted key: {mh}"
+    );
+    assert!(
+        mh.contains(r#"id="minted-key""#),
+        "selectable key value: {mh}"
+    );
+
+    // Mint a second key, then revoke the FIRST: the table renders rows
+    // in creation order, so the first data-key-id occurrence is the
+    // first key's row trigger.
+    let mint2 = client
+        .post(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("label", "e2e-key-2")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint2.status(), 200);
+    let m2h = mint2.text().await.unwrap();
+    let marker = "data-key-id=\"";
+    let idx = m2h.find(marker).expect("first key's revoke trigger");
+    let rest = &m2h[idx + marker.len()..];
+    let end = rest.find('"').expect("id must close");
+    let first_id = rest[..end].to_string();
+    let revoke = client
+        .post(format!("{base}/keys/revoke"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("id", first_id.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), 303, "revoke redirects back to /keys");
+
+    // The keys page now dims the revoked row: row--revoked on the
+    // row's cell content, "Revoked" text in the action cell (no live
+    // button on a revoked row), and only the ACTIVE key still carries
+    // a data-key-id trigger.
+    let keys = client
+        .get(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keys.status(), 200);
+    let kh = keys.text().await.unwrap();
+    assert!(kh.contains("row--revoked"), "dimmed revoked row: {kh}");
+    assert!(
+        kh.contains(">Revoked</span>"),
+        "action cell shows Revoked text: {kh}"
+    );
+    assert_eq!(
+        kh.matches(marker).count(),
+        1,
+        "only the active key carries a revoke trigger: {kh}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

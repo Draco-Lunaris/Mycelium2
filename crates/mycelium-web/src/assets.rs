@@ -217,6 +217,28 @@ leptos-island { display: contents; }
 }
 .copy-button:hover { border-color: var(--color-accent); }
 
+/* Keys page (Task 8, mockup 09): the mint form sits compact in the
+   page header's actions slot (inline label + input + primary button);
+   the shown-once value row keeps the key selectable beside its copy
+   button (the value stays plain text — copy is enhancement, never the
+   only path). */
+.mint-form {
+  display: flex; align-items: center; gap: var(--gap-2); margin: 0;
+}
+.mint-form label {
+  display: inline; margin: 0;
+  color: var(--color-text-label); font-size: var(--text-caption);
+  white-space: nowrap;
+}
+.mint-form input { width: 12rem; min-height: 38px; }
+.mint-form button { margin: 0; }
+.shown-once { margin: 0; word-break: break-all; }
+.shown-once code {
+  background: var(--color-chip-surface); color: var(--color-text-body);
+  border: 1px solid var(--color-border); border-radius: var(--radius-control);
+  padding: 0.25rem 0.5rem; font-size: var(--text-body);
+}
+
 /* --- Components (Tasks 4-6) — token-only, no raw literals ----------- */
 
 .btn {
@@ -358,6 +380,12 @@ leptos-island { display: contents; }
     text-transform: uppercase; letter-spacing: 0.08em;
   }
 }
+
+/* Keys page (Task 8): revoked rows dim — data_table owns the <tr>, so
+   every cell of a revoked row wraps its content in this class (the row
+   state rides on the composed cell markup, dimming the whole visible
+   row). */
+.row--revoked { opacity: 0.6; }
 
 /* Skills hub groups (Task 6): companions and script labels indented
    beneath their nested skill's hub row. */
@@ -1193,7 +1221,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "17";
+pub const ASSETS_VERSION: &str = "18";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
