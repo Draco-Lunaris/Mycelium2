@@ -165,6 +165,7 @@ async fn full_web_flow() {
         .send()
         .await
         .unwrap();
+    assert_eq!(pw_page.status(), 200);
     let pw_html = pw_page.text().await.unwrap();
     assert!(pw_html.contains("card__header"), "{pw_html}");
     let csrf = csrf_from_page(&client, &format!("{base}/password"), &cookie).await;

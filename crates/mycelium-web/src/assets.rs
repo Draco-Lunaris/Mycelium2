@@ -1178,7 +1178,7 @@ pub const ISLANDS_JS: &str = r#"// Islands traversal: initialize the hydrate bun
     var src = tag.getAttribute("src");
     var wasmUrl = src.replace("mycelium_ui.js", "mycelium_ui_bg.wasm");
     import(src).then(function (mod) {
-      mod.default(wasmUrl).then(function () {
+      mod.default({ module_or_path: wasmUrl }).then(function () {
         function traverse(node) {
           if (node.nodeType === Node.ELEMENT_NODE) {
             if (node.tagName.toLowerCase() === "leptos-island") {
@@ -1221,7 +1221,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "18";
+pub const ASSETS_VERSION: &str = "19";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

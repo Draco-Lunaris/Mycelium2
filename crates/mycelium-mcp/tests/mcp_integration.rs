@@ -674,7 +674,9 @@ async fn mcp_full_flow() {
         .unwrap();
     let html = page.text().await.unwrap();
     // Find the revoke trigger's key id (the most recently minted key's
-    // row — the confirm dialog's trigger carries data-key-id). Marker
+    // row — the active rows' revoke triggers carry data-key-id; the
+    // confirm dialog carries no data-key-id — its hidden input is
+    // name="id"). Marker
     // re-verified against the Task-8 keys restyle and kept: the keys
     // data_table renders rows in creation order (ASC), only ACTIVE rows
     // carry a data-key-id trigger (revoked rows render dimmed "Revoked"
