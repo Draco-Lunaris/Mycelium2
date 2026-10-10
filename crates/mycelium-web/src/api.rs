@@ -814,15 +814,23 @@ pub async fn concept_submit(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let concept = match Concept::parse(&canonical, &form.markdown) {
         Ok(c) => c,
-        Err(e) => {
+        Err(_) => {
+            // Re-render the editor with the edit preserved in the
+            // textarea: the warning banner carries the parser's own
+            // message (the preview builder re-parses with the same
+            // `Concept::parse`, so its error is exactly what the save
+            // was rejected with).
             let csrf = pages::current_csrf(&state, &session).await;
-            return pages::concept_page(
+            let (preview, frontmatter_error) = pages::build_preview_html(&form.markdown);
+            return pages::concept_editor(
                 &user,
                 &csrf,
                 &canonical,
                 &form.markdown,
-                None,
-                Some(&e.to_string()),
+                preview,
+                frontmatter_error.as_deref(),
+                form.scope.as_deref(),
+                true,
             )
             .into_response();
         }
@@ -846,14 +854,20 @@ pub async fn concept_submit(
                 ))
                 .into_response(),
                 Err(e) => {
+                    // A store failure re-renders the editor with the
+                    // edit preserved; the message rides the warning
+                    // banner (the page's single error slot).
                     let csrf = pages::current_csrf(&state, &session).await;
-                    pages::concept_page(
+                    let (preview, _) = pages::build_preview_html(&form.markdown);
+                    pages::concept_editor(
                         &user,
                         &csrf,
                         &canonical,
                         &form.markdown,
-                        None,
+                        preview,
                         Some(&e.to_string()),
+                        Some("skills"),
+                        true,
                     )
                     .into_response()
                 }
@@ -875,14 +889,20 @@ pub async fn concept_submit(
                 ))
                 .into_response(),
                 Err(e) => {
+                    // A store failure re-renders the editor with the
+                    // edit preserved; the message rides the warning
+                    // banner (the page's single error slot).
                     let csrf = pages::current_csrf(&state, &session).await;
-                    pages::concept_page(
+                    let (preview, _) = pages::build_preview_html(&form.markdown);
+                    pages::concept_editor(
                         &user,
                         &csrf,
                         &canonical,
                         &form.markdown,
-                        None,
+                        preview,
                         Some(&e.to_string()),
+                        None,
+                        true,
                     )
                     .into_response()
                 }
@@ -926,8 +946,20 @@ pub async fn concept_view(
             }
             _ => "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
         };
-        return pages::new_concept_page_with(&user, &csrf, template, query.scope.as_deref())
-            .into_response();
+        // New-concept editor: empty path + the scope's template, the
+        // same concept_editor fn (no delete — nothing is saved yet).
+        let (preview, _) = pages::build_preview_html(template);
+        return pages::concept_editor(
+            &user,
+            &csrf,
+            "",
+            template,
+            preview,
+            None,
+            query.scope.as_deref(),
+            true,
+        )
+        .into_response();
     }
     let Some(path) = query.path else {
         return Redirect::to("/").into_response();
@@ -946,8 +978,16 @@ pub async fn concept_view(
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let editable = user.role == Role::Admin;
-                    pages::concept_page_scoped(
-                        &user, &csrf, &canonical, &markdown, editable, "skills",
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &markdown,
+                        preview,
+                        None,
+                        Some("skills"),
+                        editable,
                     )
                     .into_response()
                 }
@@ -988,8 +1028,16 @@ pub async fn concept_view(
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
-                    pages::concept_page_scoped(
-                        &user, &csrf, &canonical, &markdown, false, "library",
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &markdown,
+                        preview,
+                        None,
+                        Some("library"),
+                        false,
                     )
                     .into_response()
                 }
@@ -1006,11 +1054,21 @@ pub async fn concept_view(
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
-                    pages::concept_page(&user, &csrf, &canonical, &markdown, None, None)
-                        .into_response()
+                    let (preview, _) = pages::build_preview_html(&markdown);
+                    pages::concept_editor(
+                        &user, &csrf, &canonical, &markdown, preview, None, None, true,
+                    )
+                    .into_response()
                 }
                 Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
-                    pages::new_concept_page(&user, &csrf, None).into_response()
+                    // Unknown path → the new-concept editor seeded with
+                    // the default Note template (the legacy
+                    // new_concept_page behavior).
+                    let template =
+                        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n";
+                    let (preview, _) = pages::build_preview_html(template);
+                    pages::concept_editor(&user, &csrf, "", template, preview, None, None, true)
+                        .into_response()
                 }
                 Err(_) => pages::not_found().into_response(),
             }

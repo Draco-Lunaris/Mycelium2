@@ -755,6 +755,150 @@ async fn keys_dialog_renders() {
     shutdown.cancel();
 }
 
+/// Concept editor (Task 2): breadcrumb + static server-rendered
+/// preview on the view page, saved hostile markdown escaped in the
+/// preview (Review Focus 1 — never executable markup), the
+/// confirm-on-delete dialog (the keys-page pattern) shipping with the
+/// page, and a save with broken frontmatter re-rendering the editor
+/// with the warning banner (no edit lost to a redirect).
+#[tokio::test]
+async fn editor_breadcrumb_preview_hostile() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("myc2_session="));
+
+    // A concept to open in the editor (heading + paragraph body so the
+    // preview's minimal renderer has real structure to render).
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+    let create = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/notes/test.md"),
+            (
+                "markdown",
+                "---\ntype: Note\ntitle: Test Note\ndescription: A test\n---\n\n## Section\n\nHello world",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // Editor: breadcrumb + preview + hostile-markdown safety (Review Focus 1).
+    let editor = client
+        .get(format!("{base}/concept?path=/notes/test.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(editor.status(), 200);
+    let html = editor.text().await.unwrap();
+    assert!(html.contains("breadcrumb"), "{html}");
+    assert!(html.contains("preview"), "{html}");
+    // The two-pane body and the server-rendered preview content.
+    assert!(html.contains("editor-grid"), "two-pane editor body: {html}");
+    assert!(
+        html.contains("Test Note"),
+        "preview shows the title: {html}"
+    );
+    assert!(
+        html.contains("<h3>Section</h3>"),
+        "preview renders the body heading (## maps to h3): {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">Note</span>"#),
+        "preview type chip: {html}"
+    );
+    // Confirm-on-delete: the shared dialog + confirm.js, and the
+    // per-item fallback form POSTs /concept/delete without script.
+    assert!(html.contains("<dialog"), "delete confirm dialog: {html}");
+    assert!(html.contains("/assets/confirm.js?v="), "{html}");
+    assert!(
+        html.contains(r#"data-confirm-dialog="delete""#),
+        "delete trigger: {html}"
+    );
+    assert!(
+        html.contains(r#"action="/concept/delete""#),
+        "delete form action: {html}"
+    );
+
+    // Preview of hostile saved markdown is escaped, not executed.
+    let hostile = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/hostile.md"),
+            (
+                "markdown",
+                "---\ntype: Note\n---\n\n<script>alert(1)</script>\n",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile.status(), 303, "hostile concept must save");
+    let view = client
+        .get(format!("{base}/concept?path=/hostile.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let hv = view.text().await.unwrap();
+    assert!(
+        !hv.contains("<script>alert(1)</script>"),
+        "preview must escape: {hv}"
+    );
+    assert!(hv.contains("&lt;script&gt;"), "preview escapes: {hv}");
+
+    // Frontmatter error: a save with broken frontmatter re-renders the
+    // editor with the warning banner (the edit preserved in the textarea).
+    let bad = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("path", "/notes/bad-fm.md"),
+            ("markdown", "no frontmatter here"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 200, "parse failure re-renders the editor");
+    let bh = bad.text().await.unwrap();
+    assert!(
+        bh.contains("banner--warning"),
+        "frontmatter error banner: {bh}"
+    );
+    assert!(
+        bh.contains("missing frontmatter"),
+        "the parser's own message: {bh}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

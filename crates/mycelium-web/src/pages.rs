@@ -4,6 +4,7 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use mycelium_auth::rbac::{Role, SessionUser};
+use mycelium_core::concept::Concept;
 
 use crate::middleware::SessionId;
 
@@ -225,96 +226,117 @@ pub fn home_page(
     layout("Browse", Some(user), csrf, "/", body)
 }
 
-/// Concept view/edit page (plain textarea with the raw markdown).
-pub fn concept_page(
+/// The concept editor/viewer (Task 2 rebuild — the one page fn the
+/// three legacy editors collapsed into): breadcrumb, page header with
+/// Save + Delete (the keys page's confirm-dialog pattern), the
+/// frontmatter warning banner, and the two-pane body — the markdown
+/// source textarea beside the static, server-rendered preview.
+///
+/// Escaping: `markdown` round-trips through [`textarea_escape`] into
+/// the textarea; `preview_html` is a TRUSTED-markup slot — it is
+/// built by [`build_preview_html`] from html-escaped fragments only
+/// (escape-then-compose, the spec's body-interpolation contract), so
+/// it is interpolated raw here. All other user text (path, scope, the
+/// banner message) is escaped at composition.
+///
+/// `editable=false` renders the read-only viewer (library always;
+/// global skills for non-admins). An empty `path` renders the
+/// new-concept form (path input + template, no delete — nothing is
+/// saved yet). `scope` keeps the write aimed at the right store (the
+/// hidden form field, and the delete form + dialog carry it too) and
+/// shows a muted scope note in the header actions.
+#[allow(clippy::too_many_arguments)]
+pub fn concept_editor(
     user: &SessionUser,
     csrf: &str,
     path: &str,
     markdown: &str,
-    ok: Option<&str>,
-    err: Option<&str>,
-) -> Html<String> {
-    let body = format!(
-        r#"<h1>{}</h1>
-{}
-<form method="post" action="/concept">
-  <input type="hidden" name="path" value="{}">
-  <label>Markdown (frontmatter + body)</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Save</button>
-  <button type="submit" name="delete" value="1" class="danger" formaction="/concept/delete">Delete</button>
-</form>"#,
-        html_escape(path),
-        flash(ok, err),
-        html_escape(path),
-        textarea_escape(markdown)
-    );
-    layout("Concept", Some(user), csrf, "/concept", body)
-}
-
-/// Concept view page for a scoped store (library catalogs, global
-/// skills). `editable` controls whether the save/delete form renders
-/// (library: never; global skills: admins only).
-pub fn concept_page_scoped(
-    user: &SessionUser,
-    csrf: &str,
-    path: &str,
-    markdown: &str,
+    preview_html: String,
+    frontmatter_error: Option<&str>,
+    scope: Option<&str>,
     editable: bool,
-    scope: &str,
 ) -> Html<String> {
+    let is_new = path.is_empty();
+    let title: &str = if is_new { "New concept" } else { path };
+    // Breadcrumb: Browse → this concept (a plain label, no href).
+    let breadcrumb = mycelium_ui::render::render(mycelium_ui::breadcrumb(&[
+        ("Browse", Some("/")),
+        (title, None),
+    ]));
+    // Header actions: a muted scope note, then Save (+ Delete when a
+    // concept is saved). The Delete trigger sits inside its own
+    // per-item form (hidden csrf + path + scope): without script,
+    // clicking it POSTs /concept/delete directly; with confirm.js, the
+    // click is intercepted and the shared dialog opens instead.
     let scope_note = match scope {
-        "library" => " <span class=\"muted\">(library — read-only)</span>",
-        "skills" => " <span class=\"muted\">(global skills)</span>",
+        Some("library") => r#"<span class="muted">(library — read-only)</span>"#,
+        Some("skills") => r#"<span class="muted">(global skills)</span>"#,
         _ => "",
     };
-    let form = if editable {
-        format!(
-            r#"<form method="post" action="/concept">
-  <input type="hidden" name="path" value="{}">
-  <input type="hidden" name="scope" value="{scope}">
-  <label>Markdown (frontmatter + body)</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Save</button>
-  <button type="submit" name="delete" value="1" class="danger" formaction="/concept/delete">Delete</button>
-</form>"#,
-            html_escape(path),
-            textarea_escape(markdown)
+    let show_delete = editable && !is_new;
+    let (actions, dialog, confirm_script) = if show_delete {
+        let mut delete_fields = format!(
+            r#"<input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="path" value="{}">"#,
+            html_escape(csrf),
+            html_escape(path)
+        );
+        if let Some(s) = scope {
+            delete_fields.push_str(&format!(
+                r#"<input type="hidden" name="scope" value="{}">"#,
+                html_escape(s)
+            ));
+        }
+        let delete_form = format!(
+            r#"<form method="post" action="/concept/delete">{delete_fields}<button type="submit" class="btn btn--danger" data-confirm-dialog="delete">Delete</button></form>"#
+        );
+        // One shared dialog: the path (and scope) are server-rendered
+        // into its hidden fields — one concept per page — so confirm.js
+        // needs no per-trigger copying. The hidden values render
+        // through leptos attribute positions (escaped there).
+        let mut dialog_fields = vec![
+            ("path".to_string(), path.to_string()),
+            ("csrf_token".to_string(), csrf.to_string()),
+        ];
+        if let Some(s) = scope {
+            dialog_fields.push(("scope".to_string(), s.to_string()));
+        }
+        let dialog = mycelium_ui::render::render(mycelium_ui::confirm_dialog(
+            "delete",
+            "Delete this concept?",
+            "This cannot be undone.",
+            "Delete",
+            "danger",
+            "/concept/delete",
+            &dialog_fields,
+        ));
+        (
+            format!(
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>{delete_form}"#
+            ),
+            dialog,
+            true,
+        )
+    } else if editable {
+        // New concept: Save only — nothing is saved to delete yet.
+        (
+            format!(
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>"#
+            ),
+            String::new(),
+            false,
         )
     } else {
-        format!(
-            r#"<label>Markdown (read-only)</label>
-<textarea readonly spellcheck="false">{}</textarea>"#,
-            textarea_escape(markdown)
-        )
+        (scope_note.to_string(), String::new(), false)
     };
-    let body = format!(
-        r#"<h1>{}{scope_note}</h1>
-{form}"#,
-        html_escape(path)
-    );
-    layout("Concept", Some(user), csrf, "/concept", body)
-}
-
-/// New-concept page.
-pub fn new_concept_page(user: &SessionUser, csrf: &str, err: Option<&str>) -> Html<String> {
-    let _ = err; // parse errors surface on submit instead
-    new_concept_page_with(
-        user,
-        csrf,
-        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n",
-        None,
-    )
-}
-
-/// New-concept page with a custom template and target scope. The form
-/// posts back with the scope so the write lands in the right store.
-pub fn new_concept_page_with(
-    user: &SessionUser,
-    csrf: &str,
-    template: &str,
-    scope: Option<&str>,
-) -> Html<String> {
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(title, actions));
+    let warning = frontmatter_error
+        .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
+        .unwrap_or_default();
+    // The source pane: the save form posts /concept with the path,
+    // scope, csrf, and markdown; the hidden csrf_token keeps the
+    // native form path working without app.js. The Save button lives
+    // in the header and submits this form via the HTML5 `form=`
+    // attribute (valid without script).
     let scope_input = scope
         .map(|s| {
             format!(
@@ -323,19 +345,153 @@ pub fn new_concept_page_with(
             )
         })
         .unwrap_or_default();
-    let body = format!(
-        r#"<h1>New concept</h1>
-<form method="post" action="/concept">
+    let path_input = if is_new {
+        r#"<label>Path (e.g. /notes/my-note.md)</label>
+  <input name="path" required pattern="/.*\.md" placeholder="/notes/my-note.md">"#
+            .to_string()
+    } else {
+        format!(
+            r#"<input type="hidden" name="path" value="{}">"#,
+            html_escape(path)
+        )
+    };
+    let pane = if editable {
+        format!(
+            r#"<form class="editor-pane" id="concept-editor-form" method="post" action="/concept">
+  {path_input}
   {scope_input}
-  <label>Path (e.g. /notes/my-note.md)</label>
-  <input name="path" required pattern="/.*\.md" placeholder="/notes/my-note.md">
-  <label>Markdown</label>
-  <textarea name="markdown" spellcheck="false">{}</textarea>
-  <button type="submit">Create</button>
+  <input type="hidden" name="csrf_token" value="{}">
+  <label>Markdown (frontmatter + body)</label>
+  <textarea name="markdown" class="editor-source" spellcheck="false">{}</textarea>
 </form>"#,
-        html_escape(template)
+            html_escape(csrf),
+            textarea_escape(markdown)
+        )
+    } else {
+        format!(
+            r#"<div class="editor-pane">
+  <label>Markdown (read-only)</label>
+  <textarea class="editor-source" readonly spellcheck="false">{}</textarea>
+</div>"#,
+            textarea_escape(markdown)
+        )
+    };
+    let body = format!(
+        "{breadcrumb}{header}{warning}\
+<div class=\"editor-grid\">{pane}<div class=\"editor-preview\">{preview_html}</div></div>{dialog}"
     );
-    layout("New concept", Some(user), csrf, "/concept", body)
+    let page_title = if is_new { "New concept" } else { "Concept" };
+    let scripts: &[&str] = if confirm_script {
+        &["/assets/confirm.js"]
+    } else {
+        &[]
+    };
+    layout_with_scripts(page_title, Some(user), csrf, "/concept", body, scripts)
+}
+
+/// Build the editor's static preview pane from the concept's markdown.
+/// Returns `(preview_html, frontmatter_error)`: the preview is composed
+/// from html-escaped fragments ONLY (escape-then-compose — the spec's
+/// body-interpolation contract), and `frontmatter_error` carries
+/// [`Concept::parse`]'s own message — the exact parser the save path
+/// and `ConceptStore::get` validate with, so the banner's wording is
+/// always the error a save would reject with (error parity).
+///
+/// Renderer choice (per the brief): no markdown→HTML library and no
+/// client script are in scope for this pane, so the body goes through
+/// a deliberately minimal server-side conversion —
+/// [`render_minimal_body`]: blank-line paragraphs plus `#`/`##`/`###`
+/// headings, every fragment escaped. A parse error means there is no
+/// frontmatter to feature, so the pane minimally renders the raw
+/// content (frontmatter block stripped when a closing `---` line
+/// exists) and the warning banner explains the rest.
+pub fn build_preview_html(markdown: &str) -> (String, Option<String>) {
+    match Concept::parse("/preview.md", markdown) {
+        Ok(concept) => {
+            let mut out = String::new();
+            if let Some(title) = &concept.frontmatter.title
+                && !title.is_empty()
+            {
+                out.push_str(&format!("<h2>{}</h2>", html_escape(title)));
+            }
+            out.push_str(&mycelium_ui::render::render(mycelium_ui::chip(
+                &concept.frontmatter.concept_type,
+                "neutral",
+            )));
+            if let Some(description) = &concept.frontmatter.description
+                && !description.is_empty()
+            {
+                out.push_str(&format!("<p>{}</p>", html_escape(description)));
+            }
+            out.push_str(&render_minimal_body(&concept.body));
+            (out, None)
+        }
+        Err(e) => (
+            render_minimal_body(strip_frontmatter_block(markdown)),
+            Some(e.to_string()),
+        ),
+    }
+}
+
+/// Minimal markdown→HTML for the preview pane: the body splits on blank
+/// lines into `<p>` paragraphs; a line starting `# `/`## `/`### `
+/// renders as `<h2>`/`<h3>`/`<h4>` (prefix stripped). Every fragment is
+/// html-escaped BEFORE composition — hostile markup can never become
+/// executable HTML here.
+fn render_minimal_body(body: &str) -> String {
+    fn flush(out: &mut String, para: &mut Vec<&str>) {
+        if para.is_empty() {
+            return;
+        }
+        out.push_str(&format!("<p>{}</p>", html_escape(&para.join("\n"))));
+        para.clear();
+    }
+    let mut out = String::new();
+    let mut para: Vec<&str> = Vec::new();
+    for line in body.split('\n') {
+        if let Some((tag, rest)) = heading_of(line) {
+            flush(&mut out, &mut para);
+            out.push_str(&format!("<{tag}>{}</{tag}>", html_escape(rest)));
+        } else if line.trim().is_empty() {
+            flush(&mut out, &mut para);
+        } else {
+            para.push(line);
+        }
+    }
+    flush(&mut out, &mut para);
+    out
+}
+
+/// `# `/`## `/`### ` → (`h2`|`h3`|`h4`, rest-of-line); every other line
+/// is paragraph text (longer heading runs like `#### ` stay prose).
+fn heading_of(line: &str) -> Option<(&'static str, &str)> {
+    if let Some(rest) = line.strip_prefix("### ") {
+        Some(("h4", rest))
+    } else if let Some(rest) = line.strip_prefix("## ") {
+        Some(("h3", rest))
+    } else if let Some(rest) = line.strip_prefix("# ") {
+        Some(("h2", rest))
+    } else {
+        None
+    }
+}
+
+/// Strip a leading `---\n…\n---\n` frontmatter block. Used only on the
+/// parse-error path (where `Concept::parse` could not split it): a
+/// naive scan mirroring the core splitter's delimiter rule; without a
+/// closing `---` line nothing is stripped — the whole input previews.
+fn strip_frontmatter_block(markdown: &str) -> &str {
+    let Some(rest) = markdown.strip_prefix("---\n") else {
+        return markdown;
+    };
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return &rest[offset + line.len()..];
+        }
+        offset += line.len();
+    }
+    markdown
 }
 
 /// Search page.
@@ -885,7 +1041,8 @@ mod tests {
     /// Review Focus 3: the concept editor round-trips user markdown
     /// through a textarea — a hostile `</textarea><script>` sequence must
     /// be neutralized (escaped, never executable markup), matching the
-    /// XSS integration-test posture.
+    /// XSS integration-test posture. (Rebuilt editor, Task 2: the same
+    /// guarantee through `concept_editor` + its preview builder.)
     #[test]
     fn concept_editor_neutralizes_textarea_breakout() {
         let user = SessionUser {
@@ -894,7 +1051,18 @@ mod tests {
             role: Role::User,
         };
         let hostile = "</textarea><script>alert(1)</script>";
-        let html = concept_page(&user, "", "/notes/x.md", hostile, None, None).0;
+        let (preview, fm_err) = build_preview_html(hostile);
+        let html = concept_editor(
+            &user,
+            "",
+            "/notes/x.md",
+            hostile,
+            preview,
+            fm_err.as_deref(),
+            None,
+            true,
+        )
+        .0;
         assert!(
             !html.contains("<script>alert(1)</script>"),
             "raw script tag leaked through the editor textarea: {html}"
@@ -902,6 +1070,41 @@ mod tests {
         assert!(
             html.contains("&lt;/textarea&gt;"),
             "escaped form missing: {html}"
+        );
+    }
+
+    /// Task 2: the preview pane renders hostile saved markdown ESCAPED.
+    /// The minimal renderer composes from html-escaped fragments only
+    /// (escape-then-compose, the spec's body-interpolation contract), so
+    /// a stored `<script>` can never become executable markup in the
+    /// preview — the in-module mirror of the
+    /// `editor_breadcrumb_preview_hostile` integration test.
+    #[test]
+    fn editor_preview_escapes_hostile_markdown() {
+        let user = SessionUser {
+            user_id: uuid::Uuid::new_v4(),
+            username: "test".to_string(),
+            role: Role::User,
+        };
+        let hostile =
+            "---\ntype: Note\ntitle: <script>alert(1)</script>\n---\n\n<script>alert(1)</script>\n";
+        let (preview, fm_err) = build_preview_html(hostile);
+        assert!(
+            fm_err.is_none(),
+            "hostile-but-valid frontmatter must parse: {fm_err:?}"
+        );
+        let html = concept_editor(&user, "", "/notes/x.md", hostile, preview, None, None, true).0;
+        assert!(
+            html.contains(r#"<div class="editor-preview">"#),
+            "preview pane present: {html}"
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw script tag leaked into the preview: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "escaped form missing in the preview: {html}"
         );
     }
 

@@ -392,6 +392,19 @@ body.chat-page main {
   .page-header { flex-wrap: wrap; }
 }
 
+/* Concept editor (Task 2): source/preview grid — two equal columns,
+   one under 720px (the shell's breakpoint); the preview pane is fully
+   server-rendered from escaped fragments (static, no client script). */
+.editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-4); }
+@media (max-width: 720px) {
+  .editor-grid { grid-template-columns: 1fr; }
+}
+.editor-pane textarea { min-height: 24rem; font-family: ui-monospace, monospace; }
+.editor-preview {
+  padding: var(--gap-3); background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--radius-card);
+}
+
 /* ConfirmDialog: native <dialog>, dimmed backdrop ~70% (spec §5 band). */
 .modal {
   width: min(440px, calc(100vw - 2 * var(--gap-4)));
@@ -1018,7 +1031,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "11";
+pub const ASSETS_VERSION: &str = "12";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
