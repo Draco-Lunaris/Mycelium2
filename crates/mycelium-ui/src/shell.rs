@@ -27,7 +27,7 @@ use leptos::prelude::*;
 /// `assets_versions_lockstep` unit test (only that crate sees both
 /// constants), so a one-sided bump fails CI.
 #[cfg(feature = "ssr")]
-pub const ASSETS_VERSION: &str = "10";
+pub const ASSETS_VERSION: &str = "19";
 
 /// Minimal HTML escaping for the `format!`-composed head attributes
 /// (csrf token, title) — the html-escape equivalent mycelium-ui carries
@@ -169,15 +169,17 @@ fn sidebar(name: &str, user: Option<(&str, bool)>, active_path: &str) -> impl In
 /// top bar under 720px). The class names match the `.page-header` block
 /// in mycelium-web's assets stylesheet (the actions container is
 /// `.actions`, not a BEM modifier). The title goes into a `view!` TEXT
-/// position, where leptos escapes it; `actions` is caller-composed markup
-/// passed as a child (same contract as `card`'s body).
+/// position, where leptos escapes it; `actions` is a trusted-markup
+/// slot — caller-composed markup from escaped fragments, interpolated
+/// raw via `inner_html` (the caller owns escaping, same contract as
+/// `card`'s body and the shell's page body).
 #[cfg(feature = "ssr")]
 pub fn page_header(title: &str, actions: String) -> impl IntoView {
     let title = title.to_string();
     view! {
         <header class="page-header">
             <h1>{title}</h1>
-            <div class="actions">{actions}</div>
+            <div class="actions" inner_html=actions/>
         </header>
     }
 }
@@ -186,9 +188,12 @@ pub fn page_header(title: &str, actions: String) -> impl IntoView {
 /// title, stylesheet), then the body — sidebar shell (brand lockup,
 /// grouped nav, user chip + logout; no sidebar at all without a user),
 /// the page body inside `<main>`, and the app.js + extra script tags at
-/// body end. A signed-in page's body class is prefixed with `shelled`
-/// (the flex-row layout hook); `None` user renders no nav — auth pages
-/// use `auth_shell`.
+/// body end: classic scripts first (`scripts`), then module scripts
+/// (`module_scripts` — the hydrate bundle; `type="module"` defers their
+/// execution until after the classic scripts, and the standing-guards
+/// scan accepts either attribute order). A signed-in page's body class
+/// is prefixed with `shelled` (the flex-row layout hook); `None` user
+/// renders no nav — auth pages use `auth_shell`.
 #[cfg(feature = "ssr")]
 #[allow(clippy::too_many_arguments)]
 pub fn shell(
@@ -198,6 +203,7 @@ pub fn shell(
     active_path: &str,
     body: String,
     scripts: &[&str],
+    module_scripts: &[&str],
     body_class: &str,
 ) -> String {
     let sidebar_html = match user {
@@ -213,6 +219,14 @@ pub fn shell(
         .iter()
         .map(|s| format!(r#"<script src="{s}?v={ASSETS_VERSION}"></script>"#))
         .collect::<String>();
+    // Module scripts (the hydrate bundle): `type="module"` first in
+    // the tag, `src` second — the guards scan accepts either order,
+    // and module deferral keeps them executing after the classic
+    // scripts above.
+    let module_script_tags = module_scripts
+        .iter()
+        .map(|s| format!(r#"<script type="module" src="{s}?v={ASSETS_VERSION}"></script>"#))
+        .collect::<String>();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -226,7 +240,7 @@ pub fn shell(
 <body class="{}">
 {}
 <main>{}</main>
-<script src="/assets/app.js?v={version}"></script>{extra_scripts}
+<script src="/assets/app.js?v={version}"></script>{extra_scripts}{module_script_tags}
 </body>
 </html>"#,
         escape(csrf),
@@ -277,7 +291,7 @@ mod tests {
     #[test]
     fn shell_renders_groups_and_active_state() {
         let user = Some(("echo", true));
-        let html = shell("Browse", user, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", user, "tok", "/", String::new(), &[], &[], "");
         assert!(html.contains("Knowledge"), "{html}");
         assert!(html.contains("Librarian"), "{html}");
         assert!(html.contains("Account"), "{html}");
@@ -292,13 +306,13 @@ mod tests {
     #[test]
     fn shell_hides_admin_group_for_non_admin() {
         let user = Some(("echo", false));
-        let html = shell("Browse", user, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", user, "tok", "/", String::new(), &[], &[], "");
         assert!(!html.contains("Admin"), "{html}");
     }
 
     #[test]
     fn shell_no_user_renders_no_nav() {
-        let html = shell("Browse", None, "tok", "/", String::new(), &[], "");
+        let html = shell("Browse", None, "tok", "/", String::new(), &[], &[], "");
         assert!(!html.contains("sidebar__group-label"), "{html}");
     }
 
@@ -315,6 +329,14 @@ mod tests {
         assert!(html.contains("page-header"), "{html}");
         assert!(html.contains("Browse"), "{html}");
         assert!(!html.contains("style="), "{html}");
+        // The actions slot is a trusted-markup slot: composed markup
+        // passes through raw (the caller escapes user text first).
+        let actions = r#"<a class="btn btn--primary" href="/concept?new=1">New concept</a>"#;
+        let html = render(page_header("Browse", actions.to_string()));
+        assert!(
+            html.contains(actions),
+            "actions markup must stay raw: {html}"
+        );
     }
 
     #[test]
@@ -326,7 +348,16 @@ mod tests {
             render(crate::primitives::field("f1", "A", "text", "", "")),
             render(crate::primitives::field("f2", "B", "text", "", ""))
         );
-        let html = shell("Browse", Some(("echo", false)), "tok", "/", body, &[], "");
+        let html = shell(
+            "Browse",
+            Some(("echo", false)),
+            "tok",
+            "/",
+            body,
+            &[],
+            &[],
+            "",
+        );
         assert!(html.matches("id=\"f1\"").count() == 1, "{html}");
         assert!(html.matches("id=\"f2\"").count() == 1, "{html}");
         assert!(html.matches("for=\"f1\"").count() == 1, "{html}");

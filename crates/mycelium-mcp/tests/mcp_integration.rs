@@ -187,8 +187,12 @@ async fn mint_key(client: &reqwest::Client, base: &str, cookie: &str, csrf: &str
         .unwrap();
     assert_eq!(mint.status(), 200);
     let html = mint.text().await.unwrap();
-    let code_start = html.find("<code>myc2-").expect("minted token shown");
-    let token_rest = &html[code_start + "<code>".len()..];
+    // The minted token sits in the shown-once banner's <code> element
+    // (Task 7 gave it the id the copy island targets).
+    let code_start = html
+        .find("<code id=\"minted-key\">")
+        .expect("minted token shown");
+    let token_rest = &html[code_start + "<code id=\"minted-key\">".len()..];
     let token_end = token_rest.find("</code>").unwrap();
     token_rest[..token_end].to_string()
 }
@@ -670,7 +674,15 @@ async fn mcp_full_flow() {
         .unwrap();
     let html = page.text().await.unwrap();
     // Find the revoke trigger's key id (the most recently minted key's
-    // row — the confirm dialog's trigger carries data-key-id).
+    // row — the active rows' revoke triggers carry data-key-id; the
+    // confirm dialog carries no data-key-id — its hidden input is
+    // name="id"). Marker
+    // re-verified against the Task-8 keys restyle and kept: the keys
+    // data_table renders rows in creation order (ASC), only ACTIVE rows
+    // carry a data-key-id trigger (revoked rows render dimmed "Revoked"
+    // text — no trigger), and neither the confirm dialog nor the
+    // minted banner carries one — so the LAST occurrence is the newest
+    // active key, which is token2's row.
     let revoke_marker = "data-key-id=\"";
     let mut revoke_id = None;
     let mut search_from = 0;

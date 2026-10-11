@@ -2,11 +2,15 @@
 //! Breadcrumb, TabBar, FormActions, NavGroup, NavItem. All components are
 //! SSR-gated — they render HTML through the `crate::render` bridge.
 //!
-//! Escaping rule (same as `primitives`): user text goes into `view!` TEXT
-//! interpolation positions only — leptos escapes those automatically.
-//! Attribute values are never built with `format!` on user input: classes
-//! come from fixed strings, and hrefs/labels are caller-supplied
-//! primitives passed through as typed attributes. Zero inline styles.
+//! Escaping rule: plain-text slots (titles, labels, stat values) render
+//! into `view!` TEXT interpolation positions, where leptos escapes them.
+//! The rich-content slots — `data_table` cells and `card`'s body — are
+//! TRUSTED-MARKUP slots: caller-composed markup built from escaped
+//! fragments, interpolated raw via `inner_html` (the same contract as
+//! the shell's page body — the caller owns escaping). Attribute values
+//! are never built with `format!` on user input: classes come from
+//! fixed strings, and hrefs/labels are caller-supplied primitives
+//! passed through as typed attributes. Zero inline styles.
 //!
 //! `&str` props are cloned to owned at the boundary so the returned views
 //! don't capture callers' lifetimes (the public signatures are
@@ -27,8 +31,11 @@ use crate::primitives::{button, empty_state};
 use leptos::prelude::*;
 
 /// `<section class="card"><div class="card__header"><h2>…</h2></div>
-/// {body}</section>`. Title-only this PR — the `card__header` row keeps
-/// its flex space so the action slot drops in without a DOM change.
+/// <div>{body}</div></section>`. Title-only this PR — the `card__header`
+/// row keeps its flex space so the action slot drops in without a DOM
+/// change. `body` is a trusted-markup slot: caller-composed markup from
+/// escaped fragments, interpolated raw via `inner_html` (the caller owns
+/// escaping — the shell's page-body contract).
 #[cfg(feature = "ssr")]
 pub fn card(title: &str, body: String) -> impl IntoView {
     let title = title.to_string();
@@ -37,15 +44,17 @@ pub fn card(title: &str, body: String) -> impl IntoView {
             <div class="card__header">
                 <h2>{title}</h2>
             </div>
-            {body}
+            <div inner_html=body/>
         </section>
     }
 }
 
 /// `<table class="table">` with a `<thead>` row and one `<tr>` per input
 /// row; every `<td>` carries `data-label="{header}"` for the narrow
-/// re-flow. Empty `rows` renders the primitive `empty_state` in the table
-/// slot instead.
+/// re-flow. Cells are trusted-markup slots: caller-composed markup from
+/// escaped fragments, interpolated raw via `inner_html` (the caller owns
+/// escaping — the same contract as `card`'s body). Empty `rows` renders
+/// the primitive `empty_state` in the table slot instead.
 #[cfg(feature = "ssr")]
 pub fn data_table(headers: &[&str], rows: &[Vec<String>]) -> impl IntoView {
     if rows.is_empty() {
@@ -66,7 +75,7 @@ pub fn data_table(headers: &[&str], rows: &[Vec<String>]) -> impl IntoView {
                 .enumerate()
                 .map(|(col, cell)| {
                     let label = headers.get(col).copied().unwrap_or("").to_string();
-                    view! { <td data-label={label}>{cell.clone()}</td> }
+                    view! { <td data-label={label} inner_html=cell.clone()/> }
                 })
                 .collect();
             view! { <tr>{cells}</tr> }
@@ -242,13 +251,43 @@ mod tests {
     }
 
     #[test]
-    fn data_table_carries_data_label_and_escapes() {
+    fn data_table_carries_data_label_and_trusted_markup_cells() {
+        // Cells are trusted caller-composed markup (the raw-slot
+        // contract): markup passes through unescaped, so callers escape
+        // user text before composing a cell. The end-to-end escaping
+        // posture is pinned by mycelium-web's XSS integration test
+        // (a hostile concept title renders escaped through the full
+        // Browse page).
         let headers = ["Name", "Type"];
-        let rows = vec![vec!["Title <script>".into(), "Note".into()]];
+        let rows = vec![vec![
+            // A pre-escaped fragment (how callers pass user text):
+            // stays escaped — no double-escaping, no raw script.
+            "Title &lt;script&gt;".into(),
+            // Trusted markup (chip/flag/link cells): passes through raw.
+            r#"<span class="chip chip--neutral">Note</span>"#.into(),
+        ]];
         let html = render(data_table(&headers, &rows));
         assert!(html.contains(r#"data-label="Name""#), "{html}");
-        assert!(html.contains("Title &lt;script&gt;"), "{html}");
-        assert!(!html.contains("<script>"), "{html}");
+        assert!(
+            html.contains("Title &lt;script&gt;"),
+            "escaped fragments stay escaped: {html}"
+        );
+        assert!(!html.contains("&amp;lt;"), "no double-escaping: {html}");
+        assert!(
+            html.contains(r#"<span class="chip chip--neutral">Note</span>"#),
+            "markup passes through raw: {html}"
+        );
+    }
+
+    #[test]
+    fn card_body_is_a_trusted_markup_slot() {
+        let html = render(card("Section", r#"<p>a <em>body</em></p>"#.to_string()));
+        assert!(html.contains("card__header"), "{html}");
+        assert!(
+            html.contains("<em>body</em>"),
+            "body markup must stay raw: {html}"
+        );
+        assert!(!html.contains("&lt;em&gt;"), "{html}");
     }
 
     #[test]

@@ -117,18 +117,23 @@ async fn admin_cookie(client: &reqwest::Client, base: &str) -> String {
 }
 
 /// No `<script` tag may lack a src attribute (CSP `script-src 'self'`).
-/// Regex-free scan: every `<script` occurrence must be immediately
-/// followed (modulo whitespace) by `src`.
+/// Regex-free scan: within each script tag's open tag, a `src=`
+/// attribute must appear — in either attribute order (module scripts
+/// carry `type="module"` before `src`; classic scripts put `src`
+/// first). Content-only `<script>` tags still fail.
 fn assert_no_inline_scripts(html: &str, route: &str) {
     let mut start = 0usize;
     while let Some(rel) = html[start..].find("<script") {
         let tag_open = start + rel;
-        let after = &html[tag_open + "<script".len()..];
+        let end = html[tag_open..]
+            .find('>')
+            .expect("script open tag must close");
+        let tag = &html[tag_open..tag_open + end];
         assert!(
-            after.trim_start().starts_with("src"),
+            tag.contains("src="),
             "{route}: <script> without src attribute: {html}"
         );
-        start = tag_open + "<script".len();
+        start = tag_open + end;
     }
 }
 
