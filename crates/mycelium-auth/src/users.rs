@@ -29,7 +29,7 @@ pub enum UsersError {
 }
 
 /// Raw user row shape shared by get_by_username / get_by_id.
-type UserRow = (
+type RawUserRow = (
     String,
     String,
     String,
@@ -55,6 +55,19 @@ pub struct UserRecord {
     pub must_change_password: bool,
     pub totp_secret: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A user row for the admin users table: identity plus the forced-password-
+/// change flag. Role and provider stay as the stored strings (the table
+/// renders them verbatim; the CHECK constraints keep them in range).
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub id: Uuid,
+    pub username: String,
+    pub email: String,
+    pub role: String,
+    pub auth_provider: String,
+    pub must_change_password: bool,
 }
 
 /// Result of a successful local login: the user plus their unwrapped
@@ -146,7 +159,7 @@ impl UserStore {
 
     /// Fetch a user by username (case-insensitive).
     pub async fn get_by_username(&self, username: &str) -> Result<UserRecord, UsersError> {
-        let row: Option<UserRow> = sqlx::query_as(
+        let row: Option<RawUserRow> = sqlx::query_as(
             "SELECT id, username, email, role, auth_provider, password_hash, sealed_master_key, must_change_password, totp_secret, created_at
              FROM users WHERE username = ? COLLATE NOCASE",
         )
@@ -243,7 +256,7 @@ impl UserStore {
 
     /// Fetch a user by id.
     pub async fn get_by_id(&self, user_id: Uuid) -> Result<UserRecord, UsersError> {
-        let row: Option<UserRow> = sqlx::query_as(
+        let row: Option<RawUserRow> = sqlx::query_as(
             "SELECT id, username, email, role, auth_provider, password_hash, sealed_master_key, must_change_password, totp_secret, created_at
              FROM users WHERE id = ?",
         )
@@ -283,6 +296,30 @@ impl UserStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// List all users with the fields the admin users table renders: id and
+    /// the forced-password-change flag on top of `list_all`'s four columns.
+    /// `ORDER BY username` is preserved for deterministic output.
+    pub async fn list_all_detailed(&self) -> Result<Vec<UserRow>, UsersError> {
+        let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, username, email, role, auth_provider, must_change_password
+             FROM users ORDER BY username",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(UserRow {
+                    id: Uuid::parse_str(&row.0).map_err(|_| UsersError::CorruptSeal)?,
+                    username: row.1,
+                    email: row.2,
+                    role: row.3,
+                    auth_provider: row.4,
+                    must_change_password: row.5 != 0,
+                })
+            })
+            .collect()
     }
 
     /// List a user's API keys (delegates to ApiKeyManager).
@@ -403,6 +440,48 @@ mod tests {
         assert_eq!(after.master_key.as_bytes(), before.master_key.as_bytes());
         // Old password rejected.
         assert!(users.authenticate_local("alice", PW).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_all_detailed_returns_all_fields() {
+        let (_dir, store) = test_store().await;
+        let users = UserStore::new(store.pool().clone());
+        // Created out of alphabetical order so ORDER BY username is meaningful.
+        let zoe = users
+            .create_local("zoe", "zoe@example.com", PW, Role::User)
+            .await
+            .unwrap();
+        let alice = users
+            .create_local("alice", "alice@example.com", PW, Role::Admin)
+            .await
+            .unwrap();
+        // No production path sets the flag — flip it directly by SQL, as the
+        // other suites do.
+        sqlx::query("UPDATE users SET must_change_password = 1 WHERE username = ?")
+            .bind("alice")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let rows = users.list_all_detailed().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // ORDER BY username holds.
+        assert_eq!(rows[0].username, "alice");
+        assert_eq!(rows[1].username, "zoe");
+        // Ids are real Uuids: they round-trip and match the created users.
+        assert_eq!(rows[0].id, alice.record.id);
+        assert_eq!(rows[1].id, zoe.record.id);
+        assert_ne!(rows[0].id, rows[1].id);
+        // Email / role / provider strings.
+        assert_eq!(rows[0].email, "alice@example.com");
+        assert_eq!(rows[1].email, "zoe@example.com");
+        assert_eq!(rows[0].role, "admin");
+        assert_eq!(rows[1].role, "user");
+        assert_eq!(rows[0].auth_provider, "local");
+        assert_eq!(rows[1].auth_provider, "local");
+        // The flag matches each user's SQL state.
+        assert!(rows[0].must_change_password);
+        assert!(!rows[1].must_change_password);
     }
 
     #[tokio::test]
