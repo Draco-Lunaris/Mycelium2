@@ -1807,24 +1807,16 @@ pub async fn admin_system_view(
     Query(params): Query<AdminParams>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    // The /health values — the same computation the health route runs.
-    let user_count = state.users.count().await.unwrap_or(-1);
-    let (queue_depth, oldest, dead_count) = match state.store.queue_health_counts().await {
-        Ok(h) => (h.depth, h.oldest_pending_age_seconds, h.dead_count),
-        Err(_) => (0, None, 0),
-    };
-    let llm = mycelium_librarian::llm::LLM_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);
-    let llm_secs = if llm == 0 {
-        None
-    } else {
-        Some(chrono::Utc::now().timestamp() - llm as i64)
-    };
+    // The /health values — ONE computation shared with the health route
+    // (the PR-4 SystemStats extraction); mapped into the page's StatTile
+    // DTO, which stays a rendering concern.
+    let s = crate::health::system_stats(&state).await;
     let stats = SystemStats {
-        users: user_count,
-        queue_depth,
-        oldest_pending_age_seconds: oldest,
-        queue_dead_count: dead_count,
-        llm_last_success_seconds: llm_secs,
+        users: s.user_count,
+        queue_depth: s.queue_depth as usize,
+        oldest_pending_age_seconds: s.oldest_pending_age_seconds,
+        queue_dead_count: s.queue_dead_count as usize,
+        llm_last_success_seconds: s.llm_last_success_seconds,
     };
     // Ingest jobs (slug, status, detail, created, shelf name) — the
     // old admin_view's job_rows build, moved here verbatim.

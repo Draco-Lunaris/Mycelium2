@@ -19,13 +19,27 @@ fn oldest_degraded_at_secs() -> i64 {
     2 * mycelium_librarian::queue_worker::QueueLimits::default().age_deadline_secs
 }
 
-/// GET /health — detailed status (DESIGN decision).
+/// The system-wide values /health reports and the admin System page
+/// surfaces as StatTiles — ONE computation shared by both call sites
+/// (the PR-4 extraction of the previously duplicated gathering).
 ///
-/// Degraded posture (spec §4.2), DELIBERATELY widened from the old
-/// 503-only-on-DB-failure rule: dead queue items or an overdue pending
-/// item now also 503 — this is the spec's new contract, not a
-/// regression.
-async fn health(State(state): State<AppState>) -> Response {
+/// The field types encode the historical None-rules the call sites
+/// relied on: `user_count` is the `-1` sentinel only when the user
+/// store fails; ANY queue-store error zeroes the queue fields (the
+/// `db_ok` flag already reports that failure); an LLM success
+/// timestamp of 0 (never succeeded) reads as `None`.
+pub(crate) struct SystemStats {
+    pub user_count: i64,
+    pub queue_depth: i64,
+    pub oldest_pending_age_seconds: Option<i64>,
+    pub queue_dead_count: i64,
+    pub llm_last_success_seconds: Option<i64>,
+    pub db_ok: bool,
+}
+
+/// Gather the system stats. Pure data gathering — no status decisions
+/// here; each caller applies its own degraded rule / rendering.
+pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
     let db_ok = sqlx::query("SELECT 1")
         .execute(state.store.pool())
         .await
@@ -33,18 +47,44 @@ async fn health(State(state): State<AppState>) -> Response {
     let user_count = state.users.count().await.unwrap_or(-1);
     // Queue surfaces (zeroed defaults when the store is unreachable —
     // db_ok already reports that failure).
-    let (queue_depth, oldest, dead_count) = match state.store.queue_health_counts().await {
-        Ok(h) => (h.depth, h.oldest_pending_age_seconds, h.dead_count),
-        Err(_) => (0, None, 0),
-    };
+    let (queue_depth, oldest_pending_age_seconds, queue_dead_count) =
+        match state.store.queue_health_counts().await {
+            Ok(h) => (
+                h.depth as i64,
+                h.oldest_pending_age_seconds,
+                h.dead_count as i64,
+            ),
+            Err(_) => (0, None, 0),
+        };
     let llm = mycelium_librarian::llm::LLM_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);
-    let llm_secs = if llm == 0 {
+    let llm_last_success_seconds = if llm == 0 {
         None
     } else {
         Some(chrono::Utc::now().timestamp() - llm as i64)
     };
-    let degraded =
-        !db_ok || dead_count > 0 || oldest.is_some_and(|age| age > oldest_degraded_at_secs());
+    SystemStats {
+        user_count,
+        queue_depth,
+        oldest_pending_age_seconds,
+        queue_dead_count,
+        llm_last_success_seconds,
+        db_ok,
+    }
+}
+
+/// GET /health — detailed status (DESIGN decision).
+///
+/// Degraded posture (spec §4.2), DELIBERATELY widened from the old
+/// 503-only-on-DB-failure rule: dead queue items or an overdue pending
+/// item now also 503 — this is the spec's new contract, not a
+/// regression.
+async fn health(State(state): State<AppState>) -> Response {
+    let stats = system_stats(&state).await;
+    let degraded = !stats.db_ok
+        || stats.queue_dead_count > 0
+        || stats
+            .oldest_pending_age_seconds
+            .is_some_and(|age| age > oldest_degraded_at_secs());
     let status = if degraded { "degraded" } else { "ok" };
     let code = if degraded {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -55,13 +95,13 @@ async fn health(State(state): State<AppState>) -> Response {
         code,
         axum::Json(serde_json::json!({
             "status": status,
-            "database": db_ok,
-            "users": user_count,
+            "database": stats.db_ok,
+            "users": stats.user_count,
             "version": env!("CARGO_PKG_VERSION"),
-            "queue_depth": queue_depth,
-            "oldest_pending_age_seconds": oldest,
-            "queue_dead_count": dead_count,
-            "llm_last_success_seconds": llm_secs,
+            "queue_depth": stats.queue_depth,
+            "oldest_pending_age_seconds": stats.oldest_pending_age_seconds,
+            "queue_dead_count": stats.queue_dead_count,
+            "llm_last_success_seconds": stats.llm_last_success_seconds,
         })),
     )
         .into_response()
