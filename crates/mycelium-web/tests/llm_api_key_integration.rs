@@ -193,7 +193,7 @@ async fn admin_save_seals_key_never_renders_it_and_blank_keeps_it() {
 
     // Absent at start: the status line says "not set".
     let page = cl
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/llm"))
         .header("cookie", &cookie)
         .send()
         .await
@@ -216,9 +216,9 @@ async fn admin_save_seals_key_never_renders_it_and_blank_keeps_it() {
     );
     assert!(!row.contains("127.0.0.1"), "url leaked at rest: {row}");
 
-    // GET /admin never contains the key; the status line reads "stored".
+    // GET /admin/llm never contains the key; the status line reads "stored".
     let page = cl
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/llm"))
         .header("cookie", &cookie)
         .send()
         .await

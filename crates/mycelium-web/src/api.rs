@@ -1559,24 +1559,37 @@ pub struct CreateUserForm {
     pub role: String,
 }
 
-/// POST /admin/users — create a user (admin only).
+/// POST /admin/users — create a user (admin only). Every failure
+/// bounces back to the users page as a `?error=` banner (the
+/// handler's flash mechanism — only the host page changed); success
+/// renders the users page directly with the shown-once recovery-key
+/// card (the key rides the response body, never a URL — history and
+/// referrer leakage).
 pub async fn admin_create_user(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
     axum::Form(form): axum::Form<CreateUserForm>,
 ) -> Response {
+    let bounce = |msg: String| {
+        Redirect::to(&format!(
+            "/admin/users?error={}",
+            pages::urlencoding_encode(&msg)
+        ))
+        .into_response()
+    };
     // Confirm box: a mismatch is a client-side typo, not a policy
     // failure — bounce back with a clear message.
     if let Some(confirm) = &form.password_confirm
         && confirm != &form.password
     {
-        return error_response(StatusCode::BAD_REQUEST, "passwords do not match");
+        return bounce("passwords do not match".to_string());
     }
     // Enforce the ADMIN-CONFIGURED minimum (not the hardcoded default)
     // — the form's minlength mirrors this value.
     let min_len = state.security_config().await.min_password_length;
     if let Err(e) = mycelium_auth::password::check_password_policy_min(&form.password, min_len) {
-        return error_response(StatusCode::BAD_REQUEST, &e.to_string());
+        return bounce(e.to_string());
     }
     let role = Role::parse(&form.role).unwrap_or(Role::User);
     let login = state.login.clone();
@@ -1597,43 +1610,85 @@ pub async fn admin_create_user(
                     "failed to persist service-key seal — data at risk after restart"
                 );
             }
-            // Show the recovery key in-page (never in a URL — history and
-            // referrer leakage).
-            let csrf = String::new(); // admin_view re-renders with its own csrf
-            let _ = csrf;
-            let body = format!(
-                r#"<h1>User created</h1>
-<div class="flash ok">User <b>{}</b> created. Recovery key (shown ONCE — give it to the user now):</div>
-<pre>{}</pre>
-<p><a href="/admin">Back to admin</a></p>"#,
-                pages::html_escape(&form.username),
-                pages::html_escape(&created.recovery_key)
-            );
-            let admin = SessionUser {
-                user_id: created.record.id,
-                username: form.username.clone(),
-                role: Role::Admin,
-            };
-            // Render with the creating admin's identity for the nav.
-            pages::layout("User created", Some(&admin), "", "/admin", body).into_response()
+            // Render the users page with the creating admin's identity,
+            // the fresh table, and the recovery-key shown-once card.
+            let csrf = pages::current_csrf(&state, &session).await;
+            let admin = request_admin_user(&state, &session).await;
+            let users = state.users.list_all_detailed().await.unwrap_or_default();
+            pages::admin_users_page(
+                &admin,
+                &csrf,
+                &users,
+                min_len,
+                Some((form.username.as_str(), created.recovery_key.as_str())),
+                None,
+                None,
+            )
+            .into_response()
         }
-        Err(e) => Redirect::to(&format!(
-            "/admin?error={}",
-            pages::urlencoding_encode(&e.to_string())
-        ))
-        .into_response(),
+        Err(e) => bounce(e.to_string()),
     }
 }
 
-/// GET /admin — the admin portal (admin only).
-pub async fn admin_view(
+/// GET /admin — a TRUE 307 to the users page (spec §6's route map;
+/// axum's `Redirect::to` is a 303, so the redirect is built from the
+/// status + Location header directly). RequireAdmin stays on the
+/// route: the extractor runs before the handler, so a non-admin GET
+/// keeps the gate's exact 403 (the behavior every admin route pins).
+pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [("Location", "/admin/users")],
+    )
+        .into_response()
+}
+
+/// The /health fields the System page surfaces as StatTiles — the
+/// same values the health route builds (users count, the SQL queue
+/// fields, the LLM last-success age), gathered here per page.
+#[derive(Debug)]
+pub struct SystemStats {
+    pub users: i64,
+    pub queue_depth: usize,
+    pub oldest_pending_age_seconds: Option<i64>,
+    pub queue_dead_count: usize,
+    pub llm_last_success_seconds: Option<i64>,
+}
+
+/// GET /admin/users — the users table + create-user side card
+/// (mockup 03); hosts POST /admin/users.
+pub async fn admin_users_view(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
     session: SessionId,
     Query(params): Query<AdminParams>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    let users = state.users.list_all().await.unwrap_or_default();
+    let users = state.users.list_all_detailed().await.unwrap_or_default();
+    let min_len = state.security_config().await.min_password_length;
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_users_page(
+        &admin,
+        &csrf,
+        &users,
+        min_len,
+        None,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// GET /admin/sign-in — the security settings + OIDC cards
+/// (mockup 11); hosts POST /admin/security + POST /admin/oidc.
+pub async fn admin_sign_in_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let security = state.security_config().await;
     let oidc = crate::state::decrypt_config::<mycelium_auth::oidc::OidcConfig>(
         &state.config,
         &state.service_key,
@@ -1641,16 +1696,129 @@ pub async fn admin_view(
     )
     .await
     .is_some();
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_sign_in_page(
+        &admin,
+        &csrf,
+        &security,
+        oidc,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// GET /admin/llm — the LLM backend card on its own page; hosts
+/// POST /admin/llm.
+pub async fn admin_llm_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
             .unwrap_or_default();
     let llm_api_key_set = llm.api_key.is_some();
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_llm_page(
+        &admin,
+        &csrf,
+        &llm.url,
+        &llm.model,
+        llm_api_key_set,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// GET /admin/library — the bookshelves/upload/limits/global-skills
+/// stack (mockup 12); hosts POST /admin/bookshelves +
+/// POST /admin/upload-limits, and carries the multipart upload form.
+pub async fn admin_library_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    // Shelves with the books count — the PR-2 books page's derived
+    // column pattern (books_on_shelf per shelf).
+    let shelves = state
+        .store
+        .list_bookshelves_detailed()
+        .await
+        .unwrap_or_default();
+    let mut shelf_rows: Vec<(String, bool, usize)> = Vec::new();
+    for (id, name, is_global) in shelves {
+        let count = state
+            .store
+            .books_on_shelf(id)
+            .await
+            .unwrap_or_default()
+            .len();
+        shelf_rows.push((name, is_global, count));
+    }
     let upload = state.upload_config().await;
-    let security = state.security_config().await;
-    let shelves = state.store.list_bookshelves().await.unwrap_or_default();
-    let shelf_tuples: Vec<(String, bool)> = shelves.into_iter().collect();
-    // Ingest jobs (slug, status, detail, created, shelf name).
+    // Read-only global-skills listing: hub + flat titles, sorted for
+    // deterministic output (management lives on the Skills page).
+    let global_cs = ConceptStore::for_service(
+        &state.store,
+        (*state.service_key).clone(),
+        &state.store.skills_dir(),
+        "skills",
+    );
+    let (groups, flat, _scripts) = skill_sections(&global_cs).await;
+    let mut titles: Vec<String> = groups.iter().map(|g| g.hub.title.clone()).collect();
+    titles.extend(flat.iter().map(|e| e.title.clone()));
+    titles.sort();
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_library_page(
+        &admin,
+        &csrf,
+        &shelf_rows,
+        upload.max_book_mib,
+        &titles,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// GET /admin/system — the operational view: /health's fields as
+/// StatTiles, the backup download, and the ingest-jobs table (the
+/// plan's binding ruling: jobs land here, not on Library).
+pub async fn admin_system_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    // The /health values — the same computation the health route runs.
+    let user_count = state.users.count().await.unwrap_or(-1);
+    let (queue_depth, oldest, dead_count) = match state.store.queue_health_counts().await {
+        Ok(h) => (h.depth, h.oldest_pending_age_seconds, h.dead_count),
+        Err(_) => (0, None, 0),
+    };
+    let llm = mycelium_librarian::llm::LLM_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);
+    let llm_secs = if llm == 0 {
+        None
+    } else {
+        Some(chrono::Utc::now().timestamp() - llm as i64)
+    };
+    let stats = SystemStats {
+        users: user_count,
+        queue_depth,
+        oldest_pending_age_seconds: oldest,
+        queue_dead_count: dead_count,
+        llm_last_success_seconds: llm_secs,
+    };
+    // Ingest jobs (slug, status, detail, created, shelf name) — the
+    // old admin_view's job_rows build, moved here verbatim.
     let jobs = state.store.list_ingest_jobs(20).await.unwrap_or_default();
     let mut job_rows: Vec<(String, String, String, String, String)> = Vec::new();
     for j in &jobs {
@@ -1668,21 +1836,13 @@ pub async fn admin_view(
             shelf_name,
         ));
     }
-    // RequireAdmin guarantees the session user is an admin; fetch for render.
     let admin = request_admin_user(&state, &session).await;
-    pages::admin_page(
+    pages::admin_system_page(
         &admin,
         &csrf,
-        &users,
-        oidc,
-        &llm.url,
-        &llm.model,
-        llm_api_key_set,
-        upload.max_book_mib,
-        &security,
-        &shelf_tuples,
+        &stats,
         &job_rows,
-        params.created.as_deref(),
+        params.ok.as_deref(),
         params.error.as_deref(),
     )
     .into_response()
@@ -1710,7 +1870,7 @@ async fn request_admin_user(state: &AppState, session: &SessionId) -> SessionUse
 
 #[derive(Deserialize)]
 pub struct AdminParams {
-    pub created: Option<String>,
+    pub ok: Option<String>,
     pub error: Option<String>,
 }
 
@@ -1743,7 +1903,7 @@ pub async fn admin_save_oidc(
         Ok(j) => j,
         Err(e) => {
             return Redirect::to(&format!(
-                "/admin?error={}",
+                "/admin/sign-in?error={}",
                 pages::urlencoding_encode(&e.to_string())
             ))
             .into_response();
@@ -1757,14 +1917,14 @@ pub async fn admin_save_oidc(
         Ok(s) => s,
         Err(e) => {
             return Redirect::to(&format!(
-                "/admin?error={}",
+                "/admin/sign-in?error={}",
                 pages::urlencoding_encode(&e.to_string())
             ))
             .into_response();
         }
     };
     let _ = state.config.set("oidc", &hex::encode(sealed)).await;
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin/sign-in?ok=OIDC%20config%20saved").into_response()
 }
 
 #[derive(Deserialize)]
@@ -1806,12 +1966,12 @@ pub async fn admin_save_llm(
     let sealed = crate::state::seal_config(&state.service_key, "llm", &cfg);
     if let Err(e) = state.config.set("llm", &sealed).await {
         return Redirect::to(&format!(
-            "/admin?error={}",
+            "/admin/llm?error={}",
             pages::urlencoding_encode(&e.to_string())
         ))
         .into_response();
     }
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin/llm?ok=LLM%20config%20saved").into_response()
 }
 
 #[derive(Deserialize)]
@@ -1839,7 +1999,7 @@ pub async fn admin_save_upload_limits(
         .config
         .set("upload", &crate::state::UploadConfig { max_book_mib })
         .await;
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin/library?ok=Upload%20limit%20saved").into_response()
 }
 
 #[derive(Deserialize)]
@@ -1869,7 +2029,7 @@ pub async fn admin_save_security(
     }
     .clamped();
     let _ = state.config.set("security", &cfg).await;
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin/sign-in?ok=Security%20settings%20saved").into_response()
 }
 
 /// POST /admin/bookshelves — create a bookshelf (admin only).
@@ -1880,7 +2040,7 @@ pub async fn admin_create_bookshelf(
 ) -> Response {
     let is_global = form.global == "1";
     let _ = state.store.create_bookshelf(&form.name, is_global).await;
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin/library?ok=Bookshelf%20created").into_response()
 }
 
 /// POST /admin/backup — full data-directory backup (admin only).

@@ -380,15 +380,33 @@ async fn full_web_flow() {
         .unwrap();
     assert_eq!(bad_form.status(), 403);
 
-    // 14. Admin portal renders (admin user).
+    // 14. Admin portal: PR 3's split — /admin is now a TRUE 307 to
+    //     /admin/users (bookmarked URLs keep working; RequireAdmin
+    //     stays on the redirect so the non-admin gate below still
+    //     sees 403), and the users page renders.
     let admin = client
         .get(format!("{base}/admin"))
         .header("cookie", &cookie2)
         .send()
         .await
         .unwrap();
-    assert_eq!(admin.status(), 200);
-    assert!(admin.text().await.unwrap().contains("Admin"));
+    assert_eq!(admin.status(), 307, "/admin must be a 307, not axum's 303");
+    assert_eq!(
+        admin.headers().get("location").unwrap(),
+        "/admin/users",
+        "307 targets the users page"
+    );
+    let users_page = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(users_page.status(), 200);
+    assert!(
+        users_page.text().await.unwrap().contains("Username"),
+        "users page table"
+    );
 
     // 15. Mint an API key (shown once).
     let mint = client
@@ -2048,6 +2066,231 @@ async fn keys_shown_once_banner_and_revoked_row() {
         kh.matches(marker).count(),
         1,
         "only the active key carries a revoke trigger: {kh}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Admin split (Task 4, PR 3): the five admin pages render under the
+/// TabBar, `/admin` is a TRUE 307 to `/admin/users`, every admin GET
+/// stays behind the RequireAdmin gate (403 for a logged-in non-admin —
+/// the exact status the old `/admin` gave non-admins, pinned by
+/// full_web_flow step 21 for `/admin` itself), hostile usernames
+/// escape in the users table, and the create-user error flow lands on
+/// the users page with the error banner visible.
+#[tokio::test]
+async fn admin_split_pages() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login as admin.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // 1. All five pages render 200 for the admin, each carrying the
+    //    TabBar's five labels (spec §6) and its own markers.
+    let pages: &[(&str, &[&str])] = &[
+        ("/admin/users", &["Username", "Create user"]),
+        // The en-dash range hint is the current form label's exact text.
+        ("/admin/sign-in", &["Session TTL", "15–10080", "OIDC"]),
+        ("/admin/llm", &["LLM backend"]),
+        (
+            "/admin/library",
+            &["Bookshelves", "Upload", "Global skills"],
+        ),
+        ("/admin/system", &["Download backup"]),
+    ];
+    let mut system_html = String::new();
+    for (route, markers) in pages {
+        let resp = client
+            .get(format!("{base}{route}"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{route} must render for the admin");
+        let html = resp.text().await.unwrap();
+        for label in ["Users", "Sign-in", "LLM backend", "Library", "System"] {
+            assert!(
+                html.contains(label),
+                "{route}: TabBar label {label} missing: {html}"
+            );
+        }
+        for marker in *markers {
+            assert!(
+                html.contains(marker),
+                "{route}: marker {marker} missing: {html}"
+            );
+        }
+        if *route == "/admin/system" {
+            system_html = html;
+        }
+    }
+    // The system page surfaces /health's fields as StatTiles (the
+    // StatTile class), not prose.
+    assert!(
+        system_html.contains(r#"<div class="stat">"#),
+        "StatTile markup on /admin/system: {system_html}"
+    );
+
+    // 2. /admin → 307 with Location: /admin/users (a TRUE 307 — axum's
+    //    Redirect::to is a 303; the spec's §6 route map pins 307).
+    let redirect = client
+        .get(format!("{base}/admin"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 307, "/admin must be a 307, not a 303");
+    assert_eq!(redirect.headers().get("location").unwrap(), "/admin/users");
+
+    // 3. Non-admin gate: every admin GET (the redirect included) is
+    //    rejected with RequireAdmin's 403 — the same status the old
+    //    /admin gave non-admins (rbac.rs: a logged-in non-admin gets
+    //    FORBIDDEN from the extractor).
+    let create_user = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mallory"),
+            ("email", "mallory@example.com"),
+            ("password", "mallory password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), 200, "user creation must succeed");
+    let login_mallory = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "mallory"),
+            ("password", "mallory password 20 chars"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let mallory_cookie = login_mallory
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    for route in [
+        "/admin",
+        "/admin/users",
+        "/admin/sign-in",
+        "/admin/llm",
+        "/admin/library",
+        "/admin/system",
+    ] {
+        let resp = client
+            .get(format!("{base}{route}"))
+            .header("cookie", &mallory_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{route} must reject a non-admin with the old gate's status"
+        );
+    }
+
+    // 4. Hostile username escapes in the users table: seed a user with
+    //    <script> in the name through the real create form (no
+    //    production path validates usernames — the table must escape).
+    let hostile = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "<script>alert(1)</script>"),
+            ("email", "hostile@example.com"),
+            ("password", "hostile password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile.status(), 200, "hostile-name creation must succeed");
+    let users_page = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let users_html = users_page.text().await.unwrap();
+    assert!(
+        !users_html.contains("<script>alert(1)</script>"),
+        "raw script leaked into the users table: {users_html}"
+    );
+    assert!(
+        users_html.contains("&lt;script&gt;"),
+        "escaped hostile username missing: {users_html}"
+    );
+
+    // 5. Create-user error flow: mismatched passwords redirect to
+    //    /admin/users?error=… (followed manually — the client pins
+    //    redirects), and the error renders as the page's banner.
+    let mismatch = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mismatch-user"),
+            ("email", "mismatch@example.com"),
+            ("password", "mismatch password 20 chars"),
+            ("password_confirm", "different password entirely!!"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), 303, "mismatch must redirect, not 400");
+    let location = mismatch
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/admin/users?error="),
+        "error redirect must land on the users page: {location}"
+    );
+    let follow = client
+        .get(format!("{base}{location}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(follow.status(), 200);
+    let follow_html = follow.text().await.unwrap();
+    assert!(
+        follow_html.contains("passwords do not match"),
+        "the error must render on the users page: {follow_html}"
     );
 
     shutdown.cancel();

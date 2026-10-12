@@ -1153,129 +1153,155 @@ pub fn keys_page(
     )
 }
 
-/// Admin portal.
-#[allow(clippy::too_many_arguments)]
-pub fn admin_page(
+// ---------- Admin pages (PR 3: the five-page split) ----------
+
+/// The admin section's TabBar (spec §6's exact labels) with the
+/// current page's tab active — rendered under the page header on
+/// every admin page.
+fn admin_tabs(active: &str) -> String {
+    mycelium_ui::render::render(mycelium_ui::tab_bar(&[
+        ("Users", "/admin/users", active == "/admin/users"),
+        ("Sign-in", "/admin/sign-in", active == "/admin/sign-in"),
+        ("LLM backend", "/admin/llm", active == "/admin/llm"),
+        ("Library", "/admin/library", active == "/admin/library"),
+        ("System", "/admin/system", active == "/admin/system"),
+    ]))
+}
+
+/// The admin pages' flash banners: the `ok`/`error` query params the
+/// admin POST handlers redirect back with — the handlers' flash
+/// mechanism, unchanged from the old `/admin?error=` flow (only the
+/// host page differs). Messages ride leptos TEXT positions in the
+/// banner primitive, so user-derived error text escapes there.
+fn admin_flash(ok: Option<&str>, err: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(m) = ok {
+        out.push_str(&mycelium_ui::render::render(mycelium_ui::banner(
+            "success", m,
+        )));
+    }
+    if let Some(m) = err {
+        out.push_str(&mycelium_ui::render::render(mycelium_ui::banner(
+            "danger", m,
+        )));
+    }
+    out
+}
+
+/// Admin: Users (mockup 03) — the TabBar, the users data_table
+/// (username, email, Role chip, provider, Status chip), and the
+/// right-hand create-user side card (the existing POST /admin/users
+/// form: the confirm field kept, the minlength mirroring
+/// security_config kept). `created` renders the shown-once
+/// recovery-key card the create flow answers with — the key rides the
+/// response body, never a URL.
+///
+/// Escaping: every cell is a raw-markup slot composed from escaped
+/// fragments (usernames, emails, providers `html_escape`d) and
+/// trusted component output (the role/status chips); the created
+/// card's username and key are escaped at composition.
+pub fn admin_users_page(
     user: &SessionUser,
     csrf: &str,
-    users: &[(String, String, String, String)],
-    oidc_configured: bool,
-    llm_url: &str,
-    llm_model: &str,
-    llm_api_key_set: bool,
-    max_book_mib: u64,
-    security: &crate::state::SecurityConfig,
-    bookshelves: &[(String, bool)],
-    ingest_jobs: &[(String, String, String, String, String)],
+    users: &[mycelium_auth::users::UserRow],
+    min_password_len: usize,
+    created: Option<(&str, &str)>,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
-    let user_rows = users
+    let rows: Vec<Vec<TrustedHtml>> = users
         .iter()
-        .map(|(u, email, role, provider)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                html_escape(u),
-                html_escape(email),
-                html_escape(role),
-                html_escape(provider)
-            )
+        .map(|u| {
+            // Role chip: admin accented, anything else neutral (the
+            // CHECK constraint keeps the stored string in range).
+            let role_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                &u.role,
+                if u.role == "admin" {
+                    "accent"
+                } else {
+                    "neutral"
+                },
+            ));
+            // Status chip: the forced-change flag is the warning
+            // state; a healthy account reads "ok".
+            let status_chip = if u.must_change_password {
+                mycelium_ui::render::render(mycelium_ui::chip("must change password", "warning"))
+            } else {
+                mycelium_ui::render::render(mycelium_ui::chip("ok", "neutral"))
+            };
+            vec![
+                TrustedHtml::from_markup(html_escape(&u.username)),
+                TrustedHtml::from_markup(html_escape(&u.email)),
+                TrustedHtml::from_markup(role_chip),
+                TrustedHtml::from_markup(html_escape(&u.auth_provider)),
+                TrustedHtml::from_markup(status_chip),
+            ]
         })
-        .collect::<String>();
-    let shelf_rows = bookshelves
-        .iter()
-        .map(|(name, global)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td></tr>"#,
-                html_escape(name),
-                if *global { "global-read" } else { "private" }
-            )
-        })
-        .collect::<String>();
-    let shelf_options = bookshelves
-        .iter()
-        .map(|(name, _)| {
-            format!(
-                r#"<option value="{}">{}</option>"#,
-                html_escape(name),
-                html_escape(name)
-            )
-        })
-        .collect::<String>();
-    let job_rows = ingest_jobs
-        .iter()
-        .map(|(slug, status, detail, created, shelf)| {
-            format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                html_escape(slug),
-                html_escape(status),
-                html_escape(detail),
-                html_escape(created),
-                html_escape(shelf)
-            )
-        })
-        .collect::<String>();
-    let oidc_status = if oidc_configured {
-        "configured"
-    } else {
-        "not configured"
-    };
-    // Status only — the key itself is never rendered back to the browser.
-    let llm_api_key_status = if llm_api_key_set { "stored" } else { "not set" };
-    let body = format!(
-        r#"<h1>Admin</h1>
-{}
-<h2>Users</h2>
-<table><tr><th>Username</th><th>Email</th><th>Role</th><th>Provider</th></tr>{user_rows}</table>
-<h2>Create user</h2>
-<form method="post" action="/admin/users">
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Username", "Email", "Role", "Provider", "Status"],
+        &rows,
+    ));
+    // The create-user side card — the existing form, plus the
+    // recovery-key note (the flow's honest companion: the success
+    // answer shows the key exactly once).
+    let form = format!(
+        r#"<form method="post" action="/admin/users">
   <label>Username</label><input name="username" required>
   <label>Email</label><input name="email" type="email" required>
-  <label>Password (min {} chars)</label><input name="password" type="password" required minlength="{}">
-  <label>Confirm password</label><input name="password_confirm" type="password" required minlength="{}">
+  <label>Password (min {min_password_len} chars)</label><input name="password" type="password" required minlength="{min_password_len}">
+  <label>Confirm password</label><input name="password_confirm" type="password" required minlength="{min_password_len}">
   <label>Role</label><select name="role"><option value="user">user</option><option value="admin">admin</option></select>
+  <p class="muted">A recovery key is generated on creation and shown once — hand it to the user now.</p>
   <button type="submit">Create</button>
-</form>
-<h2>OIDC SSO</h2>
-<p class="muted">Status: {oidc_status}</p>
-<form method="post" action="/admin/oidc">
-  <label>Issuer URL</label><input name="issuer_url" placeholder="https://sso.example.com/realms/main">
-  <label>Client ID</label><input name="client_id">
-  <label>Client secret</label><input name="client_secret" type="password">
-  <label>Redirect URI</label><input name="redirect_uri" placeholder="https://host/auth/oidc/callback">
-  <button type="submit">Save OIDC config</button>
-</form>
-<h2>LLM backend</h2>
-<p class="muted">API key: {llm_api_key_status}</p>
-<form method="post" action="/admin/llm">
-  <label>OpenAI-compatible base URL</label><input name="url" value="{}">
-  <label>Model</label><input name="model" value="{}">
-  <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
-  <button type="submit">Save LLM config</button>
-</form>
-<h2>Bookshelves</h2>
-<table><tr><th>Name</th><th>Visibility</th></tr>{shelf_rows}</table>
-<form method="post" action="/admin/bookshelves">
-  <label>Name</label><input name="name" required>
-  <label>Global read</label><select name="global"><option value="0">private</option><option value="1">global-read</option></select>
-  <button type="submit">Create bookshelf</button>
-</form>
-<h2>Upload book</h2>
-<p class="muted">Markdown (.md) up to {max_book_mib} MiB (adjustable below). The librarian catalogs it onto the bookshelf (LLM-assisted when the configured backend is reachable; heuristic otherwise).</p>
-<form method="post" action="/api/v1/ingest" enctype="multipart/form-data">
-  <label>Bookshelf</label><select name="bookshelf" required>{shelf_options}</select>
-  <label>Slug</label><input name="slug" required pattern="[a-zA-Z0-9-]+" placeholder="my-book">
-  <label>Title</label><input name="title" required>
-  <label>Book file (.md)</label><input name="file" type="file" accept=".md,text/markdown" required>
-  <button type="submit">Upload and ingest</button>
-</form>
-<h3>Upload limits</h3>
-<form method="post" action="/admin/upload-limits">
-  <label>Max book size (MiB, 1–255)</label><input name="max_book_mib" type="number" min="1" max="255" value="{max_book_mib}" required>
-  <button type="submit">Save limit</button>
-</form>
-<h2>Security settings</h2>
-<p class="muted">Tunable within guardrails — values outside the ranges below are clamped. Session TTL applies to new logins; existing sessions keep their expiry.</p>
+</form>"#
+    );
+    let side = mycelium_ui::render::render(mycelium_ui::card(
+        "Create user",
+        TrustedHtml::from_markup(form),
+    ));
+    // The shown-once recovery-key card: the old page's exact in-page
+    // treatment (flash line + <pre>), both fragments escaped.
+    let created_card = created
+        .map(|(username, key)| {
+            let body = format!(
+                r#"<div class="flash ok">User <b>{}</b> created. Recovery key (shown ONCE — give it to the user now):</div>
+<pre>{}</pre>"#,
+                html_escape(username),
+                html_escape(key)
+            );
+            mycelium_ui::render::render(mycelium_ui::card(
+                "User created",
+                TrustedHtml::from_markup(body),
+            ))
+        })
+        .unwrap_or_default();
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Users",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{created_card}<div class=\"split-grid\">{table}{side}</div>",
+        tabs = admin_tabs("/admin/users"),
+        flash = admin_flash(ok, err),
+    );
+    layout("Users", Some(user), csrf, "/admin", body)
+}
+
+/// Admin: Sign-in (mockup 11) — the security settings card (the
+/// existing POST /admin/security form, its five labels carrying the
+/// exact clamp ranges) and the OIDC card (the existing POST
+/// /admin/oidc form). Both POSTs redirect back here with ?ok=/?error=.
+pub fn admin_sign_in_page(
+    user: &SessionUser,
+    csrf: &str,
+    security: &crate::state::SecurityConfig,
+    oidc_configured: bool,
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    let security_body = format!(
+        r#"<p class="muted">Tunable within guardrails — values outside the ranges below are clamped. Session TTL applies to new logins; existing sessions keep their expiry.</p>
 <form method="post" action="/admin/security">
   <label>Session TTL (minutes, 15–10080; 720 = 12h)</label><input name="session_ttl_minutes" type="number" min="15" max="10080" value="{}" required>
   <label>Login failures before lockout (3–10)</label><input name="login_max_failures" type="number" min="3" max="10" value="{}" required>
@@ -1283,26 +1309,277 @@ pub fn admin_page(
   <label>Minimum password length (12–128)</label><input name="min_password_length" type="number" min="12" max="128" value="{}" required>
   <label>Passage cap (chars, 16384–1048576; 131072 = 128k)</label><input name="passage_max_chars" type="number" min="16384" max="1048576" value="{}" required>
   <button type="submit">Save security settings</button>
-</form>
-<h2>Ingest jobs</h2>
-<table><tr><th>Book</th><th>Status</th><th>Detail</th><th>Created</th><th>Shelf</th></tr>{job_rows}</table>
-<h2>Global skills</h2>
-<p class="muted">The global skills shelf is readable by all users; only admins can edit. Manage skills on the <a href="/skills">Skills page</a> (edit links appear there for admins).</p>
-<h2>Maintenance</h2>
-<form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>"#,
-        flash(ok, err),
-        security.min_password_length,
-        security.min_password_length,
-        security.min_password_length,
-        html_escape(llm_url),
-        html_escape(llm_model),
+</form>"#,
         security.session_ttl_minutes,
         security.login_max_failures,
         security.login_lockout_seconds,
         security.min_password_length,
         security.passage_max_chars
     );
-    layout("Admin", Some(user), csrf, "/admin", body)
+    let oidc_status = if oidc_configured {
+        "configured"
+    } else {
+        "not configured"
+    };
+    let oidc_body = format!(
+        r#"<p class="muted">Status: {oidc_status}</p>
+<form method="post" action="/admin/oidc">
+  <label>Issuer URL</label><input name="issuer_url" placeholder="https://sso.example.com/realms/main">
+  <label>Client ID</label><input name="client_id">
+  <label>Client secret</label><input name="client_secret" type="password">
+  <label>Redirect URI</label><input name="redirect_uri" placeholder="https://host/auth/oidc/callback">
+  <button type="submit">Save OIDC config</button>
+</form>"#
+    );
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Sign-in",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Security settings",
+            TrustedHtml::from_markup(security_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "OIDC SSO",
+            TrustedHtml::from_markup(oidc_body),
+        )),
+        tabs = admin_tabs("/admin/sign-in"),
+        flash = admin_flash(ok, err),
+    );
+    layout("Sign-in", Some(user), csrf, "/admin", body)
+}
+
+/// Admin: LLM backend — the LLM card on its own page (the existing
+/// POST /admin/llm form). The api-key STATUS renders; the key itself
+/// is never rendered back to the browser.
+pub fn admin_llm_page(
+    user: &SessionUser,
+    csrf: &str,
+    llm_url: &str,
+    llm_model: &str,
+    llm_api_key_set: bool,
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    let key_status = if llm_api_key_set { "stored" } else { "not set" };
+    let body_form = format!(
+        r#"<p class="muted">API key: {key_status}</p>
+<form method="post" action="/admin/llm">
+  <label>OpenAI-compatible base URL</label><input name="url" value="{}">
+  <label>Model</label><input name="model" value="{}">
+  <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
+  <button type="submit">Save LLM config</button>
+</form>"#,
+        html_escape(llm_url),
+        html_escape(llm_model)
+    );
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "LLM backend",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "LLM backend",
+            TrustedHtml::from_markup(body_form),
+        )),
+        tabs = admin_tabs("/admin/llm"),
+        flash = admin_flash(ok, err),
+    );
+    layout("LLM backend", Some(user), csrf, "/admin", body)
+}
+
+/// Admin: Library (mockup 12) — the stack of section cards:
+/// bookshelves (create form + table with the books-count column, the
+/// PR-2 books page's derived-count pattern), the upload card (the
+/// existing multipart POST /api/v1/ingest form with the shelf
+/// select), the upload limits (existing POST /admin/upload-limits),
+/// and the read-only global-skills listing (a link to /skills; no
+/// edit affordances here).
+pub fn admin_library_page(
+    user: &SessionUser,
+    csrf: &str,
+    shelves: &[(String, bool, usize)],
+    max_book_mib: u64,
+    global_skills: &[String],
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    let rows: Vec<Vec<TrustedHtml>> = shelves
+        .iter()
+        .map(|(name, global, count)| {
+            let vis_chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if *global { "global-read" } else { "private" },
+                if *global { "accent" } else { "neutral" },
+            ));
+            vec![
+                TrustedHtml::from_markup(html_escape(name)),
+                TrustedHtml::from_markup(vis_chip),
+                TrustedHtml::from_markup(count.to_string()),
+            ]
+        })
+        .collect();
+    let shelf_table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Name", "Visibility", "Books"],
+        &rows,
+    ));
+    let shelves_body = format!(
+        r#"{shelf_table}
+<form method="post" action="/admin/bookshelves">
+  <label>Name</label><input name="name" required>
+  <label>Global read</label><select name="global"><option value="0">private</option><option value="1">global-read</option></select>
+  <button type="submit">Create bookshelf</button>
+</form>"#
+    );
+    // The upload form's shelf select: every shelf name, escaped for
+    // both the value attribute and the label text.
+    let shelf_options = shelves
+        .iter()
+        .map(|(name, _, _)| {
+            format!(
+                r#"<option value="{}">{}</option>"#,
+                html_escape(name),
+                html_escape(name)
+            )
+        })
+        .collect::<String>();
+    let upload_body = format!(
+        r#"<p class="muted">Markdown (.md) up to {max_book_mib} MiB (adjustable below). The librarian catalogs it onto the bookshelf (LLM-assisted when the configured backend is reachable; heuristic otherwise).</p>
+<form method="post" action="/api/v1/ingest" enctype="multipart/form-data">
+  <label>Bookshelf</label><select name="bookshelf" required>{shelf_options}</select>
+  <label>Slug</label><input name="slug" required pattern="[a-zA-Z0-9-]+" placeholder="my-book">
+  <label>Title</label><input name="title" required>
+  <label>Book file (.md)</label><input name="file" type="file" accept=".md,text/markdown" required>
+  <button type="submit">Upload and ingest</button>
+</form>"#
+    );
+    let limits_body = format!(
+        r#"<form method="post" action="/admin/upload-limits">
+  <label>Max book size (MiB, 1–255)</label><input name="max_book_mib" type="number" min="1" max="255" value="{max_book_mib}" required>
+  <button type="submit">Save limit</button>
+</form>"#
+    );
+    // Read-only global-skills listing: names only — management lives
+    // on the Skills page.
+    let skills_list = if global_skills.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No global skills",
+            "Install a skill to begin.",
+        ))
+    } else {
+        let items = global_skills
+            .iter()
+            .map(|t| format!("<li>{}</li>", html_escape(t)))
+            .collect::<String>();
+        format!("<ul>{items}</ul>")
+    };
+    let skills_body = format!(
+        r#"{skills_list}<p class="muted">The global skills shelf is readable by all users; only admins can edit. Manage skills on the <a href="/skills">Skills page</a> (edit links appear there for admins).</p>"#
+    );
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Library",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{}{}{}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Bookshelves",
+            TrustedHtml::from_markup(shelves_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Upload book",
+            TrustedHtml::from_markup(upload_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Upload limits",
+            TrustedHtml::from_markup(limits_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Global skills",
+            TrustedHtml::from_markup(skills_body),
+        )),
+        tabs = admin_tabs("/admin/library"),
+        flash = admin_flash(ok, err),
+    );
+    layout("Library", Some(user), csrf, "/admin", body)
+}
+
+/// Admin: System — the operational view: /health's fields as
+/// StatTiles (a tile per value), the backup download (the existing
+/// POST /admin/backup button + the no-store rationale), and the
+/// ingest-jobs table (the plan's binding ruling: jobs live here).
+pub fn admin_system_page(
+    user: &SessionUser,
+    csrf: &str,
+    stats: &crate::api::SystemStats,
+    jobs: &[(String, String, String, String, String)],
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    // A StatTile per /health value; absent optionals read "—".
+    let absent = "—";
+    let tiles = [
+        ("Users", stats.users.to_string()),
+        ("Queue depth", stats.queue_depth.to_string()),
+        (
+            "Oldest pending age (s)",
+            stats
+                .oldest_pending_age_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+        ("Dead queue items", stats.queue_dead_count.to_string()),
+        (
+            "LLM last success (s ago)",
+            stats
+                .llm_last_success_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+    ];
+    let stat_row = tiles
+        .iter()
+        .map(|(label, value)| mycelium_ui::render::render(mycelium_ui::stat_tile(label, value)))
+        .collect::<String>();
+    let stats_html = format!(r#"<div class="stat-row">{stat_row}</div>"#);
+    let backup_body = r#"<form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>
+<p class="muted">The download is served with Cache-Control: no-store — the archive contains the service key and sealed master keys, so it must never sit in a shared or CDN cache.</p>"#;
+    let jobs_rows: Vec<Vec<TrustedHtml>> = jobs
+        .iter()
+        .map(|(slug, status, detail, created, shelf)| {
+            vec![
+                TrustedHtml::from_markup(html_escape(slug)),
+                TrustedHtml::from_markup(html_escape(status)),
+                TrustedHtml::from_markup(html_escape(detail)),
+                TrustedHtml::from_markup(html_escape(created)),
+                TrustedHtml::from_markup(html_escape(shelf)),
+            ]
+        })
+        .collect();
+    let jobs_body = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Book", "Status", "Detail", "Created", "Shelf"],
+        &jobs_rows,
+    ));
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "System",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{stats_html}{}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Maintenance",
+            TrustedHtml::from_markup(backup_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Ingest jobs",
+            TrustedHtml::from_markup(jobs_body),
+        )),
+        tabs = admin_tabs("/admin/system"),
+        flash = admin_flash(ok, err),
+    );
+    layout("System", Some(user), csrf, "/admin", body)
 }
 
 /// Minimal percent-encoding for query-string values.

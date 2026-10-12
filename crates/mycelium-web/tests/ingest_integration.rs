@@ -274,18 +274,26 @@ async fn book_upload_ingest_and_passages() {
     );
 
     // 7. The catalog concepts exist in the shared library scope (hub +
-    //    chapters) — verify via the admin page's jobs table and by
-    //    reading the hub through the service-scope store directly.
-    let admin_page = client
-        .get(format!("{base}/admin"))
+    //    chapters) — verify via the admin pages: the upload card on
+    //    /admin/library, the completed job in the jobs table on
+    //    /admin/system (the PR-3 split's ruling), and by reading the
+    //    hub through the service-scope store directly.
+    let library_page = client
+        .get(format!("{base}/admin/library"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    let admin_html = admin_page.text().await.unwrap();
-    assert!(admin_html.contains("Upload book"));
-    assert!(admin_html.contains("my-book"));
-    assert!(admin_html.contains("done"));
+    assert!(library_page.text().await.unwrap().contains("Upload book"));
+    let system_page = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let system_html = system_page.text().await.unwrap();
+    assert!(system_html.contains("my-book"));
+    assert!(system_html.contains("done"));
 
     // 8. Duplicate slug is rejected.
     let boundary2 = "testboundary67890";
@@ -661,9 +669,9 @@ async fn upload_validation_errors() {
     );
     let big_json: serde_json::Value = big.json().await.unwrap();
     assert_eq!(big_json["status"], "done", "big book ingested: {big_json}");
-    // The admin page reflects the configured limit.
+    // The admin library page reflects the configured limit.
     let admin_html = client
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/library"))
         .header("cookie", &cookie)
         .send()
         .await

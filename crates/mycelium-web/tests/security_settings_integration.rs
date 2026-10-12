@@ -116,9 +116,9 @@ async fn security_settings_guardrails() {
     let client = client();
     let (cookie, csrf) = login_admin(&client, &base).await;
 
-    // 1. The admin page renders the security form with the defaults.
+    // 1. The admin sign-in page renders the security form with the defaults.
     let admin_html = client
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/sign-in"))
         .header("cookie", &cookie)
         .send()
         .await
@@ -147,9 +147,9 @@ async fn security_settings_guardrails() {
         .unwrap();
     assert_eq!(save.status(), 303, "valid settings save");
 
-    // 3. The admin page reflects the saved values.
+    // 3. The admin sign-in page reflects the saved values.
     let admin_html = client
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/sign-in"))
         .header("cookie", &cookie)
         .send()
         .await
@@ -222,7 +222,7 @@ async fn security_settings_guardrails() {
         .unwrap();
     assert_eq!(save.status(), 303);
     let admin_html = client
-        .get(format!("{base}/admin"))
+        .get(format!("{base}/admin/sign-in"))
         .header("cookie", &cookie2)
         .send()
         .await
