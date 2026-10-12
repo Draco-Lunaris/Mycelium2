@@ -2293,6 +2293,47 @@ async fn admin_split_pages() {
         "the error must render on the users page: {follow_html}"
     );
 
+    // 6. Session-only provisioning: POST /admin/users is a browser-flow
+    //    admin action. A bearer API key (an MCP/REST data credential)
+    //    passes CSRF (bearer-exempt) and RequireAdmin, but the
+    //    SessionId extractor 401s the session-less request before the
+    //    handler runs — pinning that user creation is not a bearer
+    //    capability.
+    let mint = client
+        .post(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("label", "admin-split-bearer")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint.status(), 200);
+    let mint_html = mint.text().await.unwrap();
+    let code_start = mint_html
+        .find("<code id=\"minted-key\">")
+        .expect("minted token shown");
+    let token_rest = &mint_html[code_start + "<code id=\"minted-key\">".len()..];
+    let token_end = token_rest.find("</code>").expect("token end");
+    let api_token = token_rest[..token_end].to_string();
+    assert!(api_token.starts_with("myc2-"));
+    let bearer_create = client
+        .post(format!("{base}/admin/users"))
+        .header("authorization", format!("Bearer {api_token}"))
+        .form(&[
+            ("username", "bearer-user"),
+            ("email", "bearer@example.com"),
+            ("password", "bearer password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_create.status(),
+        401,
+        "bearer API keys must not provision users — the session extractor rejects session-less POSTs"
+    );
+
     shutdown.cancel();
 }
 

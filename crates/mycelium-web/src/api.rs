@@ -1565,6 +1565,15 @@ pub struct CreateUserForm {
 /// renders the users page directly with the shown-once recovery-key
 /// card (the key rides the response body, never a URL — history and
 /// referrer leakage).
+///
+/// Session-only: user creation is a browser-flow admin action; bearer
+/// API keys (MCP/REST data credentials) are deliberately not accepted
+/// as provisioning credentials. A bearer request passes the CSRF
+/// middleware's bearer exemption and RequireAdmin (both see the
+/// bearer-injected SessionUser), but the `SessionId` extractor —
+/// required because the success path renders the page with the
+/// creating session's real CSRF token — 401s session-less requests
+/// before the handler runs.
 pub async fn admin_create_user(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,

@@ -288,18 +288,9 @@ impl UserStore {
         Ok(n)
     }
 
-    /// List all users (admin portal): (username, email, role, provider).
-    pub async fn list_all(&self) -> Result<Vec<(String, String, String, String)>, UsersError> {
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT username, email, role, auth_provider FROM users ORDER BY username",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// List all users with the fields the admin users table renders: id and
-    /// the forced-password-change flag on top of `list_all`'s four columns.
+    /// List all users with the fields the admin users table renders: id
+    /// and the forced-password-change flag on top of the four identity
+    /// columns (username, email, role, auth_provider).
     /// `ORDER BY username` is preserved for deterministic output.
     pub async fn list_all_detailed(&self) -> Result<Vec<UserRow>, UsersError> {
         let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
