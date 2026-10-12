@@ -2647,14 +2647,32 @@ pub async fn admin_save_security(
 }
 
 /// POST /admin/bookshelves — create a bookshelf (admin only).
+///
+/// The store insert is NOT swallowed (the carried Phase-9 follow-up:
+/// `let _ =` made a failed insert — e.g. a duplicate name, rejected by
+/// `bookshelves.name TEXT NOT NULL UNIQUE` — answer with the success
+/// banner while creating nothing). `Err` logs the real detail
+/// server-side and bounces the fixed generic literal
+/// `?error=bookshelf creation failed`; the store's Display never rides
+/// the URL (the Phase-9 convention — history/referrer leakage). The
+/// success arm is unchanged.
 pub async fn admin_create_bookshelf(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
     axum::Form(form): axum::Form<BookshelfForm>,
 ) -> Response {
     let is_global = form.global == "1";
-    let _ = state.store.create_bookshelf(&form.name, is_global).await;
-    Redirect::to("/admin/library?ok=Bookshelf%20created").into_response()
+    match state.store.create_bookshelf(&form.name, is_global).await {
+        Ok(_) => Redirect::to("/admin/library?ok=Bookshelf%20created").into_response(),
+        Err(e) => {
+            tracing::warn!(
+                name = %form.name,
+                error = %e,
+                "bookshelf creation failed"
+            );
+            Redirect::to("/admin/library?error=bookshelf%20creation%20failed").into_response()
+        }
+    }
 }
 
 /// POST /admin/backup — full data-directory backup (admin only).

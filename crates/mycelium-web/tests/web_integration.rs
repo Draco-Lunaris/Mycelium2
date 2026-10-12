@@ -2752,6 +2752,143 @@ async fn admin_library_escapes_and_pairs_shelf_names() {
     shutdown.cancel();
 }
 
+/// Task 6 (PR 4, carried Phase-9 follow-up): `POST /admin/bookshelves`
+/// no longer swallows the store result. A duplicate shelf name is
+/// rejected by `bookshelves.name TEXT NOT NULL UNIQUE`; the old
+/// `let _ =` discarded that error and answered with the SUCCESS banner
+/// while creating nothing — a false success.
+///
+/// Legs:
+/// 1. the first create succeeds and redirects with `?ok=`;
+/// 2. the duplicate redirects to the library page with the GENERIC
+///    error literal (`?error=bookshelf%20creation%20failed`) — and the
+///    store's Display text must NOT ride the URL (the Phase-9
+///    convention: no internal detail in a URL that lands in history and
+///    referrers);
+/// 3. GET /admin/library renders the danger banner with the generic
+///    message and NOT the success banner;
+/// 4. the table holds exactly ONE row with that name (the duplicate
+///    never landed), pinned both in the rendered page and in the DB.
+#[tokio::test]
+async fn duplicate_bookshelf_name_reports_error_not_false_success() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/library"), &cookie).await;
+
+    let post_create = || {
+        let client = &client;
+        let base = &base;
+        let cookie = &cookie;
+        let csrf = &csrf;
+        async move {
+            client
+                .post(format!("{base}/admin/bookshelves"))
+                .header("cookie", cookie)
+                .header("x-csrf-token", csrf)
+                .form(&[("name", "Duplicate Shelf"), ("global", "0")])
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. First create: success, `?ok=` flash.
+    let first = post_create().await;
+    assert_eq!(first.status(), 303);
+    assert_eq!(
+        first.headers().get("location").unwrap(),
+        "/admin/library?ok=Bookshelf%20created",
+        "the success arm is unchanged"
+    );
+
+    // 2. The SAME name again: the UNIQUE constraint rejects the insert.
+    //    The redirect must carry the generic literal, never the store's
+    //    error Display.
+    let second = post_create().await;
+    assert_eq!(second.status(), 303);
+    let location = second
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        location, "/admin/library?error=bookshelf%20creation%20failed",
+        "duplicate create must bounce the generic error literal"
+    );
+    let lower = location.to_lowercase();
+    for leak in ["sqlite", "constraint", "unique", "0001_init", "database"] {
+        assert!(
+            !lower.contains(leak),
+            "internal error detail must not ride the URL: {location}"
+        );
+    }
+
+    // 3. Following the redirect, the library page renders the danger
+    //    banner with the generic message and no success banner (the
+    //    flash lives in the query string, so the redirect TARGET is
+    //    what carries it).
+    let page = client
+        .get(format!("{base}{location}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains("banner--danger"),
+        "the error flash renders the danger banner: {html}"
+    );
+    assert!(
+        html.contains("<p>bookshelf creation failed</p>"),
+        "the generic message renders in the banner: {html}"
+    );
+    assert!(
+        !html.contains("banner--success"),
+        "the false-success banner must be gone: {html}"
+    );
+    assert!(
+        !html.contains("Bookshelf created"),
+        "no ok flash after a failed create: {html}"
+    );
+
+    // 4. Exactly one row with that name — in the rendered table and in
+    //    the store.
+    assert_eq!(
+        html.matches(r#"<td data-label="Name">Duplicate Shelf</td>"#)
+            .count(),
+        1,
+        "the duplicate must not create a second row: {html}"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM bookshelves WHERE name = 'Duplicate Shelf'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "the store holds exactly one such shelf");
+
+    shutdown.cancel();
+}
+
 /// Task 2 (PR 4): the Librarian status page — GET /status renders for
 /// the admin with the four queue StatTiles, the state chips, the
 /// ingest-jobs table (moved here from the PR-3 System stopgap, spec
