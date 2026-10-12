@@ -673,7 +673,10 @@ pub async fn login_submit(
                 success.session.id
             );
             let mut response = if success.must_change_password {
-                Redirect::to("/password?forced=1").into_response()
+                // Task 5's merge: the forced-change destination is the
+                // account page (the password card's home) — the login
+                // gate's redirect targets the same URL.
+                Redirect::to("/account?forced=1").into_response()
             } else {
                 Redirect::to("/").into_response()
             };
@@ -1440,14 +1443,18 @@ pub struct PasswordForm {
     pub repeat: String,
 }
 
-/// POST /password — change password (invalidates sessions, forces re-login).
+/// POST /password — change password (invalidates sessions, forces
+/// re-login). The route and the success arm are UNCHANGED by Task 5's
+/// merge — the /account password card posts here — but the error
+/// re-renders land on the account page's composition now (the old
+/// bare /password page is gone; `account_password_error` below).
 pub async fn password_submit(
     State(state): State<AppState>,
     session: SessionId,
     axum::Form(form): axum::Form<PasswordForm>,
 ) -> Response {
     if form.new != form.repeat {
-        return pages::password_page("", None, Some("Passwords do not match")).into_response();
+        return account_password_error(&state, &session, "Passwords do not match").await;
     }
     let sess = match state.sessions.get(session.0).await {
         Ok(s) => s,
@@ -1471,14 +1478,56 @@ pub async fn password_submit(
             );
             response
         }
-        Err(e) => pages::password_page("", None, Some(&e.to_string())).into_response(),
+        Err(e) => account_password_error(&state, &session, &e.to_string()).await,
     }
 }
 
-/// GET /password — change-password page.
-pub async fn password_view(session: SessionId, State(state): State<AppState>) -> Response {
-    let csrf = pages::current_csrf(&state, &session).await;
-    pages::password_page(&csrf, None, None).into_response()
+/// The password form's error re-render: the full /account composition
+/// with the failure riding the page's banner slot (a danger banner
+/// above the password card) — Task 5's merge rule: the error lands on
+/// the account page's layout, not a bare /password page. The banner
+/// primitive's text position escapes the message (PasswordError's
+/// Display strings — no user text rides it).
+///
+/// CSRF note (pre-existing behavior, deliberately mirrored): the
+/// re-render carries an EMPTY csrf token, exactly as the old
+/// password_page arms did — threading the live token is the plan's
+/// Task 7 follow-up, which swaps this for `pages::current_csrf`.
+async fn account_password_error(state: &AppState, session: &SessionId, message: &str) -> Response {
+    let Ok(sess) = state.sessions.get(session.0).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let Ok(record) = state.users.get_by_id(sess.user_id).await else {
+        return Redirect::to("/login").into_response();
+    };
+    let enrolled = record.totp_secret.is_some();
+    let user = SessionUser {
+        user_id: record.id,
+        username: record.username,
+        role: record.role,
+    };
+    let (count, credentials) = webauthn_rows(state, record.id).await;
+    pages::account_page(
+        &user,
+        "",
+        pages::TotpSection::Row { enrolled },
+        pages::RecoverySection::Resting,
+        count,
+        &credentials,
+        Some(("danger", message)),
+    )
+    .into_response()
+}
+
+/// GET /password — a TRUE 307 to /account (Task 5's merge: the password
+/// card's home is the account page, so bookmarked /password URLs keep
+/// working — the /admin split's precedent; axum's `Redirect::to` is a
+/// 303, so the redirect is built from the status + Location header
+/// directly). The login gate still runs first: an anonymous GET
+/// redirects to /login exactly as before, and a must-change user lands
+/// on /account?forced=1 (the banner) via the gate's allowed set.
+pub async fn password_view() -> Response {
+    (StatusCode::TEMPORARY_REDIRECT, [("Location", "/account")]).into_response()
 }
 
 /// GET /keys — API keys page.
@@ -1580,10 +1629,14 @@ async fn webauthn_rows(
 /// gated for every logged-in user (the nav item is not admin-gated,
 /// spec §6); the resting TOTP state reads `UserRecord.totp_secret`
 /// (`get_by_id` already carries the column — no new query shape).
+/// `?forced=1` — the login redirect's and the login gate's target for
+/// must-change users (Task 5's merge) — renders the warning banner
+/// above the password card.
 pub async fn account_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let enrolled = state
@@ -1593,6 +1646,13 @@ pub async fn account_view(
         .map(|r| r.totp_secret.is_some())
         .unwrap_or(false);
     let (count, credentials) = webauthn_rows(&state, user.user_id).await;
+    // The forced-change marker: pinned to the exact "1" the redirects
+    // send — any other value renders the plain page.
+    let banner = if params.get("forced").is_some_and(|f| f == "1") {
+        Some(("warning", "You must change your password before continuing"))
+    } else {
+        None
+    };
     pages::account_page(
         &user,
         &csrf,
@@ -1600,7 +1660,7 @@ pub async fn account_view(
         pages::RecoverySection::Resting,
         count,
         &credentials,
-        None,
+        banner,
     )
     .into_response()
 }

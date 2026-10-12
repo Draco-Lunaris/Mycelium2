@@ -77,6 +77,9 @@ pub fn build_router_with_shutdown(
         // operational page — session-gated here, RequireAdmin in the
         // handler (the same gate shape as the /admin pages).
         .route("/status", get(api::status_view))
+        // /password (Task 5's merge): the GET 307s to /account (the
+        // password card's home); the POST stays the change form's
+        // unchanged target (the account card posts here).
         .route(
             "/password",
             get(api::password_view).post(api::password_submit),
@@ -86,8 +89,10 @@ pub fn build_router_with_shutdown(
         // Account security (PR 4, mockup 10): GET /account for every
         // logged-in user; the TOTP POSTs are thin wrappers over
         // mycelium-auth's totp service (spec §6's exact route names);
-        // the password card posts the EXISTING /password handler
-        // (unchanged — Task 5 owns the gate retarget). Task 4 adds the
+        // the password card posts the EXISTING /password handler (its
+        // POST unchanged — Task 5's merge made the /password GET a 307
+        // here and moved the forced-change gate to /account). Task 4
+        // adds the
         // recovery-key regenerate POST and the WebAuthn ceremony routes
         // (challenge GET + register/remove POSTs) — all session-gated
         // behind the same middleware stack.
@@ -154,7 +159,8 @@ pub fn build_router_with_shutdown(
 /// Gate that allows public paths through without a session but keeps the
 /// require-login redirect for protected pages. Also enforces the forced
 /// password change: users with must_change_password can only reach
-/// /password (and /logout) until they change it.
+/// /account (the password card's home), POST /password (the card's
+/// unchanged form target), and /logout until they change it.
 async fn require_login_gate(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
@@ -183,18 +189,22 @@ async fn require_login_gate(
     else {
         return Redirect::to("/login").into_response();
     };
-    // Forced password change gate: only /password (and logout, handled
-    // above) is reachable until the password is changed. Bearer API-key
+    // Forced password change gate (Task 5's merge): a must-change user
+    // reaches /account — the password card's home, where the ?forced=1
+    // banner renders — plus POST /password, the card's UNCHANGED form
+    // target (dropping /password from the allowed set would brick the
+    // very flow the gate exists to force: the change form could never
+    // submit). Logout stays public (handled above). Bearer API-key
     // clients are exempt — the flag is a browser-flow concern, and API
     // keys are minted deliberately by the user.
     let bearer = request
         .extensions()
         .get::<crate::middleware::BearerAuth>()
         .is_some();
-    if path != "/password" && !bearer {
+    if path != "/account" && path != "/password" && !bearer {
         let record = state.users.get_by_id(user.user_id).await;
         if matches!(record, Ok(ref r) if r.must_change_password) {
-            return Redirect::to("/password?forced=1").into_response();
+            return Redirect::to("/account?forced=1").into_response();
         }
     }
     next.run(request).await

@@ -987,51 +987,6 @@ pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
     )
 }
 
-/// Change-password page (Task 9 — lone card): the PR-1 ruled None-user
-/// shell-less rendering kept (no sidebar), but the body is now a single
-/// `card("Change password", …)` — the flash banners plus the change
-/// form. The three password fields compose INLINE on the field markup
-/// pattern (the Task-3 search-page precedent): the primitive `field()`
-/// renders only `<input id type>`, while these inputs must carry
-/// name/required/minlength for the native POST; extending the shared
-/// primitive (and every consumer) for one page's attributes is the
-/// worse shape, and this markup keeps the component's exact `.field`
-/// shape (label[for] above input, id-pairing). The hidden csrf_token
-/// follows the row-form pattern (app.js skips injection when the field
-/// exists; the middleware's form path verifies it) and `form_actions`
-/// supplies the primary submit (a bare button inside a form submits
-/// natively — no JS needed). No user text beyond the flash messages,
-/// which the flash helper escapes at composition (card bodies are raw
-/// slots).
-pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<String> {
-    let csrf_esc = html_escape(csrf);
-    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
-    let card_body = format!(
-        r#"{flashes}<form method="post" action="/password">
-  <input type="hidden" name="csrf_token" value="{csrf_esc}">
-  <div class="field">
-    <label for="pw-old">Current password</label>
-    <input id="pw-old" type="password" name="old" required>
-  </div>
-  <div class="field">
-    <label for="pw-new">New password (min 20 chars)</label>
-    <input id="pw-new" type="password" name="new" required minlength="20">
-  </div>
-  <div class="field">
-    <label for="pw-repeat">Repeat new password</label>
-    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
-  </div>
-  {actions}
-</form>"#,
-        flashes = flash(ok, err),
-    );
-    let body = mycelium_ui::render::render(mycelium_ui::card(
-        "Change password",
-        TrustedHtml::from_markup(card_body),
-    ));
-    layout("Password", None, csrf, "/password", body)
-}
-
 /// API keys page (Task 8 rebuild — mockup 09): the page header's actions
 /// slot carries the mint form (label input + primary Mint key button,
 /// with its own server-rendered hidden CSRF token — the row-form
@@ -1230,7 +1185,8 @@ pub enum RecoverySection {
 
 /// Account security (mockup 10): three cards — Password (the PR-2
 /// lone card's body moved here verbatim: three fields posting the
-/// EXISTING /password handler, unchanged until Task 5's gate work),
+/// EXISTING /password handler — its POST unchanged by Task 5's merge,
+/// which retargeted that handler's error renders to this page),
 /// Two-factor (the TOTP section per `totp` + the WebAuthn rows:
 /// credential count + the per-credential Remove list — nickname-less
 /// base64url ids with a Remove form each — and the Register button,
@@ -1268,8 +1224,9 @@ pub fn account_page(
         .unwrap_or_default();
 
     // Password card: the PR-2 password page's card body, moved as-is
-    // (flash slot dropped — /password's own handler renders those
-    // until Task 5 retargets the gate).
+    // (flash slot dropped — /password's error renders and the
+    // ?forced=1 marker ride this page's banner slot since Task 5's
+    // merge).
     let pw_actions =
         mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
     let password_body = format!(

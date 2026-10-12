@@ -185,7 +185,9 @@ async fn security_settings_guardrails() {
     //    password (below the saved min of 12) is rejected with the
     //    configured minimum in the message. The session stays alive
     //    (the change failed), so the same cookie keeps working.
-    let csrf2 = csrf_from_page(&client, &format!("{base}/password"), &cookie2).await;
+    //    CSRF source is /account (the /password GET is a 307 there
+    //    since the Task-5 merge).
+    let csrf2 = csrf_from_page(&client, &format!("{base}/account"), &cookie2).await;
     let really_short = client
         .post(format!("{base}/password"))
         .header("cookie", &cookie2)

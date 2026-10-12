@@ -121,10 +121,11 @@ async fn full_web_flow() {
         .send()
         .await
         .unwrap();
-    // Forced password change → redirect to /password?forced=1.
+    // Forced password change → redirect to /account?forced=1 (Task 5:
+    // the /password merge — the password card's home is /account now).
     assert_eq!(login.status(), 303);
     let location = login.headers().get("location").unwrap().to_str().unwrap();
-    assert!(location.contains("/password"), "got {location}");
+    assert_eq!(location, "/account?forced=1", "got {location}");
     let cookie = login
         .headers()
         .get("set-cookie")
@@ -138,7 +139,7 @@ async fn full_web_flow() {
     assert!(cookie.starts_with("myc2_session="));
 
     // 5. The forced-change gate: with the flag set, / redirects to
-    //    /password?forced=1 (the gate blocks everything else).
+    //    /account?forced=1 (the gate blocks everything else).
     let gated = client
         .get(format!("{base}/"))
         .header("cookie", &cookie)
@@ -153,22 +154,39 @@ async fn full_web_flow() {
             .unwrap()
             .to_str()
             .unwrap()
-            .contains("/password?forced=1")
+            .contains("/account?forced=1")
     );
 
     // 5b. Change the password (forced flow) — invalidates the session.
-    //    CSRF comes from the /password page (the only reachable page).
-    //    Task 9 pin: the page renders as a lone card (card__header).
+    //    The /password GET is a 307 to /account now (Task 5's merge —
+    //    the password card lives there); CSRF comes from the /account
+    //    page (the only reachable page), and ?forced=1 renders the
+    //    must-change warning banner above the password card.
     let pw_page = client
         .get(format!("{base}/password"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(pw_page.status(), 200);
-    let pw_html = pw_page.text().await.unwrap();
-    assert!(pw_html.contains("card__header"), "{pw_html}");
-    let csrf = csrf_from_page(&client, &format!("{base}/password"), &cookie).await;
+    assert_eq!(pw_page.status(), 307, "/password GET must be a 307");
+    assert_eq!(pw_page.headers().get("location").unwrap(), "/account");
+    let account_page = client
+        .get(format!("{base}/account?forced=1"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(account_page.status(), 200);
+    let acct_html = account_page.text().await.unwrap();
+    assert!(
+        acct_html.contains("You must change your password before continuing"),
+        "forced banner on /account?forced=1: {acct_html}"
+    );
+    assert!(
+        acct_html.contains("card__header"),
+        "account page renders cards: {acct_html}"
+    );
+    let csrf = csrf_from_page(&client, &format!("{base}/account"), &cookie).await;
     let new_password = "new admin password 20 chars!";
     let change = client
         .post(format!("{base}/password"))

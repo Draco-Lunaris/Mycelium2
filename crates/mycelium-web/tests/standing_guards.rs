@@ -155,9 +155,11 @@ async fn csp_sweep_no_inline_style_or_script() {
         "/books",
         "/chat",
         "/keys",
-        "/password",
         // Account security (PR 4, Task 3): the password card + 2FA
         // rows + recovery card page, swept like its siblings.
+        // (/password itself is Task 5's merge — a 307 to /account, no
+        // HTML to sweep; full_web_flow pins that redirect, and this
+        // /account sweep covers the card the redirect leads to.)
         "/account",
         // The admin split (PR 3): the five pages, all 200 for the swept
         // admin session. (/admin itself is a 307 now — its redirect is
@@ -219,7 +221,9 @@ async fn fields_pair_labels_and_inputs() {
     let client = client();
     let cookie = admin_cookie(&client, &base).await;
 
-    for route in ["/keys", "/password", "/account"] {
+    // The password card's fields live on /account since Task 5's
+    // merge — this sweep covers them there (/password 307s to it).
+    for route in ["/keys", "/account"] {
         let resp = client
             .get(format!("{base}{route}"))
             .header("cookie", &cookie)
