@@ -1489,10 +1489,11 @@ pub async fn password_submit(
 /// primitive's text position escapes the message (PasswordError's
 /// Display strings — no user text rides it).
 ///
-/// CSRF note (pre-existing behavior, deliberately mirrored): the
-/// re-render carries an EMPTY csrf token, exactly as the old
-/// password_page arms did — threading the live token is the plan's
-/// Task 7 follow-up, which swaps this for `pages::current_csrf`.
+/// CSRF (Task 7): the re-render threads the session's LIVE token via
+/// `pages::current_csrf` — the concept_submit pattern. An empty token
+/// would strand the user: the retry they just clicked would 403 at the
+/// CSRF gate, so every form on the error page (the password card and
+/// the head meta app.js reads) must carry a token that verifies.
 async fn account_password_error(state: &AppState, session: &SessionId, message: &str) -> Response {
     let Ok(sess) = state.sessions.get(session.0).await else {
         return Redirect::to("/login").into_response();
@@ -1507,9 +1508,10 @@ async fn account_password_error(state: &AppState, session: &SessionId, message: 
         role: record.role,
     };
     let (count, credentials) = webauthn_rows(state, record.id).await;
+    let csrf = pages::current_csrf(state, session).await;
     pages::account_page(
         &user,
-        "",
+        &csrf,
         pages::TotpSection::Row { enrolled },
         pages::RecoverySection::Resting,
         count,

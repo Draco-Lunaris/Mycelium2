@@ -188,11 +188,68 @@ async fn full_web_flow() {
     );
     let csrf = csrf_from_page(&client, &format!("{base}/account"), &cookie).await;
     let new_password = "new admin password 20 chars!";
-    let change = client
+
+    // 5b-i. Wrong old password → the /account composition with the
+    // failure in the banner slot (200, not a redirect), and — Task 7 —
+    // the re-render must carry a LIVE csrf token in both the password
+    // form's hidden field and the head's csrf meta. An empty token
+    // would strand the user: the retry they just clicked would 403.
+    let wrong = client
         .post(format!("{base}/password"))
         .header("cookie", &cookie)
         .header("x-csrf-token", &csrf)
         .form(&[
+            ("old", "definitely not the old password"),
+            ("new", new_password),
+            ("repeat", new_password),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200, "wrong password re-renders /account");
+    let wrong_html = wrong.text().await.unwrap();
+    assert!(
+        wrong_html.contains("invalid credentials"),
+        "the failure rides the banner slot: {wrong_html}"
+    );
+    assert!(
+        !wrong_html.contains("You must change your password before continuing"),
+        "the forced banner is replaced by the failure banner (single slot): {wrong_html}"
+    );
+    let retry_csrf = {
+        let marker = r#"name="csrf-token" content=""#;
+        let idx = wrong_html
+            .find(marker)
+            .expect("csrf meta on the error re-render");
+        let rest = &wrong_html[idx + marker.len()..];
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+    assert!(
+        !retry_csrf.is_empty(),
+        "the error re-render carries a live csrf token (Task 7): {wrong_html}"
+    );
+    let hidden = {
+        let marker = r#"action="/password">
+  <input type="hidden" name="csrf_token" value=""#;
+        let idx = wrong_html
+            .find(marker)
+            .expect("password form hidden csrf on the error re-render");
+        let rest = &wrong_html[idx + marker.len()..];
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+    assert_eq!(
+        hidden, retry_csrf,
+        "the form's hidden field and the head meta carry the same live token"
+    );
+
+    // 5b-ii. The retry the user actually makes: the token from the
+    // error page's own form field (no re-GET), plus the RIGHT old
+    // password → the change succeeds (303 → /login).
+    let change = client
+        .post(format!("{base}/password"))
+        .header("cookie", &cookie)
+        .form(&[
+            ("csrf_token", retry_csrf.as_str()),
             ("old", password),
             ("new", new_password),
             ("repeat", new_password),
@@ -200,7 +257,11 @@ async fn full_web_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(change.status(), 303);
+    assert_eq!(
+        change.status(),
+        303,
+        "retry with the error page's token succeeds: {change:?}"
+    );
     assert!(
         change
             .headers()
@@ -210,6 +271,10 @@ async fn full_web_flow() {
             .unwrap()
             .contains("/login")
     );
+
+    // (The pre-Task-7 success leg — fresh csrf via the x-csrf-token
+    // header — is folded into 5b-ii above: the retry IS the successful
+    // change, so the sequence pins both the fix and the change itself.)
 
     // 6. Log in with the new password.
     let login2 = client
@@ -3171,6 +3236,13 @@ async fn account_totp_flow() {
         .unwrap();
     assert_eq!(page.status(), 200, "GET /account for a session");
     let html = page.text().await.unwrap();
+    // Task-5 review pin: the forced-change banner is ?forced=1-driven,
+    // never session-state-driven — a plain GET on a normal account must
+    // NOT show it.
+    assert!(
+        !html.contains("must change your password before continuing"),
+        "no forced banner on a plain GET /account: {html}"
+    );
     assert!(html.contains("Change password"), "password card: {html}");
     assert!(html.contains("Two-factor"), "2FA card: {html}");
     assert!(html.contains("Recovery key"), "recovery card: {html}");
