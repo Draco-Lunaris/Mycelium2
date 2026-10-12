@@ -3037,8 +3037,8 @@ async fn account_totp_flow() {
         "WebAuthn row shows the credential count: {html}"
     );
     assert!(
-        html.contains(r#"<button class="btn" disabled>Register</button>"#),
-        "WebAuthn row's disabled Register placeholder (Task 4 wires it): {html}"
+        html.contains(r#"<button class="btn" disabled data-webauthn-register>Register</button>"#),
+        "WebAuthn row's disabled Register button (webauthn.js enables it when script runs): {html}"
     );
     assert!(
         html.contains(r#"href="/account""#),
@@ -3174,6 +3174,407 @@ async fn account_totp_flow() {
             .await
             .unwrap();
     assert!(row.is_none(), "clear_secret removed the enrollment");
+
+    shutdown.cancel();
+}
+
+/// Task 4 (PR 4): the recovery-key regenerate flow + the WebAuthn
+/// register/remove wiring on /account.
+///
+/// Recovery-flow reality, pinned by reading login.rs in full before
+/// writing this: NO recovery-login path exists — `unseal_with_recovery`
+/// has zero production callers and login takes username + password (+
+/// TOTP) only, so a recovery key can never log a user in. The
+/// old-dead/new-live legs therefore pin the SEAL level: the record
+/// persisted by rotation unseals with the new key and refuses the old
+/// one — the exact property any future recovery-login path would rely
+/// on. On top of the brief's floor (row-change +
+/// session-preservation) this is the strongest pin expressible today.
+///
+/// Review Focus 1 (wrong password): the failed check must leave the
+/// stored sealed row byte-identical — no rotation, no persist. Review
+/// Focus 5: rotation touches seals only, never the sessions table, so
+/// a second session keeps working.
+///
+/// WebAuthn: webauthn-rs-core 0.5 ships no soft-token test helper
+/// (fake.rs only generates credential-ID distributions), so no real
+/// browser ceremony can run in-process; the legs pin the server
+/// surfaces — the register POST failing closed without a challenge,
+/// the challenge GET's creation-options JSON (session-gated; anonymous
+/// requests hit the uniform login-gate 303 like every other protected
+/// page, not a 401), and the per-credential Remove rows + removal via
+/// a seeded credential.
+#[tokio::test]
+async fn recovery_and_webauthn_flows() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    // Seed a second user with a KNOWN recovery key: boot() discards the
+    // admin's create-time key (shown once, by design), but old-dead/
+    // new-live needs key material for the previous seal.
+    const ROT_PW: &str = "rotator password known to the suite";
+    let rot_master = mycelium_crypto::generate_master_key();
+    let old_recovery = mycelium_crypto::generate_recovery_key();
+    let rot_sealed = mycelium_crypto::seal_master_key(&rot_master, ROT_PW, &old_recovery).unwrap();
+    let rot_json = serde_json::to_string(&rot_sealed).unwrap();
+    let rot_hash = mycelium_auth::hash_password(ROT_PW).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, role, auth_provider, password_hash, sealed_master_key, created_at, updated_at)
+         VALUES (?, 'rotator', 'rotator@localhost.local', 'user', 'local', ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&rot_hash)
+    .bind(&rot_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Two independent sessions (Review Focus 5's setup).
+    let login1 = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login1.status(), 303);
+    let cookie1 = login1
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let login2 = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login2.status(), 303);
+    let cookie2 = login2
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf1 = csrf_from_page(&client, &format!("{base}/account"), &cookie1).await;
+
+    // Leg 1 — wrong_password_leaves_seal_untouched (Review Focus 1):
+    // the password check runs BEFORE any rotation or persist, so a
+    // failed check leaves the stored row byte-identical.
+    let (pre_sealed,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let wrong = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie1)
+        .form(&[
+            ("csrf_token", csrf1.as_str()),
+            ("current_password", "wrong password entirely!!"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200, "the failed check re-renders the page");
+    let wh = wrong.text().await.unwrap();
+    assert!(
+        wh.contains("Current password is incorrect"),
+        "the wrong-password banner: {wh}"
+    );
+    assert!(
+        !wh.contains(r#"id="new-recovery-key""#),
+        "no key may render on a failed password check: {wh}"
+    );
+    // The resting regenerate form renders with paired label/input (the
+    // standing label-pairing guard also sweeps /account).
+    assert!(
+        wh.contains(r#"<form method="post" action="/account/recovery/regenerate">"#),
+        "regenerate form: {wh}"
+    );
+    assert!(wh.contains(r#"for="regen-password""#), "label pairs: {wh}");
+    assert!(wh.contains(r#"id="regen-password""#), "input pairs: {wh}");
+    // The Register button stays the script-less disabled shape and the
+    // hydrate bundle does NOT load on the resting page.
+    assert!(
+        wh.contains(r#"<button class="btn" disabled data-webauthn-register>Register</button>"#),
+        "Register renders disabled for script-less browsers: {wh}"
+    );
+    assert!(!wh.contains("islands.js"), "resting page stays light: {wh}");
+    let (post_sealed,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pre_sealed, post_sealed,
+        "Review Focus 1: the sealed row must be byte-identical after the failed check"
+    );
+
+    // Leg 2 — rotation_shows_once_and_stores: the right password rotates
+    // the recovery seal, persists, and renders the shown-once card.
+    let ok = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie1)
+        .form(&[("csrf_token", csrf1.as_str()), ("current_password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let oh = ok.text().await.unwrap();
+    assert!(
+        oh.contains(r#"<code id="new-recovery-key">"#),
+        "the shown-once key renders: {oh}"
+    );
+    assert!(
+        oh.contains(r#"class="shown-once""#),
+        "the keys-page shown-once treatment: {oh}"
+    );
+    assert!(
+        oh.contains(r#"data-copy-target="new-recovery-key""#),
+        "copy-button island: {oh}"
+    );
+    assert!(
+        oh.contains("islands.js"),
+        "the rotated page loads the hydrate bundle for the copy island: {oh}"
+    );
+    // Extract the shown-once key (hex + prefix — no escapable characters).
+    let marker = r#"<code id="new-recovery-key">"#;
+    let idx = oh.find(marker).expect("key marker");
+    let rest = &oh[idx + marker.len()..];
+    let new_key = rest[..rest.find('<').unwrap()].to_string();
+    assert!(
+        new_key.starts_with("myc2-recovery-"),
+        "parsed key looks like a recovery key: {new_key}"
+    );
+    // The stored row CHANGED.
+    let (rot_stored,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(rot_stored, pre_sealed, "rotation must persist a new record");
+    // Seal-level old-dead / new-live (the strongest pin expressible
+    // while no recovery-login path exists): the new key unseals the
+    // SAME master; the old key is dead.
+    let rot_after: mycelium_crypto::SealedMasterKey = serde_json::from_str(&rot_stored).unwrap();
+    let by_new = mycelium_crypto::unseal_with_recovery(&rot_after, &new_key).unwrap();
+    assert_eq!(
+        by_new.as_bytes(),
+        rot_master.as_bytes(),
+        "the new key must unseal the SAME master key"
+    );
+    assert!(
+        mycelium_crypto::unseal_with_recovery(&rot_after, &old_recovery).is_err(),
+        "the OLD recovery key must be dead after rotation"
+    );
+    // The password seal carried over: password login still works.
+    let relogin = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relogin.status(), 303, "password login survives rotation");
+
+    // Leg 3 — rotation_preserves_other_sessions (Review Focus 5): the
+    // second session still works — rotation never touches sessions.
+    let still = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        still.status(),
+        200,
+        "rotation must not invalidate other sessions"
+    );
+
+    // Leg 4 — the pre-seeded admin rotates too (its create-time key is
+    // unknown by design, so this leg pins row-change + the new key
+    // unsealing the same master the password does).
+    let admin_login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_login.status(), 303);
+    let cookie_a = admin_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf_a = csrf_from_page(&client, &format!("{base}/account"), &cookie_a).await;
+    let (admin_pre,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let admin_ok = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("current_password", ADMIN_PASSWORD),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_ok.status(), 200);
+    let ah = admin_ok.text().await.unwrap();
+    let idx = ah.find(marker).expect("admin key marker");
+    let rest = &ah[idx + marker.len()..];
+    let admin_key = rest[..rest.find('<').unwrap()].to_string();
+    let (admin_stored,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(admin_stored, admin_pre, "admin rotation persisted");
+    let admin_after: mycelium_crypto::SealedMasterKey =
+        serde_json::from_str(&admin_stored).unwrap();
+    let by_rec = mycelium_crypto::unseal_with_recovery(&admin_after, &admin_key).unwrap();
+    let by_pw = mycelium_crypto::unseal_with_password(&admin_after, ADMIN_PASSWORD).unwrap();
+    assert_eq!(
+        by_rec.as_bytes(),
+        by_pw.as_bytes(),
+        "the new key unseals the same master the password does"
+    );
+    // The WebAuthn resting row on this render (0 credentials).
+    assert!(ah.contains("0 credentials"), "count renders: {ah}");
+
+    // Leg 5 — register fails closed with no live challenge (this leg
+    // runs BEFORE any challenge GET so ChallengeNotFound is the true
+    // failure reason).
+    let reg = client
+        .post(format!("{base}/account/webauthn/register"))
+        .header("cookie", &cookie_a)
+        .header("x-csrf-token", csrf_a.as_str())
+        .header("content-type", "application/json")
+        .body(r#"{"id":"x","rawId":"eA","response":{"attestationObject":"eA","clientDataJSON":"eA"},"type":"public-key"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status(), 400, "no challenge to consume → fail closed");
+    let rj: serde_json::Value = reg.json().await.unwrap();
+    assert!(rj["error"].is_string(), "error shape: {rj}");
+
+    // Leg 6 — the challenge GET: session-gated creation-options JSON.
+    let ch = client
+        .get(format!("{base}/account/webauthn/challenge"))
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ch.status(), 200);
+    let cj: serde_json::Value = ch.json().await.unwrap();
+    let challenge = cj["publicKey"]["challenge"].as_str().unwrap_or("");
+    assert!(!challenge.is_empty(), "challenge field: {cj}");
+    assert_eq!(
+        cj["publicKey"]["rp"]["id"], "localhost",
+        "the default RP id derives from the default origin: {cj}"
+    );
+    assert_eq!(cj["publicKey"]["user"]["name"], "admin", "{cj}");
+    // Anonymous: the uniform login gate (303 → /login) — the codebase's
+    // real behavior for every protected page, not a 401.
+    let anon = client
+        .get(format!("{base}/account/webauthn/challenge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 303);
+    assert_eq!(anon.headers().get("location").unwrap(), "/login");
+
+    // Leg 7 — per-credential Remove rows + removal. Seed a credential
+    // (list_credentials reads id/created_at only — the key blob is
+    // never parsed on the render path).
+    let (admin_id,): (String,) = sqlx::query_as("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO webauthn_credentials (id, user_id, public_key, counter, transports, created_at)
+         VALUES ('seeded-cred-1', ?, ?, 0, '', ?)",
+    )
+    .bind(&admin_id)
+    .bind(b"seed" as &[u8])
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let page = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let ph = page.text().await.unwrap();
+    assert!(ph.contains("1 credential"), "count after seed: {ph}");
+    assert!(
+        ph.contains(r#"<span class="chip chip--accent">enrolled</span>"#),
+        "enrolled chip: {ph}"
+    );
+    assert!(
+        ph.contains("seeded-cred-1"),
+        "the credential id renders: {ph}"
+    );
+    assert!(
+        ph.contains(r#"<form method="post" action="/account/webauthn/remove">"#),
+        "per-credential Remove form: {ph}"
+    );
+    let remove = client
+        .post(format!("{base}/account/webauthn/remove"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("credential_id", "seeded-cred-1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), 200);
+    let rh = remove.text().await.unwrap();
+    assert!(rh.contains("0 credentials"), "count back to zero: {rh}");
+    assert!(!rh.contains("seeded-cred-1"), "the row is gone: {rh}");
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?")
+            .bind(&admin_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "remove_credential deleted the row");
+    // Removing an unknown id: the page re-renders (the user-scoped
+    // delete matched nothing — a no-op, not an error page).
+    let remove2 = client
+        .post(format!("{base}/account/webauthn/remove"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("credential_id", "does-not-exist"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove2.status(), 200);
 
     shutdown.cancel();
 }

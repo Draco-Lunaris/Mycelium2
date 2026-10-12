@@ -254,6 +254,33 @@ impl UserStore {
         Ok(())
     }
 
+    /// Replace a user's sealed master-key record (recovery-key
+    /// rotation). The caller has already proven the password
+    /// (`unseal_with_password`) and rotated the record; this persists
+    /// it — mirroring change_password's UPDATE WITHOUT the
+    /// password_hash / must_change_password arms (rotation touches
+    /// neither: the password seal is carried over verbatim and the
+    /// forced-change flag is a password-flow concern).
+    pub async fn update_sealed(
+        &self,
+        user_id: Uuid,
+        sealed: &SealedMasterKey,
+    ) -> Result<(), UsersError> {
+        let sealed_json = serde_json::to_string(sealed).map_err(|_| UsersError::CorruptSeal)?;
+        let now = Utc::now().to_rfc3339();
+        let res =
+            sqlx::query("UPDATE users SET sealed_master_key = ?, updated_at = ? WHERE id = ?")
+                .bind(&sealed_json)
+                .bind(&now)
+                .bind(user_id.to_string())
+                .execute(&self.pool)
+                .await?;
+        if res.rows_affected() == 0 {
+            return Err(UsersError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Fetch a user by id.
     pub async fn get_by_id(&self, user_id: Uuid) -> Result<UserRecord, UsersError> {
         let row: Option<RawUserRow> = sqlx::query_as(
@@ -486,6 +513,47 @@ mod tests {
         users.delete(created.record.id).await.unwrap();
         assert!(matches!(
             users.get_by_id(created.record.id).await,
+            Err(UsersError::NotFound)
+        ));
+    }
+
+    /// Task 4 (PR 4): update_sealed round-trips a rotated record —
+    /// the recovery regenerate flow's persistence step. Mirrors the
+    /// handler's exact sequence: rotate over the same master key →
+    /// persist → re-read. Pins that only the recovery seal changes
+    /// (the password seal is carried over verbatim), that the new key
+    /// unseals the same master the password does, and that an
+    /// unknown user id is NotFound (no row written).
+    #[tokio::test]
+    async fn update_sealed_round_trips_rotated_record() {
+        let (_dir, store) = test_store().await;
+        let users = UserStore::new(store.pool().clone());
+        let created = users
+            .create_local("carol", "carol@example.com", PW, Role::User)
+            .await
+            .unwrap();
+        let before = users.get_by_id(created.record.id).await.unwrap();
+        let sealed: SealedMasterKey = serde_json::from_str(&before.sealed_master_key).unwrap();
+        // Rotate: a fresh recovery key wrapping the SAME master key.
+        let new_recovery = generate_recovery_key();
+        let rotated = mycelium_crypto::rotate_recovery_key(&sealed, PW, &new_recovery).unwrap();
+        users
+            .update_sealed(created.record.id, &rotated)
+            .await
+            .unwrap();
+        let after = users.get_by_id(created.record.id).await.unwrap();
+        let stored: SealedMasterKey = serde_json::from_str(&after.sealed_master_key).unwrap();
+        // The persisted record is the rotated one: password seal carried
+        // over verbatim, recovery seal replaced.
+        assert_eq!(stored.password_sealed_hex, rotated.password_sealed_hex);
+        assert_ne!(stored.recovery_sealed_hex, sealed.recovery_sealed_hex);
+        // The NEW key unseals the same master the password does.
+        let by_recovery = mycelium_crypto::unseal_with_recovery(&stored, &new_recovery).unwrap();
+        let by_password = mycelium_crypto::unseal_with_password(&stored, PW).unwrap();
+        assert_eq!(by_recovery.as_bytes(), by_password.as_bytes());
+        // Unknown user: NotFound (nothing written, nothing else touched).
+        assert!(matches!(
+            users.update_sealed(Uuid::new_v4(), &rotated).await,
             Err(UsersError::NotFound)
         ));
     }

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mycelium_auth::login::LoginService;
 use mycelium_auth::session::SessionManager;
 use mycelium_auth::users::UserStore;
+use mycelium_auth::webauthn::WebAuthnManager;
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_store::{ConfigStore, Store};
 use uuid::Uuid;
@@ -210,6 +211,10 @@ pub struct AppState {
     pub assets_dir: std::path::PathBuf,
     /// Librarian chat history per session (multi-turn memory).
     pub chat_history: Arc<ChatHistory>,
+    /// WebAuthn ceremony manager — built once per process (Task 4
+    /// hoists what Task 3 constructed per request). RP config:
+    /// [`webauthn_origin_from_env`].
+    pub webauthn: Arc<WebAuthnManager>,
 }
 
 impl AppState {
@@ -255,6 +260,17 @@ impl AppState {
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
         let login = login.with_service_key((*service_key).clone());
+        // WebAuthn RP (hoisted — Task-3 review Minor 4): built once per
+        // process instead of per request. The origin comes from
+        // MYCELIUM2_WEBAUTHN_ORIGIN (see the helper's rationale); a bad
+        // explicit value refuses to boot (fail fast, like every other
+        // operator-facing boot config — bad bind addresses, bad TLS
+        // paths).
+        let webauthn = Arc::new(
+            WebAuthnManager::from_origin(pool.clone(), &webauthn_origin_from_env()).expect(
+                "invalid MYCELIUM2_WEBAUTHN_ORIGIN — must be an https:// URL with a DNS host",
+            ),
+        );
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),
@@ -268,6 +284,7 @@ impl AppState {
             queue_worker,
             assets_dir,
             chat_history: Arc::new(ChatHistory::default()),
+            webauthn,
         }
     }
 
@@ -323,4 +340,32 @@ pub async fn decrypt_config<T: serde::de::DeserializeOwned>(
     key: &str,
 ) -> Option<T> {
     mycelium_store::config::get_sealed(config, service_key, key).await
+}
+
+/// The WebAuthn relying-party origin: `MYCELIUM2_WEBAUTHN_ORIGIN` (a
+/// full origin URL, e.g. `https://mycelium.example.com`), default
+/// `https://localhost`.
+///
+/// Why an env var and not the request Host or the config table:
+/// AppState is built once at boot, before any request exists (no Host
+/// is available at build time), and `AppState::new` is sync while
+/// ConfigStore reads are async — so neither dynamic surface can
+/// configure the RP at construction. The env override follows the
+/// `MYCELIUM2_SERVICE_KEY` precedent (operator-provided boot config).
+/// The default matches the self-signed-cert dev posture (HTTPS on
+/// localhost); real deployments set the env var to their origin. The
+/// RP id derives from the origin's DNS host (see
+/// `WebAuthnManager::from_origin`).
+fn webauthn_origin_from_env() -> String {
+    match std::env::var("MYCELIUM2_WEBAUTHN_ORIGIN") {
+        Ok(origin) => {
+            let trimmed = origin.trim().to_string();
+            if trimmed.is_empty() {
+                "https://localhost".to_string()
+            } else {
+                trimmed
+            }
+        }
+        Err(_) => "https://localhost".to_string(),
+    }
 }

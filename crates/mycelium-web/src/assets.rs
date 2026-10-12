@@ -1141,6 +1141,82 @@ pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management f
 })();
 "#;
 
+/// The /account passkey enrollment wiring (external asset — CSP-safe
+/// like chat.js; loads under script-src 'self'). Fetches the
+/// creation options from GET /account/webauthn/challenge, runs
+/// `navigator.credentials.create`, and POSTs the resulting credential
+/// to /account/webauthn/register as JSON, then reloads so the row
+/// re-renders with the new count. Without this script (or on a
+/// browser without WebAuthn support) the Register button stays in its
+/// SSR state — disabled — and the page degrades to state-only rows:
+/// the honest script-less degradation spec §7 pins. Encoding: the
+/// server speaks base64url without padding (base64urlsafedata's wire
+/// form); the helpers convert between that and the browser's
+/// ArrayBuffer.
+pub const WEBAUTHN_JS: &str = r#"// Passkey enrollment on /account: fetch the creation options, run the
+// browser ceremony, POST the credential, reload. SSR renders the
+// Register button disabled — this script (when WebAuthn is available)
+// enables it, so no script means no ceremony, never a broken one.
+(function () {
+  var btn = document.querySelector("[data-webauthn-register]");
+  if (!btn || !navigator.credentials || !window.PublicKeyCredential) return;
+  btn.disabled = false;
+  btn.addEventListener("click", function (e) {
+    e.preventDefault();
+    btn.disabled = true;
+    var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+    fetch("/account/webauthn/challenge")
+      .then(function (r) { if (!r.ok) throw new Error("challenge failed"); return r.json(); })
+      .then(function (opts) {
+        var pk = opts.publicKey;
+        pk.challenge = toBytes(pk.challenge);
+        pk.user.id = toBytes(pk.user.id);
+        return navigator.credentials.create({ publicKey: pk });
+      })
+      .then(function (cred) {
+        return fetch("/account/webauthn/register", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": csrfMeta ? csrfMeta.content : ""
+          },
+          body: JSON.stringify({
+            id: cred.id,
+            rawId: b64url(cred.rawId),
+            response: {
+              attestationObject: b64url(cred.response.attestationObject),
+              clientDataJSON: b64url(cred.response.clientDataJSON)
+            },
+            type: cred.type
+          })
+        });
+      })
+      .then(function (r) {
+        if (!r.ok) throw new Error("registration failed");
+        window.location.reload();
+      })
+      .catch(function (err) {
+        alert("passkey enrollment failed: " + (err && err.message ? err.message : "cancelled"));
+        btn.disabled = false;
+      });
+  });
+  function toBytes(b64) {
+    var s = b64.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    s = atob(s);
+    var out = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+  }
+  function b64url(buf) {
+    var bytes = new Uint8Array(buf);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+})();
+"#;
+
 /// Confirm-dialog wiring (external asset — CSP-safe like chat.js):
 /// `[data-confirm-dialog]` triggers open the page's named native
 /// `<dialog>`. The trigger's `data-key-id` (when present) is copied
@@ -1260,7 +1336,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "22";
+pub const ASSETS_VERSION: &str = "23";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
@@ -1278,6 +1354,7 @@ pub fn scaffold_defaults(assets_dir: &Path) -> std::io::Result<()> {
         ("chat.js", CHAT_JS),
         ("confirm.js", CONFIRM_JS),
         ("islands.js", ISLANDS_JS),
+        ("webauthn.js", WEBAUTHN_JS),
         // The hydrate bundle is a bindgen output pair — the JS wrapper
         // fetches `mycelium_ui_bg.wasm` by filename, so both names are
         // load-bearing. The wasm is written separately after the loop
@@ -1314,6 +1391,7 @@ mod tests {
         assert!(dir.path().join("chat.js").exists());
         assert!(dir.path().join("confirm.js").exists());
         assert!(dir.path().join("islands.js").exists());
+        assert!(dir.path().join("webauthn.js").exists());
         // Same version: does not overwrite (admin customization safe).
         std::fs::write(dir.path().join("style.css"), "custom").unwrap();
         scaffold_defaults(dir.path()).unwrap();

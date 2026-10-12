@@ -1554,21 +1554,26 @@ pub struct TotpVerifyForm {
     pub code: String,
 }
 
-/// The WebAuthn credential count for the 2FA row. The relying-party
-/// name/origin/id are the placeholder trio mycelium-auth's own tests
-/// use — the count query is RP-independent (it only touches the pool);
-/// Task 4 owns the real deployment RP config for the actual
-/// register/remove ceremony.
-async fn webauthn_count(state: &AppState, user_id: Uuid) -> i64 {
-    match mycelium_auth::webauthn::WebAuthnManager::new(
-        state.store.pool().clone(),
-        "Mycelium2",
-        "https://localhost",
-        "localhost",
-    ) {
-        Ok(m) => m.credential_count(user_id).await.unwrap_or(0),
-        Err(_) => 0,
-    }
+/// The /account render's WebAuthn inputs (Task 4): the credential
+/// count plus the per-credential rows, both from the HOISTED manager
+/// (built once in AppState::new — Task-3 review Minor 4; the RP
+/// config lives there, see state's `webauthn_origin_from_env`).
+async fn webauthn_rows(
+    state: &AppState,
+    user_id: Uuid,
+) -> (i64, Vec<mycelium_auth::webauthn::CredentialRow>) {
+    let count = state.webauthn.credential_count(user_id).await.unwrap_or(0);
+    // Skip the list query on the common no-credentials path.
+    let credentials = if count > 0 {
+        state
+            .webauthn
+            .list_credentials(user_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    (count, credentials)
 }
 
 /// GET /account — the Account security page (mockup 10). Session-
@@ -1587,12 +1592,14 @@ pub async fn account_view(
         .await
         .map(|r| r.totp_secret.is_some())
         .unwrap_or(false);
-    let count = webauthn_count(&state, user.user_id).await;
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
     pages::account_page(
         &user,
         &csrf,
         pages::TotpSection::Row { enrolled },
+        pages::RecoverySection::Resting,
         count,
+        &credentials,
         None,
     )
     .into_response()
@@ -1619,10 +1626,13 @@ pub async fn account_view(
 /// Accepted consequence, documented: a POST that persists but whose
 /// response never renders leaves the user enrolled with a secret they
 /// never saw (password-only login then fails). The way back is the
-/// recovery-key flow (Task 4) or an admin; adding a pending-enrollment
-/// column would be an auth-logic change — spec §1's non-goal for
-/// these UI wrappers. Between the two imperfect options the fail-closed
-/// one is chosen.
+/// in-session Disable → Enroll again, or operator DB surgery on the
+/// totp_secret column — NOT the recovery key: a recovery key cannot
+/// log a user in (no recovery-login path exists; login.rs takes
+/// username + password + TOTP only, and `unseal_with_recovery` has no
+/// production caller). Adding a pending-enrollment column would be an
+/// auth-logic change — spec §1's non-goal for these UI wrappers.
+/// Between the two imperfect options the fail-closed one is chosen.
 pub async fn account_totp_enroll(
     State(state): State<AppState>,
     user: SessionUser,
@@ -1646,12 +1656,14 @@ pub async fn account_totp_enroll(
         tracing::error!(user_id = %user.user_id, error = %e, "totp set_secret failed");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     }
-    let count = webauthn_count(&state, user.user_id).await;
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
     pages::account_page(
         &user,
         &csrf,
         pages::TotpSection::Enrolling { secret, url },
+        pages::RecoverySection::Resting,
         count,
+        &credentials,
         None,
     )
     .into_response()
@@ -1673,7 +1685,7 @@ pub async fn account_totp_verify(
     axum::Form(form): axum::Form<TotpVerifyForm>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    let count = webauthn_count(&state, user.user_id).await;
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
     let enrolled = state
         .users
         .get_by_id(user.user_id)
@@ -1685,7 +1697,9 @@ pub async fn account_totp_verify(
             &user,
             &csrf,
             pages::TotpSection::Row { enrolled: false },
+            pages::RecoverySection::Resting,
             count,
+            &credentials,
             None,
         )
         .into_response();
@@ -1698,14 +1712,22 @@ pub async fn account_totp_verify(
             &user,
             &csrf,
             pages::TotpSection::Row { enrolled: true },
+            pages::RecoverySection::Resting,
             count,
+            &credentials,
             Some(("success", "Authenticator app verified")),
         )
         .into_response(),
-        Ok(false) => {
-            pages::account_page(&user, &csrf, pages::TotpSection::VerifyFailed, count, None)
-                .into_response()
-        }
+        Ok(false) => pages::account_page(
+            &user,
+            &csrf,
+            pages::TotpSection::VerifyFailed,
+            pages::RecoverySection::Resting,
+            count,
+            &credentials,
+            None,
+        )
+        .into_response(),
         Err(e) => {
             // The enrollment's live state is unaffected — re-read it so
             // the row never lies, and surface the failure.
@@ -1720,7 +1742,9 @@ pub async fn account_totp_verify(
                 &user,
                 &csrf,
                 pages::TotpSection::Row { enrolled },
+                pages::RecoverySection::Resting,
                 count,
+                &credentials,
                 Some(("danger", "TOTP verification failed — try again")),
             )
             .into_response()
@@ -1736,14 +1760,16 @@ pub async fn account_totp_disable(
     session: SessionId,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    let count = webauthn_count(&state, user.user_id).await;
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
     let pool = state.store.pool();
     match mycelium_auth::totp::clear_secret(pool, user.user_id).await {
         Ok(()) => pages::account_page(
             &user,
             &csrf,
             pages::TotpSection::Row { enrolled: false },
+            pages::RecoverySection::Resting,
             count,
+            &credentials,
             Some(("success", "Authenticator app disabled")),
         )
         .into_response(),
@@ -1759,12 +1785,246 @@ pub async fn account_totp_disable(
                 &user,
                 &csrf,
                 pages::TotpSection::Row { enrolled },
+                pages::RecoverySection::Resting,
                 count,
+                &credentials,
                 Some(("danger", "could not disable the authenticator")),
             )
             .into_response()
         }
     }
+}
+
+// ---------- Account security (PR 4, Task 4: recovery + WebAuthn) ----
+
+#[derive(Deserialize)]
+pub struct RecoveryRegenerateForm {
+    pub current_password: String,
+}
+
+/// POST /account/recovery/regenerate — rotate the recovery key.
+///
+/// Flow (binding order): fetch the record → parse the sealed JSON →
+/// `unseal_with_password` — THE password check, running BEFORE any key
+/// generation or persistence, so a wrong password leaves the stored
+/// row byte-identical (no rotation, no persist, only the banner) →
+/// `generate_recovery_key` → `rotate_recovery_key` (re-wraps the
+/// master key under the new recovery key; the password seal and all
+/// file ciphertext are untouched) → `UserStore::update_sealed`
+/// (persist) → `persist_service_seal` (the same master key re-sealed
+/// under the service key) → the shown-once card (the keys page's
+/// treatment — the key rides the response body, never a URL).
+///
+/// Master-key and cache invariants, documented for the reviewer: the
+/// rotation changes SEALS ONLY — the master key never changes — so
+/// `MasterKeyCache` needs NO invalidation (the cached key still
+/// decrypts everything, and a fresh unseal yields the same bytes).
+/// The service-key seal re-persist is defensive idempotence: the
+/// restart-recovery row already holds the same master key; this write
+/// just keeps `updated_at` and the row in step. Sessions are
+/// deliberately untouched (unlike password change, which invalidates
+/// them): a recovery key alone can never log anyone in (no
+/// recovery-login path exists), so rotation is not a
+/// credential-compromise event.
+pub async fn account_recovery_regenerate(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    axum::Form(form): axum::Form<RecoveryRegenerateForm>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
+    let record = match state.users.get_by_id(user.user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(user_id = %user.user_id, error = %e, "recovery: user fetch failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let sealed: mycelium_crypto::SealedMasterKey =
+        match serde_json::from_str(&record.sealed_master_key) {
+            Ok(s) => s,
+            Err(e) => {
+                // An unparseable record cannot be rotated — fail
+                // loudly, touch nothing.
+                tracing::error!(
+                    user_id = %user.user_id,
+                    error = %e,
+                    "recovery: sealed record unparseable — refusing to rotate"
+                );
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        };
+    // THE password check — before any generation or persistence.
+    let master = match mycelium_crypto::unseal_with_password(&sealed, &form.current_password) {
+        Ok(m) => m,
+        Err(_) => {
+            // Banner, no rotation, no persist: the row stays as it was.
+            return pages::account_page(
+                &user,
+                &csrf,
+                pages::TotpSection::Row {
+                    enrolled: record.totp_secret.is_some(),
+                },
+                pages::RecoverySection::WrongPassword,
+                count,
+                &credentials,
+                Some(("danger", "Current password is incorrect")),
+            )
+            .into_response();
+        }
+    };
+    let new_key = mycelium_crypto::generate_recovery_key();
+    let rotated =
+        match mycelium_crypto::rotate_recovery_key(&sealed, &form.current_password, &new_key) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(user_id = %user.user_id, error = %e, "recovery rotation failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        };
+    if let Err(e) = state.users.update_sealed(user.user_id, &rotated).await {
+        tracing::error!(user_id = %user.user_id, error = %e, "update_sealed failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+    // See the doc comment: idempotent defensive re-persist; the master
+    // key is unchanged, so no cache invalidation is needed anywhere.
+    if let Err(e) = state.persist_service_seal(user.user_id, &master).await {
+        tracing::error!(
+            user_id = %user.user_id,
+            error = %e,
+            "service seal re-persist failed after rotation — existing seal still valid"
+        );
+    }
+    pages::account_page(
+        &user,
+        &csrf,
+        pages::TotpSection::Row {
+            enrolled: record.totp_secret.is_some(),
+        },
+        pages::RecoverySection::Rotated { key: new_key },
+        count,
+        &credentials,
+        None,
+    )
+    .into_response()
+}
+
+/// GET /account/webauthn/challenge — start passkey enrollment:
+/// `start_enrollment`'s creation options serialized as JSON for
+/// webauthn.js (`{"publicKey": {...}}` — the wire shape
+/// webauthn-rs-proto defines: camelCase keys, base64url-no-pad
+/// strings). The ceremony state is stored server-side (single-use,
+/// 5-minute expiry); the browser only ever sees the options.
+pub async fn account_webauthn_challenge(
+    State(state): State<AppState>,
+    user: SessionUser,
+) -> Response {
+    match state
+        .webauthn
+        .start_enrollment(user.user_id, &user.username, &user.username)
+        .await
+    {
+        Ok(challenge) => Json(challenge).into_response(),
+        Err(e) => {
+            tracing::error!(
+                user_id = %user.user_id,
+                error = %e,
+                "webauthn start_enrollment failed"
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// POST /account/webauthn/register — complete the ceremony: webauthn.js
+/// POSTs the browser's credential (JSON, x-csrf-token header);
+/// `finish_enrollment` verifies it against the stored single-use
+/// challenge state and persists the passkey. JSON response — the
+/// client reloads on success so the row re-renders with the new
+/// count. `RegisterPublicKeyCredential` is re-exported by
+/// mycelium-auth so this crate needs no direct webauthn dependency.
+pub async fn account_webauthn_register(
+    State(state): State<AppState>,
+    user: SessionUser,
+    axum::Json(cred): axum::Json<mycelium_auth::webauthn::RegisterPublicKeyCredential>,
+) -> Response {
+    match state.webauthn.finish_enrollment(user.user_id, &cred).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(mycelium_auth::webauthn::WebAuthnError::ChallengeNotFound) => {
+            // No live challenge (never started, already consumed, or
+            // expired): fail closed, tell the client to restart.
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "no active enrollment challenge — restart registration",
+            )
+        }
+        Err(mycelium_auth::webauthn::WebAuthnError::Db(e)) => {
+            tracing::error!(
+                user_id = %user.user_id,
+                error = %e,
+                "webauthn finish_enrollment db failure"
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+        Err(e) => {
+            // Verification failure: client-input problem (bad
+            // attestation, origin mismatch, duplicate credential).
+            tracing::warn!(user_id = %user.user_id, error = %e, "webauthn registration rejected");
+            error_response(StatusCode::BAD_REQUEST, "registration failed")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WebauthnRemoveForm {
+    pub credential_id: String,
+}
+
+/// POST /account/webauthn/remove — unenroll one passkey (the
+/// per-credential Remove form, native POST + hidden csrf_token).
+/// `remove_credential` scopes the delete to the logged-in user's id,
+/// so a foreign or unknown credential id is a no-op. Renders the page
+/// back with the fresh rows.
+pub async fn account_webauthn_remove(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    axum::Form(form): axum::Form<WebauthnRemoveForm>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let removed = state
+        .webauthn
+        .remove_credential(user.user_id, &form.credential_id)
+        .await;
+    // NotFound (unknown/foreign id) is the no-op path — not an error.
+    // Anything else is a real failure: log it.
+    if let Err(e) = &removed
+        && !matches!(e, mycelium_auth::webauthn::WebAuthnError::NotFound)
+    {
+        tracing::error!(user_id = %user.user_id, error = %e, "webauthn remove_credential failed");
+    }
+    let (count, credentials) = webauthn_rows(&state, user.user_id).await;
+    let enrolled = state
+        .users
+        .get_by_id(user.user_id)
+        .await
+        .map(|r| r.totp_secret.is_some())
+        .unwrap_or(false);
+    pages::account_page(
+        &user,
+        &csrf,
+        pages::TotpSection::Row { enrolled },
+        pages::RecoverySection::Resting,
+        count,
+        &credentials,
+        if removed.is_ok() {
+            Some(("success", "Passkey removed"))
+        } else {
+            None
+        },
+    )
+    .into_response()
 }
 
 // ---------- Admin handlers ----------

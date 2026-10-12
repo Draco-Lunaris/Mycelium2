@@ -87,11 +87,30 @@ pub fn build_router_with_shutdown(
         // logged-in user; the TOTP POSTs are thin wrappers over
         // mycelium-auth's totp service (spec §6's exact route names);
         // the password card posts the EXISTING /password handler
-        // (unchanged — Task 5 owns the gate retarget).
+        // (unchanged — Task 5 owns the gate retarget). Task 4 adds the
+        // recovery-key regenerate POST and the WebAuthn ceremony routes
+        // (challenge GET + register/remove POSTs) — all session-gated
+        // behind the same middleware stack.
         .route("/account", get(api::account_view))
         .route("/account/totp/enroll", post(api::account_totp_enroll))
         .route("/account/totp/verify", post(api::account_totp_verify))
         .route("/account/totp/disable", post(api::account_totp_disable))
+        .route(
+            "/account/recovery/regenerate",
+            post(api::account_recovery_regenerate),
+        )
+        .route(
+            "/account/webauthn/challenge",
+            get(api::account_webauthn_challenge),
+        )
+        .route(
+            "/account/webauthn/register",
+            post(api::account_webauthn_register),
+        )
+        .route(
+            "/account/webauthn/remove",
+            post(api::account_webauthn_remove),
+        )
         // Admin: five pages under a TabBar (spec §6); /admin is a 307
         // to the users page (bookmarks keep working). The POST routes
         // keep their exact paths — each renders back to its host page.
