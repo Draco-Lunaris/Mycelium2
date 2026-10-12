@@ -2479,6 +2479,220 @@ async fn security_settings_clamp_round_trip() {
     shutdown.cancel();
 }
 
+/// Test-side HTML entity decoder for the five entities
+/// `pages::html_escape` produces. `&amp;` MUST be decoded last, or a
+/// source `&lt;` would double-decode into `<` — the same ordering rule
+/// the real parsers follow.
+fn unescape_for_test(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+}
+
+/// Library page (Task 6, PR 3): the shelves table's Books count column
+/// and the upload form's shelf select, pinned against a HOSTILE shelf
+/// name (`<b>Shelf</b> & Co` — `POST /admin/bookshelves` validates
+/// nothing, so the name reaches the page verbatim).
+///
+/// Three positions are pinned, and they are pinned SEPARATELY because
+/// the raw name legitimately appears in two different rendered shapes:
+///
+/// 1. the table CELL — `TrustedHtml::from_markup(html_escape(name))`
+///    interpolated into `<td data-label="Name">…</td>` via `inner_html`
+///    (Task 3's raw-slot contract: the caller escapes), so the exact
+///    escaped text must sit between the cell's tags;
+/// 2. the select OPTION — `<option value="{escaped}">{escaped}</option>`
+///    (the same `html_escape` for both positions; it escapes `"` too,
+///    which is what makes it attribute-safe);
+/// 3. the raw markup must be ABSENT — no `<b>Shelf` anywhere, i.e. the
+///    name never becomes an element.
+///
+/// The PAIRING pin is empirical, not textual: the test extracts the
+/// option's `value` attribute from the rendered page, decodes it the way
+/// a browser would, and POSTs it as the upload form's `bookshelf` field
+/// — the ingest resolves the shelf by name, so a value that did not
+/// round-trip would answer "unknown bookshelf". The count column is
+/// pinned on both arms: `0` while the hostile shelf is empty, `1` once
+/// the paired upload lands (and the `0` cell is then gone — the column
+/// tracks the store, it is not a constant).
+#[tokio::test]
+async fn admin_library_escapes_and_pairs_shelf_names() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/library"), &cookie).await;
+
+    // The hostile name: tags, an ampersand, and a quote-free space —
+    // `html_escape` turns it into `&lt;b&gt;Shelf&lt;/b&gt; &amp; Co`.
+    let hostile = "<b>Shelf</b> & Co";
+    let escaped = "&lt;b&gt;Shelf&lt;/b&gt; &amp; Co";
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("name", hostile), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303, "shelf creation redirects to library");
+
+    let page = client
+        .get(format!("{base}/admin/library"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+
+    // 1. The table cell: the escaped name, exactly, between the Name
+    //    cell's tags (the data_table's narrow-reflow attribute and the
+    //    cell content are one contiguous string).
+    assert!(
+        html.contains(&format!(r#"<td data-label="Name">{escaped}</td>"#)),
+        "hostile shelf name must render escaped in the table cell: {html}"
+    );
+    // 2. The select option: value attribute AND label text both in the
+    //    escaped-for-attribute form (html_escape escapes `"` as well, so
+    //    the attribute cannot be broken out of).
+    assert!(
+        html.contains(&format!(r#"<option value="{escaped}">{escaped}</option>"#)),
+        "upload form's shelf option must carry the escaped name in both positions: {html}"
+    );
+    // 3. No raw markup anywhere: the name never becomes a `<b>` element
+    //    (in a cell, an option, or anywhere else on the page).
+    assert!(
+        !html.contains("<b>Shelf"),
+        "raw hostile markup leaked into /admin/library: {html}"
+    );
+    assert!(
+        !html.contains("&lt;b&gt;Shelf&lt;/b&gt; & Co<"),
+        "half-escaped form (ampersand left raw) would double-decode: {html}"
+    );
+    // 4. The count column for the fresh, empty hostile shelf. One shelf
+    //    on a fresh boot → exactly one Books cell, holding "0".
+    assert_eq!(
+        html.matches(r#"<td data-label="Books">"#).count(),
+        1,
+        "one row per shelf: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Books">0</td>"#),
+        "empty shelf count: {html}"
+    );
+
+    // 5. The pairing pin, empirically: decode the option's value the way
+    //    a browser would and post it back as the upload form's
+    //    `bookshelf` field. Scoped to the upload form's select — the
+    //    create form above it has its own `global` select whose options
+    //    are `0`/`1`.
+    let select_at = html
+        .find(r#"<select name="bookshelf""#)
+        .expect("upload form's shelf select");
+    let after_select = &html[select_at..];
+    let option_marker = r#"<option value=""#;
+    let at = after_select
+        .find(option_marker)
+        .expect("shelf option present in the upload form");
+    let rest = &after_select[at + option_marker.len()..];
+    let raw_value = &rest[..rest.find('"').expect("value attribute closes")];
+    assert_eq!(
+        raw_value, escaped,
+        "the option's value attribute is the escaped-for-attribute form"
+    );
+    let posted = unescape_for_test(raw_value);
+    assert_eq!(
+        posted, hostile,
+        "the decoded value is exactly the stored shelf name"
+    );
+
+    // The upload form posts that decoded value (browser semantics: the
+    // option's value attribute is what the form submits, entities
+    // already decoded). Ingest resolves the shelf BY NAME, so this is
+    // the pairing proof — a non-round-tripping value would answer
+    // "unknown bookshelf" (400).
+    let boundary = "librarypairing01";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", &posted),
+            ("slug", "hostile-shelf-book"),
+            ("title", "Hostile Shelf Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let upload = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
+    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    assert_eq!(
+        upload_json["status"], "done",
+        "ingest ran inline: {upload_json}"
+    );
+
+    // 6. The count column follows the store: the same shelf now holds
+    //    one book, and the "0" cell is gone (still exactly one Books
+    //    cell — the row count did not change). The escaping pins still
+    //    hold with a book on the shelf.
+    let after = client
+        .get(format!("{base}/admin/library"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let after_html = after.text().await.unwrap();
+    assert_eq!(
+        after_html.matches(r#"<td data-label="Books">"#).count(),
+        1,
+        "still one row: {after_html}"
+    );
+    assert!(
+        after_html.contains(r#"<td data-label="Books">1</td>"#),
+        "count column tracks the seeded book: {after_html}"
+    );
+    assert!(
+        !after_html.contains(r#"<td data-label="Books">0</td>"#),
+        "the stale 0 cell must be gone: {after_html}"
+    );
+    assert!(
+        after_html.contains(&format!(r#"<td data-label="Name">{escaped}</td>"#)),
+        "cell escaping holds after ingest: {after_html}"
+    );
+    assert!(
+        !after_html.contains("<b>Shelf"),
+        "no raw markup after ingest: {after_html}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client
