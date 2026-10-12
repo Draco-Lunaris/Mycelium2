@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
+use mycelium_ui::TrustedHtml;
 
 use crate::middleware::SessionId;
 
@@ -191,7 +192,7 @@ pub fn home_page(
     // Table rows: the filter narrows the listing; each row's cells are
     // composed from escaped fragments (the link label) and trusted
     // component output (the type chip, the constant flag span).
-    let rows: Vec<Vec<String>> = entries
+    let rows: Vec<Vec<TrustedHtml>> = entries
         .iter()
         .filter(|e| type_filter.is_none_or(|t| e.concept_type == t))
         .map(|e| {
@@ -207,7 +208,12 @@ pub fn home_page(
             } else {
                 String::new()
             };
-            vec![title_link, type_chip, flag, html_escape(&e.updated_at)]
+            vec![
+                TrustedHtml::from_markup(title_link),
+                TrustedHtml::from_markup(type_chip),
+                TrustedHtml::from_markup(flag),
+                TrustedHtml::from_markup(html_escape(&e.updated_at)),
+            ]
         })
         .collect();
     let content = if rows.is_empty() {
@@ -223,7 +229,10 @@ pub fn home_page(
     };
     let body = format!(
         "{}{}{}",
-        mycelium_ui::render::render(mycelium_ui::page_header("Browse", actions)),
+        mycelium_ui::render::render(mycelium_ui::page_header(
+            "Browse",
+            TrustedHtml::from_markup(actions),
+        )),
         flash(ok, err),
         content
     );
@@ -332,7 +341,10 @@ pub fn concept_editor(
     } else {
         (scope_note.to_string(), String::new(), false)
     };
-    let header = mycelium_ui::render::render(mycelium_ui::page_header(title, actions));
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        title,
+        TrustedHtml::from_markup(actions),
+    ));
     let warning = frontmatter_error
         .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
         .unwrap_or_default();
@@ -637,7 +649,10 @@ pub fn search_page(
     };
     let body = format!(
         "{}{query_row}{chips}{content}",
-        mycelium_ui::render::render(mycelium_ui::page_header("Search", String::new()))
+        mycelium_ui::render::render(mycelium_ui::page_header(
+            "Search",
+            TrustedHtml::from_markup(""),
+        ))
     );
     layout("Search", Some(user), csrf, "/search", body)
 }
@@ -649,7 +664,10 @@ pub fn search_page(
 /// overlay) anchor to the `position: relative` `#graph-wrap`; the
 /// usage hint sits under the panel.
 pub fn graph_page(user: &SessionUser, csrf: &str) -> Html<String> {
-    let header = mycelium_ui::render::render(mycelium_ui::page_header("Graph", String::new()));
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Graph",
+        TrustedHtml::from_markup(""),
+    ));
     let body = format!(
         r#"{header}
 <div id="graph-wrap">
@@ -765,12 +783,23 @@ pub fn skills_page(
     );
     let body = format!(
         "{}{}{}",
-        mycelium_ui::render::render(mycelium_ui::page_header("Skills", actions)),
+        mycelium_ui::render::render(mycelium_ui::page_header(
+            "Skills",
+            TrustedHtml::from_markup(actions)
+        )),
         mycelium_ui::render::render(mycelium_ui::card(
             "Your private skills",
-            section_body(private_groups, private_scripts, private_flat, "user"),
+            TrustedHtml::from_markup(section_body(
+                private_groups,
+                private_scripts,
+                private_flat,
+                "user"
+            )),
         )),
-        mycelium_ui::render::render(mycelium_ui::card("Global skills", global_body)),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Global skills",
+            TrustedHtml::from_markup(global_body),
+        )),
     );
     layout("Skills", Some(user), csrf, "/skills", body)
 }
@@ -826,7 +855,7 @@ pub fn books_page(
     };
     // Shelves table: the count column is the SQL book listing's length
     // (RF 3 — the count must match what the row's Browse link opens).
-    let rows: Vec<Vec<String>> = shelves
+    let rows: Vec<Vec<TrustedHtml>> = shelves
         .iter()
         .map(|(name, is_global, books)| {
             let vis_chip = mycelium_ui::render::render(mycelium_ui::chip(
@@ -837,7 +866,12 @@ pub fn books_page(
                 r#"<a href="/books?shelf={}">Browse</a>"#,
                 urlencoding_encode(name)
             );
-            vec![html_escape(name), vis_chip, books.len().to_string(), browse]
+            vec![
+                TrustedHtml::from_markup(html_escape(name)),
+                TrustedHtml::from_markup(vis_chip),
+                TrustedHtml::from_markup(books.len().to_string()),
+                TrustedHtml::from_markup(browse),
+            ]
         })
         .collect();
     let table = mycelium_ui::render::render(mycelium_ui::data_table(
@@ -886,7 +920,10 @@ pub fn books_page(
     let warning = passage_err
         .map(|m| mycelium_ui::render::render(mycelium_ui::banner("warning", m)))
         .unwrap_or_default();
-    let header = mycelium_ui::render::render(mycelium_ui::page_header("Books", String::new()));
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Books",
+        TrustedHtml::from_markup(""),
+    ));
     let body = format!("{breadcrumb}{header}{warning}{table}{chapters_section}{reader}");
     layout("Books", Some(user), csrf, "/books", body)
 }
@@ -973,7 +1010,10 @@ pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<St
 </form>"#,
         flashes = flash(ok, err),
     );
-    let body = mycelium_ui::render::render(mycelium_ui::card("Change password", card_body));
+    let body = mycelium_ui::render::render(mycelium_ui::card(
+        "Change password",
+        TrustedHtml::from_markup(card_body),
+    ));
     layout("Password", None, csrf, "/password", body)
 }
 
@@ -1009,7 +1049,7 @@ pub fn keys_page(
     minted: Option<&str>,
 ) -> Html<String> {
     let csrf_esc = html_escape(csrf);
-    let rows: Vec<Vec<String>> = keys
+    let rows: Vec<Vec<TrustedHtml>> = keys
         .iter()
         .map(|k| {
             let revoked = k.revoked_at.is_some();
@@ -1042,14 +1082,15 @@ pub fn keys_page(
                 )
             };
             vec![
-                wrap(html_escape(&k.label)),
-                wrap(status_chip),
-                wrap(k.created_at.format("%Y-%m-%d").to_string()),
-                wrap(k
-                    .last_used_at
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default()),
-                action,
+                TrustedHtml::from_markup(wrap(html_escape(&k.label))),
+                TrustedHtml::from_markup(wrap(status_chip)),
+                TrustedHtml::from_markup(wrap(k.created_at.format("%Y-%m-%d").to_string())),
+                TrustedHtml::from_markup(wrap(
+                    k.last_used_at
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default(),
+                )),
+                TrustedHtml::from_markup(action),
             ]
         })
         .collect();
@@ -1083,7 +1124,10 @@ pub fn keys_page(
             let body = format!(
                 r#"<p>Copy this key now — it is shown only once and cannot be retrieved later.</p><p class="shown-once"><code id="minted-key">{t}</code>{copy}</p>"#
             );
-            mycelium_ui::render::render(mycelium_ui::card("New key — shown once", body))
+            mycelium_ui::render::render(mycelium_ui::card(
+                "New key — shown once",
+                TrustedHtml::from_markup(body),
+            ))
         })
         .unwrap_or_default();
     // Actions slot: the mint form, compact in the title row (mockup 09
@@ -1092,7 +1136,10 @@ pub fn keys_page(
     let actions = format!(
         r#"<form method="post" action="/keys" class="mint-form"><input type="hidden" name="csrf_token" value="{csrf_esc}"><label for="mint-label">Label</label><input id="mint-label" name="label" required><button type="submit" class="btn btn--primary">Mint key</button></form>"#
     );
-    let header = mycelium_ui::render::render(mycelium_ui::page_header("API keys", actions));
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "API keys",
+        TrustedHtml::from_markup(actions),
+    ));
     let body = format!("{header}{minted_html}{table}{dialog}");
     layout_full(
         "API keys",

@@ -19,6 +19,8 @@ use crate::layout::nav_group;
 #[cfg(feature = "ssr")]
 use crate::render::render;
 #[cfg(feature = "ssr")]
+use crate::trusted::TrustedHtml;
+#[cfg(feature = "ssr")]
 use leptos::prelude::*;
 
 /// The default assets' content version — mycelium-ui's own mirror of
@@ -170,12 +172,14 @@ fn sidebar(name: &str, user: Option<(&str, bool)>, active_path: &str) -> impl In
 /// in mycelium-web's assets stylesheet (the actions container is
 /// `.actions`, not a BEM modifier). The title goes into a `view!` TEXT
 /// position, where leptos escapes it; `actions` is a trusted-markup
-/// slot — caller-composed markup from escaped fragments, interpolated
-/// raw via `inner_html` (the caller owns escaping, same contract as
-/// `card`'s body and the shell's page body).
+/// slot typed `TrustedHtml` — caller-composed markup from escaped
+/// fragments, interpolated raw via `inner_html` (the caller owns
+/// escaping, same contract as `card`'s body and the shell's page body;
+/// a plain `String` here does not compile).
 #[cfg(feature = "ssr")]
-pub fn page_header(title: &str, actions: String) -> impl IntoView {
+pub fn page_header(title: &str, actions: TrustedHtml) -> impl IntoView {
     let title = title.to_string();
+    let actions = actions.as_str().to_string();
     view! {
         <header class="page-header">
             <h1>{title}</h1>
@@ -325,14 +329,14 @@ mod tests {
 
     #[test]
     fn page_header_renders_title_and_actions_slot() {
-        let html = render(page_header("Browse", String::new()));
+        let html = render(page_header("Browse", TrustedHtml::from_markup("")));
         assert!(html.contains("page-header"), "{html}");
         assert!(html.contains("Browse"), "{html}");
         assert!(!html.contains("style="), "{html}");
         // The actions slot is a trusted-markup slot: composed markup
         // passes through raw (the caller escapes user text first).
         let actions = r#"<a class="btn btn--primary" href="/concept?new=1">New concept</a>"#;
-        let html = render(page_header("Browse", actions.to_string()));
+        let html = render(page_header("Browse", TrustedHtml::from_markup(actions)));
         assert!(
             html.contains(actions),
             "actions markup must stay raw: {html}"

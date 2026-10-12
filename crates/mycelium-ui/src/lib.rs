@@ -21,6 +21,7 @@ mod layout;
 mod primitives;
 #[cfg(feature = "ssr")]
 pub mod shell;
+mod trusted;
 
 #[cfg(feature = "ssr")]
 pub use islands::{chat_composer, copy_button};
@@ -32,6 +33,8 @@ pub use layout::{
 pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_state, field};
 #[cfg(feature = "ssr")]
 pub use shell::{ASSETS_VERSION, page_header};
+#[cfg(feature = "ssr")]
+pub use trusted::TrustedHtml;
 
 /// Hydration entry: wasm-bindgen auto-runs this on module init; it
 /// sets up the reactive owner root that island hydration runs under.
