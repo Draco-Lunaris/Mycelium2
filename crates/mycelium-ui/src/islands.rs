@@ -51,12 +51,12 @@ fn chat_send(msg: &str) -> bool {
     };
     let target = JsValue::from(window);
     let helper = js_sys::Reflect::get(&target, &JsValue::from_str("myceliumChatSend"));
-    if let Ok(f) = helper {
-        if f.is_function() {
-            let send = f.unchecked_into::<js_sys::Function>();
-            if let Ok(result) = send.call1(&JsValue::NULL, &JsValue::from_str(msg)) {
-                return result.as_bool().unwrap_or(false);
-            }
+    if let Ok(f) = helper
+        && f.is_function()
+    {
+        let send = f.unchecked_into::<js_sys::Function>();
+        if let Ok(result) = send.call1(&JsValue::NULL, &JsValue::from_str(msg)) {
+            return result.as_bool().unwrap_or(false);
         }
     }
     false
@@ -96,12 +96,12 @@ fn legacy_copy(value_id: &str) {
     let Some(el) = doc.get_element_by_id(value_id) else {
         return;
     };
-    if let Ok(Some(selection)) = window.get_selection() {
-        if let Ok(range) = doc.create_range() {
-            let _ = range.select_node_contents(&el);
-            let _ = selection.remove_all_ranges();
-            let _ = selection.add_range(&range);
-        }
+    if let Ok(Some(selection)) = window.get_selection()
+        && let Ok(range) = doc.create_range()
+    {
+        let _ = range.select_node_contents(&el);
+        let _ = selection.remove_all_ranges();
+        let _ = selection.add_range(&range);
     }
     let html_doc = doc.clone().unchecked_into::<web_sys::HtmlDocument>();
     let _ = html_doc.exec_command("copy");

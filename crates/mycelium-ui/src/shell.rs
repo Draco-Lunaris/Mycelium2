@@ -19,6 +19,8 @@ use crate::layout::nav_group;
 #[cfg(feature = "ssr")]
 use crate::render::render;
 #[cfg(feature = "ssr")]
+use crate::trusted::TrustedHtml;
+#[cfg(feature = "ssr")]
 use leptos::prelude::*;
 
 /// The default assets' content version — mycelium-ui's own mirror of
@@ -27,7 +29,7 @@ use leptos::prelude::*;
 /// `assets_versions_lockstep` unit test (only that crate sees both
 /// constants), so a one-sided bump fails CI.
 #[cfg(feature = "ssr")]
-pub const ASSETS_VERSION: &str = "19";
+pub const ASSETS_VERSION: &str = "20";
 
 /// Minimal HTML escaping for the `format!`-composed head attributes
 /// (csrf token, title) — the html-escape equivalent mycelium-ui carries
@@ -75,7 +77,16 @@ pub fn nav_groups(
         ("Account", vec![item("API keys", "/keys")]),
     ];
     if let Some((_, true)) = user {
-        groups.push(("Admin", vec![item("Admin", "/admin")]));
+        groups.push((
+            "Admin",
+            vec![
+                item("Users", "/admin/users"),
+                item("Sign-in", "/admin/sign-in"),
+                item("LLM backend", "/admin/llm"),
+                item("Library", "/admin/library"),
+                item("System", "/admin/system"),
+            ],
+        ));
     }
     groups
 }
@@ -170,12 +181,14 @@ fn sidebar(name: &str, user: Option<(&str, bool)>, active_path: &str) -> impl In
 /// in mycelium-web's assets stylesheet (the actions container is
 /// `.actions`, not a BEM modifier). The title goes into a `view!` TEXT
 /// position, where leptos escapes it; `actions` is a trusted-markup
-/// slot — caller-composed markup from escaped fragments, interpolated
-/// raw via `inner_html` (the caller owns escaping, same contract as
-/// `card`'s body and the shell's page body).
+/// slot typed `TrustedHtml` — caller-composed markup from escaped
+/// fragments, interpolated raw via `inner_html` (the caller owns
+/// escaping, same contract as `card`'s body and the shell's page body;
+/// a plain `String` here does not compile).
 #[cfg(feature = "ssr")]
-pub fn page_header(title: &str, actions: String) -> impl IntoView {
+pub fn page_header(title: &str, actions: TrustedHtml) -> impl IntoView {
     let title = title.to_string();
+    let actions = actions.as_str().to_string();
     view! {
         <header class="page-header">
             <h1>{title}</h1>
@@ -304,6 +317,70 @@ mod tests {
     }
 
     #[test]
+    fn admin_group_is_the_five_spec_items_with_per_page_active() {
+        // Spec §6: the Admin group is five items, not the PR-1-era
+        // single link — exact (label, href) list, in order.
+        let groups = nav_groups(Some(("echo", true)), "/");
+        let admin = &groups
+            .iter()
+            .find(|(name, _)| *name == "Admin")
+            .expect("admin group for an admin")
+            .1;
+        let got: Vec<(&str, &str)> = admin
+            .iter()
+            .map(|(label, href, _)| (*label, *href))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Users", "/admin/users"),
+                ("Sign-in", "/admin/sign-in"),
+                ("LLM backend", "/admin/llm"),
+                ("Library", "/admin/library"),
+                ("System", "/admin/system"),
+            ]
+        );
+        // Active is derived per item by href == active_path: nothing is
+        // active off the admin routes, exactly one item on one of them.
+        assert!(admin.iter().all(|(_, _, active)| !*active));
+        let on_system = nav_groups(Some(("echo", true)), "/admin/system")
+            .into_iter()
+            .find(|(name, _)| *name == "Admin")
+            .expect("admin group")
+            .1;
+        let active: Vec<&str> = on_system
+            .iter()
+            .filter(|(_, _, active)| *active)
+            .map(|(_, href, _)| *href)
+            .collect();
+        assert_eq!(active, vec!["/admin/system"]);
+
+        // Rendered both ways: the active item carries `aria-current="page"`
+        // + the active class, a sibling carries neither. (Leptos emits
+        // `href`, then `aria-current`, then `class`.)
+        let html = shell(
+            "Users",
+            Some(("echo", true)),
+            "tok",
+            "/admin/users",
+            String::new(),
+            &[],
+            &[],
+            "",
+        );
+        assert!(
+            html.contains(
+                r#"<a href="/admin/users" aria-current="page" class="nav-item nav-item--active">"#
+            ),
+            "Users item must be active on /admin/users: {html}"
+        );
+        assert!(
+            html.contains(r#"<a href="/admin/system" class="nav-item">"#),
+            "System item must render plain (no aria-current, no active class): {html}"
+        );
+    }
+
+    #[test]
     fn shell_hides_admin_group_for_non_admin() {
         let user = Some(("echo", false));
         let html = shell("Browse", user, "tok", "/", String::new(), &[], &[], "");
@@ -325,14 +402,14 @@ mod tests {
 
     #[test]
     fn page_header_renders_title_and_actions_slot() {
-        let html = render(page_header("Browse", String::new()));
+        let html = render(page_header("Browse", TrustedHtml::from_markup("")));
         assert!(html.contains("page-header"), "{html}");
         assert!(html.contains("Browse"), "{html}");
         assert!(!html.contains("style="), "{html}");
         // The actions slot is a trusted-markup slot: composed markup
         // passes through raw (the caller escapes user text first).
         let actions = r#"<a class="btn btn--primary" href="/concept?new=1">New concept</a>"#;
-        let html = render(page_header("Browse", actions.to_string()));
+        let html = render(page_header("Browse", TrustedHtml::from_markup(actions)));
         assert!(
             html.contains(actions),
             "actions markup must stay raw: {html}"

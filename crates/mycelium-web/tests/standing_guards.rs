@@ -156,7 +156,14 @@ async fn csp_sweep_no_inline_style_or_script() {
         "/chat",
         "/keys",
         "/password",
-        "/admin",
+        // The admin split (PR 3): the five pages, all 200 for the swept
+        // admin session. (/admin itself is a 307 now — its redirect is
+        // pinned by admin_split_pages, not swept here.)
+        "/admin/users",
+        "/admin/sign-in",
+        "/admin/llm",
+        "/admin/library",
+        "/admin/system",
         "/concept?new=1",
     ] {
         let resp = client

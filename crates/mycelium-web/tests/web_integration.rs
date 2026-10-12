@@ -380,15 +380,33 @@ async fn full_web_flow() {
         .unwrap();
     assert_eq!(bad_form.status(), 403);
 
-    // 14. Admin portal renders (admin user).
+    // 14. Admin portal: PR 3's split — /admin is now a TRUE 307 to
+    //     /admin/users (bookmarked URLs keep working; RequireAdmin
+    //     stays on the redirect so the non-admin gate below still
+    //     sees 403), and the users page renders.
     let admin = client
         .get(format!("{base}/admin"))
         .header("cookie", &cookie2)
         .send()
         .await
         .unwrap();
-    assert_eq!(admin.status(), 200);
-    assert!(admin.text().await.unwrap().contains("Admin"));
+    assert_eq!(admin.status(), 307, "/admin must be a 307, not axum's 303");
+    assert_eq!(
+        admin.headers().get("location").unwrap(),
+        "/admin/users",
+        "307 targets the users page"
+    );
+    let users_page = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(users_page.status(), 200);
+    assert!(
+        users_page.text().await.unwrap().contains("Username"),
+        "users page table"
+    );
 
     // 15. Mint an API key (shown once).
     let mint = client
@@ -676,8 +694,17 @@ async fn browse_type_filter() {
     // the Decision concept is filtered out (the chip row still lists
     // its type — chips derive from the full entry list).
     assert!(
-        html.contains(r#"<a class="chip chip--accent" href="/?type=Note">Note</a>"#),
+        html.contains(
+            r#"<a class="chip chip--accent" href="/?type=Note" aria-current="true">Note</a>"#
+        ),
         "Note chip active: {html}"
+    );
+    // Filter semantics: `aria-current="true"` on the active chip only
+    // (the tab bar's navigation semantics use `aria-current="page"`);
+    // inactive chips carry no aria-current at all.
+    assert!(
+        html.contains(r#"<a class="chip" href="/">All</a>"#),
+        "inactive All chip has no aria-current: {html}"
     );
     assert!(
         !html.contains("Decision note"),
@@ -697,7 +724,7 @@ async fn browse_type_filter() {
         "unknown filter shows all: {html2}"
     );
     assert!(
-        html2.contains(r#"<a class="chip chip--accent" href="/">All</a>"#),
+        html2.contains(r#"<a class="chip chip--accent" href="/" aria-current="true">All</a>"#),
         "unknown filter activates the All chip: {html2}"
     );
     // A concept with a broken link renders the amber flag.
@@ -1128,9 +1155,14 @@ async fn search_scope_chips() {
     // The user chip is the active one (exact span, Task 1's pattern).
     assert!(
         html.contains(
-            r#"<a class="chip chip--accent" href="/search?q=note&scope=user">Your bundle</a>"#
+            r#"<a class="chip chip--accent" href="/search?q=note&scope=user" aria-current="true">Your bundle</a>"#
         ),
         "user scope chip active: {html}"
+    );
+    // Inactive scope chips carry no aria-current (filter semantics).
+    assert!(
+        html.contains(r#"<a class="chip" href="/search?q=note">All</a>"#),
+        "inactive All scope chip has no aria-current: {html}"
     );
     // The count line names the (escaped) query.
     assert!(
@@ -1165,7 +1197,9 @@ async fn search_scope_chips() {
     assert_eq!(s3.status(), 200);
     let h3 = s3.text().await.unwrap();
     assert!(
-        h3.contains(r#"<a class="chip chip--accent" href="/search?q=note">All</a>"#),
+        h3.contains(
+            r#"<a class="chip chip--accent" href="/search?q=note" aria-current="true">All</a>"#
+        ),
         "unknown scope activates the All chip: {h3}"
     );
     assert!(
@@ -2048,6 +2082,653 @@ async fn keys_shown_once_banner_and_revoked_row() {
         kh.matches(marker).count(),
         1,
         "only the active key carries a revoke trigger: {kh}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Admin split (Task 4, PR 3): the five admin pages render under the
+/// TabBar, `/admin` is a TRUE 307 to `/admin/users`, every admin GET
+/// stays behind the RequireAdmin gate (403 for a logged-in non-admin —
+/// the exact status the old `/admin` gave non-admins, pinned by
+/// full_web_flow step 21 for `/admin` itself), hostile usernames
+/// escape in the users table, and the create-user error flow lands on
+/// the users page with the error banner visible.
+#[tokio::test]
+async fn admin_split_pages() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    // Fresh boot (no forced password change): plain login as admin.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // 1. All five pages render 200 for the admin, each carrying the
+    //    TabBar's five labels (spec §6) and its own markers.
+    let pages: &[(&str, &[&str])] = &[
+        ("/admin/users", &["Username", "Create user"]),
+        // The en-dash range hint is the current form label's exact text.
+        ("/admin/sign-in", &["Session TTL", "15–10080", "OIDC"]),
+        ("/admin/llm", &["LLM backend"]),
+        (
+            "/admin/library",
+            &["Bookshelves", "Upload", "Global skills"],
+        ),
+        ("/admin/system", &["Download backup"]),
+    ];
+    let mut sign_in_html = String::new();
+    let mut system_html = String::new();
+    for (route, markers) in pages {
+        let resp = client
+            .get(format!("{base}{route}"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{route} must render for the admin");
+        let html = resp.text().await.unwrap();
+        for label in ["Users", "Sign-in", "LLM backend", "Library", "System"] {
+            assert!(
+                html.contains(label),
+                "{route}: TabBar label {label} missing: {html}"
+            );
+        }
+        for marker in *markers {
+            assert!(
+                html.contains(marker),
+                "{route}: marker {marker} missing: {html}"
+            );
+        }
+        if *route == "/admin/system" {
+            system_html = html;
+        } else if *route == "/admin/sign-in" {
+            sign_in_html = html;
+        }
+    }
+    // Mockup 11: the five security fields' ranges render as SMALL LINES
+    // UNDER the fields in `.field__hint` elements (the CSS exists), not
+    // baked into the labels. Each hint text is the old label's range
+    // text, character-for-character (en dashes and all).
+    let hints: &[(&str, &str)] = &[
+        ("Session TTL", "(minutes, 15–10080; 720 = 12h)"),
+        ("Login failures before lockout", "(3–10)"),
+        ("Lockout backoff cap", "(seconds, 30–3600)"),
+        ("Minimum password length", "(12–128)"),
+        ("Passage cap", "(chars, 16384–1048576; 131072 = 128k)"),
+    ];
+    let mut hint_zone = sign_in_html
+        .find(r#"action="/admin/security""#)
+        .unwrap_or(sign_in_html.len());
+    // Narrow to the security form: from the form tag to its closing tag.
+    if let Some(form_end) = sign_in_html[hint_zone..].find("</form>") {
+        hint_zone += form_end;
+    }
+    let form = &sign_in_html[..hint_zone];
+    for (label, hint) in hints {
+        assert!(
+            form.contains(label),
+            "sign-in: plain field label {label} missing: {form}"
+        );
+        assert!(
+            !form.contains(&format!(">{label} {hint}<")),
+            "sign-in: {label} range must live in a hint line, not the label: {form}"
+        );
+        assert!(
+            form.contains(&format!(r#"<p class="field__hint">{hint}</p>"#)),
+            "sign-in: hint {hint} must render in a field__hint element: {form}"
+        );
+    }
+    // The system page surfaces /health's fields as StatTiles (the
+    // StatTile class), not prose.
+    assert!(
+        system_html.contains(r#"<div class="stat">"#),
+        "StatTile markup on /admin/system: {system_html}"
+    );
+
+    // Sidebar (spec §6): the Admin group's ACTIVE item is the current
+    // page — pinned on both sides. The markup is the sidebar's
+    // `nav-item` (the TabBar's `tab` links carry their own active state),
+    // so the assertion targets the nav-item class and would fail if the
+    // page passed a stale `/admin` active_path.
+    let users_page_html = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        users_page_html.contains(
+            r#"<a href="/admin/users" aria-current="page" class="nav-item nav-item--active">"#
+        ),
+        "sidebar Users item must be active on /admin/users: {users_page_html}"
+    );
+    assert!(
+        users_page_html.contains(r#"<a href="/admin/system" class="nav-item">"#),
+        "sidebar System item must NOT be active on /admin/users: {users_page_html}"
+    );
+
+    // 2. /admin → 307 with Location: /admin/users (a TRUE 307 — axum's
+    //    Redirect::to is a 303; the spec's §6 route map pins 307).
+    let redirect = client
+        .get(format!("{base}/admin"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 307, "/admin must be a 307, not a 303");
+    assert_eq!(redirect.headers().get("location").unwrap(), "/admin/users");
+
+    // 3. Non-admin gate: every admin GET (the redirect included) is
+    //    rejected with RequireAdmin's 403 — the same status the old
+    //    /admin gave non-admins (rbac.rs: a logged-in non-admin gets
+    //    FORBIDDEN from the extractor).
+    let create_user = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mallory"),
+            ("email", "mallory@example.com"),
+            ("password", "mallory password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), 200, "user creation must succeed");
+    let login_mallory = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "mallory"),
+            ("password", "mallory password 20 chars"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let mallory_cookie = login_mallory
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    for route in [
+        "/admin",
+        "/admin/users",
+        "/admin/sign-in",
+        "/admin/llm",
+        "/admin/library",
+        "/admin/system",
+    ] {
+        let resp = client
+            .get(format!("{base}{route}"))
+            .header("cookie", &mallory_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{route} must reject a non-admin with the old gate's status"
+        );
+    }
+
+    // 4. Hostile username escapes in the users table: seed a user with
+    //    <script> in the name through the real create form (no
+    //    production path validates usernames — the table must escape).
+    let hostile = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "<script>alert(1)</script>"),
+            ("email", "hostile@example.com"),
+            ("password", "hostile password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hostile.status(), 200, "hostile-name creation must succeed");
+    let users_page = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let users_html = users_page.text().await.unwrap();
+    assert!(
+        !users_html.contains("<script>alert(1)</script>"),
+        "raw script leaked into the users table: {users_html}"
+    );
+    assert!(
+        users_html.contains("&lt;script&gt;"),
+        "escaped hostile username missing: {users_html}"
+    );
+
+    // 5. Create-user error flow: mismatched passwords redirect to
+    //    /admin/users?error=… (followed manually — the client pins
+    //    redirects), and the error renders as the page's banner.
+    let mismatch = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mismatch-user"),
+            ("email", "mismatch@example.com"),
+            ("password", "mismatch password 20 chars"),
+            ("password_confirm", "different password entirely!!"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), 303, "mismatch must redirect, not 400");
+    let location = mismatch
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/admin/users?error="),
+        "error redirect must land on the users page: {location}"
+    );
+    let follow = client
+        .get(format!("{base}{location}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(follow.status(), 200);
+    let follow_html = follow.text().await.unwrap();
+    assert!(
+        follow_html.contains("passwords do not match"),
+        "the error must render on the users page: {follow_html}"
+    );
+
+    // 6. Session-only provisioning: POST /admin/users is a browser-flow
+    //    admin action. A bearer API key (an MCP/REST data credential)
+    //    passes CSRF (bearer-exempt) and RequireAdmin, but the
+    //    SessionId extractor 401s the session-less request before the
+    //    handler runs — pinning that user creation is not a bearer
+    //    capability.
+    let mint = client
+        .post(format!("{base}/keys"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("label", "admin-split-bearer")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint.status(), 200);
+    let mint_html = mint.text().await.unwrap();
+    let code_start = mint_html
+        .find("<code id=\"minted-key\">")
+        .expect("minted token shown");
+    let token_rest = &mint_html[code_start + "<code id=\"minted-key\">".len()..];
+    let token_end = token_rest.find("</code>").expect("token end");
+    let api_token = token_rest[..token_end].to_string();
+    assert!(api_token.starts_with("myc2-"));
+    let bearer_create = client
+        .post(format!("{base}/admin/users"))
+        .header("authorization", format!("Bearer {api_token}"))
+        .form(&[
+            ("username", "bearer-user"),
+            ("email", "bearer@example.com"),
+            ("password", "bearer password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_create.status(),
+        401,
+        "bearer API keys must not provision users — the session extractor rejects session-less POSTs"
+    );
+
+    shutdown.cancel();
+}
+
+/// Clamp round-trip pin (plan §"open questions" item 4): a POST
+/// /admin/security with values outside the guardrail ranges —
+/// bypassing the form's min/max — is CLAMPED by the handler, never
+/// rejected (admin_save_security builds a SecurityConfig and calls
+/// `.clamped()` before storing; state.rs `clamped()` clamps every
+/// field into security_bounds). Pinned on both sides of the round
+/// trip: the STORED config row holds the clamped values (save-side
+/// clamp — the raw ConfigStore read proves the handler, not the
+/// read-side clamp, did the work), and GET /admin/sign-in renders
+/// them back. Own boot, so the mutated security config never leaks
+/// to other tests.
+#[tokio::test]
+async fn security_settings_clamp_round_trip() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/sign-in"), &cookie).await;
+
+    // Below-min AND above-max values, sent directly (no form min/max).
+    let save = client
+        .post(format!("{base}/admin/security"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("session_ttl_minutes", "1"),      // below min 15
+            ("login_max_failures", "1000"),    // above max 10
+            ("login_lockout_seconds", "1"),    // below min 30
+            ("min_password_length", "999999"), // above max 128
+            ("passage_max_chars", "1"),        // below min 16384
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        save.status(),
+        303,
+        "out-of-range values must clamp, not reject"
+    );
+    assert_eq!(
+        save.headers().get("location").unwrap(),
+        "/admin/sign-in?ok=Security%20settings%20saved"
+    );
+
+    // The stored row itself holds the clamped values — the handler's
+    // `.clamped()` ran before the write (security_bounds: TTL 15..=10080,
+    // failures 3..=10, lockout 30..=3600, password 12..=128,
+    // passage 16384..=1048576).
+    let config = mycelium_store::ConfigStore::new(pool.clone());
+    let stored: serde_json::Value = config
+        .get::<serde_json::Value>("security")
+        .await
+        .unwrap()
+        .expect("security config stored");
+    assert_eq!(stored["session_ttl_minutes"], 15, "TTL clamped up to 15");
+    assert_eq!(
+        stored["login_max_failures"], 10,
+        "failures clamped down to 10"
+    );
+    assert_eq!(
+        stored["login_lockout_seconds"], 30,
+        "lockout clamped up to 30"
+    );
+    assert_eq!(
+        stored["min_password_length"], 128,
+        "password length clamped down to 128"
+    );
+    assert_eq!(
+        stored["passage_max_chars"], 16384,
+        "passage cap clamped up to 16384"
+    );
+
+    // The page's own read-back renders the clamped values.
+    let page = client
+        .get(format!("{base}/admin/sign-in"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    for value in ["15", "10", "30", "128", "16384"] {
+        assert!(
+            html.contains(&format!(r#"value="{value}""#)),
+            "clamped value {value} must render back: {html}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// Test-side HTML entity decoder for the five entities
+/// `pages::html_escape` produces. `&amp;` MUST be decoded last, or a
+/// source `&lt;` would double-decode into `<` — the same ordering rule
+/// the real parsers follow.
+fn unescape_for_test(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+}
+
+/// Library page (Task 6, PR 3): the shelves table's Books count column
+/// and the upload form's shelf select, pinned against a HOSTILE shelf
+/// name (`<b>Shelf</b> & Co` — `POST /admin/bookshelves` validates
+/// nothing, so the name reaches the page verbatim).
+///
+/// Three positions are pinned, and they are pinned SEPARATELY because
+/// the raw name legitimately appears in two different rendered shapes:
+///
+/// 1. the table CELL — `TrustedHtml::from_markup(html_escape(name))`
+///    interpolated into `<td data-label="Name">…</td>` via `inner_html`
+///    (Task 3's raw-slot contract: the caller escapes), so the exact
+///    escaped text must sit between the cell's tags;
+/// 2. the select OPTION — `<option value="{escaped}">{escaped}</option>`
+///    (the same `html_escape` for both positions; it escapes `"` too,
+///    which is what makes it attribute-safe);
+/// 3. the raw markup must be ABSENT — no `<b>Shelf` anywhere, i.e. the
+///    name never becomes an element.
+///
+/// The PAIRING pin is empirical, not textual: the test extracts the
+/// option's `value` attribute from the rendered page, decodes it the way
+/// a browser would, and POSTs it as the upload form's `bookshelf` field
+/// — the ingest resolves the shelf by name, so a value that did not
+/// round-trip would answer "unknown bookshelf". The count column is
+/// pinned on both arms: `0` while the hostile shelf is empty, `1` once
+/// the paired upload lands (and the `0` cell is then gone — the column
+/// tracks the store, it is not a constant).
+#[tokio::test]
+async fn admin_library_escapes_and_pairs_shelf_names() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/library"), &cookie).await;
+
+    // The hostile name: tags, an ampersand, and a quote-free space —
+    // `html_escape` turns it into `&lt;b&gt;Shelf&lt;/b&gt; &amp; Co`.
+    let hostile = "<b>Shelf</b> & Co";
+    let escaped = "&lt;b&gt;Shelf&lt;/b&gt; &amp; Co";
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("name", hostile), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303, "shelf creation redirects to library");
+
+    let page = client
+        .get(format!("{base}/admin/library"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+
+    // 1. The table cell: the escaped name, exactly, between the Name
+    //    cell's tags (the data_table's narrow-reflow attribute and the
+    //    cell content are one contiguous string).
+    assert!(
+        html.contains(&format!(r#"<td data-label="Name">{escaped}</td>"#)),
+        "hostile shelf name must render escaped in the table cell: {html}"
+    );
+    // 2. The select option: value attribute AND label text both in the
+    //    escaped-for-attribute form (html_escape escapes `"` as well, so
+    //    the attribute cannot be broken out of).
+    assert!(
+        html.contains(&format!(r#"<option value="{escaped}">{escaped}</option>"#)),
+        "upload form's shelf option must carry the escaped name in both positions: {html}"
+    );
+    // 3. No raw markup anywhere: the name never becomes a `<b>` element
+    //    (in a cell, an option, or anywhere else on the page).
+    assert!(
+        !html.contains("<b>Shelf"),
+        "raw hostile markup leaked into /admin/library: {html}"
+    );
+    assert!(
+        !html.contains("&lt;b&gt;Shelf&lt;/b&gt; & Co<"),
+        "half-escaped form (ampersand left raw) would double-decode: {html}"
+    );
+    // 4. The count column for the fresh, empty hostile shelf. One shelf
+    //    on a fresh boot → exactly one Books cell, holding "0".
+    assert_eq!(
+        html.matches(r#"<td data-label="Books">"#).count(),
+        1,
+        "one row per shelf: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Books">0</td>"#),
+        "empty shelf count: {html}"
+    );
+
+    // 5. The pairing pin, empirically: decode the option's value the way
+    //    a browser would and post it back as the upload form's
+    //    `bookshelf` field. Scoped to the upload form's select — the
+    //    create form above it has its own `global` select whose options
+    //    are `0`/`1`.
+    let select_at = html
+        .find(r#"<select name="bookshelf""#)
+        .expect("upload form's shelf select");
+    let after_select = &html[select_at..];
+    let option_marker = r#"<option value=""#;
+    let at = after_select
+        .find(option_marker)
+        .expect("shelf option present in the upload form");
+    let rest = &after_select[at + option_marker.len()..];
+    let raw_value = &rest[..rest.find('"').expect("value attribute closes")];
+    assert_eq!(
+        raw_value, escaped,
+        "the option's value attribute is the escaped-for-attribute form"
+    );
+    let posted = unescape_for_test(raw_value);
+    assert_eq!(
+        posted, hostile,
+        "the decoded value is exactly the stored shelf name"
+    );
+
+    // The upload form posts that decoded value (browser semantics: the
+    // option's value attribute is what the form submits, entities
+    // already decoded). Ingest resolves the shelf BY NAME, so this is
+    // the pairing proof — a non-round-tripping value would answer
+    // "unknown bookshelf" (400).
+    let boundary = "librarypairing01";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", &posted),
+            ("slug", "hostile-shelf-book"),
+            ("title", "Hostile Shelf Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let upload = client
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
+    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    assert_eq!(
+        upload_json["status"], "done",
+        "ingest ran inline: {upload_json}"
+    );
+
+    // 6. The count column follows the store: the same shelf now holds
+    //    one book, and the "0" cell is gone (still exactly one Books
+    //    cell — the row count did not change). The escaping pins still
+    //    hold with a book on the shelf.
+    let after = client
+        .get(format!("{base}/admin/library"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let after_html = after.text().await.unwrap();
+    assert_eq!(
+        after_html.matches(r#"<td data-label="Books">"#).count(),
+        1,
+        "still one row: {after_html}"
+    );
+    assert!(
+        after_html.contains(r#"<td data-label="Books">1</td>"#),
+        "count column tracks the seeded book: {after_html}"
+    );
+    assert!(
+        !after_html.contains(r#"<td data-label="Books">0</td>"#),
+        "the stale 0 cell must be gone: {after_html}"
+    );
+    assert!(
+        after_html.contains(&format!(r#"<td data-label="Name">{escaped}</td>"#)),
+        "cell escaping holds after ingest: {after_html}"
+    );
+    assert!(
+        !after_html.contains("<b>Shelf"),
+        "no raw markup after ingest: {after_html}"
     );
 
     shutdown.cancel();

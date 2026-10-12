@@ -548,7 +548,7 @@ body.auth main {
    hide, icons stay; the shell keeps one DOM (spec §10, mockup 15). */
 @media (max-width: 720px) {
   .sidebar {
-    width: var(--rail-width); flex: 0 0 var(--rail-width);
+    width: var(--rail-width); flex:0 0 var(--rail-width);
     padding: var(--gap-3) var(--gap-1); align-items: center;
   }
   .brand { margin: 0 0 var(--gap-3); padding: 0; }
@@ -558,6 +558,25 @@ body.auth main {
   .sidebar__footer { padding: var(--gap-3) 0 0; flex-direction: column; gap: var(--gap-2); }
   .sidebar__logout { margin: 0; }
 }
+
+/* Admin split (PR 3): the users page's table + create-user side form
+   (mockup 03 — table left, form right, stacked under 720px), and the
+   system page's StatTile row (a responsive tile grid). */
+.split-grid {
+  display: grid; grid-template-columns: 2fr 1fr;
+  gap: var(--gap-4); align-items: start;
+}
+.split-grid .card { margin-bottom: 0; }
+@media (max-width: 720px) {
+  .split-grid { grid-template-columns: 1fr; }
+  .split-grid .card { margin-bottom: var(--gap-4); }
+}
+.stat-row {
+  display: grid; gap: var(--gap-3);
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  margin-bottom: var(--gap-4);
+}
+.stat-row .stat { margin-bottom: 0; }
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.
@@ -1221,7 +1240,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "19";
+pub const ASSETS_VERSION: &str = "20";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

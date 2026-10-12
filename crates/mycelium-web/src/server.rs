@@ -79,11 +79,22 @@ pub fn build_router_with_shutdown(
         )
         .route("/keys", get(api::keys_view).post(api::keys_mint))
         .route("/keys/revoke", post(api::keys_revoke))
-        // Admin.
+        // Admin: five pages under a TabBar (spec §6); /admin is a 307
+        // to the users page (bookmarks keep working). The POST routes
+        // keep their exact paths — each renders back to its host page.
         .route("/admin", get(api::admin_view))
-        .route("/admin/users", post(api::admin_create_user))
+        .route(
+            "/admin/users",
+            get(api::admin_users_view).post(api::admin_create_user),
+        )
+        .route("/admin/sign-in", get(api::admin_sign_in_view))
+        .route(
+            "/admin/llm",
+            get(api::admin_llm_view).post(api::admin_save_llm),
+        )
+        .route("/admin/library", get(api::admin_library_view))
+        .route("/admin/system", get(api::admin_system_view))
         .route("/admin/oidc", post(api::admin_save_oidc))
-        .route("/admin/llm", post(api::admin_save_llm))
         .route("/admin/upload-limits", post(api::admin_save_upload_limits))
         .route("/admin/security", post(api::admin_save_security))
         .route("/admin/bookshelves", post(api::admin_create_bookshelf))

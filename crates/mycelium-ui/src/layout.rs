@@ -5,9 +5,11 @@
 //! Escaping rule: plain-text slots (titles, labels, stat values) render
 //! into `view!` TEXT interpolation positions, where leptos escapes them.
 //! The rich-content slots — `data_table` cells and `card`'s body — are
-//! TRUSTED-MARKUP slots: caller-composed markup built from escaped
-//! fragments, interpolated raw via `inner_html` (the same contract as
-//! the shell's page body — the caller owns escaping). Attribute values
+//! TRUSTED-MARKUP slots typed `TrustedHtml`: caller-composed markup built
+//! from escaped fragments, interpolated raw via `inner_html` (the same
+//! contract as the shell's page body — the caller owns escaping, and the
+//! newtype slot param makes passing an unescaped `String` a compile
+//! error). Attribute values
 //! are never built with `format!` on user input: classes come from
 //! fixed strings, and hrefs/labels are caller-supplied primitives
 //! passed through as typed attributes. Zero inline styles.
@@ -28,17 +30,22 @@
 #[cfg(feature = "ssr")]
 use crate::primitives::{button, empty_state};
 #[cfg(feature = "ssr")]
+use crate::trusted::TrustedHtml;
+#[cfg(feature = "ssr")]
 use leptos::prelude::*;
 
 /// `<section class="card"><div class="card__header"><h2>…</h2></div>
 /// <div>{body}</div></section>`. Title-only this PR — the `card__header`
 /// row keeps its flex space so the action slot drops in without a DOM
-/// change. `body` is a trusted-markup slot: caller-composed markup from
-/// escaped fragments, interpolated raw via `inner_html` (the caller owns
-/// escaping — the shell's page-body contract).
+/// change. `body` is a trusted-markup slot typed `TrustedHtml`: caller-
+/// composed markup from escaped fragments, interpolated raw via
+/// `inner_html` (the caller owns escaping — the escape-then-compose
+/// witness is `TrustedHtml::from_markup`; a plain `String` here does not
+/// compile).
 #[cfg(feature = "ssr")]
-pub fn card(title: &str, body: String) -> impl IntoView {
+pub fn card(title: &str, body: TrustedHtml) -> impl IntoView {
     let title = title.to_string();
+    let body = body.as_str().to_string();
     view! {
         <section class="card">
             <div class="card__header">
@@ -51,12 +58,13 @@ pub fn card(title: &str, body: String) -> impl IntoView {
 
 /// `<table class="table">` with a `<thead>` row and one `<tr>` per input
 /// row; every `<td>` carries `data-label="{header}"` for the narrow
-/// re-flow. Cells are trusted-markup slots: caller-composed markup from
-/// escaped fragments, interpolated raw via `inner_html` (the caller owns
-/// escaping — the same contract as `card`'s body). Empty `rows` renders
-/// the primitive `empty_state` in the table slot instead.
+/// re-flow. Cells are trusted-markup slots typed `TrustedHtml`:
+/// caller-composed markup from escaped fragments, interpolated raw via
+/// `inner_html` (the caller owns escaping — the same contract as
+/// `card`'s body; a plain `String` cell does not compile). Empty `rows`
+/// renders the primitive `empty_state` in the table slot instead.
 #[cfg(feature = "ssr")]
-pub fn data_table(headers: &[&str], rows: &[Vec<String>]) -> impl IntoView {
+pub fn data_table(headers: &[&str], rows: &[Vec<TrustedHtml>]) -> impl IntoView {
     if rows.is_empty() {
         return empty_state("No items", "Nothing here yet.").into_any();
     }
@@ -75,7 +83,7 @@ pub fn data_table(headers: &[&str], rows: &[Vec<String>]) -> impl IntoView {
                 .enumerate()
                 .map(|(col, cell)| {
                     let label = headers.get(col).copied().unwrap_or("").to_string();
-                    view! { <td data-label={label} inner_html=cell.clone()/> }
+                    view! { <td data-label={label} inner_html=cell.as_str().to_string()/> }
                 })
                 .collect();
             view! { <tr>{cells}</tr> }
@@ -262,9 +270,9 @@ mod tests {
         let rows = vec![vec![
             // A pre-escaped fragment (how callers pass user text):
             // stays escaped — no double-escaping, no raw script.
-            "Title &lt;script&gt;".into(),
+            TrustedHtml::from_markup("Title &lt;script&gt;"),
             // Trusted markup (chip/flag/link cells): passes through raw.
-            r#"<span class="chip chip--neutral">Note</span>"#.into(),
+            TrustedHtml::from_markup(r#"<span class="chip chip--neutral">Note</span>"#),
         ]];
         let html = render(data_table(&headers, &rows));
         assert!(html.contains(r#"data-label="Name""#), "{html}");
@@ -281,7 +289,10 @@ mod tests {
 
     #[test]
     fn card_body_is_a_trusted_markup_slot() {
-        let html = render(card("Section", r#"<p>a <em>body</em></p>"#.to_string()));
+        let html = render(card(
+            "Section",
+            TrustedHtml::from_markup(r#"<p>a <em>body</em></p>"#),
+        ));
         assert!(html.contains("card__header"), "{html}");
         assert!(
             html.contains("<em>body</em>"),
@@ -293,7 +304,7 @@ mod tests {
     #[test]
     fn empty_table_renders_empty_state() {
         let headers = ["Name"];
-        let rows: Vec<Vec<String>> = vec![];
+        let rows: Vec<Vec<TrustedHtml>> = vec![];
         let html = render(data_table(&headers, &rows));
         assert!(html.contains("empty"), "{html}");
     }
