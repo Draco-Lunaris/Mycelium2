@@ -1289,9 +1289,11 @@ pub fn admin_users_page(
 }
 
 /// Admin: Sign-in (mockup 11) — the security settings card (the
-/// existing POST /admin/security form, its five labels carrying the
-/// exact clamp ranges) and the OIDC card (the existing POST
-/// /admin/oidc form). Both POSTs redirect back here with ?ok=/?error=.
+/// existing POST /admin/security form; each field is a `.field` with
+/// a plain label and its clamp range as a small `.field__hint` line
+/// under the input — the range text verbatim from the old labels) and
+/// the OIDC card (the existing POST /admin/oidc form). Both POSTs
+/// redirect back here with ?ok=/?error=.
 pub fn admin_sign_in_page(
     user: &SessionUser,
     csrf: &str,
@@ -1303,11 +1305,26 @@ pub fn admin_sign_in_page(
     let security_body = format!(
         r#"<p class="muted">Tunable within guardrails — values outside the ranges below are clamped. Session TTL applies to new logins; existing sessions keep their expiry.</p>
 <form method="post" action="/admin/security">
-  <label>Session TTL (minutes, 15–10080; 720 = 12h)</label><input name="session_ttl_minutes" type="number" min="15" max="10080" value="{}" required>
-  <label>Login failures before lockout (3–10)</label><input name="login_max_failures" type="number" min="3" max="10" value="{}" required>
-  <label>Lockout backoff cap (seconds, 30–3600)</label><input name="login_lockout_seconds" type="number" min="30" max="3600" value="{}" required>
-  <label>Minimum password length (12–128)</label><input name="min_password_length" type="number" min="12" max="128" value="{}" required>
-  <label>Passage cap (chars, 16384–1048576; 131072 = 128k)</label><input name="passage_max_chars" type="number" min="16384" max="1048576" value="{}" required>
+  <div class="field">
+    <label>Session TTL</label><input name="session_ttl_minutes" type="number" min="15" max="10080" value="{}" required>
+    <p class="field__hint">(minutes, 15–10080; 720 = 12h)</p>
+  </div>
+  <div class="field">
+    <label>Login failures before lockout</label><input name="login_max_failures" type="number" min="3" max="10" value="{}" required>
+    <p class="field__hint">(3–10)</p>
+  </div>
+  <div class="field">
+    <label>Lockout backoff cap</label><input name="login_lockout_seconds" type="number" min="30" max="3600" value="{}" required>
+    <p class="field__hint">(seconds, 30–3600)</p>
+  </div>
+  <div class="field">
+    <label>Minimum password length</label><input name="min_password_length" type="number" min="12" max="128" value="{}" required>
+    <p class="field__hint">(12–128)</p>
+  </div>
+  <div class="field">
+    <label>Passage cap</label><input name="passage_max_chars" type="number" min="16384" max="1048576" value="{}" required>
+    <p class="field__hint">(chars, 16384–1048576; 131072 = 128k)</p>
+  </div>
   <button type="submit">Save security settings</button>
 </form>"#,
         security.session_ttl_minutes,

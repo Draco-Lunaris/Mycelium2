@@ -2116,6 +2116,7 @@ async fn admin_split_pages() {
         ),
         ("/admin/system", &["Download backup"]),
     ];
+    let mut sign_in_html = String::new();
     let mut system_html = String::new();
     for (route, markers) in pages {
         let resp = client
@@ -2140,7 +2141,42 @@ async fn admin_split_pages() {
         }
         if *route == "/admin/system" {
             system_html = html;
+        } else if *route == "/admin/sign-in" {
+            sign_in_html = html;
         }
+    }
+    // Mockup 11: the five security fields' ranges render as SMALL LINES
+    // UNDER the fields in `.field__hint` elements (the CSS exists), not
+    // baked into the labels. Each hint text is the old label's range
+    // text, character-for-character (en dashes and all).
+    let hints: &[(&str, &str)] = &[
+        ("Session TTL", "(minutes, 15–10080; 720 = 12h)"),
+        ("Login failures before lockout", "(3–10)"),
+        ("Lockout backoff cap", "(seconds, 30–3600)"),
+        ("Minimum password length", "(12–128)"),
+        ("Passage cap", "(chars, 16384–1048576; 131072 = 128k)"),
+    ];
+    let mut hint_zone = sign_in_html
+        .find(r#"action="/admin/security""#)
+        .unwrap_or(sign_in_html.len());
+    // Narrow to the security form: from the form tag to its closing tag.
+    if let Some(form_end) = sign_in_html[hint_zone..].find("</form>") {
+        hint_zone += form_end;
+    }
+    let form = &sign_in_html[..hint_zone];
+    for (label, hint) in hints {
+        assert!(
+            form.contains(label),
+            "sign-in: plain field label {label} missing: {form}"
+        );
+        assert!(
+            !form.contains(&format!(">{label} {hint}<")),
+            "sign-in: {label} range must live in a hint line, not the label: {form}"
+        );
+        assert!(
+            form.contains(&format!(r#"<p class="field__hint">{hint}</p>"#)),
+            "sign-in: hint {hint} must render in a field__hint element: {form}"
+        );
     }
     // The system page surfaces /health's fields as StatTiles (the
     // StatTile class), not prose.
@@ -2333,6 +2369,112 @@ async fn admin_split_pages() {
         401,
         "bearer API keys must not provision users — the session extractor rejects session-less POSTs"
     );
+
+    shutdown.cancel();
+}
+
+/// Clamp round-trip pin (plan §"open questions" item 4): a POST
+/// /admin/security with values outside the guardrail ranges —
+/// bypassing the form's min/max — is CLAMPED by the handler, never
+/// rejected (admin_save_security builds a SecurityConfig and calls
+/// `.clamped()` before storing; state.rs `clamped()` clamps every
+/// field into security_bounds). Pinned on both sides of the round
+/// trip: the STORED config row holds the clamped values (save-side
+/// clamp — the raw ConfigStore read proves the handler, not the
+/// read-side clamp, did the work), and GET /admin/sign-in renders
+/// them back. Own boot, so the mutated security config never leaks
+/// to other tests.
+#[tokio::test]
+async fn security_settings_clamp_round_trip() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/sign-in"), &cookie).await;
+
+    // Below-min AND above-max values, sent directly (no form min/max).
+    let save = client
+        .post(format!("{base}/admin/security"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("session_ttl_minutes", "1"),      // below min 15
+            ("login_max_failures", "1000"),    // above max 10
+            ("login_lockout_seconds", "1"),    // below min 30
+            ("min_password_length", "999999"), // above max 128
+            ("passage_max_chars", "1"),        // below min 16384
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        save.status(),
+        303,
+        "out-of-range values must clamp, not reject"
+    );
+    assert_eq!(
+        save.headers().get("location").unwrap(),
+        "/admin/sign-in?ok=Security%20settings%20saved"
+    );
+
+    // The stored row itself holds the clamped values — the handler's
+    // `.clamped()` ran before the write (security_bounds: TTL 15..=10080,
+    // failures 3..=10, lockout 30..=3600, password 12..=128,
+    // passage 16384..=1048576).
+    let config = mycelium_store::ConfigStore::new(pool.clone());
+    let stored: serde_json::Value = config
+        .get::<serde_json::Value>("security")
+        .await
+        .unwrap()
+        .expect("security config stored");
+    assert_eq!(stored["session_ttl_minutes"], 15, "TTL clamped up to 15");
+    assert_eq!(
+        stored["login_max_failures"], 10,
+        "failures clamped down to 10"
+    );
+    assert_eq!(
+        stored["login_lockout_seconds"], 30,
+        "lockout clamped up to 30"
+    );
+    assert_eq!(
+        stored["min_password_length"], 128,
+        "password length clamped down to 128"
+    );
+    assert_eq!(
+        stored["passage_max_chars"], 16384,
+        "passage cap clamped up to 16384"
+    );
+
+    // The page's own read-back renders the clamped values.
+    let page = client
+        .get(format!("{base}/admin/sign-in"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    for value in ["15", "10", "30", "128", "16384"] {
+        assert!(
+            html.contains(&format!(r#"value="{value}""#)),
+            "clamped value {value} must render back: {html}"
+        );
+    }
 
     shutdown.cancel();
 }
