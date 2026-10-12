@@ -1547,6 +1547,226 @@ pub async fn keys_revoke(
     Redirect::to("/keys").into_response()
 }
 
+// ---------- Account security (PR 4, Task 3: /account + TOTP) ----------
+
+#[derive(Deserialize)]
+pub struct TotpVerifyForm {
+    pub code: String,
+}
+
+/// The WebAuthn credential count for the 2FA row. The relying-party
+/// name/origin/id are the placeholder trio mycelium-auth's own tests
+/// use — the count query is RP-independent (it only touches the pool);
+/// Task 4 owns the real deployment RP config for the actual
+/// register/remove ceremony.
+async fn webauthn_count(state: &AppState, user_id: Uuid) -> i64 {
+    match mycelium_auth::webauthn::WebAuthnManager::new(
+        state.store.pool().clone(),
+        "Mycelium2",
+        "https://localhost",
+        "localhost",
+    ) {
+        Ok(m) => m.credential_count(user_id).await.unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// GET /account — the Account security page (mockup 10). Session-
+/// gated for every logged-in user (the nav item is not admin-gated,
+/// spec §6); the resting TOTP state reads `UserRecord.totp_secret`
+/// (`get_by_id` already carries the column — no new query shape).
+pub async fn account_view(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let enrolled = state
+        .users
+        .get_by_id(user.user_id)
+        .await
+        .map(|r| r.totp_secret.is_some())
+        .unwrap_or(false);
+    let count = webauthn_count(&state, user.user_id).await;
+    pages::account_page(
+        &user,
+        &csrf,
+        pages::TotpSection::Row { enrolled },
+        count,
+        None,
+    )
+    .into_response()
+}
+
+/// POST /account/totp/enroll — generate a secret, persist it, and
+/// render the enrollment card (secret + otpauth URL + verify form).
+///
+/// TOTP semantics (pinned by reading mycelium-auth's totp.rs in
+/// full): `set_secret`'s third parameter is the at-rest encoding
+/// choice ONLY — `Some(&ServiceKey)` seals the secret as an `enc1:`
+/// envelope (the same key AppState::new attaches to the login service,
+/// so login decrypts transparently), `None` stores legacy plaintext —
+/// and the store has NO pending/confirmed state: the column set_secret
+/// writes is the exact column login's verify reads, so the second
+/// factor goes LIVE at this POST (login requires a code from here on —
+/// mycelium-auth's `totp_enrolled_requires_code` pins it). The
+/// brief's alternative design (persist pending, flip to confirmed on
+/// verify) is therefore NOT what the store supports; this handler
+/// matches reality: enroll makes it live, and the verify POST is UX
+/// confirmation (the enrollment card says "already active" so the
+/// user is never misled).
+///
+/// Accepted consequence, documented: a POST that persists but whose
+/// response never renders leaves the user enrolled with a secret they
+/// never saw (password-only login then fails). The way back is the
+/// recovery-key flow (Task 4) or an admin; adding a pending-enrollment
+/// column would be an auth-logic change — spec §1's non-goal for
+/// these UI wrappers. Between the two imperfect options the fail-closed
+/// one is chosen.
+pub async fn account_totp_enroll(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let secret = mycelium_auth::totp::generate_secret();
+    let url = match mycelium_auth::totp::enrollment_url(&secret, &user.username, "Mycelium2") {
+        Ok(u) => u,
+        Err(e) => {
+            // Nothing persisted yet — fail honestly without state.
+            tracing::error!(user_id = %user.user_id, error = %e, "totp enrollment_url failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let pool = state.store.pool();
+    if let Err(e) =
+        mycelium_auth::totp::set_secret(pool, user.user_id, &secret, Some(&*state.service_key))
+            .await
+    {
+        tracing::error!(user_id = %user.user_id, error = %e, "totp set_secret failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+    let count = webauthn_count(&state, user.user_id).await;
+    pages::account_page(
+        &user,
+        &csrf,
+        pages::TotpSection::Enrolling { secret, url },
+        count,
+        None,
+    )
+    .into_response()
+}
+
+/// POST /account/totp/verify — confirm the enrollment with a code.
+/// A correct code → the resting enrolled row + the success banner; a
+/// wrong or stale code → the spec §7 "code expired/invalid, try
+/// again" banner + the verify form again (the live enrollment is
+/// untouched — see `account_totp_enroll` for why "pending" cannot
+/// exist). A verify with nothing enrolled renders the plain
+/// not-enrolled page: `totp::verify` passes unenrolled users (login
+/// semantics — the factor is optional per user), which here would
+/// otherwise paint a false "verified" state.
+pub async fn account_totp_verify(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    axum::Form(form): axum::Form<TotpVerifyForm>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let count = webauthn_count(&state, user.user_id).await;
+    let enrolled = state
+        .users
+        .get_by_id(user.user_id)
+        .await
+        .map(|r| r.totp_secret.is_some())
+        .unwrap_or(false);
+    if !enrolled {
+        return pages::account_page(
+            &user,
+            &csrf,
+            pages::TotpSection::Row { enrolled: false },
+            count,
+            None,
+        )
+        .into_response();
+    }
+    let pool = state.store.pool();
+    match mycelium_auth::totp::verify(pool, user.user_id, &form.code, Some(&*state.service_key))
+        .await
+    {
+        Ok(true) => pages::account_page(
+            &user,
+            &csrf,
+            pages::TotpSection::Row { enrolled: true },
+            count,
+            Some(("success", "Authenticator app verified")),
+        )
+        .into_response(),
+        Ok(false) => {
+            pages::account_page(&user, &csrf, pages::TotpSection::VerifyFailed, count, None)
+                .into_response()
+        }
+        Err(e) => {
+            // The enrollment's live state is unaffected — re-read it so
+            // the row never lies, and surface the failure.
+            tracing::error!(user_id = %user.user_id, error = %e, "totp verify failed");
+            let enrolled = state
+                .users
+                .get_by_id(user.user_id)
+                .await
+                .map(|r| r.totp_secret.is_some())
+                .unwrap_or(false);
+            pages::account_page(
+                &user,
+                &csrf,
+                pages::TotpSection::Row { enrolled },
+                count,
+                Some(("danger", "TOTP verification failed — try again")),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// POST /account/totp/disable — clear the stored secret (unenroll) and
+/// render the not-enrolled row.
+pub async fn account_totp_disable(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let count = webauthn_count(&state, user.user_id).await;
+    let pool = state.store.pool();
+    match mycelium_auth::totp::clear_secret(pool, user.user_id).await {
+        Ok(()) => pages::account_page(
+            &user,
+            &csrf,
+            pages::TotpSection::Row { enrolled: false },
+            count,
+            Some(("success", "Authenticator app disabled")),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(user_id = %user.user_id, error = %e, "totp clear_secret failed");
+            let enrolled = state
+                .users
+                .get_by_id(user.user_id)
+                .await
+                .map(|r| r.totp_secret.is_some())
+                .unwrap_or(false);
+            pages::account_page(
+                &user,
+                &csrf,
+                pages::TotpSection::Row { enrolled },
+                count,
+                Some(("danger", "could not disable the authenticator")),
+            )
+            .into_response()
+        }
+    }
+}
+
 // ---------- Admin handlers ----------
 
 #[derive(Deserialize)]

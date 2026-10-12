@@ -2959,6 +2959,248 @@ async fn status_non_admin_403() {
     shutdown.cancel();
 }
 
+/// Task 3 (PR 4): the Account security page + the TOTP enroll →
+/// verify → disable round-trip.
+///
+/// TOTP semantics pinned from mycelium-auth (totp.rs): `set_secret`
+/// carries NO pending/confirmed state — its `Option<&ServiceKey>`
+/// parameter only selects the at-rest encoding (`Some` = sealed
+/// `enc1:` envelope, `None` = legacy plaintext) — so enroll makes the
+/// second factor LIVE the moment it persists (login requires a code
+/// from then on; login.rs's `totp_enrolled_requires_code` pins it)
+/// and the verify POST is a UX confirmation, not a state gate. The
+/// wrong-code leg (stale_totp_code_keeps_enrollment_pending) pins
+/// that reality exactly: the DB row stays SET, password-only login
+/// is rejected, and the page re-renders the verify form with the
+/// try-again banner — never the resting "enrolled" row.
+///
+/// QR deviation: no QR generator exists in the repo and adding a
+/// dependency is not this task's decision — the enrollment card
+/// renders the otpauth:// URL as selectable text beside the secret;
+/// a QR image lands when a QR dependency does.
+#[tokio::test]
+async fn account_totp_flow() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    // Fresh boot: no forced password change; plain admin login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Leg 1: GET /account → 200 with the three cards; the TOTP row
+    // and the WebAuthn row both read not-enrolled; the WebAuthn row
+    // shows the credential count + the disabled Register placeholder
+    // (Task 4 wires the real action); the password card posts the
+    // EXISTING /password handler; and the nav's Account group carries
+    // Account security (leg 6 — the group is not admin-gated).
+    let page = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200, "GET /account for a session");
+    let html = page.text().await.unwrap();
+    assert!(html.contains("Change password"), "password card: {html}");
+    assert!(html.contains("Two-factor"), "2FA card: {html}");
+    assert!(html.contains("Recovery key"), "recovery card: {html}");
+    assert!(
+        html.contains(r#"<form method="post" action="/password">"#),
+        "password card posts the existing /password handler: {html}"
+    );
+    assert_eq!(
+        html.matches("not enrolled").count(),
+        2,
+        "TOTP + WebAuthn rows both show not-enrolled chips: {html}"
+    );
+    assert!(
+        html.contains(r#"<form method="post" action="/account/totp/enroll">"#),
+        "TOTP Enroll action: {html}"
+    );
+    assert!(
+        html.contains("0 credentials"),
+        "WebAuthn row shows the credential count: {html}"
+    );
+    assert!(
+        html.contains(r#"<button class="btn" disabled>Register</button>"#),
+        "WebAuthn row's disabled Register placeholder (Task 4 wires it): {html}"
+    );
+    assert!(
+        html.contains(r#"href="/account""#),
+        "nav Account group carries Account security (not admin-gated): {html}"
+    );
+
+    let csrf = csrf_from_page(&client, &format!("{base}/account"), &cookie).await;
+
+    // Leg 2: POST /account/totp/enroll → the enrollment card: the
+    // secret text, the otpauth URL (rendered as text — the QR
+    // deviation), and the verify form.
+    let enroll = client
+        .post(format!("{base}/account/totp/enroll"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enroll.status(), 200);
+    let eh = enroll.text().await.unwrap();
+    assert!(eh.contains("otpauth://"), "otpauth URL renders: {eh}");
+    assert!(
+        eh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form on the enrollment card: {eh}"
+    );
+    let marker = r#"id="totp-secret">"#;
+    let idx = eh.find(marker).expect("secret renders for manual entry");
+    let rest = &eh[idx + marker.len()..];
+    let secret = rest[..rest.find('<').unwrap()].to_string();
+    assert!(!secret.is_empty(), "non-empty secret: {eh}");
+
+    // Leg 3 — stale_totp_code_keeps_enrollment_pending: a wrong code
+    // does NOT complete the flow. Reality: enrollment went live at
+    // enroll time — the row stays SET, password-only login is now
+    // rejected, and the response re-renders the verify form with the
+    // spec §7 try-again banner. It must NOT render the resting
+    // enrolled row (the Disable action) as if verified.
+    let wrong = client
+        .post(format!("{base}/account/totp/verify"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str()), ("code", "000000")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200);
+    let wh = wrong.text().await.unwrap();
+    assert!(
+        wh.contains("code expired/invalid"),
+        "the spec §7 try-again banner: {wh}"
+    );
+    assert!(
+        wh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form re-renders: {wh}"
+    );
+    assert!(
+        !wh.contains(r#"action="/account/totp/disable""#),
+        "the resting enrolled row must not render before a successful verify: {wh}"
+    );
+    let (row,): (Option<String>,) =
+        sqlx::query_as("SELECT totp_secret FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        row.is_some(),
+        "set_secret made the enrollment live (no pending state exists)"
+    );
+    // The behavior-level reality pin: password-only login is rejected.
+    let totp_login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        totp_login.status(),
+        200,
+        "not a 303: password-only login is rejected while enrolled"
+    );
+    assert!(
+        totp_login
+            .text()
+            .await
+            .unwrap()
+            .contains("Invalid credentials")
+    );
+
+    // Leg 4: the RIGHT code (minted with mycelium-auth's exact
+    // verification parameters) completes the flow → the resting
+    // enrolled row (Disable action) + the success banner.
+    let code = totp_code(&secret);
+    let verify = client
+        .post(format!("{base}/account/totp/verify"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str()), ("code", code.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), 200);
+    let vh = verify.text().await.unwrap();
+    assert!(
+        vh.contains("Authenticator app verified"),
+        "success banner: {vh}"
+    );
+    assert!(
+        vh.contains(r#"<form method="post" action="/account/totp/disable">"#),
+        "Disable action on the enrolled row: {vh}"
+    );
+    assert!(
+        !vh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form gone after success: {vh}"
+    );
+
+    // Leg 5: POST disable → the not-enrolled row again; the row is
+    // gone at the store level too.
+    let disable = client
+        .post(format!("{base}/account/totp/disable"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), 200);
+    let dh = disable.text().await.unwrap();
+    assert!(dh.contains("not enrolled"), "not-enrolled chip back: {dh}");
+    assert!(
+        dh.contains(r#"<form method="post" action="/account/totp/enroll">"#),
+        "Enroll action back: {dh}"
+    );
+    let (row,): (Option<String>,) =
+        sqlx::query_as("SELECT totp_secret FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(row.is_none(), "clear_secret removed the enrollment");
+
+    shutdown.cancel();
+}
+
+/// Mint the current TOTP code for a secret using mycelium-auth's exact
+/// verification parameters (SHA1 / 6 digits / skew 1 / 30s step —
+/// totp.rs's make_totp). Mirrors how login.rs's tests mint codes.
+fn totp_code(secret: &str) -> String {
+    use totp_rs::{Algorithm, Builder, Secret};
+    let s = Secret::try_from_base32(secret).unwrap();
+    let totp = Builder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(s)
+        .with_account_name("verify")
+        .with_issuer(Some("Mycelium2"))
+        .build()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    totp.generate(now).to_string()
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client

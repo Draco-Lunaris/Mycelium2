@@ -42,3 +42,8 @@ tempfile.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", features = ["json"] }
 md-5 = "0.10"
+# Test-only: mint valid TOTP codes from an enrolled secret (the exact
+# parameters mycelium-auth builds for verification) — mirrors
+# mycelium-auth's own test helpers. Not a new dependency decision: the
+# workspace already pins this exact spec for mycelium-auth.
+totp-rs.workspace = true

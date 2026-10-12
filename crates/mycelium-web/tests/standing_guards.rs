@@ -156,6 +156,9 @@ async fn csp_sweep_no_inline_style_or_script() {
         "/chat",
         "/keys",
         "/password",
+        // Account security (PR 4, Task 3): the password card + 2FA
+        // rows + recovery card page, swept like its siblings.
+        "/account",
         // The admin split (PR 3): the five pages, all 200 for the swept
         // admin session. (/admin itself is a 307 now — its redirect is
         // pinned by admin_split_pages, not swept here.)
@@ -216,7 +219,7 @@ async fn fields_pair_labels_and_inputs() {
     let client = client();
     let cookie = admin_cookie(&client, &base).await;
 
-    for route in ["/keys", "/password"] {
+    for route in ["/keys", "/password", "/account"] {
         let resp = client
             .get(format!("{base}{route}"))
             .header("cookie", &cookie)

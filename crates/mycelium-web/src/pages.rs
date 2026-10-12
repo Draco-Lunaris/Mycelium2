@@ -1168,6 +1168,197 @@ pub fn keys_page(
     )
 }
 
+// ---------- Account security (PR 4, Task 3) ----------
+
+/// The TOTP half of the Two-factor card — one variant per /account
+/// handler response. The resting state is the user's stored secret
+/// (`UserRecord.totp_secret` — `get_by_id` already carries the column,
+/// so no new query shape exists); the enrollment states render the
+/// enroll/verify flow (see `account_totp_enroll` in api.rs for the
+/// pinned live-at-enroll semantics).
+pub enum TotpSection {
+    /// GET /account, a successful verify, a disable: the state chip
+    /// plus the Enroll (not enrolled) / Disable (enrolled) action.
+    Row { enrolled: bool },
+    /// POST /account/totp/enroll: the secret + the otpauth URL + the
+    /// verify form (the factor is already live — the card says so;
+    /// verification is confirmation, not the state flip).
+    Enrolling { secret: String, url: String },
+    /// POST /account/totp/verify with a wrong or stale code: the
+    /// spec §7 try-again banner + the verify form again. The secret
+    /// is deliberately not re-rendered — the enroll response already
+    /// showed it (and the authenticator app holds it);
+    /// mycelium-auth exposes no decrypt-for-display path and adding
+    /// one is an auth-surface change (spec §1 non-goal).
+    VerifyFailed,
+}
+
+/// The verify form shared by the enrollment card and the failed-code
+/// re-render — a single page-load POST (spec §7: SSR, no script; the
+/// hidden csrf_token follows the row-form pattern).
+fn totp_verify_form(csrf_esc: &str) -> String {
+    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Verify", "primary")]));
+    format!(
+        r#"<form method="post" action="/account/totp/verify">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="totp-code">Verification code</label>
+    <input id="totp-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+  </div>
+  {actions}
+</form>"#
+    )
+}
+
+/// Account security (mockup 10): three cards — Password (the PR-2
+/// lone card's body moved here verbatim: three fields posting the
+/// EXISTING /password handler, unchanged until Task 5's gate work),
+/// Two-factor (the TOTP section per `totp` + the WebAuthn row:
+/// credential count via `WebAuthnManager::credential_count` and a
+/// disabled Register placeholder that Task 4 wires to the ceremony),
+/// and Recovery key (explanatory text only, mockup 10's letter — the
+/// Regenerate action is Task 4's).
+///
+/// QR deviation (documented): the enrollment card renders the
+/// otpauth URL as selectable text beside the secret. The repo has no
+/// QR generator, no QR dependency exists in the workspace, and taking
+/// one unilaterally is not this task's decision — the data:-URI QR
+/// lands when a QR dependency decision lands (CSP `img-src` already
+/// allows `data:`).
+///
+/// Escaping: card bodies are raw `TrustedHtml` slots composed from
+/// escaped fragments — the secret is base32 (no escapable characters)
+/// but escapes anyway, the otpauth URL carries the username and
+/// escapes, CSRF tokens escape, and every banner message is a
+/// handler-side constant riding the banner primitive's TEXT position.
+pub fn account_page(
+    user: &SessionUser,
+    csrf: &str,
+    totp: TotpSection,
+    webauthn_count: i64,
+    banner: Option<(&str, &str)>,
+) -> Html<String> {
+    let csrf_esc = html_escape(csrf);
+    let banner_html = banner
+        .map(|(kind, msg)| mycelium_ui::render::render(mycelium_ui::banner(kind, msg)))
+        .unwrap_or_default();
+
+    // Password card: the PR-2 password page's card body, moved as-is
+    // (flash slot dropped — /password's own handler renders those
+    // until Task 5 retargets the gate).
+    let pw_actions =
+        mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
+    let password_body = format!(
+        r#"<form method="post" action="/password">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="pw-old">Current password</label>
+    <input id="pw-old" type="password" name="old" required>
+  </div>
+  <div class="field">
+    <label for="pw-new">New password (min 20 chars)</label>
+    <input id="pw-new" type="password" name="new" required minlength="20">
+  </div>
+  <div class="field">
+    <label for="pw-repeat">Repeat new password</label>
+    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
+  </div>
+  {pw_actions}
+</form>"#
+    );
+
+    // TOTP row / enrollment flow.
+    let totp_html = match &totp {
+        TotpSection::Row { enrolled } => {
+            let chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if *enrolled {
+                    "enrolled"
+                } else {
+                    "not enrolled"
+                },
+                if *enrolled { "accent" } else { "neutral" },
+            ));
+            let action = if *enrolled {
+                format!(
+                    r#"<form method="post" action="/account/totp/disable"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" class="btn">Disable</button></form>"#
+                )
+            } else {
+                format!(
+                    r#"<form method="post" action="/account/totp/enroll"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" class="btn btn--primary">Enroll</button></form>"#
+                )
+            };
+            format!(
+                r#"<div class="qa-row"><div class="qa-row__label"><span>Authenticator app (TOTP)</span></div><div class="qa-row__side">{chip}{action}</div></div>"#
+            )
+        }
+        TotpSection::Enrolling { secret, url } => {
+            let form = totp_verify_form(&csrf_esc);
+            format!(
+                r#"<p>Enter this secret into your authenticator app, then confirm with its current 6-digit code. Your second factor is already active — verification confirms your app is in sync.</p>
+  <p>Secret: <code id="totp-secret">{secret}</code></p>
+  <p>Enrollment URL: <code>{url}</code></p>
+  {form}"#,
+                secret = html_escape(secret),
+                url = html_escape(url),
+            )
+        }
+        TotpSection::VerifyFailed => {
+            let warn = mycelium_ui::render::render(mycelium_ui::banner(
+                "warning",
+                "code expired/invalid, try again",
+            ));
+            format!("{warn}{}", totp_verify_form(&csrf_esc))
+        }
+    };
+
+    // WebAuthn row: the count is real (WebAuthnManager's query); the
+    // action is the disabled placeholder until Task 4 wires the
+    // register/remove ceremony (the honest degradation spec §7 pins
+    // for script-less WebAuthn).
+    let wa_enrolled = webauthn_count > 0;
+    let wa_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if wa_enrolled {
+            "enrolled"
+        } else {
+            "not enrolled"
+        },
+        if wa_enrolled { "accent" } else { "neutral" },
+    ));
+    let wa_count = format!(
+        "{webauthn_count} credential{}",
+        if webauthn_count == 1 { "" } else { "s" }
+    );
+    let webauthn_row = format!(
+        r#"<div class="qa-row"><div class="qa-row__label"><span>Passkey (WebAuthn)</span></div><div class="qa-row__side">{wa_chip}<span>{wa_count}</span><button class="btn" disabled>Register</button></div></div>"#
+    );
+
+    let twofa_body = format!("{totp_html}{webauthn_row}");
+
+    // Recovery key card: explanatory text only (mockup 10's letter);
+    // the Regenerate action arrives with Task 4.
+    let recovery_body = r#"<p>Your recovery key is the last-resort way back into your account if you lose your password and your second factor.</p>
+  <p>The key was shown once when your account was created. Regenerating it requires your current password, and the new key is shown only once. Rotation does not sign you out.</p>"#;
+
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Account security",
+        TrustedHtml::from_markup(""),
+    ));
+    let pw_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Change password",
+        TrustedHtml::from_markup(password_body),
+    ));
+    let twofa_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Two-factor",
+        TrustedHtml::from_markup(twofa_body),
+    ));
+    let recovery_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Recovery key",
+        TrustedHtml::from_markup(recovery_body),
+    ));
+    let body = format!("{header}{banner_html}{pw_card}{twofa_card}{recovery_card}");
+    layout("Account security", Some(user), csrf, "/account", body)
+}
+
 // ---------- Admin pages (PR 3: the five-page split) ----------
 
 /// The admin section's TabBar (spec §6's exact labels) with the
@@ -1652,9 +1843,9 @@ pub fn librarian_status_page(
         if degraded { "danger" } else { "neutral" },
     ));
     // The LLM chip on the same window: llm_last_success_seconds is an
-    // AGE in seconds (None = never succeeded); older than the
-    // degraded window reads unreachable (the /health + /metrics
-    // LLM-alive reporting rule).
+    // AGE in seconds (None = never succeeded); older than the shared
+    // oldest_degraded_at_secs() window (the same threshold that flags
+    // an overdue pending queue item) reads unreachable.
     let llm_unreachable = stats
         .llm_last_success_seconds
         .is_none_or(|age| age > crate::health::oldest_degraded_at_secs());

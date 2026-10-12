@@ -585,6 +585,18 @@ body.auth main {
   display: flex; gap: var(--gap-2); flex-wrap: wrap;
   margin-bottom: var(--gap-4);
 }
+
+/* Account security (PR 4, mockup 10): the 2FA rows — label left,
+   chip + count + action right; a hairline separates siblings and the
+   row wraps at narrow widths. */
+.qa-row {
+  display: flex; gap: var(--gap-3); flex-wrap: wrap;
+  align-items: center; justify-content: space-between;
+  padding: var(--gap-3) 0; border-bottom: 1px solid var(--color-border);
+}
+.qa-row:last-child { border-bottom: none; }
+.qa-row__side { display: flex; gap: var(--gap-2); align-items: center; flex-wrap: wrap; }
+.qa-row__side form { margin: 0; }
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.
@@ -1248,7 +1260,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "21";
+pub const ASSETS_VERSION: &str = "22";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
