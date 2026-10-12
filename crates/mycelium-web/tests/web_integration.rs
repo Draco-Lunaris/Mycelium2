@@ -2201,6 +2201,31 @@ async fn admin_split_pages() {
         "StatTile markup on /admin/system: {system_html}"
     );
 
+    // Sidebar (spec §6): the Admin group's ACTIVE item is the current
+    // page — pinned on both sides. The markup is the sidebar's
+    // `nav-item` (the TabBar's `tab` links carry their own active state),
+    // so the assertion targets the nav-item class and would fail if the
+    // page passed a stale `/admin` active_path.
+    let users_page_html = client
+        .get(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        users_page_html.contains(
+            r#"<a href="/admin/users" aria-current="page" class="nav-item nav-item--active">"#
+        ),
+        "sidebar Users item must be active on /admin/users: {users_page_html}"
+    );
+    assert!(
+        users_page_html.contains(r#"<a href="/admin/system" class="nav-item">"#),
+        "sidebar System item must NOT be active on /admin/users: {users_page_html}"
+    );
+
     // 2. /admin → 307 with Location: /admin/users (a TRUE 307 — axum's
     //    Redirect::to is a 303; the spec's §6 route map pins 307).
     let redirect = client

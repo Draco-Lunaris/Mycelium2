@@ -1300,7 +1300,7 @@ pub fn admin_users_page(
         tabs = admin_tabs("/admin/users"),
         flash = admin_flash(ok, err),
     );
-    layout("Users", Some(user), csrf, "/admin", body)
+    layout("Users", Some(user), csrf, "/admin/users", body)
 }
 
 /// Admin: Sign-in (mockup 11) — the security settings card (the
@@ -1380,7 +1380,7 @@ pub fn admin_sign_in_page(
         tabs = admin_tabs("/admin/sign-in"),
         flash = admin_flash(ok, err),
     );
-    layout("Sign-in", Some(user), csrf, "/admin", body)
+    layout("Sign-in", Some(user), csrf, "/admin/sign-in", body)
 }
 
 /// Admin: LLM backend — the LLM card on its own page (the existing
@@ -1420,7 +1420,7 @@ pub fn admin_llm_page(
         tabs = admin_tabs("/admin/llm"),
         flash = admin_flash(ok, err),
     );
-    layout("LLM backend", Some(user), csrf, "/admin", body)
+    layout("LLM backend", Some(user), csrf, "/admin/llm", body)
 }
 
 /// Admin: Library (mockup 12) — the stack of section cards:
@@ -1535,7 +1535,7 @@ pub fn admin_library_page(
         tabs = admin_tabs("/admin/library"),
         flash = admin_flash(ok, err),
     );
-    layout("Library", Some(user), csrf, "/admin", body)
+    layout("Library", Some(user), csrf, "/admin/library", body)
 }
 
 /// Admin: System — the operational view: /health's fields as
@@ -1611,7 +1611,7 @@ pub fn admin_system_page(
         tabs = admin_tabs("/admin/system"),
         flash = admin_flash(ok, err),
     );
-    layout("System", Some(user), csrf, "/admin", body)
+    layout("System", Some(user), csrf, "/admin/system", body)
 }
 
 /// Minimal percent-encoding for query-string values.

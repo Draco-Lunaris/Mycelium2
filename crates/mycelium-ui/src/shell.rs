@@ -77,7 +77,16 @@ pub fn nav_groups(
         ("Account", vec![item("API keys", "/keys")]),
     ];
     if let Some((_, true)) = user {
-        groups.push(("Admin", vec![item("Admin", "/admin")]));
+        groups.push((
+            "Admin",
+            vec![
+                item("Users", "/admin/users"),
+                item("Sign-in", "/admin/sign-in"),
+                item("LLM backend", "/admin/llm"),
+                item("Library", "/admin/library"),
+                item("System", "/admin/system"),
+            ],
+        ));
     }
     groups
 }
@@ -304,6 +313,70 @@ mod tests {
         assert!(
             html.contains(r#"<main></main>"#),
             "body lands in main: {html}"
+        );
+    }
+
+    #[test]
+    fn admin_group_is_the_five_spec_items_with_per_page_active() {
+        // Spec §6: the Admin group is five items, not the PR-1-era
+        // single link — exact (label, href) list, in order.
+        let groups = nav_groups(Some(("echo", true)), "/");
+        let admin = &groups
+            .iter()
+            .find(|(name, _)| *name == "Admin")
+            .expect("admin group for an admin")
+            .1;
+        let got: Vec<(&str, &str)> = admin
+            .iter()
+            .map(|(label, href, _)| (*label, *href))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Users", "/admin/users"),
+                ("Sign-in", "/admin/sign-in"),
+                ("LLM backend", "/admin/llm"),
+                ("Library", "/admin/library"),
+                ("System", "/admin/system"),
+            ]
+        );
+        // Active is derived per item by href == active_path: nothing is
+        // active off the admin routes, exactly one item on one of them.
+        assert!(admin.iter().all(|(_, _, active)| !*active));
+        let on_system = nav_groups(Some(("echo", true)), "/admin/system")
+            .into_iter()
+            .find(|(name, _)| *name == "Admin")
+            .expect("admin group")
+            .1;
+        let active: Vec<&str> = on_system
+            .iter()
+            .filter(|(_, _, active)| *active)
+            .map(|(_, href, _)| *href)
+            .collect();
+        assert_eq!(active, vec!["/admin/system"]);
+
+        // Rendered both ways: the active item carries `aria-current="page"`
+        // + the active class, a sibling carries neither. (Leptos emits
+        // `href`, then `aria-current`, then `class`.)
+        let html = shell(
+            "Users",
+            Some(("echo", true)),
+            "tok",
+            "/admin/users",
+            String::new(),
+            &[],
+            &[],
+            "",
+        );
+        assert!(
+            html.contains(
+                r#"<a href="/admin/users" aria-current="page" class="nav-item nav-item--active">"#
+            ),
+            "Users item must be active on /admin/users: {html}"
+        );
+        assert!(
+            html.contains(r#"<a href="/admin/system" class="nav-item">"#),
+            "System item must render plain (no aria-current, no active class): {html}"
         );
     }
 
