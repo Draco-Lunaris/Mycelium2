@@ -276,7 +276,8 @@ async fn book_upload_ingest_and_passages() {
     // 7. The catalog concepts exist in the shared library scope (hub +
     //    chapters) — verify via the admin pages: the upload card on
     //    /admin/library, the completed job in the jobs table on
-    //    /admin/system (the PR-3 split's ruling), and by reading the
+    //    /status (its home since PR 4 per spec §8 — the PR-3 System
+    //    placement was a stopgap), and by reading the
     //    hub through the service-scope store directly.
     let library_page = client
         .get(format!("{base}/admin/library"))
@@ -285,6 +286,22 @@ async fn book_upload_ingest_and_passages() {
         .await
         .unwrap();
     assert!(library_page.text().await.unwrap().contains("Upload book"));
+    let status_page = client
+        .get(format!("{base}/status"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_page.status(),
+        200,
+        "/status must render for the admin (the jobs table's home)"
+    );
+    let status_html = status_page.text().await.unwrap();
+    assert!(status_html.contains("my-book"));
+    assert!(status_html.contains("done"));
+    // The move's negative pin: the System page no longer carries the
+    // jobs table (spec §8's ruling — /status is its home now).
     let system_page = client
         .get(format!("{base}/admin/system"))
         .header("cookie", &cookie)
@@ -292,8 +309,10 @@ async fn book_upload_ingest_and_passages() {
         .await
         .unwrap();
     let system_html = system_page.text().await.unwrap();
-    assert!(system_html.contains("my-book"));
-    assert!(system_html.contains("done"));
+    assert!(
+        !system_html.contains("Ingest jobs"),
+        "the jobs table moved to /status; /admin/system must not carry it: {system_html}"
+    );
 
     // 8. Duplicate slug is rejected.
     let boundary2 = "testboundary67890";

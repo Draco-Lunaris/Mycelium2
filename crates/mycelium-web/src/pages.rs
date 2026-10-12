@@ -192,9 +192,11 @@ pub fn home_page(
         ));
     }
     // Actions: the New-concept primary button (an anchor — works
-    // without script) plus the filter chips, one row (mockup 01).
+    // without script), the filter chips, and mockup 01's small search
+    // field — a plain GET form aimed at /search (Enter submits; no
+    // submit button, no script), one row.
     let actions = format!(
-        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}"#,
+        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}<form class="search-mini" method="get" action="/search"><input name="q" placeholder="Search…" aria-label="Search"></form>"#,
         mycelium_ui::button_class("primary")
     );
     // Table rows: the filter narrows the listing; each row's cells are
@@ -987,51 +989,6 @@ pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
     )
 }
 
-/// Change-password page (Task 9 — lone card): the PR-1 ruled None-user
-/// shell-less rendering kept (no sidebar), but the body is now a single
-/// `card("Change password", …)` — the flash banners plus the change
-/// form. The three password fields compose INLINE on the field markup
-/// pattern (the Task-3 search-page precedent): the primitive `field()`
-/// renders only `<input id type>`, while these inputs must carry
-/// name/required/minlength for the native POST; extending the shared
-/// primitive (and every consumer) for one page's attributes is the
-/// worse shape, and this markup keeps the component's exact `.field`
-/// shape (label[for] above input, id-pairing). The hidden csrf_token
-/// follows the row-form pattern (app.js skips injection when the field
-/// exists; the middleware's form path verifies it) and `form_actions`
-/// supplies the primary submit (a bare button inside a form submits
-/// natively — no JS needed). No user text beyond the flash messages,
-/// which the flash helper escapes at composition (card bodies are raw
-/// slots).
-pub fn password_page(csrf: &str, ok: Option<&str>, err: Option<&str>) -> Html<String> {
-    let csrf_esc = html_escape(csrf);
-    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
-    let card_body = format!(
-        r#"{flashes}<form method="post" action="/password">
-  <input type="hidden" name="csrf_token" value="{csrf_esc}">
-  <div class="field">
-    <label for="pw-old">Current password</label>
-    <input id="pw-old" type="password" name="old" required>
-  </div>
-  <div class="field">
-    <label for="pw-new">New password (min 20 chars)</label>
-    <input id="pw-new" type="password" name="new" required minlength="20">
-  </div>
-  <div class="field">
-    <label for="pw-repeat">Repeat new password</label>
-    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
-  </div>
-  {actions}
-</form>"#,
-        flashes = flash(ok, err),
-    );
-    let body = mycelium_ui::render::render(mycelium_ui::card(
-        "Change password",
-        TrustedHtml::from_markup(card_body),
-    ));
-    layout("Password", None, csrf, "/password", body)
-}
-
 /// API keys page (Task 8 rebuild — mockup 09): the page header's actions
 /// slot carries the mint form (label input + primary Mint key button,
 /// with its own server-rendered hidden CSRF token — the row-form
@@ -1164,6 +1121,288 @@ pub fn keys_page(
         body,
         &["/assets/confirm.js", "/assets/islands.js"],
         &["/assets/mycelium_ui.js"],
+        "",
+    )
+}
+
+// ---------- Account security (PR 4, Task 3) ----------
+
+/// The TOTP half of the Two-factor card — one variant per /account
+/// handler response. The resting state is the user's stored secret
+/// (`UserRecord.totp_secret` — `get_by_id` already carries the column,
+/// so no new query shape exists); the enrollment states render the
+/// enroll/verify flow (see `account_totp_enroll` in api.rs for the
+/// pinned live-at-enroll semantics).
+pub enum TotpSection {
+    /// GET /account, a successful verify, a disable: the state chip
+    /// plus the Enroll (not enrolled) / Disable (enrolled) action.
+    Row { enrolled: bool },
+    /// POST /account/totp/enroll: the secret + the otpauth URL + the
+    /// verify form (the factor is already live — the card says so;
+    /// verification is confirmation, not the state flip).
+    Enrolling { secret: String, url: String },
+    /// POST /account/totp/verify with a wrong or stale code: the
+    /// spec §7 try-again banner + the verify form again. The secret
+    /// is deliberately not re-rendered — the enroll response already
+    /// showed it (and the authenticator app holds it);
+    /// mycelium-auth exposes no decrypt-for-display path and adding
+    /// one is an auth-surface change (spec §1 non-goal).
+    VerifyFailed,
+}
+
+/// The verify form shared by the enrollment card and the failed-code
+/// re-render — a single page-load POST (spec §7: SSR, no script; the
+/// hidden csrf_token follows the row-form pattern).
+fn totp_verify_form(csrf_esc: &str) -> String {
+    let actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[("Verify", "primary")]));
+    format!(
+        r#"<form method="post" action="/account/totp/verify">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="totp-code">Verification code</label>
+    <input id="totp-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+  </div>
+  {actions}
+</form>"#
+    )
+}
+
+/// The Recovery key card's state — one variant per /account response
+/// (Task 4). The resting card carries the regenerate form (current
+/// password; the hidden csrf_token follows the row-form pattern); a
+/// failed password check re-renders the same form plus a banner; a
+/// successful rotation renders the shown-once key card (the keys
+/// page's treatment: the key in `<code id="new-recovery-key">` beside
+/// the copy-button island — the key rides the response body, never a
+/// URL).
+pub enum RecoverySection {
+    /// The resting card: explanatory text + the Regenerate form.
+    Resting,
+    /// The wrong-password check failed: nothing was rotated or
+    /// persisted; the danger banner rides the page's banner slot.
+    WrongPassword,
+    /// The rotation succeeded and persisted: the shown-once card.
+    Rotated { key: String },
+}
+
+/// Account security (mockup 10): three cards — Password (the PR-2
+/// lone card's body moved here verbatim: three fields posting the
+/// EXISTING /password handler — its POST unchanged by Task 5's merge,
+/// which retargeted that handler's error renders to this page),
+/// Two-factor (the TOTP section per `totp` + the WebAuthn rows:
+/// credential count + the per-credential Remove list — nickname-less
+/// base64url ids with a Remove form each — and the Register button,
+/// disabled in SSR until webauthn.js enables it), and Recovery key
+/// (the regenerate flow: password-gated rotation, the new key shown
+/// exactly once, sessions untouched).
+///
+/// QR deviation (documented): the enrollment card renders the
+/// otpauth URL as selectable text beside the secret. The repo has no
+/// QR generator, no QR dependency exists in the workspace, and taking
+/// one unilaterally is not this task's decision — the data:-URI QR
+/// lands when a QR dependency decision lands (CSP `img-src` already
+/// allows `data:`).
+///
+/// Escaping: card bodies are raw `TrustedHtml` slots composed from
+/// escaped fragments — the secret is base32 (no escapable characters)
+/// but escapes anyway, the otpauth URL carries the username and
+/// escapes, CSRF tokens escape, the recovery key is hex+prefix but
+/// escapes anyway, credential ids are base64url but escape anyway,
+/// and every banner message is a handler-side constant riding the
+/// banner primitive's TEXT position.
+#[allow(clippy::too_many_arguments)]
+pub fn account_page(
+    user: &SessionUser,
+    csrf: &str,
+    totp: TotpSection,
+    recovery: RecoverySection,
+    webauthn_count: i64,
+    webauthn_credentials: &[mycelium_auth::webauthn::CredentialRow],
+    banner: Option<(&str, &str)>,
+) -> Html<String> {
+    let csrf_esc = html_escape(csrf);
+    let banner_html = banner
+        .map(|(kind, msg)| mycelium_ui::render::render(mycelium_ui::banner(kind, msg)))
+        .unwrap_or_default();
+
+    // Password card: the PR-2 password page's card body, moved as-is
+    // (flash slot dropped — /password's error renders and the
+    // ?forced=1 marker ride this page's banner slot since Task 5's
+    // merge).
+    let pw_actions =
+        mycelium_ui::render::render(mycelium_ui::form_actions(&[("Change", "primary")]));
+    let password_body = format!(
+        r#"<form method="post" action="/password">
+  <input type="hidden" name="csrf_token" value="{csrf_esc}">
+  <div class="field">
+    <label for="pw-old">Current password</label>
+    <input id="pw-old" type="password" name="old" required>
+  </div>
+  <div class="field">
+    <label for="pw-new">New password (min 20 chars)</label>
+    <input id="pw-new" type="password" name="new" required minlength="20">
+  </div>
+  <div class="field">
+    <label for="pw-repeat">Repeat new password</label>
+    <input id="pw-repeat" type="password" name="repeat" required minlength="20">
+  </div>
+  {pw_actions}
+</form>"#
+    );
+
+    // TOTP row / enrollment flow.
+    let totp_html = match &totp {
+        TotpSection::Row { enrolled } => {
+            let chip = mycelium_ui::render::render(mycelium_ui::chip(
+                if *enrolled {
+                    "enrolled"
+                } else {
+                    "not enrolled"
+                },
+                if *enrolled { "accent" } else { "neutral" },
+            ));
+            let action = if *enrolled {
+                format!(
+                    r#"<form method="post" action="/account/totp/disable"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" class="btn">Disable</button></form>"#
+                )
+            } else {
+                format!(
+                    r#"<form method="post" action="/account/totp/enroll"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" class="btn btn--primary">Enroll</button></form>"#
+                )
+            };
+            format!(
+                r#"<div class="qa-row"><div class="qa-row__label"><span>Authenticator app (TOTP)</span></div><div class="qa-row__side">{chip}{action}</div></div>"#
+            )
+        }
+        TotpSection::Enrolling { secret, url } => {
+            let form = totp_verify_form(&csrf_esc);
+            format!(
+                r#"<p>Enter this secret into your authenticator app, then confirm with its current 6-digit code. Your second factor is already active — verification confirms your app is in sync, and you will need a code from your authenticator app at every sign-in from now on — don't lose the secret.</p>
+  <p>Secret: <code id="totp-secret">{secret}</code></p>
+  <p>Enrollment URL: <code>{url}</code></p>
+  {form}"#,
+                secret = html_escape(secret),
+                url = html_escape(url),
+            )
+        }
+        TotpSection::VerifyFailed => {
+            let warn = mycelium_ui::render::render(mycelium_ui::banner(
+                "warning",
+                "code expired/invalid, try again",
+            ));
+            format!("{warn}{}", totp_verify_form(&csrf_esc))
+        }
+    };
+
+    // WebAuthn rows: the count and the per-credential list are real
+    // (the hoisted manager's queries); the Register button renders
+    // DISABLED in SSR and webauthn.js enables it when the browser has
+    // WebAuthn support — without script the rows stay state-only with
+    // a disabled action (the honest degradation spec §7 pins). Each
+    // enrolled credential gets its own Remove form (nickname-less:
+    // the base64url credential id is the only identifier the store
+    // ever kept).
+    let wa_enrolled = webauthn_count > 0;
+    let wa_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if wa_enrolled {
+            "enrolled"
+        } else {
+            "not enrolled"
+        },
+        if wa_enrolled { "accent" } else { "neutral" },
+    ));
+    let wa_count = format!(
+        "{webauthn_count} credential{}",
+        if webauthn_count == 1 { "" } else { "s" }
+    );
+    let webauthn_row = format!(
+        r#"<div class="qa-row"><div class="qa-row__label"><span>Passkey (WebAuthn)</span></div><div class="qa-row__side">{wa_chip}<span>{wa_count}</span><button class="btn" disabled data-webauthn-register>Register</button></div></div>"#
+    );
+    let webauthn_creds = webauthn_credentials
+        .iter()
+        .map(|c| {
+            format!(
+                r#"<div class="qa-row"><div class="qa-row__label"><span class="muted">Added {}</span></div><div class="qa-row__side"><code>{}</code><form method="post" action="/account/webauthn/remove"><input type="hidden" name="csrf_token" value="{csrf_esc}"><input type="hidden" name="credential_id" value="{}"><button type="submit" class="btn btn--danger">Remove</button></form></div></div>"#,
+                c.created_at.format("%Y-%m-%d"),
+                html_escape(&c.id),
+                html_escape(&c.id),
+            )
+        })
+        .collect::<String>();
+
+    let twofa_body = format!("{totp_html}{webauthn_row}{webauthn_creds}");
+
+    // Recovery key card (mockup 10's letter + the regenerate flow).
+    let recovery_body = match &recovery {
+        RecoverySection::Resting | RecoverySection::WrongPassword => {
+            // WrongPassword's banner rides the page banner slot; the
+            // card itself is identical to the resting state.
+            let regen_actions = mycelium_ui::render::render(mycelium_ui::form_actions(&[(
+                "Regenerate",
+                "primary",
+            )]));
+            format!(
+                r#"<p>Your recovery key is the last-resort way back into your account if you lose your password and your second factor.</p>
+  <p>The key was shown once when your account was created. Regenerating it requires your current password, and the new key is shown only once. Rotation does not sign you out.</p>
+  <form method="post" action="/account/recovery/regenerate">
+    <input type="hidden" name="csrf_token" value="{csrf_esc}">
+    <div class="field">
+      <label for="regen-password">Current password</label>
+      <input id="regen-password" type="password" name="current_password" required>
+    </div>
+    {regen_actions}
+  </form>"#
+            )
+        }
+        RecoverySection::Rotated { key } => {
+            // The shown-once card: the keys page's treatment — the key
+            // in a selectable <code> beside the copy-button island
+            // (islands.js + the hydrate bundle load for this render).
+            let copy = mycelium_ui::render::render(mycelium_ui::copy_button("new-recovery-key"));
+            format!(
+                r#"<p>Copy this recovery key now — it is shown only once and cannot be retrieved later. The previous key stopped working the moment this one was created.</p><p class="shown-once"><code id="new-recovery-key">{}</code>{copy}</p>"#,
+                html_escape(key)
+            )
+        }
+    };
+
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Account security",
+        TrustedHtml::from_markup(""),
+    ));
+    let pw_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Change password",
+        TrustedHtml::from_markup(password_body),
+    ));
+    let twofa_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Two-factor",
+        TrustedHtml::from_markup(twofa_body),
+    ));
+    let recovery_card = mycelium_ui::render::render(mycelium_ui::card(
+        "Recovery key",
+        TrustedHtml::from_markup(recovery_body),
+    ));
+    let body = format!("{header}{banner_html}{pw_card}{twofa_card}{recovery_card}");
+    // webauthn.js loads on every /account render (the Register button
+    // wiring); the copy-button island's hydrate bundle loads only for
+    // the shown-once render — the resting page stays light, and the
+    // value stays selectable text without the bundle either way.
+    let (extra, modules) = if matches!(recovery, RecoverySection::Rotated { .. }) {
+        (
+            &["/assets/webauthn.js", "/assets/islands.js"][..],
+            &["/assets/mycelium_ui.js"][..],
+        )
+    } else {
+        (&["/assets/webauthn.js"][..], &[][..])
+    };
+    layout_full(
+        "Account security",
+        Some(user),
+        csrf,
+        "/account",
+        body,
+        extra,
+        modules,
         "",
     )
 }
@@ -1539,14 +1778,15 @@ pub fn admin_library_page(
 }
 
 /// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value), the backup download (the existing
-/// POST /admin/backup button + the no-store rationale), and the
-/// ingest-jobs table (the plan's binding ruling: jobs live here).
+/// StatTiles (a tile per value) and the backup download (the existing
+/// POST /admin/backup button + the no-store rationale). The
+/// ingest-jobs table moved to /status (spec §8's PR-4 ruling —
+/// /status is the jobs-table home; the PR-3 placement here was a
+/// stopgap pending that page).
 pub fn admin_system_page(
     user: &SessionUser,
     csrf: &str,
-    stats: &crate::api::SystemStats,
-    jobs: &[(String, String, String, String, String)],
+    stats: &crate::api::SystemPageStats,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
@@ -1578,6 +1818,95 @@ pub fn admin_system_page(
     let stats_html = format!(r#"<div class="stat-row">{stat_row}</div>"#);
     let backup_body = r#"<form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>
 <p class="muted">The download is served with Cache-Control: no-store — the archive contains the service key and sealed master keys, so it must never sit in a shared or CDN cache.</p>"#;
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "System",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{stats_html}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Maintenance",
+            TrustedHtml::from_markup(backup_body),
+        )),
+        tabs = admin_tabs("/admin/system"),
+        flash = admin_flash(ok, err),
+    );
+    layout("System", Some(user), csrf, "/admin/system", body)
+}
+
+/// Librarian status (mockup 04; admin-only per spec §6 — the page
+/// shows cross-user jobs): the mutation queue's /health surfaces as
+/// StatTiles, state chips (the /health degraded rule mirrored over the
+/// same values, plus the LLM chip on the same staleness window), the
+/// ingest-jobs table (moved here from the PR-3 System page — spec §8
+/// names /status the jobs-table home), and the issue-#1 receipt
+/// placeholder card (mockup-vs-handler item 5 — no fabricated
+/// receipts).
+///
+/// Escaping: tile labels/values ride leptos TEXT positions inside the
+/// stat_tile primitive; the chips' texts are constants; every jobs
+/// cell is an escaped fragment in a TrustedHtml slot (the System
+/// page's exact job-row composition); the receipt banner's message is
+/// the pinned constant text.
+pub fn librarian_status_page(
+    user: &SessionUser,
+    csrf: &str,
+    stats: &crate::health::SystemStats,
+    jobs: &[(String, String, String, String, String)],
+) -> Html<String> {
+    // A StatTile per queue field; absent optionals read "—".
+    let absent = "—";
+    let tiles = [
+        ("Queue depth", stats.queue_depth.to_string()),
+        (
+            "Oldest pending",
+            stats
+                .oldest_pending_age_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+        ("Dead", stats.queue_dead_count.to_string()),
+        (
+            "LLM last success",
+            stats
+                .llm_last_success_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+    ];
+    let stat_row = tiles
+        .iter()
+        .map(|(label, value)| mycelium_ui::render::render(mycelium_ui::stat_tile(label, value)))
+        .collect::<String>();
+    let stats_html = format!(r#"<div class="stat-row">{stat_row}</div>"#);
+    // State chips — the /health degraded rule mirrored over the same
+    // values (db reachable, no dead items, no overdue pending item).
+    let degraded = !stats.db_ok
+        || stats.queue_dead_count > 0
+        || stats
+            .oldest_pending_age_seconds
+            .is_some_and(|age| age > crate::health::oldest_degraded_at_secs());
+    let state_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if degraded { "degraded" } else { "ok" },
+        if degraded { "danger" } else { "neutral" },
+    ));
+    // The LLM chip on the same window: llm_last_success_seconds is an
+    // AGE in seconds (None = never succeeded); older than the shared
+    // oldest_degraded_at_secs() window (the same threshold that flags
+    // an overdue pending queue item) reads unreachable.
+    let llm_unreachable = stats
+        .llm_last_success_seconds
+        .is_none_or(|age| age > crate::health::oldest_degraded_at_secs());
+    let llm_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if llm_unreachable {
+            "LLM unreachable"
+        } else {
+            "LLM reachable"
+        },
+        if llm_unreachable { "danger" } else { "accent" },
+    ));
+    let chips_html = format!(r#"<div class="chip-row">{state_chip}{llm_chip}</div>"#);
+    // The jobs table — the System page's exact build, moved here.
     let jobs_rows: Vec<Vec<TrustedHtml>> = jobs
         .iter()
         .map(|(slug, status, detail, created, shelf)| {
@@ -1594,24 +1923,29 @@ pub fn admin_system_page(
         &["Book", "Status", "Detail", "Created", "Shelf"],
         &jobs_rows,
     ));
+    // The receipt panel — mockup-vs-handler item 5's pinned
+    // placeholder (the only place issue #1's outcome touches; no
+    // fabricated receipts).
+    let receipts_banner = mycelium_ui::render::render(mycelium_ui::banner(
+        "info",
+        "Receipt IDs and state names are pending the queue-work item (issue #1).",
+    ));
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
-        "System",
+        "Librarian status",
         TrustedHtml::from_markup(""),
     ));
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}{}",
-        mycelium_ui::render::render(mycelium_ui::card(
-            "Maintenance",
-            TrustedHtml::from_markup(backup_body),
-        )),
+        "{header}{stats_html}{chips_html}{}{}",
         mycelium_ui::render::render(mycelium_ui::card(
             "Ingest jobs",
             TrustedHtml::from_markup(jobs_body),
         )),
-        tabs = admin_tabs("/admin/system"),
-        flash = admin_flash(ok, err),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Receipts",
+            TrustedHtml::from_markup(receipts_banner),
+        )),
     );
-    layout("System", Some(user), csrf, "/admin/system", body)
+    layout("Librarian status", Some(user), csrf, "/status", body)
 }
 
 /// Minimal percent-encoding for query-string values.

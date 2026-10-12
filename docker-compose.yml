@@ -14,8 +14,13 @@ services:
     # - ./certs/privkey.pem:/opt/mycelium2/tls/privkey.pem:ro
     environment:
       MYCELIUM2_DATA_DIR: /opt/mycelium2/data
+      # Optional: supply real TLS certs (auto self-signed when absent).
       # MYCELIUM2_TLS_CERT: /opt/mycelium2/tls/fullchain.pem
       # MYCELIUM2_TLS_KEY: /opt/mycelium2/tls/privkey.pem
+      # Optional: WebAuthn relying-party origin — passkey ceremonies are
+      # refused by the browser unless this matches the HTTPS origin you
+      # browse from (default https://localhost).
+      # MYCELIUM2_WEBAUTHN_ORIGIN: https://mycelium.example.com
       # RUST_LOG: mycelium_web=debug,info
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:80/"]

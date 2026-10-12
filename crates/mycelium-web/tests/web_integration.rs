@@ -121,10 +121,11 @@ async fn full_web_flow() {
         .send()
         .await
         .unwrap();
-    // Forced password change → redirect to /password?forced=1.
+    // Forced password change → redirect to /account?forced=1 (Task 5:
+    // the /password merge — the password card's home is /account now).
     assert_eq!(login.status(), 303);
     let location = login.headers().get("location").unwrap().to_str().unwrap();
-    assert!(location.contains("/password"), "got {location}");
+    assert_eq!(location, "/account?forced=1", "got {location}");
     let cookie = login
         .headers()
         .get("set-cookie")
@@ -138,7 +139,7 @@ async fn full_web_flow() {
     assert!(cookie.starts_with("myc2_session="));
 
     // 5. The forced-change gate: with the flag set, / redirects to
-    //    /password?forced=1 (the gate blocks everything else).
+    //    /account?forced=1 (the gate blocks everything else).
     let gated = client
         .get(format!("{base}/"))
         .header("cookie", &cookie)
@@ -153,28 +154,102 @@ async fn full_web_flow() {
             .unwrap()
             .to_str()
             .unwrap()
-            .contains("/password?forced=1")
+            .contains("/account?forced=1")
     );
 
     // 5b. Change the password (forced flow) — invalidates the session.
-    //    CSRF comes from the /password page (the only reachable page).
-    //    Task 9 pin: the page renders as a lone card (card__header).
+    //    The /password GET is a 307 to /account now (Task 5's merge —
+    //    the password card lives there); CSRF comes from the /account
+    //    page (the only reachable page), and ?forced=1 renders the
+    //    must-change warning banner above the password card.
     let pw_page = client
         .get(format!("{base}/password"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(pw_page.status(), 200);
-    let pw_html = pw_page.text().await.unwrap();
-    assert!(pw_html.contains("card__header"), "{pw_html}");
-    let csrf = csrf_from_page(&client, &format!("{base}/password"), &cookie).await;
+    assert_eq!(pw_page.status(), 307, "/password GET must be a 307");
+    assert_eq!(pw_page.headers().get("location").unwrap(), "/account");
+    let account_page = client
+        .get(format!("{base}/account?forced=1"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(account_page.status(), 200);
+    let acct_html = account_page.text().await.unwrap();
+    assert!(
+        acct_html.contains("You must change your password before continuing"),
+        "forced banner on /account?forced=1: {acct_html}"
+    );
+    assert!(
+        acct_html.contains("card__header"),
+        "account page renders cards: {acct_html}"
+    );
+    let csrf = csrf_from_page(&client, &format!("{base}/account"), &cookie).await;
     let new_password = "new admin password 20 chars!";
-    let change = client
+
+    // 5b-i. Wrong old password → the /account composition with the
+    // failure in the banner slot (200, not a redirect), and — Task 7 —
+    // the re-render must carry a LIVE csrf token in both the password
+    // form's hidden field and the head's csrf meta. An empty token
+    // would strand the user: the retry they just clicked would 403.
+    let wrong = client
         .post(format!("{base}/password"))
         .header("cookie", &cookie)
         .header("x-csrf-token", &csrf)
         .form(&[
+            ("old", "definitely not the old password"),
+            ("new", new_password),
+            ("repeat", new_password),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200, "wrong password re-renders /account");
+    let wrong_html = wrong.text().await.unwrap();
+    assert!(
+        wrong_html.contains("invalid credentials"),
+        "the failure rides the banner slot: {wrong_html}"
+    );
+    assert!(
+        !wrong_html.contains("You must change your password before continuing"),
+        "the forced banner is replaced by the failure banner (single slot): {wrong_html}"
+    );
+    let retry_csrf = {
+        let marker = r#"name="csrf-token" content=""#;
+        let idx = wrong_html
+            .find(marker)
+            .expect("csrf meta on the error re-render");
+        let rest = &wrong_html[idx + marker.len()..];
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+    assert!(
+        !retry_csrf.is_empty(),
+        "the error re-render carries a live csrf token (Task 7): {wrong_html}"
+    );
+    let hidden = {
+        let marker = r#"action="/password">
+  <input type="hidden" name="csrf_token" value=""#;
+        let idx = wrong_html
+            .find(marker)
+            .expect("password form hidden csrf on the error re-render");
+        let rest = &wrong_html[idx + marker.len()..];
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+    assert_eq!(
+        hidden, retry_csrf,
+        "the form's hidden field and the head meta carry the same live token"
+    );
+
+    // 5b-ii. The retry the user actually makes: the token from the
+    // error page's own form field (no re-GET), plus the RIGHT old
+    // password → the change succeeds (303 → /login).
+    let change = client
+        .post(format!("{base}/password"))
+        .header("cookie", &cookie)
+        .form(&[
+            ("csrf_token", retry_csrf.as_str()),
             ("old", password),
             ("new", new_password),
             ("repeat", new_password),
@@ -182,7 +257,11 @@ async fn full_web_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(change.status(), 303);
+    assert_eq!(
+        change.status(),
+        303,
+        "retry with the error page's token succeeds: {change:?}"
+    );
     assert!(
         change
             .headers()
@@ -192,6 +271,10 @@ async fn full_web_flow() {
             .unwrap()
             .contains("/login")
     );
+
+    // (The pre-Task-7 success leg — fresh csrf via the x-csrf-token
+    // header — is folded into 5b-ii above: the retry IS the successful
+    // change, so the sequence pins both the fix and the change itself.)
 
     // 6. Log in with the new password.
     let login2 = client
@@ -748,6 +831,19 @@ async fn browse_type_filter() {
     assert!(
         html3.contains(r#"<span class="flag flag--warning">broken links</span>"#),
         "broken-links flag span: {html3}"
+    );
+    // Task 8 (mockup 01): the header actions area carries the small
+    // search field — a plain GET form aimed at /search with the `q`
+    // input, beside the type chips. Scoped to the actions slot so the
+    // assertion is about the header, not any other form on the page.
+    let actions_area = html3
+        .split(r#"<div class="actions">"#)
+        .nth(1)
+        .and_then(|s| s.split("</header>").next())
+        .unwrap_or("");
+    assert!(
+        actions_area.contains(r#"action="/search""#) && actions_area.contains(r#"name="q""#),
+        "browse header actions must carry the small search form: {actions_area}"
     );
 
     shutdown.cancel();
@@ -2732,6 +2828,1046 @@ async fn admin_library_escapes_and_pairs_shelf_names() {
     );
 
     shutdown.cancel();
+}
+
+/// Task 6 (PR 4, carried Phase-9 follow-up): `POST /admin/bookshelves`
+/// no longer swallows the store result. A duplicate shelf name is
+/// rejected by `bookshelves.name TEXT NOT NULL UNIQUE`; the old
+/// `let _ =` discarded that error and answered with the SUCCESS banner
+/// while creating nothing — a false success.
+///
+/// Legs:
+/// 1. the first create succeeds and redirects with `?ok=`;
+/// 2. the duplicate redirects to the library page with the GENERIC
+///    error literal (`?error=bookshelf%20creation%20failed`) — and the
+///    store's Display text must NOT ride the URL (the Phase-9
+///    convention: no internal detail in a URL that lands in history and
+///    referrers);
+/// 3. GET /admin/library renders the danger banner with the generic
+///    message and NOT the success banner;
+/// 4. the table holds exactly ONE row with that name (the duplicate
+///    never landed), pinned both in the rendered page and in the DB.
+#[tokio::test]
+async fn duplicate_bookshelf_name_reports_error_not_false_success() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/admin/library"), &cookie).await;
+
+    let post_create = || {
+        let client = &client;
+        let base = &base;
+        let cookie = &cookie;
+        let csrf = &csrf;
+        async move {
+            client
+                .post(format!("{base}/admin/bookshelves"))
+                .header("cookie", cookie)
+                .header("x-csrf-token", csrf)
+                .form(&[("name", "Duplicate Shelf"), ("global", "0")])
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. First create: success, `?ok=` flash.
+    let first = post_create().await;
+    assert_eq!(first.status(), 303);
+    assert_eq!(
+        first.headers().get("location").unwrap(),
+        "/admin/library?ok=Bookshelf%20created",
+        "the success arm is unchanged"
+    );
+
+    // 2. The SAME name again: the UNIQUE constraint rejects the insert.
+    //    The redirect must carry the generic literal, never the store's
+    //    error Display.
+    let second = post_create().await;
+    assert_eq!(second.status(), 303);
+    let location = second
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        location, "/admin/library?error=bookshelf%20creation%20failed",
+        "duplicate create must bounce the generic error literal"
+    );
+    let lower = location.to_lowercase();
+    for leak in ["sqlite", "constraint", "unique", "0001_init", "database"] {
+        assert!(
+            !lower.contains(leak),
+            "internal error detail must not ride the URL: {location}"
+        );
+    }
+
+    // 3. Following the redirect, the library page renders the danger
+    //    banner with the generic message and no success banner (the
+    //    flash lives in the query string, so the redirect TARGET is
+    //    what carries it).
+    let page = client
+        .get(format!("{base}{location}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains("banner--danger"),
+        "the error flash renders the danger banner: {html}"
+    );
+    assert!(
+        html.contains("<p>bookshelf creation failed</p>"),
+        "the generic message renders in the banner: {html}"
+    );
+    assert!(
+        !html.contains("banner--success"),
+        "the false-success banner must be gone: {html}"
+    );
+    assert!(
+        !html.contains("Bookshelf created"),
+        "no ok flash after a failed create: {html}"
+    );
+
+    // 4. Exactly one row with that name — in the rendered table and in
+    //    the store.
+    assert_eq!(
+        html.matches(r#"<td data-label="Name">Duplicate Shelf</td>"#)
+            .count(),
+        1,
+        "the duplicate must not create a second row: {html}"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM bookshelves WHERE name = 'Duplicate Shelf'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "the store holds exactly one such shelf");
+
+    shutdown.cancel();
+}
+
+/// Task 2 (PR 4): the Librarian status page — GET /status renders for
+/// the admin with the four queue StatTiles, the state chips, the
+/// ingest-jobs table (moved here from the PR-3 System stopgap, spec
+/// §8's PR-4 ruling), and the issue-#1 receipt placeholder; the
+/// sidebar's Librarian group carries the Status item (admin-only,
+/// spec §6).
+#[tokio::test]
+async fn librarian_status_page() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Seed one completed ingest job so the jobs table renders its
+    // headers (data_table renders the empty state — no headers — on
+    // zero rows) and a row whose cells the assertions can pin. Direct
+    // SQL on the test pool, satisfying the FKs (shelf → book → job →
+    // the seeded admin user).
+    let now = chrono::Utc::now().to_rfc3339();
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let shelf_id = uuid::Uuid::new_v4().to_string();
+    let book_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO bookshelves (id, name, created_at) VALUES (?, 'Status Shelf', ?)")
+        .bind(&shelf_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO books (id, bookshelf_id, slug, title, created_at)
+         VALUES (?, ?, 'status-book', 'Status Book', ?)",
+    )
+    .bind(&book_id)
+    .bind(&shelf_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingest_jobs (id, bookshelf_id, book_id, requested_by_user_id, status, detail, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'done', '', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&shelf_id)
+    .bind(&book_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Admin GET → 200 with every surface (spec §8's /status slice).
+    let status = client
+        .get(format!("{base}/status"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), 200, "/status must render for the admin");
+    let html = status.text().await.unwrap();
+    // The four queue StatTiles (the brief's exact labels) inside the
+    // PR-3 .stat-row (reused, not duplicated).
+    for label in ["Queue depth", "Oldest pending", "Dead", "LLM last success"] {
+        assert!(
+            html.contains(&format!(r#"<span class="stat__label">{label}</span>"#)),
+            "{label} tile missing: {html}"
+        );
+    }
+    assert!(
+        html.contains(r#"<div class="stat-row">"#),
+        "StatTile row missing: {html}"
+    );
+    // State chips: fresh boot → db ok, empty queue → the "ok" chip
+    // (the /health status rule mirrored); no LLM success ever recorded
+    // in this test process → the "LLM unreachable" chip.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">ok</span>"#),
+        "ok state chip missing: {html}"
+    );
+    assert!(
+        html.contains("LLM unreachable"),
+        "LLM unreachable chip missing: {html}"
+    );
+    // The jobs table moved here from /admin/system: headers + the
+    // seeded row's Book cell.
+    assert!(
+        html.contains("<th>Book</th>") && html.contains("<th>Status</th>"),
+        "jobs table headers missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Book">status-book</td>"#),
+        "seeded job row missing: {html}"
+    );
+    // The issue-#1 receipt placeholder — mockup-vs-handler item 5's
+    // exact text, the only place #1's outcome touches.
+    assert!(
+        html.contains("Receipt IDs and state names are pending the queue-work item (issue #1)."),
+        "receipt placeholder text missing: {html}"
+    );
+
+    // 2. The sidebar's Librarian group carries Status for the admin,
+    //    active on this page (spec §6: the item is admin-only).
+    assert!(
+        html.contains(
+            r#"<a href="/status" aria-current="page" class="nav-item nav-item--active">"#
+        ),
+        "Status nav item must be present and active for the admin: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Task 2 (PR 4), Review Focus 3: a non-admin's GET /status is rejected
+/// with the admin gate's exact 403 (RequireAdmin — the same status the
+/// /admin pages' loop pins), and the sidebar's Librarian group shows no
+/// Status item for a normal user (spec §6: Status is admin-only; the
+/// 403 body has no sidebar, so the nav check runs on a real page).
+#[tokio::test]
+async fn status_non_admin_403() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+    // Create a normal user through the real admin form.
+    let create_user = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mallory"),
+            ("email", "mallory@example.com"),
+            ("password", "mallory password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), 200, "user creation must succeed");
+    let login_mallory = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "mallory"),
+            ("password", "mallory password 20 chars"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_mallory.status(), 303);
+    let mallory_cookie = login_mallory
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The gate: the same 403 the admin pages' loop pins.
+    let status = client
+        .get(format!("{base}/status"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status.status(),
+        403,
+        "non-admin GET /status must hit the RequireAdmin 403"
+    );
+
+    // The nav gate: a normal user's shelled page carries no /status
+    // nav item.
+    let browse = client
+        .get(format!("{base}/"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(browse.status(), 200);
+    let html = browse.text().await.unwrap();
+    assert!(
+        !html.contains(r#"href="/status""#),
+        "Status nav item must not render for a normal user: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Task 3 (PR 4): the Account security page + the TOTP enroll →
+/// verify → disable round-trip.
+///
+/// TOTP semantics pinned from mycelium-auth (totp.rs): `set_secret`
+/// carries NO pending/confirmed state — its `Option<&ServiceKey>`
+/// parameter only selects the at-rest encoding (`Some` = sealed
+/// `enc1:` envelope, `None` = legacy plaintext) — so enroll makes the
+/// second factor LIVE the moment it persists (login requires a code
+/// from then on; login.rs's `totp_enrolled_requires_code` pins it)
+/// and the verify POST is a UX confirmation, not a state gate. The
+/// wrong-code leg (stale_totp_code_keeps_enrollment_pending) pins
+/// that reality exactly: the DB row stays SET, password-only login
+/// is rejected, and the page re-renders the verify form with the
+/// try-again banner — never the resting "enrolled" row.
+///
+/// QR deviation: no QR generator exists in the repo and adding a
+/// dependency is not this task's decision — the enrollment card
+/// renders the otpauth:// URL as selectable text beside the secret;
+/// a QR image lands when a QR dependency does.
+#[tokio::test]
+async fn account_totp_flow() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    // Fresh boot: no forced password change; plain admin login.
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Leg 1: GET /account → 200 with the three cards; the TOTP row
+    // and the WebAuthn row both read not-enrolled; the WebAuthn row
+    // shows the credential count + the disabled Register placeholder
+    // (Task 4 wires the real action); the password card posts the
+    // EXISTING /password handler; and the nav's Account group carries
+    // Account security (leg 6 — the group is not admin-gated).
+    let page = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200, "GET /account for a session");
+    let html = page.text().await.unwrap();
+    // Task-5 review pin: the forced-change banner is ?forced=1-driven,
+    // never session-state-driven — a plain GET on a normal account must
+    // NOT show it.
+    assert!(
+        !html.contains("must change your password before continuing"),
+        "no forced banner on a plain GET /account: {html}"
+    );
+    assert!(html.contains("Change password"), "password card: {html}");
+    assert!(html.contains("Two-factor"), "2FA card: {html}");
+    assert!(html.contains("Recovery key"), "recovery card: {html}");
+    assert!(
+        html.contains(r#"<form method="post" action="/password">"#),
+        "password card posts the existing /password handler: {html}"
+    );
+    assert_eq!(
+        html.matches("not enrolled").count(),
+        2,
+        "TOTP + WebAuthn rows both show not-enrolled chips: {html}"
+    );
+    assert!(
+        html.contains(r#"<form method="post" action="/account/totp/enroll">"#),
+        "TOTP Enroll action: {html}"
+    );
+    assert!(
+        html.contains("0 credentials"),
+        "WebAuthn row shows the credential count: {html}"
+    );
+    assert!(
+        html.contains(r#"<button class="btn" disabled data-webauthn-register>Register</button>"#),
+        "WebAuthn row's disabled Register button (webauthn.js enables it when script runs): {html}"
+    );
+    assert!(
+        html.contains(r#"href="/account""#),
+        "nav Account group carries Account security (not admin-gated): {html}"
+    );
+
+    let csrf = csrf_from_page(&client, &format!("{base}/account"), &cookie).await;
+
+    // Leg 2: POST /account/totp/enroll → the enrollment card: the
+    // secret text, the otpauth URL (rendered as text — the QR
+    // deviation), and the verify form.
+    let enroll = client
+        .post(format!("{base}/account/totp/enroll"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enroll.status(), 200);
+    let eh = enroll.text().await.unwrap();
+    assert!(eh.contains("otpauth://"), "otpauth URL renders: {eh}");
+    assert!(
+        eh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form on the enrollment card: {eh}"
+    );
+    let marker = r#"id="totp-secret">"#;
+    let idx = eh.find(marker).expect("secret renders for manual entry");
+    let rest = &eh[idx + marker.len()..];
+    let secret = rest[..rest.find('<').unwrap()].to_string();
+    assert!(!secret.is_empty(), "non-empty secret: {eh}");
+
+    // Leg 3 — stale_totp_code_keeps_enrollment_pending: a wrong code
+    // does NOT complete the flow. Reality: enrollment went live at
+    // enroll time — the row stays SET, password-only login is now
+    // rejected, and the response re-renders the verify form with the
+    // spec §7 try-again banner. It must NOT render the resting
+    // enrolled row (the Disable action) as if verified.
+    let wrong = client
+        .post(format!("{base}/account/totp/verify"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str()), ("code", "000000")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200);
+    let wh = wrong.text().await.unwrap();
+    assert!(
+        wh.contains("code expired/invalid"),
+        "the spec §7 try-again banner: {wh}"
+    );
+    assert!(
+        wh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form re-renders: {wh}"
+    );
+    assert!(
+        !wh.contains(r#"action="/account/totp/disable""#),
+        "the resting enrolled row must not render before a successful verify: {wh}"
+    );
+    let (row,): (Option<String>,) =
+        sqlx::query_as("SELECT totp_secret FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        row.is_some(),
+        "set_secret made the enrollment live (no pending state exists)"
+    );
+    // The behavior-level reality pin: password-only login is rejected.
+    let totp_login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        totp_login.status(),
+        200,
+        "not a 303: password-only login is rejected while enrolled"
+    );
+    assert!(
+        totp_login
+            .text()
+            .await
+            .unwrap()
+            .contains("Invalid credentials")
+    );
+
+    // Leg 4: the RIGHT code (minted with mycelium-auth's exact
+    // verification parameters) completes the flow → the resting
+    // enrolled row (Disable action) + the success banner.
+    let code = totp_code(&secret);
+    let verify = client
+        .post(format!("{base}/account/totp/verify"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str()), ("code", code.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), 200);
+    let vh = verify.text().await.unwrap();
+    assert!(
+        vh.contains("Authenticator app verified"),
+        "success banner: {vh}"
+    );
+    assert!(
+        vh.contains(r#"<form method="post" action="/account/totp/disable">"#),
+        "Disable action on the enrolled row: {vh}"
+    );
+    assert!(
+        !vh.contains(r#"<form method="post" action="/account/totp/verify">"#),
+        "verify form gone after success: {vh}"
+    );
+
+    // Leg 5: POST disable → the not-enrolled row again; the row is
+    // gone at the store level too.
+    let disable = client
+        .post(format!("{base}/account/totp/disable"))
+        .header("cookie", &cookie)
+        .form(&[("csrf_token", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), 200);
+    let dh = disable.text().await.unwrap();
+    assert!(dh.contains("not enrolled"), "not-enrolled chip back: {dh}");
+    assert!(
+        dh.contains(r#"<form method="post" action="/account/totp/enroll">"#),
+        "Enroll action back: {dh}"
+    );
+    let (row,): (Option<String>,) =
+        sqlx::query_as("SELECT totp_secret FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(row.is_none(), "clear_secret removed the enrollment");
+
+    shutdown.cancel();
+}
+
+/// Task 4 (PR 4): the recovery-key regenerate flow + the WebAuthn
+/// register/remove wiring on /account.
+///
+/// Recovery-flow reality, pinned by reading login.rs in full before
+/// writing this: NO recovery-login path exists — `unseal_with_recovery`
+/// has zero production callers and login takes username + password (+
+/// TOTP) only, so a recovery key can never log a user in. The
+/// old-dead/new-live legs therefore pin the SEAL level: the record
+/// persisted by rotation unseals with the new key and refuses the old
+/// one — the exact property any future recovery-login path would rely
+/// on. On top of the brief's floor (row-change +
+/// session-preservation) this is the strongest pin expressible today.
+///
+/// Review Focus 1 (wrong password): the failed check must leave the
+/// stored sealed row byte-identical — no rotation, no persist. Review
+/// Focus 5: rotation touches seals only, never the sessions table, so
+/// a second session keeps working.
+///
+/// WebAuthn: webauthn-rs-core 0.5 ships no soft-token test helper
+/// (fake.rs only generates credential-ID distributions), so no real
+/// browser ceremony can run in-process; the legs pin the server
+/// surfaces — the register POST failing closed without a challenge,
+/// the challenge GET's creation-options JSON (session-gated; anonymous
+/// requests hit the uniform login-gate 303 like every other protected
+/// page, not a 401), and the per-credential Remove rows + removal via
+/// a seeded credential.
+///
+/// Fix round — concurrent regenerate: the race is closed by
+/// compare-and-swap (update_sealed conditions the UPDATE on the
+/// PRE-READ sealed JSON, so the loser writes zero rows and the
+/// handler renders a retry banner, never a shown-once card for an
+/// already-dead key). The racing interleaving itself is not
+/// deterministically expressible in an in-process e2e test — the CAS
+/// semantics are pinned by users.rs's stale-pre-read unit leg, and
+/// the handler's zero-rows arm rides code review; this flow pins the
+/// sequential face of the same mechanism (each POST re-reads the
+/// record, so its own CAS matches).
+#[tokio::test]
+async fn recovery_and_webauthn_flows() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    // Seed a second user with a KNOWN recovery key: boot() discards the
+    // admin's create-time key (shown once, by design), but old-dead/
+    // new-live needs key material for the previous seal.
+    const ROT_PW: &str = "rotator password known to the suite";
+    let rot_master = mycelium_crypto::generate_master_key();
+    let old_recovery = mycelium_crypto::generate_recovery_key();
+    let rot_sealed = mycelium_crypto::seal_master_key(&rot_master, ROT_PW, &old_recovery).unwrap();
+    let rot_json = serde_json::to_string(&rot_sealed).unwrap();
+    let rot_hash = mycelium_auth::hash_password(ROT_PW).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, role, auth_provider, password_hash, sealed_master_key, created_at, updated_at)
+         VALUES (?, 'rotator', 'rotator@localhost.local', 'user', 'local', ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&rot_hash)
+    .bind(&rot_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Two independent sessions (Review Focus 5's setup).
+    let login1 = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login1.status(), 303);
+    let cookie1 = login1
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let login2 = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login2.status(), 303);
+    let cookie2 = login2
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf1 = csrf_from_page(&client, &format!("{base}/account"), &cookie1).await;
+
+    // Leg 1 — wrong_password_leaves_seal_untouched (Review Focus 1):
+    // the password check runs BEFORE any rotation or persist, so a
+    // failed check leaves the stored row byte-identical.
+    let (pre_sealed,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let wrong = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie1)
+        .form(&[
+            ("csrf_token", csrf1.as_str()),
+            ("current_password", "wrong password entirely!!"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 200, "the failed check re-renders the page");
+    let wh = wrong.text().await.unwrap();
+    assert!(
+        wh.contains("Current password is incorrect"),
+        "the wrong-password banner: {wh}"
+    );
+    assert!(
+        !wh.contains(r#"id="new-recovery-key""#),
+        "no key may render on a failed password check: {wh}"
+    );
+    // The resting regenerate form renders with paired label/input (the
+    // standing label-pairing guard also sweeps /account).
+    assert!(
+        wh.contains(r#"<form method="post" action="/account/recovery/regenerate">"#),
+        "regenerate form: {wh}"
+    );
+    assert!(wh.contains(r#"for="regen-password""#), "label pairs: {wh}");
+    assert!(wh.contains(r#"id="regen-password""#), "input pairs: {wh}");
+    // The Register button stays the script-less disabled shape and the
+    // hydrate bundle does NOT load on the resting page.
+    assert!(
+        wh.contains(r#"<button class="btn" disabled data-webauthn-register>Register</button>"#),
+        "Register renders disabled for script-less browsers: {wh}"
+    );
+    assert!(!wh.contains("islands.js"), "resting page stays light: {wh}");
+    let (post_sealed,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pre_sealed, post_sealed,
+        "Review Focus 1: the sealed row must be byte-identical after the failed check"
+    );
+
+    // Leg 2 — rotation_shows_once_and_stores: the right password rotates
+    // the recovery seal, persists, and renders the shown-once card.
+    let ok = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie1)
+        .form(&[("csrf_token", csrf1.as_str()), ("current_password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let oh = ok.text().await.unwrap();
+    assert!(
+        oh.contains(r#"<code id="new-recovery-key">"#),
+        "the shown-once key renders: {oh}"
+    );
+    assert!(
+        oh.contains(r#"class="shown-once""#),
+        "the keys-page shown-once treatment: {oh}"
+    );
+    assert!(
+        oh.contains(r#"data-copy-target="new-recovery-key""#),
+        "copy-button island: {oh}"
+    );
+    assert!(
+        oh.contains("islands.js"),
+        "the rotated page loads the hydrate bundle for the copy island: {oh}"
+    );
+    // Extract the shown-once key (hex + prefix — no escapable characters).
+    let marker = r#"<code id="new-recovery-key">"#;
+    let idx = oh.find(marker).expect("key marker");
+    let rest = &oh[idx + marker.len()..];
+    let new_key = rest[..rest.find('<').unwrap()].to_string();
+    assert!(
+        new_key.starts_with("myc2-recovery-"),
+        "parsed key looks like a recovery key: {new_key}"
+    );
+    // The stored row CHANGED.
+    let (rot_stored,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'rotator'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(rot_stored, pre_sealed, "rotation must persist a new record");
+    // Seal-level old-dead / new-live (the strongest pin expressible
+    // while no recovery-login path exists): the new key unseals the
+    // SAME master; the old key is dead.
+    let rot_after: mycelium_crypto::SealedMasterKey = serde_json::from_str(&rot_stored).unwrap();
+    let by_new = mycelium_crypto::unseal_with_recovery(&rot_after, &new_key).unwrap();
+    assert_eq!(
+        by_new.as_bytes(),
+        rot_master.as_bytes(),
+        "the new key must unseal the SAME master key"
+    );
+    assert!(
+        mycelium_crypto::unseal_with_recovery(&rot_after, &old_recovery).is_err(),
+        "the OLD recovery key must be dead after rotation"
+    );
+    // The password seal carried over: password login still works.
+    let relogin = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "rotator"), ("password", ROT_PW)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relogin.status(), 303, "password login survives rotation");
+
+    // Leg 3 — rotation_preserves_other_sessions (Review Focus 5): the
+    // second session still works — rotation never touches sessions.
+    let still = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        still.status(),
+        200,
+        "rotation must not invalidate other sessions"
+    );
+
+    // Leg 4 — the pre-seeded admin rotates too (its create-time key is
+    // unknown by design, so this leg pins row-change + the new key
+    // unsealing the same master the password does).
+    let admin_login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_login.status(), 303);
+    let cookie_a = admin_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf_a = csrf_from_page(&client, &format!("{base}/account"), &cookie_a).await;
+    let (admin_pre,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let admin_ok = client
+        .post(format!("{base}/account/recovery/regenerate"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("current_password", ADMIN_PASSWORD),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_ok.status(), 200);
+    let ah = admin_ok.text().await.unwrap();
+    let idx = ah.find(marker).expect("admin key marker");
+    let rest = &ah[idx + marker.len()..];
+    let admin_key = rest[..rest.find('<').unwrap()].to_string();
+    let (admin_stored,): (String,) =
+        sqlx::query_as("SELECT sealed_master_key FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(admin_stored, admin_pre, "admin rotation persisted");
+    let admin_after: mycelium_crypto::SealedMasterKey =
+        serde_json::from_str(&admin_stored).unwrap();
+    let by_rec = mycelium_crypto::unseal_with_recovery(&admin_after, &admin_key).unwrap();
+    let by_pw = mycelium_crypto::unseal_with_password(&admin_after, ADMIN_PASSWORD).unwrap();
+    assert_eq!(
+        by_rec.as_bytes(),
+        by_pw.as_bytes(),
+        "the new key unseals the same master the password does"
+    );
+    // The WebAuthn resting row on this render (0 credentials).
+    assert!(ah.contains("0 credentials"), "count renders: {ah}");
+
+    // Leg 5a — malformed register body: the JSON extractor's rejection
+    // maps to the endpoint-wide JSON error (fix-round hardening —
+    // axum's default plain-text rejection would echo the serde error
+    // string).
+    let bad = client
+        .post(format!("{base}/account/webauthn/register"))
+        .header("cookie", &cookie_a)
+        .header("x-csrf-token", csrf_a.as_str())
+        .header("content-type", "application/json")
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bj: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(bj["error"], "invalid body", "JSON error shape: {bj}");
+
+    // Leg 5b — a well-formed body with no live challenge fails closed
+    // (this leg runs BEFORE any challenge GET so ChallengeNotFound is
+    // the true failure reason).
+    let reg = client
+        .post(format!("{base}/account/webauthn/register"))
+        .header("cookie", &cookie_a)
+        .header("x-csrf-token", csrf_a.as_str())
+        .header("content-type", "application/json")
+        .body(r#"{"id":"x","rawId":"eA","response":{"attestationObject":"eA","clientDataJSON":"eA"},"type":"public-key"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg.status(), 400, "no challenge to consume → fail closed");
+    let rj: serde_json::Value = reg.json().await.unwrap();
+    assert!(rj["error"].is_string(), "error shape: {rj}");
+
+    // Leg 6 — the challenge GET: session-gated creation-options JSON.
+    let ch = client
+        .get(format!("{base}/account/webauthn/challenge"))
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ch.status(), 200);
+    let cj: serde_json::Value = ch.json().await.unwrap();
+    let challenge = cj["publicKey"]["challenge"].as_str().unwrap_or("");
+    assert!(!challenge.is_empty(), "challenge field: {cj}");
+    assert_eq!(
+        cj["publicKey"]["rp"]["id"], "localhost",
+        "the default RP id derives from the default origin: {cj}"
+    );
+    assert_eq!(cj["publicKey"]["user"]["name"], "admin", "{cj}");
+    // Anonymous: the uniform login gate (303 → /login) — the codebase's
+    // real behavior for every protected page, not a 401.
+    let anon = client
+        .get(format!("{base}/account/webauthn/challenge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 303);
+    assert_eq!(anon.headers().get("location").unwrap(), "/login");
+
+    // Leg 7 — per-credential Remove rows + removal. Seed a credential
+    // (list_credentials reads id/created_at only — the key blob is
+    // never parsed on the render path).
+    let (admin_id,): (String,) = sqlx::query_as("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO webauthn_credentials (id, user_id, public_key, counter, transports, created_at)
+         VALUES ('seeded-cred-1', ?, ?, 0, '', ?)",
+    )
+    .bind(&admin_id)
+    .bind(b"seed" as &[u8])
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let page = client
+        .get(format!("{base}/account"))
+        .header("cookie", &cookie_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let ph = page.text().await.unwrap();
+    assert!(ph.contains("1 credential"), "count after seed: {ph}");
+    assert!(
+        ph.contains(r#"<span class="chip chip--accent">enrolled</span>"#),
+        "enrolled chip: {ph}"
+    );
+    assert!(
+        ph.contains("seeded-cred-1"),
+        "the credential id renders: {ph}"
+    );
+    assert!(
+        ph.contains(r#"<form method="post" action="/account/webauthn/remove">"#),
+        "per-credential Remove form: {ph}"
+    );
+    let remove = client
+        .post(format!("{base}/account/webauthn/remove"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("credential_id", "seeded-cred-1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), 200);
+    let rh = remove.text().await.unwrap();
+    assert!(rh.contains("0 credentials"), "count back to zero: {rh}");
+    assert!(!rh.contains("seeded-cred-1"), "the row is gone: {rh}");
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?")
+            .bind(&admin_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "remove_credential deleted the row");
+    // Removing an unknown id: the page re-renders (the user-scoped
+    // delete matched nothing — a no-op, not an error page).
+    let remove2 = client
+        .post(format!("{base}/account/webauthn/remove"))
+        .header("cookie", &cookie_a)
+        .form(&[
+            ("csrf_token", csrf_a.as_str()),
+            ("credential_id", "does-not-exist"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove2.status(), 200);
+
+    shutdown.cancel();
+}
+
+/// Mint the current TOTP code for a secret using mycelium-auth's exact
+/// verification parameters (SHA1 / 6 digits / skew 1 / 30s step —
+/// totp.rs's make_totp). Mirrors how login.rs's tests mint codes.
+fn totp_code(secret: &str) -> String {
+    use totp_rs::{Algorithm, Builder, Secret};
+    let s = Secret::try_from_base32(secret).unwrap();
+    let totp = Builder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(s)
+        .with_account_name("verify")
+        .with_issuer(Some("Mycelium2"))
+        .build()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    totp.generate(now).to_string()
 }
 
 /// Fetch a page URL and extract the CSRF token from the meta tag.

@@ -73,12 +73,49 @@ pub fn build_router_with_shutdown(
         .route("/skills", get(api::skills_view))
         .route("/books", get(api::books_view))
         .route("/chat", get(api::chat_view))
+        // Librarian status (PR 4, spec §6/§8): the admin-only
+        // operational page — session-gated here, RequireAdmin in the
+        // handler (the same gate shape as the /admin pages).
+        .route("/status", get(api::status_view))
+        // /password (Task 5's merge): the GET 307s to /account (the
+        // password card's home); the POST stays the change form's
+        // unchanged target (the account card posts here).
         .route(
             "/password",
             get(api::password_view).post(api::password_submit),
         )
         .route("/keys", get(api::keys_view).post(api::keys_mint))
         .route("/keys/revoke", post(api::keys_revoke))
+        // Account security (PR 4, mockup 10): GET /account for every
+        // logged-in user; the TOTP POSTs are thin wrappers over
+        // mycelium-auth's totp service (spec §6's exact route names);
+        // the password card posts the EXISTING /password handler (its
+        // POST unchanged — Task 5's merge made the /password GET a 307
+        // here and moved the forced-change gate to /account). Task 4
+        // adds the
+        // recovery-key regenerate POST and the WebAuthn ceremony routes
+        // (challenge GET + register/remove POSTs) — all session-gated
+        // behind the same middleware stack.
+        .route("/account", get(api::account_view))
+        .route("/account/totp/enroll", post(api::account_totp_enroll))
+        .route("/account/totp/verify", post(api::account_totp_verify))
+        .route("/account/totp/disable", post(api::account_totp_disable))
+        .route(
+            "/account/recovery/regenerate",
+            post(api::account_recovery_regenerate),
+        )
+        .route(
+            "/account/webauthn/challenge",
+            get(api::account_webauthn_challenge),
+        )
+        .route(
+            "/account/webauthn/register",
+            post(api::account_webauthn_register),
+        )
+        .route(
+            "/account/webauthn/remove",
+            post(api::account_webauthn_remove),
+        )
         // Admin: five pages under a TabBar (spec §6); /admin is a 307
         // to the users page (bookmarks keep working). The POST routes
         // keep their exact paths — each renders back to its host page.
@@ -122,7 +159,8 @@ pub fn build_router_with_shutdown(
 /// Gate that allows public paths through without a session but keeps the
 /// require-login redirect for protected pages. Also enforces the forced
 /// password change: users with must_change_password can only reach
-/// /password (and /logout) until they change it.
+/// /account (the password card's home), POST /password (the card's
+/// unchanged form target), and /logout until they change it.
 async fn require_login_gate(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
@@ -151,18 +189,22 @@ async fn require_login_gate(
     else {
         return Redirect::to("/login").into_response();
     };
-    // Forced password change gate: only /password (and logout, handled
-    // above) is reachable until the password is changed. Bearer API-key
+    // Forced password change gate (Task 5's merge): a must-change user
+    // reaches /account — the password card's home, where the ?forced=1
+    // banner renders — plus POST /password, the card's UNCHANGED form
+    // target (dropping /password from the allowed set would brick the
+    // very flow the gate exists to force: the change form could never
+    // submit). Logout stays public (handled above). Bearer API-key
     // clients are exempt — the flag is a browser-flow concern, and API
     // keys are minted deliberately by the user.
     let bearer = request
         .extensions()
         .get::<crate::middleware::BearerAuth>()
         .is_some();
-    if path != "/password" && !bearer {
+    if path != "/account" && path != "/password" && !bearer {
         let record = state.users.get_by_id(user.user_id).await;
         if matches!(record, Ok(ref r) if r.must_change_password) {
-            return Redirect::to("/password?forced=1").into_response();
+            return Redirect::to("/account?forced=1").into_response();
         }
     }
     next.run(request).await

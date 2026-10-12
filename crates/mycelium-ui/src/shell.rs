@@ -29,7 +29,7 @@ use leptos::prelude::*;
 /// `assets_versions_lockstep` unit test (only that crate sees both
 /// constants), so a one-sided bump fails CI.
 #[cfg(feature = "ssr")]
-pub const ASSETS_VERSION: &str = "20";
+pub const ASSETS_VERSION: &str = "24";
 
 /// Minimal HTML escaping for the `format!`-composed head attributes
 /// (csrf token, title) — the html-escape equivalent mycelium-ui carries
@@ -43,12 +43,15 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Sidebar groups (spec §6, this PR's slice): Knowledge, Librarian,
-/// Account, and the admin-only Admin group. `active` is derived per
-/// item by comparing its href against `active_path` (matching
-/// `nav_group`'s item shape). `None` user → no nav (login/setup render
-/// through `auth_shell` instead); a non-admin → no Admin group. Status
-/// and Account-security items do not exist yet (PR 4).
+/// Sidebar groups (spec §6): Knowledge, Librarian (Chat for everyone;
+/// Status admin-only), Account, and the admin-only Admin group.
+/// `active` is derived per item by comparing its href against
+/// `active_path` (matching `nav_group`'s item shape). `None` user → no
+/// nav (login/setup render through `auth_shell` instead); a non-admin
+/// → no Admin group and no Status item (spec §6: the operational page
+/// shows cross-user jobs). The Account group (API keys + Account
+/// security, PR 4) renders for every logged-in user — account
+/// security is per-user, never admin-gated (spec §6).
 #[cfg(feature = "ssr")]
 // The return shape is pinned by the brief verbatim — (group name,
 // [(label, href, active)]) feeding Task 5's `nav_group` slice — so the
@@ -62,6 +65,14 @@ pub fn nav_groups(
         return Vec::new();
     }
     let item = |label: &'static str, href: &'static str| (label, href, href == active_path);
+    let is_admin = matches!(user, Some((_, true)));
+    // Librarian: Chat for everyone; Status admin-only (spec §6 — the
+    // operational page shows cross-user jobs).
+    let librarian = if is_admin {
+        vec![item("Chat", "/chat"), item("Status", "/status")]
+    } else {
+        vec![item("Chat", "/chat")]
+    };
     let mut groups = vec![
         (
             "Knowledge",
@@ -73,10 +84,16 @@ pub fn nav_groups(
                 item("Books", "/books"),
             ],
         ),
-        ("Librarian", vec![item("Chat", "/chat")]),
-        ("Account", vec![item("API keys", "/keys")]),
+        ("Librarian", librarian),
+        (
+            "Account",
+            vec![
+                item("API keys", "/keys"),
+                item("Account security", "/account"),
+            ],
+        ),
     ];
-    if let Some((_, true)) = user {
+    if is_admin {
         groups.push((
             "Admin",
             vec![
@@ -378,6 +395,87 @@ mod tests {
             html.contains(r#"<a href="/admin/system" class="nav-item">"#),
             "System item must render plain (no aria-current, no active class): {html}"
         );
+    }
+
+    #[test]
+    fn librarian_group_status_is_admin_gated() {
+        // Spec §6: the Librarian group carries Chat for everyone and
+        // Status for admins only (the operational page shows
+        // cross-user jobs) — exact (label, href) lists per role, and
+        // the per-item active derivation holds for the new item.
+        let admin_groups = nav_groups(Some(("echo", true)), "/");
+        let librarian = &admin_groups
+            .iter()
+            .find(|(name, _)| *name == "Librarian")
+            .expect("librarian group for an admin")
+            .1;
+        let got: Vec<(&str, &str)> = librarian
+            .iter()
+            .map(|(label, href, _)| (*label, *href))
+            .collect();
+        assert_eq!(got, vec![("Chat", "/chat"), ("Status", "/status")]);
+        let on_status = nav_groups(Some(("echo", true)), "/status")
+            .into_iter()
+            .find(|(name, _)| *name == "Librarian")
+            .expect("librarian group")
+            .1;
+        let active: Vec<&str> = on_status
+            .iter()
+            .filter(|(_, _, active)| *active)
+            .map(|(_, href, _)| *href)
+            .collect();
+        assert_eq!(active, vec!["/status"]);
+        // Non-admin: Chat only — no Status item renders.
+        let user_groups = nav_groups(Some(("echo", false)), "/");
+        let librarian = &user_groups
+            .iter()
+            .find(|(name, _)| *name == "Librarian")
+            .expect("librarian group for a user")
+            .1;
+        let got: Vec<(&str, &str)> = librarian
+            .iter()
+            .map(|(label, href, _)| (*label, *href))
+            .collect();
+        assert_eq!(got, vec![("Chat", "/chat")]);
+    }
+
+    #[test]
+    fn account_group_carries_security_for_every_user() {
+        // Spec §6: the Account group is API keys + Account security,
+        // NOT admin-gated — every logged-in user manages their own
+        // account security. Exact (label, href) lists per role, and
+        // the per-item active derivation holds on /account (PR 4,
+        // Task 3).
+        for is_admin in [true, false] {
+            let groups = nav_groups(Some(("echo", is_admin)), "/");
+            let account = &groups
+                .iter()
+                .find(|(name, _)| *name == "Account")
+                .expect("account group")
+                .1;
+            let got: Vec<(&str, &str)> = account
+                .iter()
+                .map(|(label, href, _)| (*label, *href))
+                .collect();
+            assert_eq!(
+                got,
+                vec![("API keys", "/keys"), ("Account security", "/account")],
+                "is_admin = {is_admin}"
+            );
+        }
+        // Active is derived per item by href == active_path: on
+        // /account the security item carries the active flag.
+        let on_account = nav_groups(Some(("echo", false)), "/account")
+            .into_iter()
+            .find(|(name, _)| *name == "Account")
+            .expect("account group")
+            .1;
+        let active: Vec<&str> = on_account
+            .iter()
+            .filter(|(_, _, active)| *active)
+            .map(|(_, href, _)| *href)
+            .collect();
+        assert_eq!(active, vec!["/account"]);
     }
 
     #[test]

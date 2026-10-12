@@ -9,6 +9,7 @@
 | `MYCELIUM2_HTTP_ADDR` | `--http-addr` | `0.0.0.0:80` | HTTP → HTTPS redirect listener |
 | `MYCELIUM2_TLS_CERT` | `--tls-cert` | *(auto self-signed)* | TLS certificate PEM path |
 | `MYCELIUM2_TLS_KEY` | `--tls-key` | *(auto self-signed)* | TLS private key PEM path |
+| `MYCELIUM2_WEBAUTHN_ORIGIN` | — | `https://localhost` | WebAuthn relying-party origin — the full HTTPS origin (e.g. `https://mycelium.example.com`) passkey ceremonies bind to. Domain deployments must set it to their HTTPS origin or the browser refuses passkey ceremonies; invalid values fail boot |
 | `RUST_LOG` | — | `info` | Log filter (e.g. `mycelium_web=debug,info`) |
 
 ## Service key

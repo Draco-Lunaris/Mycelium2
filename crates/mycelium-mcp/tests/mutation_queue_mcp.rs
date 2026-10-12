@@ -121,9 +121,10 @@ async fn login_and_settle(
         .unwrap()
         .to_string();
 
-    // Forced-change gate: read the CSRF from /password, change it.
+    // Forced-change gate: read the CSRF from /account (the /password
+    // page is a 307 there since the Task-5 merge), change it.
     let page = client
-        .get(format!("{base}/password"))
+        .get(format!("{base}/account"))
         .header("cookie", &cookie)
         .send()
         .await
