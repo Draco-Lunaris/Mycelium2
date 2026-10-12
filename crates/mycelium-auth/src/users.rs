@@ -255,30 +255,40 @@ impl UserStore {
     }
 
     /// Replace a user's sealed master-key record (recovery-key
-    /// rotation). The caller has already proven the password
-    /// (`unseal_with_password`) and rotated the record; this persists
-    /// it — mirroring change_password's UPDATE WITHOUT the
-    /// password_hash / must_change_password arms (rotation touches
-    /// neither: the password seal is carried over verbatim and the
-    /// forced-change flag is a password-flow concern).
+    /// rotation) as a compare-and-swap: the caller's PRE-READ sealed
+    /// JSON (`pre_read`) is the UPDATE's condition. The caller has
+    /// already proven the password (`unseal_with_password`) and
+    /// rotated the record; this persists it — mirroring
+    /// change_password's UPDATE WITHOUT the password_hash /
+    /// must_change_password arms (rotation touches neither: the
+    /// password seal is carried over verbatim and the forced-change
+    /// flag is a password-flow concern).
+    ///
+    /// Returns `Ok(true)` when the row matched and was written;
+    /// `Ok(false)` when the UPDATE matched zero rows — the stored
+    /// record changed under us (a concurrent rotation won) or the
+    /// user no longer exists. Nothing is written in that case: the
+    /// caller must re-read and must NOT treat its own rotation as
+    /// current (the regenerate handler renders a retry banner instead
+    /// of a shown-once card for an already-dead key).
     pub async fn update_sealed(
         &self,
         user_id: Uuid,
+        pre_read: &str,
         sealed: &SealedMasterKey,
-    ) -> Result<(), UsersError> {
+    ) -> Result<bool, UsersError> {
         let sealed_json = serde_json::to_string(sealed).map_err(|_| UsersError::CorruptSeal)?;
         let now = Utc::now().to_rfc3339();
-        let res =
-            sqlx::query("UPDATE users SET sealed_master_key = ?, updated_at = ? WHERE id = ?")
-                .bind(&sealed_json)
-                .bind(&now)
-                .bind(user_id.to_string())
-                .execute(&self.pool)
-                .await?;
-        if res.rows_affected() == 0 {
-            return Err(UsersError::NotFound);
-        }
-        Ok(())
+        let res = sqlx::query(
+            "UPDATE users SET sealed_master_key = ?, updated_at = ? WHERE id = ? AND sealed_master_key = ?",
+        )
+        .bind(&sealed_json)
+        .bind(&now)
+        .bind(user_id.to_string())
+        .bind(pre_read)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Fetch a user by id.
@@ -518,12 +528,18 @@ mod tests {
     }
 
     /// Task 4 (PR 4): update_sealed round-trips a rotated record —
-    /// the recovery regenerate flow's persistence step. Mirrors the
-    /// handler's exact sequence: rotate over the same master key →
-    /// persist → re-read. Pins that only the recovery seal changes
-    /// (the password seal is carried over verbatim), that the new key
-    /// unseals the same master the password does, and that an
-    /// unknown user id is NotFound (no row written).
+    /// the recovery regenerate flow's persistence step (a
+    /// compare-and-swap). Mirrors the handler's exact sequence:
+    /// rotate over the same master key → persist with the PRE-READ
+    /// record as the CAS condition → re-read. Pins that only the
+    /// recovery seal changes (the password seal is carried over
+    /// verbatim), that the new key unseals the same master the
+    /// password does, that a STALE pre-read loses the CAS without
+    /// writing (the concurrent-rotation guard — the regenerate
+    /// handler's zero-rows arm is this mechanism; the racing
+    /// interleaving itself is not deterministically reachable in an
+    /// e2e test, so the CAS semantics are pinned here), and that an
+    /// unknown user id is a zero-rows miss (no row written).
     #[tokio::test]
     async fn update_sealed_round_trips_rotated_record() {
         let (_dir, store) = test_store().await;
@@ -537,10 +553,14 @@ mod tests {
         // Rotate: a fresh recovery key wrapping the SAME master key.
         let new_recovery = generate_recovery_key();
         let rotated = mycelium_crypto::rotate_recovery_key(&sealed, PW, &new_recovery).unwrap();
-        users
-            .update_sealed(created.record.id, &rotated)
-            .await
-            .unwrap();
+        // The CAS write: the pre-read record is the condition.
+        assert!(
+            users
+                .update_sealed(created.record.id, &before.sealed_master_key, &rotated)
+                .await
+                .unwrap(),
+            "the fresh pre-read must win the CAS"
+        );
         let after = users.get_by_id(created.record.id).await.unwrap();
         let stored: SealedMasterKey = serde_json::from_str(&after.sealed_master_key).unwrap();
         // The persisted record is the rotated one: password seal carried
@@ -551,10 +571,30 @@ mod tests {
         let by_recovery = mycelium_crypto::unseal_with_recovery(&stored, &new_recovery).unwrap();
         let by_password = mycelium_crypto::unseal_with_password(&stored, PW).unwrap();
         assert_eq!(by_recovery.as_bytes(), by_password.as_bytes());
-        // Unknown user: NotFound (nothing written, nothing else touched).
-        assert!(matches!(
-            users.update_sealed(Uuid::new_v4(), &rotated).await,
-            Err(UsersError::NotFound)
-        ));
+        // STALE CAS: a second rotation whose pre-read is the ORIGINAL
+        // (pre-first-write) record must lose — zero rows, and the row
+        // keeps the first rotation's record untouched.
+        let newer_recovery = generate_recovery_key();
+        let rotated2 = mycelium_crypto::rotate_recovery_key(&rotated, PW, &newer_recovery).unwrap();
+        assert!(
+            !users
+                .update_sealed(created.record.id, &before.sealed_master_key, &rotated2)
+                .await
+                .unwrap(),
+            "a stale pre-read must lose the CAS"
+        );
+        let after2 = users.get_by_id(created.record.id).await.unwrap();
+        assert_eq!(
+            after2.sealed_master_key, after.sealed_master_key,
+            "the losing write must not touch the row"
+        );
+        // Unknown user: zero rows too (nothing written anywhere).
+        assert!(
+            !users
+                .update_sealed(Uuid::new_v4(), &before.sealed_master_key, &rotated2)
+                .await
+                .unwrap(),
+            "an unknown user id is a zero-rows miss, not an error"
+        );
     }
 }

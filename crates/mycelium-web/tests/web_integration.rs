@@ -3204,6 +3204,17 @@ async fn account_totp_flow() {
 /// requests hit the uniform login-gate 303 like every other protected
 /// page, not a 401), and the per-credential Remove rows + removal via
 /// a seeded credential.
+///
+/// Fix round — concurrent regenerate: the race is closed by
+/// compare-and-swap (update_sealed conditions the UPDATE on the
+/// PRE-READ sealed JSON, so the loser writes zero rows and the
+/// handler renders a retry banner, never a shown-once card for an
+/// already-dead key). The racing interleaving itself is not
+/// deterministically expressible in an in-process e2e test — the CAS
+/// semantics are pinned by users.rs's stale-pre-read unit leg, and
+/// the handler's zero-rows arm rides code review; this flow pins the
+/// sequential face of the same mechanism (each POST re-reads the
+/// record, so its own CAS matches).
 #[tokio::test]
 async fn recovery_and_webauthn_flows() {
     let (base, shutdown, _dir, pool) = boot().await;
@@ -3461,9 +3472,26 @@ async fn recovery_and_webauthn_flows() {
     // The WebAuthn resting row on this render (0 credentials).
     assert!(ah.contains("0 credentials"), "count renders: {ah}");
 
-    // Leg 5 — register fails closed with no live challenge (this leg
-    // runs BEFORE any challenge GET so ChallengeNotFound is the true
-    // failure reason).
+    // Leg 5a — malformed register body: the JSON extractor's rejection
+    // maps to the endpoint-wide JSON error (fix-round hardening —
+    // axum's default plain-text rejection would echo the serde error
+    // string).
+    let bad = client
+        .post(format!("{base}/account/webauthn/register"))
+        .header("cookie", &cookie_a)
+        .header("x-csrf-token", csrf_a.as_str())
+        .header("content-type", "application/json")
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bj: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(bj["error"], "invalid body", "JSON error shape: {bj}");
+
+    // Leg 5b — a well-formed body with no live challenge fails closed
+    // (this leg runs BEFORE any challenge GET so ChallengeNotFound is
+    // the true failure reason).
     let reg = client
         .post(format!("{base}/account/webauthn/register"))
         .header("cookie", &cookie_a)

@@ -1811,9 +1811,13 @@ pub struct RecoveryRegenerateForm {
 /// `generate_recovery_key` → `rotate_recovery_key` (re-wraps the
 /// master key under the new recovery key; the password seal and all
 /// file ciphertext are untouched) → `UserStore::update_sealed`
-/// (persist) → `persist_service_seal` (the same master key re-sealed
-/// under the service key) → the shown-once card (the keys page's
-/// treatment — the key rides the response body, never a URL).
+/// (compare-and-swap persist: the PRE-READ record's JSON is the
+/// UPDATE's condition, so a concurrent rotation that already won the
+/// row makes this write match zero rows — the response then renders
+/// a warning banner, never a shown-once card for an already-dead key)
+/// → `persist_service_seal` (the same master key re-sealed under the
+/// service key) → the shown-once card (the keys page's treatment —
+/// the key rides the response body, never a URL).
 ///
 /// Master-key and cache invariants, documented for the reviewer: the
 /// rotation changes SEALS ONLY — the master key never changes — so
@@ -1883,9 +1887,46 @@ pub async fn account_recovery_regenerate(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         };
-    if let Err(e) = state.users.update_sealed(user.user_id, &rotated).await {
-        tracing::error!(user_id = %user.user_id, error = %e, "update_sealed failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    match state
+        .users
+        .update_sealed(user.user_id, &record.sealed_master_key, &rotated)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // CAS lost: a concurrent rotation won the row (or the user
+            // vanished). This request's key never became current —
+            // showing it would render an already-dead "current" key, so
+            // re-read the state and render the resting page with a
+            // retry banner. Nothing was written by this request.
+            tracing::warn!(
+                user_id = %user.user_id,
+                "recovery rotation lost a concurrent race — no key shown"
+            );
+            let enrolled = state
+                .users
+                .get_by_id(user.user_id)
+                .await
+                .map(|r| r.totp_secret.is_some())
+                .unwrap_or(false);
+            return pages::account_page(
+                &user,
+                &csrf,
+                pages::TotpSection::Row { enrolled },
+                pages::RecoverySection::Resting,
+                count,
+                &credentials,
+                Some((
+                    "warning",
+                    "recovery key changed concurrently — retry to see the current key",
+                )),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user.user_id, error = %e, "update_sealed failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
     }
     // See the doc comment: idempotent defensive re-persist; the master
     // key is unchanged, so no cache invalidation is needed anywhere.
@@ -1944,11 +1985,23 @@ pub async fn account_webauthn_challenge(
 /// client reloads on success so the row re-renders with the new
 /// count. `RegisterPublicKeyCredential` is re-exported by
 /// mycelium-auth so this crate needs no direct webauthn dependency.
+/// The body extractor is `Result<Json<_>, JsonRejection>`: a
+/// malformed body renders the endpoint-wide JSON error
+/// (`400 {"error":"invalid body"}`) instead of axum's default
+/// plain-text rejection echoing the serde error string (an
+/// internal-detail leak — the same class the Phase-11 review closed).
 pub async fn account_webauthn_register(
     State(state): State<AppState>,
     user: SessionUser,
-    axum::Json(cred): axum::Json<mycelium_auth::webauthn::RegisterPublicKeyCredential>,
+    body: Result<
+        axum::Json<mycelium_auth::webauthn::RegisterPublicKeyCredential>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
+    let axum::Json(cred) = match body {
+        Ok(json) => json,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid body"),
+    };
     match state.webauthn.finish_enrollment(user.user_id, &cred).await {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(mycelium_auth::webauthn::WebAuthnError::ChallengeNotFound) => {

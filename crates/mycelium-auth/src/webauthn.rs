@@ -71,7 +71,7 @@ impl WebAuthnManager {
         Ok(Self { pool, rp })
     }
 
-    /// Build a manager from a full origin URL (e.g.
+    /// Build a manager from a full HTTPS origin URL (e.g.
     /// `https://mycelium.example.com`): the RP id is the origin's DNS
     /// host — the registrable domain a credential binds to, with any
     /// port dropped (ports are not part of an RP id) — and the
@@ -79,12 +79,17 @@ impl WebAuthnManager {
     /// stay strict, so a ported deployment configures its exact
     /// origin).
     ///
-    /// IP-literal hosts are refused (`WebauthnBuilder` requires a
-    /// DNS domain — an RP id must be a registrable domain the browser
-    /// can bind the credential to): `BadRpConfig`, never a silent
-    /// default.
+    /// Non-https schemes are refused (WebAuthn ceremonies only run
+    /// in secure contexts — the browser would reject the challenge
+    /// anyway), as are IP-literal hosts (`WebauthnBuilder` requires
+    /// a DNS domain — an RP id must be a registrable domain the
+    /// browser can bind the credential to): `BadRpConfig`, never a
+    /// silent default.
     pub fn from_origin(pool: sqlx::SqlitePool, origin: &str) -> Result<Self, WebAuthnError> {
         let url = url::Url::parse(origin).map_err(|_| WebAuthnError::BadRpConfig)?;
+        if url.scheme() != "https" {
+            return Err(WebAuthnError::BadRpConfig);
+        }
         match url.host() {
             Some(url::Host::Domain(host)) => Self::new(pool, "Mycelium2", origin, host),
             _ => Err(WebAuthnError::BadRpConfig),
@@ -420,14 +425,20 @@ mod tests {
         assert_eq!(ch.public_key.rp.id, "mycelium.example.com");
     }
 
-    /// from_origin refuses IP-literal origins (no registrable domain to
-    /// bind the credential to — WebauthnBuilder requires one) and
-    /// unparseable strings: BadRpConfig, never a silent default.
+    /// from_origin refuses IP-literal origins (no registrable domain
+    /// to bind the credential to — WebauthnBuilder requires one),
+    /// non-https origins (WebAuthn runs only in secure contexts —
+    /// even with a valid DNS host), and unparseable strings:
+    /// BadRpConfig, never a silent default.
     #[tokio::test]
     async fn from_origin_rejects_ip_hosts_and_bad_urls() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-        for bad in ["https://127.0.0.1:8443", "not a url"] {
+        for bad in [
+            "https://127.0.0.1:8443",
+            "http://mycelium.example.com",
+            "not a url",
+        ] {
             assert!(
                 matches!(
                     WebAuthnManager::from_origin(store.pool().clone(), bad),
