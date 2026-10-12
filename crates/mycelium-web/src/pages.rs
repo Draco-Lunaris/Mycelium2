@@ -167,11 +167,19 @@ pub fn home_page(
         .into_iter()
         .collect();
     types.sort_unstable();
+    // The active chip also carries `aria-current="true"` — filter
+    // semantics, distinct from the tab bar/nav items' navigation
+    // semantics (`aria-current="page"`). Inactive chips get neither.
     let filter_chip = |label: &str, href: &str, active: bool| {
         format!(
-            r#"<a class="chip{}" href="{}">{}</a>"#,
+            r#"<a class="chip{}" href="{}"{}>{}</a>"#,
             if active { " chip--accent" } else { "" },
             href,
+            if active {
+                r#" aria-current="true""#
+            } else {
+                ""
+            },
             html_escape(label)
         )
     };
@@ -573,11 +581,18 @@ pub fn search_page(
     // scope the handler kept (None → "All").
     let chips = if queried {
         let enc = urlencoding_encode(query);
+        // Active chip: `chip--accent` plus `aria-current="true"` (filter
+        // semantics, not the nav/tab `aria-current="page"`).
         let chip = |label: &str, href: String, active: bool| {
             format!(
-                r#"<a class="chip{}" href="{}">{}</a>"#,
+                r#"<a class="chip{}" href="{}"{}>{}</a>"#,
                 if active { " chip--accent" } else { "" },
                 href,
+                if active {
+                    r#" aria-current="true""#
+                } else {
+                    ""
+                },
                 html_escape(label)
             )
         };

@@ -694,8 +694,17 @@ async fn browse_type_filter() {
     // the Decision concept is filtered out (the chip row still lists
     // its type — chips derive from the full entry list).
     assert!(
-        html.contains(r#"<a class="chip chip--accent" href="/?type=Note">Note</a>"#),
+        html.contains(
+            r#"<a class="chip chip--accent" href="/?type=Note" aria-current="true">Note</a>"#
+        ),
         "Note chip active: {html}"
+    );
+    // Filter semantics: `aria-current="true"` on the active chip only
+    // (the tab bar's navigation semantics use `aria-current="page"`);
+    // inactive chips carry no aria-current at all.
+    assert!(
+        html.contains(r#"<a class="chip" href="/">All</a>"#),
+        "inactive All chip has no aria-current: {html}"
     );
     assert!(
         !html.contains("Decision note"),
@@ -715,7 +724,7 @@ async fn browse_type_filter() {
         "unknown filter shows all: {html2}"
     );
     assert!(
-        html2.contains(r#"<a class="chip chip--accent" href="/">All</a>"#),
+        html2.contains(r#"<a class="chip chip--accent" href="/" aria-current="true">All</a>"#),
         "unknown filter activates the All chip: {html2}"
     );
     // A concept with a broken link renders the amber flag.
@@ -1146,9 +1155,14 @@ async fn search_scope_chips() {
     // The user chip is the active one (exact span, Task 1's pattern).
     assert!(
         html.contains(
-            r#"<a class="chip chip--accent" href="/search?q=note&scope=user">Your bundle</a>"#
+            r#"<a class="chip chip--accent" href="/search?q=note&scope=user" aria-current="true">Your bundle</a>"#
         ),
         "user scope chip active: {html}"
+    );
+    // Inactive scope chips carry no aria-current (filter semantics).
+    assert!(
+        html.contains(r#"<a class="chip" href="/search?q=note">All</a>"#),
+        "inactive All scope chip has no aria-current: {html}"
     );
     // The count line names the (escaped) query.
     assert!(
@@ -1183,7 +1197,9 @@ async fn search_scope_chips() {
     assert_eq!(s3.status(), 200);
     let h3 = s3.text().await.unwrap();
     assert!(
-        h3.contains(r#"<a class="chip chip--accent" href="/search?q=note">All</a>"#),
+        h3.contains(
+            r#"<a class="chip chip--accent" href="/search?q=note" aria-current="true">All</a>"#
+        ),
         "unknown scope activates the All chip: {h3}"
     );
     assert!(
