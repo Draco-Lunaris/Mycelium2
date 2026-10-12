@@ -73,6 +73,10 @@ pub fn build_router_with_shutdown(
         .route("/skills", get(api::skills_view))
         .route("/books", get(api::books_view))
         .route("/chat", get(api::chat_view))
+        // Librarian status (PR 4, spec §6/§8): the admin-only
+        // operational page — session-gated here, RequireAdmin in the
+        // handler (the same gate shape as the /admin pages).
+        .route("/status", get(api::status_view))
         .route(
             "/password",
             get(api::password_view).post(api::password_submit),

@@ -15,20 +15,29 @@ pub fn routes() -> Router<AppState> {
 
 /// The degraded threshold: 2× the drain's age deadline (spec §4.2).
 /// Sourced from the worker's limits constant, never a bare literal.
-fn oldest_degraded_at_secs() -> i64 {
+/// Shared by the /health route and the /status page's state chips
+/// (PR 4) so both derive "degraded" from one window.
+pub(crate) fn oldest_degraded_at_secs() -> i64 {
     2 * mycelium_librarian::queue_worker::QueueLimits::default().age_deadline_secs
 }
 
-/// The system-wide values /health reports and the admin System page
-/// surfaces as StatTiles — ONE computation shared by both call sites
-/// (the PR-4 extraction of the previously duplicated gathering).
+/// The system-wide values /health reports and the admin System and
+/// Librarian status pages surface as StatTiles — ONE computation
+/// shared by every call site (the PR-4 extraction of the previously
+/// duplicated gathering).
 ///
 /// The field types encode the historical None-rules the call sites
 /// relied on: `user_count` is the `-1` sentinel only when the user
 /// store fails; ANY queue-store error zeroes the queue fields (the
 /// `db_ok` flag already reports that failure); an LLM success
 /// timestamp of 0 (never succeeded) reads as `None`.
-pub(crate) struct SystemStats {
+///
+/// `pub` (widened from Task 1's `pub(crate)` in PR 4: the new
+/// `pages::librarian_status_page` — a `pub fn` in the pub `pages`
+/// module — takes the struct directly; the `system_stats` constructor
+/// stays crate-only, so external code can name the type but only the
+/// crate produces real values).
+pub struct SystemStats {
     pub user_count: i64,
     pub queue_depth: i64,
     pub oldest_pending_age_seconds: Option<i64>,

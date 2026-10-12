@@ -1539,14 +1539,15 @@ pub fn admin_library_page(
 }
 
 /// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value), the backup download (the existing
-/// POST /admin/backup button + the no-store rationale), and the
-/// ingest-jobs table (the plan's binding ruling: jobs live here).
+/// StatTiles (a tile per value) and the backup download (the existing
+/// POST /admin/backup button + the no-store rationale). The
+/// ingest-jobs table moved to /status (spec §8's PR-4 ruling —
+/// /status is the jobs-table home; the PR-3 placement here was a
+/// stopgap pending that page).
 pub fn admin_system_page(
     user: &SessionUser,
     csrf: &str,
-    stats: &crate::api::SystemStats,
-    jobs: &[(String, String, String, String, String)],
+    stats: &crate::api::SystemPageStats,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
@@ -1578,6 +1579,95 @@ pub fn admin_system_page(
     let stats_html = format!(r#"<div class="stat-row">{stat_row}</div>"#);
     let backup_body = r#"<form method="post" action="/admin/backup"><button type="submit">Download backup</button></form>
 <p class="muted">The download is served with Cache-Control: no-store — the archive contains the service key and sealed master keys, so it must never sit in a shared or CDN cache.</p>"#;
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "System",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{stats_html}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Maintenance",
+            TrustedHtml::from_markup(backup_body),
+        )),
+        tabs = admin_tabs("/admin/system"),
+        flash = admin_flash(ok, err),
+    );
+    layout("System", Some(user), csrf, "/admin/system", body)
+}
+
+/// Librarian status (mockup 04; admin-only per spec §6 — the page
+/// shows cross-user jobs): the mutation queue's /health surfaces as
+/// StatTiles, state chips (the /health degraded rule mirrored over the
+/// same values, plus the LLM chip on the same staleness window), the
+/// ingest-jobs table (moved here from the PR-3 System page — spec §8
+/// names /status the jobs-table home), and the issue-#1 receipt
+/// placeholder card (mockup-vs-handler item 5 — no fabricated
+/// receipts).
+///
+/// Escaping: tile labels/values ride leptos TEXT positions inside the
+/// stat_tile primitive; the chips' texts are constants; every jobs
+/// cell is an escaped fragment in a TrustedHtml slot (the System
+/// page's exact job-row composition); the receipt banner's message is
+/// the pinned constant text.
+pub fn librarian_status_page(
+    user: &SessionUser,
+    csrf: &str,
+    stats: &crate::health::SystemStats,
+    jobs: &[(String, String, String, String, String)],
+) -> Html<String> {
+    // A StatTile per queue field; absent optionals read "—".
+    let absent = "—";
+    let tiles = [
+        ("Queue depth", stats.queue_depth.to_string()),
+        (
+            "Oldest pending",
+            stats
+                .oldest_pending_age_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+        ("Dead", stats.queue_dead_count.to_string()),
+        (
+            "LLM last success",
+            stats
+                .llm_last_success_seconds
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| absent.to_string()),
+        ),
+    ];
+    let stat_row = tiles
+        .iter()
+        .map(|(label, value)| mycelium_ui::render::render(mycelium_ui::stat_tile(label, value)))
+        .collect::<String>();
+    let stats_html = format!(r#"<div class="stat-row">{stat_row}</div>"#);
+    // State chips — the /health degraded rule mirrored over the same
+    // values (db reachable, no dead items, no overdue pending item).
+    let degraded = !stats.db_ok
+        || stats.queue_dead_count > 0
+        || stats
+            .oldest_pending_age_seconds
+            .is_some_and(|age| age > crate::health::oldest_degraded_at_secs());
+    let state_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if degraded { "degraded" } else { "ok" },
+        if degraded { "danger" } else { "neutral" },
+    ));
+    // The LLM chip on the same window: llm_last_success_seconds is an
+    // AGE in seconds (None = never succeeded); older than the
+    // degraded window reads unreachable (the /health + /metrics
+    // LLM-alive reporting rule).
+    let llm_unreachable = stats
+        .llm_last_success_seconds
+        .is_none_or(|age| age > crate::health::oldest_degraded_at_secs());
+    let llm_chip = mycelium_ui::render::render(mycelium_ui::chip(
+        if llm_unreachable {
+            "LLM unreachable"
+        } else {
+            "LLM reachable"
+        },
+        if llm_unreachable { "danger" } else { "accent" },
+    ));
+    let chips_html = format!(r#"<div class="chip-row">{state_chip}{llm_chip}</div>"#);
+    // The jobs table — the System page's exact build, moved here.
     let jobs_rows: Vec<Vec<TrustedHtml>> = jobs
         .iter()
         .map(|(slug, status, detail, created, shelf)| {
@@ -1594,24 +1684,29 @@ pub fn admin_system_page(
         &["Book", "Status", "Detail", "Created", "Shelf"],
         &jobs_rows,
     ));
+    // The receipt panel — mockup-vs-handler item 5's pinned
+    // placeholder (the only place issue #1's outcome touches; no
+    // fabricated receipts).
+    let receipts_banner = mycelium_ui::render::render(mycelium_ui::banner(
+        "info",
+        "Receipt IDs and state names are pending the queue-work item (issue #1).",
+    ));
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
-        "System",
+        "Librarian status",
         TrustedHtml::from_markup(""),
     ));
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}{}",
-        mycelium_ui::render::render(mycelium_ui::card(
-            "Maintenance",
-            TrustedHtml::from_markup(backup_body),
-        )),
+        "{header}{stats_html}{chips_html}{}{}",
         mycelium_ui::render::render(mycelium_ui::card(
             "Ingest jobs",
             TrustedHtml::from_markup(jobs_body),
         )),
-        tabs = admin_tabs("/admin/system"),
-        flash = admin_flash(ok, err),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Receipts",
+            TrustedHtml::from_markup(receipts_banner),
+        )),
     );
-    layout("System", Some(user), csrf, "/admin/system", body)
+    layout("Librarian status", Some(user), csrf, "/status", body)
 }
 
 /// Minimal percent-encoding for query-string values.

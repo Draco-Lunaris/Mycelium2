@@ -577,6 +577,14 @@ body.auth main {
   margin-bottom: var(--gap-4);
 }
 .stat-row .stat { margin-bottom: 0; }
+
+/* Librarian status (PR 4, mockup 04): the state-chip row — the chips
+   are inline-flex spans, so the row wrapper supplies the gap, the
+   narrow-width wrap, and the section spacing. */
+.chip-row {
+  display: flex; gap: var(--gap-2); flex-wrap: wrap;
+  margin-bottom: var(--gap-4);
+}
 "#;
 
 pub const APP_JS: &str = r#"// CSRF: attach the session's CSRF token to every fetch/form request.
@@ -1240,7 +1248,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "20";
+pub const ASSETS_VERSION: &str = "21";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

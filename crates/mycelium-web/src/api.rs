@@ -1653,10 +1653,12 @@ pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
 }
 
 /// The /health fields the System page surfaces as StatTiles — the
-/// same values the health route builds (users count, the SQL queue
-/// fields, the LLM last-success age), gathered here per page.
+/// page's rendering DTO, mapped from health::system_stats (the ONE
+/// shared computation). Renamed SystemPageStats in PR 4 (the Task-1
+/// review's ruling) so only the health-side struct carries the
+/// SystemStats name.
 #[derive(Debug)]
-pub struct SystemStats {
+pub struct SystemPageStats {
     pub users: i64,
     pub queue_depth: usize,
     pub oldest_pending_age_seconds: Option<i64>,
@@ -1798,8 +1800,9 @@ pub async fn admin_library_view(
 }
 
 /// GET /admin/system — the operational view: /health's fields as
-/// StatTiles, the backup download, and the ingest-jobs table (the
-/// plan's binding ruling: jobs land here, not on Library).
+/// StatTiles and the backup download. The ingest-jobs table moved to
+/// /status (spec §8's PR-4 ruling — /status is the jobs-table home;
+/// the PR-3 placement here was a stopgap pending that page).
 pub async fn admin_system_view(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -1807,19 +1810,44 @@ pub async fn admin_system_view(
     Query(params): Query<AdminParams>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    // The /health values — ONE computation shared with the health route
-    // (the PR-4 SystemStats extraction); mapped into the page's StatTile
-    // DTO, which stays a rendering concern.
+    // The /health values — ONE computation shared with the health
+    // route and /status (the PR-4 SystemStats extraction); mapped into
+    // the page's StatTile DTO, which stays a rendering concern.
     let s = crate::health::system_stats(&state).await;
-    let stats = SystemStats {
+    let stats = SystemPageStats {
         users: s.user_count,
         queue_depth: s.queue_depth as usize,
         oldest_pending_age_seconds: s.oldest_pending_age_seconds,
         queue_dead_count: s.queue_dead_count as usize,
         llm_last_success_seconds: s.llm_last_success_seconds,
     };
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_system_page(
+        &admin,
+        &csrf,
+        &stats,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// GET /status — the Librarian status page (mockup 04; admin-only per
+/// spec §6 — the operational page shows cross-user jobs): the
+/// mutation queue's /health surfaces as StatTiles with state chips,
+/// the ingest-jobs table (moved here from the PR-3 System page per
+/// spec §8's ruling), and the issue-#1 receipt placeholder.
+pub async fn status_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    // The /health values — ONE computation shared with the health
+    // route and the System page (the PR-4 SystemStats extraction).
+    let stats = crate::health::system_stats(&state).await;
     // Ingest jobs (slug, status, detail, created, shelf name) — the
-    // old admin_view's job_rows build, moved here verbatim.
+    // System page's job_rows build, moved here per spec §8's ruling.
     let jobs = state.store.list_ingest_jobs(20).await.unwrap_or_default();
     let mut job_rows: Vec<(String, String, String, String, String)> = Vec::new();
     for j in &jobs {
@@ -1838,15 +1866,7 @@ pub async fn admin_system_view(
         ));
     }
     let admin = request_admin_user(&state, &session).await;
-    pages::admin_system_page(
-        &admin,
-        &csrf,
-        &stats,
-        &job_rows,
-        params.ok.as_deref(),
-        params.error.as_deref(),
-    )
-    .into_response()
+    pages::librarian_status_page(&admin, &csrf, &stats, &job_rows).into_response()
 }
 
 /// Fetch the SessionUser for an admin session (RequireAdmin already

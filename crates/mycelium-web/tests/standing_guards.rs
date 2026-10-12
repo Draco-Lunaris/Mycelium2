@@ -164,6 +164,8 @@ async fn csp_sweep_no_inline_style_or_script() {
         "/admin/llm",
         "/admin/library",
         "/admin/system",
+        // Librarian status (PR 4): admin-only page, same swept session.
+        "/status",
         "/concept?new=1",
     ] {
         let resp = client

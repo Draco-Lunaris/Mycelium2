@@ -2734,6 +2734,231 @@ async fn admin_library_escapes_and_pairs_shelf_names() {
     shutdown.cancel();
 }
 
+/// Task 2 (PR 4): the Librarian status page — GET /status renders for
+/// the admin with the four queue StatTiles, the state chips, the
+/// ingest-jobs table (moved here from the PR-3 System stopgap, spec
+/// §8's PR-4 ruling), and the issue-#1 receipt placeholder; the
+/// sidebar's Librarian group carries the Status item (admin-only,
+/// spec §6).
+#[tokio::test]
+async fn librarian_status_page() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Seed one completed ingest job so the jobs table renders its
+    // headers (data_table renders the empty state — no headers — on
+    // zero rows) and a row whose cells the assertions can pin. Direct
+    // SQL on the test pool, satisfying the FKs (shelf → book → job →
+    // the seeded admin user).
+    let now = chrono::Utc::now().to_rfc3339();
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let shelf_id = uuid::Uuid::new_v4().to_string();
+    let book_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO bookshelves (id, name, created_at) VALUES (?, 'Status Shelf', ?)")
+        .bind(&shelf_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO books (id, bookshelf_id, slug, title, created_at)
+         VALUES (?, ?, 'status-book', 'Status Book', ?)",
+    )
+    .bind(&book_id)
+    .bind(&shelf_id)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingest_jobs (id, bookshelf_id, book_id, requested_by_user_id, status, detail, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'done', '', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&shelf_id)
+    .bind(&book_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Admin GET → 200 with every surface (spec §8's /status slice).
+    let status = client
+        .get(format!("{base}/status"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), 200, "/status must render for the admin");
+    let html = status.text().await.unwrap();
+    // The four queue StatTiles (the brief's exact labels) inside the
+    // PR-3 .stat-row (reused, not duplicated).
+    for label in ["Queue depth", "Oldest pending", "Dead", "LLM last success"] {
+        assert!(
+            html.contains(&format!(r#"<span class="stat__label">{label}</span>"#)),
+            "{label} tile missing: {html}"
+        );
+    }
+    assert!(
+        html.contains(r#"<div class="stat-row">"#),
+        "StatTile row missing: {html}"
+    );
+    // State chips: fresh boot → db ok, empty queue → the "ok" chip
+    // (the /health status rule mirrored); no LLM success ever recorded
+    // in this test process → the "LLM unreachable" chip.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">ok</span>"#),
+        "ok state chip missing: {html}"
+    );
+    assert!(
+        html.contains("LLM unreachable"),
+        "LLM unreachable chip missing: {html}"
+    );
+    // The jobs table moved here from /admin/system: headers + the
+    // seeded row's Book cell.
+    assert!(
+        html.contains("<th>Book</th>") && html.contains("<th>Status</th>"),
+        "jobs table headers missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Book">status-book</td>"#),
+        "seeded job row missing: {html}"
+    );
+    // The issue-#1 receipt placeholder — mockup-vs-handler item 5's
+    // exact text, the only place #1's outcome touches.
+    assert!(
+        html.contains("Receipt IDs and state names are pending the queue-work item (issue #1)."),
+        "receipt placeholder text missing: {html}"
+    );
+
+    // 2. The sidebar's Librarian group carries Status for the admin,
+    //    active on this page (spec §6: the item is admin-only).
+    assert!(
+        html.contains(
+            r#"<a href="/status" aria-current="page" class="nav-item nav-item--active">"#
+        ),
+        "Status nav item must be present and active for the admin: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Task 2 (PR 4), Review Focus 3: a non-admin's GET /status is rejected
+/// with the admin gate's exact 403 (RequireAdmin — the same status the
+/// /admin pages' loop pins), and the sidebar's Librarian group shows no
+/// Status item for a normal user (spec §6: Status is admin-only; the
+/// 403 body has no sidebar, so the nav check runs on a real page).
+#[tokio::test]
+async fn status_non_admin_403() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+    // Create a normal user through the real admin form.
+    let create_user = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[
+            ("username", "mallory"),
+            ("email", "mallory@example.com"),
+            ("password", "mallory password 20 chars"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), 200, "user creation must succeed");
+    let login_mallory = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "mallory"),
+            ("password", "mallory password 20 chars"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_mallory.status(), 303);
+    let mallory_cookie = login_mallory
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The gate: the same 403 the admin pages' loop pins.
+    let status = client
+        .get(format!("{base}/status"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status.status(),
+        403,
+        "non-admin GET /status must hit the RequireAdmin 403"
+    );
+
+    // The nav gate: a normal user's shelled page carries no /status
+    // nav item.
+    let browse = client
+        .get(format!("{base}/"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(browse.status(), 200);
+    let html = browse.text().await.unwrap();
+    assert!(
+        !html.contains(r#"href="/status""#),
+        "Status nav item must not render for a normal user: {html}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Fetch a page URL and extract the CSRF token from the meta tag.
 async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> String {
     let page = client
