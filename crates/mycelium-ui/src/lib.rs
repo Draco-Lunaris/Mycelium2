@@ -31,7 +31,7 @@ pub use layout::{
 #[cfg(feature = "ssr")]
 pub use primitives::{banner, button, button_class, chip, confirm_dialog, empty_state, field};
 #[cfg(feature = "ssr")]
-pub use shell::{page_header, ASSETS_VERSION};
+pub use shell::{ASSETS_VERSION, page_header};
 
 /// Hydration entry: wasm-bindgen auto-runs this on module init; it
 /// sets up the reactive owner root that island hydration runs under.
