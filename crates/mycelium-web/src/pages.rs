@@ -192,9 +192,11 @@ pub fn home_page(
         ));
     }
     // Actions: the New-concept primary button (an anchor — works
-    // without script) plus the filter chips, one row (mockup 01).
+    // without script), the filter chips, and mockup 01's small search
+    // field — a plain GET form aimed at /search (Enter submits; no
+    // submit button, no script), one row.
     let actions = format!(
-        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}"#,
+        r#"<a class="{}" href="/concept?new=1">New concept</a>{chips}<form class="search-mini" method="get" action="/search"><input name="q" placeholder="Search…" aria-label="Search"></form>"#,
         mycelium_ui::button_class("primary")
     );
     // Table rows: the filter narrows the listing; each row's cells are

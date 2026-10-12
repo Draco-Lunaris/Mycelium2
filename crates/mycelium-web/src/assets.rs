@@ -461,6 +461,14 @@ leptos-island { display: contents; }
   .page-header { flex-wrap: wrap; }
 }
 
+/* Browse header small-search (Task 8, mockup 01): the compact GET
+   search form beside the type chips — the base `input { width: 100% }`
+   would stretch it across the actions row, so the field gets the
+   mint-form's small control shape (same width/height, token-only).
+   Enter submits; no submit button, no script. */
+.search-mini { margin: 0; }
+.search-mini input { width: 12rem; min-height: 38px; }
+
 /* Concept editor (Task 2): source/preview grid — two equal columns,
    one under 720px (the shell's breakpoint); the preview pane is fully
    server-rendered from escaped fragments (static, no client script). */
@@ -1336,7 +1344,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "23";
+pub const ASSETS_VERSION: &str = "24";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

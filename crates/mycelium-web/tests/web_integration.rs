@@ -832,6 +832,19 @@ async fn browse_type_filter() {
         html3.contains(r#"<span class="flag flag--warning">broken links</span>"#),
         "broken-links flag span: {html3}"
     );
+    // Task 8 (mockup 01): the header actions area carries the small
+    // search field — a plain GET form aimed at /search with the `q`
+    // input, beside the type chips. Scoped to the actions slot so the
+    // assertion is about the header, not any other form on the page.
+    let actions_area = html3
+        .split(r#"<div class="actions">"#)
+        .nth(1)
+        .and_then(|s| s.split("</header>").next())
+        .unwrap_or("");
+    assert!(
+        actions_area.contains(r#"action="/search""#) && actions_area.contains(r#"name="q""#),
+        "browse header actions must carry the small search form: {actions_area}"
+    );
 
     shutdown.cancel();
 }
