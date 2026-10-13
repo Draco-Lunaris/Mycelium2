@@ -1642,6 +1642,7 @@ pub fn admin_llm_page(
   <label>Model</label><input name="model" value="{}">
   <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
   <button type="submit">Save LLM config</button>
+  <button type="submit" formaction="/admin/llm/test">Test connection</button>
 </form>"#,
         html_escape(llm_url),
         html_escape(llm_model)

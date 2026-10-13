@@ -129,6 +129,7 @@ pub fn build_router_with_shutdown(
             "/admin/llm",
             get(api::admin_llm_view).post(api::admin_save_llm),
         )
+        .route("/admin/llm/test", post(api::admin_test_llm))
         .route("/admin/library", get(api::admin_library_view))
         .route("/admin/system", get(api::admin_system_view))
         .route("/admin/oidc", post(api::admin_save_oidc))

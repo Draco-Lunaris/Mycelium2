@@ -2590,6 +2590,48 @@ pub async fn admin_save_llm(
     Redirect::to("/admin/llm?ok=LLM%20config%20saved").into_response()
 }
 
+/// POST /admin/llm/test — probe the LLM backend with one minimal
+/// completion using the submitted form values (blank api_key = the
+/// stored key, mirroring the save semantics). Nothing is persisted.
+/// The redirect verdict carries the backend's status + body on failure
+/// so a mis-pasted key or wrong URL is visible in seconds — the chat
+/// path only says "librarian unavailable", never why.
+pub async fn admin_test_llm(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<LlmForm>,
+) -> Response {
+    // Same blank-key semantics as admin_save_llm: the stored key when
+    // the field is blank/absent, so testing what is saved works.
+    let existing =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
+    let api_key = match form.api_key.as_deref().map(str::trim) {
+        None | Some("") => existing.api_key,
+        Some(k) => Some(k.to_string()),
+    };
+    let client = mycelium_librarian::llm::LlmClient::new(&crate::LlmConfig {
+        url: form.url.trim().to_string(),
+        model: form.model.trim().to_string(),
+        api_key,
+    });
+    let verdict = match client
+        .chat_system(Some("You are a connectivity probe."), "Reply with OK", 0.0)
+        .await
+    {
+        Ok(reply) => format!("ok=connected%20%E2%80%94%20backend%20responded:{reply}",),
+        Err(e) => {
+            tracing::warn!(error = %e, "LLM test connection failed");
+            format!(
+                "error={}",
+                pages::urlencoding_encode(&format!("test connection failed: {e}"))
+            )
+        }
+    };
+    Redirect::to(&format!("/admin/llm?{verdict}")).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct BookshelfForm {
     pub name: String,
