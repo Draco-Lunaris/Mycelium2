@@ -22,6 +22,17 @@ At startup the server picks its certificate in this order:
    while an uploaded pair is active, so reverting always has a
    working fallback.
 
+The generated pair is **managed**: `config/tls/sans.txt` records the SAN
+set it was built for, and any mismatch between that sidecar and the
+requested set (including a missing sidecar) replaces the pair on boot.
+So a hand-placed `config/tls/cert.pem` + `key.pem` pair that predates
+this version — one you dropped in yourself, with no `sans.txt` beside it
+— is silently deleted and regenerated on the first boot after upgrade.
+Real certificates do not belong in that directory at all: mount them via
+`MYCELIUM2_TLS_CERT` / `MYCELIUM2_TLS_KEY` (precedence 1) or install
+them through the upload flow (precedence 2), neither of which the
+manager ever touches.
+
 ## Posture 1: built-in self-signed (with your names)
 
 With no configuration the generated certificate carries the SAN
@@ -85,17 +96,22 @@ openssl ca -batch -config ca.cnf -extensions server \
   -in csr.pem -out issued.pem
 ```
 
-Upload `issued.pem` (plus your chain, leaf first) and the pending key
-through the card; a successful install clears the pending CSR.
-Discarding a pending CSR is fine — it just means the next upload is an
-independent pair.
+Upload `issued.pem` (plus your chain, leaf first) through the card
+together with the pending key — the upload form always takes both a
+certificate and a key, and the key must be exactly the one the CSR was
+made from. That key never leaves the server: read it off disk at
+`<data_dir>/config/tls/pending-csr-key.pem` (the card prints the same
+path) and pick it as the **Private key (PEM)** file. A successful
+install clears the pending CSR. Discarding a pending CSR is fine — it
+just means the next upload is an independent pair, and you supply both
+halves yourself.
 
 ## Posture 3: reverse proxy terminates TLS
 
 Run your proxy (nginx, Caddy, …) with your real certificate in front of
 Mycelium2. Mycelium2 always terminates its own TLS, so the proxy must
 forward to the **HTTPS** listener, not the HTTP one — the HTTP listener
-is redirect-only (it 307s every request to the HTTPS port), so proxying
+is redirect-only (it 303s every request to the HTTPS port), so proxying
 to it either loops or bypasses your proxy entirely. Bind Mycelium2 to
 loopback and point the proxy at it over TLS:
 
@@ -107,11 +123,12 @@ MYCELIUM2_HTTPS_ADDR=127.0.0.1:8443
 # nginx: terminate TLS here, proxy to Mycelium2's HTTPS listener
 location / {
     proxy_pass https://127.0.0.1:8443;
-    proxy_ssl_trusted_certificate /etc/mycelium2/cert.pem;  # the self-signed pair, or set proxy_ssl_verify off
+    proxy_ssl_verify on;  # proxy_ssl_trusted_certificate has no effect without this
+    proxy_ssl_trusted_certificate <data_dir>/config/tls/cert.pem;  # the self-signed pair, or set proxy_ssl_verify off
 }
 ```
 
-(See [deployment.md](deployment.md) — *Behind a reverse proxy* — for the
+(See [Deployment](deployment.md) — *Behind a reverse proxy* — for the
 full `proxy_pass https://…` recipe.) Two things to get right:
 
 - The proxy connects to Mycelium2 over TLS, so it must trust (or be told

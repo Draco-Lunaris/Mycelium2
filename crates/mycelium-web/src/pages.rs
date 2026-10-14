@@ -1858,6 +1858,9 @@ pub fn tls_card(
 {cn}
 {sans}
 {created}
+<p class="muted">The matching private key stays on this server at
+<code>&lt;data_dir&gt;/config/tls/pending-csr-key.pem</code> — the upload
+form needs it alongside the issued certificate.</p>
 <p><a href="/admin/tls/csr">Download CSR</a></p>
 <form method="post" action="/admin/tls/pending/discard">{csrf_field}<button type="submit">Discard CSR</button></form>"#,
             cn = row("CN", html_escape(&p.cn)),

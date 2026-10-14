@@ -128,8 +128,11 @@ const SMALL_MULTIPART_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// A path whose multipart body may be as large as the book ceiling.
 /// `POST /api/v1/ingest` is the only book-upload route (the admin library
 /// page posts there); every other multipart endpoint is a small form.
+/// Exact match, not a prefix: unregistered paths under `/api/v1/ingest/…`
+/// never reach the ingest handler, so they must not inherit the book
+/// ceiling before routing rejects them.
 fn is_book_upload_path(path: &str) -> bool {
-    path.starts_with("/api/v1/ingest")
+    path == "/api/v1/ingest"
 }
 
 /// The body cap (bytes) the CSRF body-buffering branch will accept for
@@ -481,8 +484,14 @@ mod tests {
             multipart_buffer_cap("/api/v1/concepts/x.md", book),
             SMALL_MULTIPART_MAX_BYTES
         );
-        // Book ingest keeps its configured ceiling, unchanged.
+        // Book ingest keeps its configured ceiling, unchanged — but
+        // only the exact route path: unregistered subpaths never reach
+        // the ingest handler and must not inherit the book ceiling.
         assert_eq!(multipart_buffer_cap("/api/v1/ingest", book), book);
+        assert_eq!(
+            multipart_buffer_cap("/api/v1/ingest/anything", book),
+            SMALL_MULTIPART_MAX_BYTES
+        );
     }
 
     #[test]

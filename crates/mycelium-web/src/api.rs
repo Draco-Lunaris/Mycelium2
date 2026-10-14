@@ -3201,6 +3201,14 @@ pub async fn tls_cert_download(
             StatusCode::OK,
             [
                 (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+                // Attachment disposition (same pattern as the CSR
+                // download): the PEM body is attacker-influenced when an
+                // uploaded cert is active, so never let a browser render
+                // it inline in the admin's tab.
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"cert.pem\"",
+                ),
                 (axum::http::header::CACHE_CONTROL, "no-store"),
             ],
             pem,
