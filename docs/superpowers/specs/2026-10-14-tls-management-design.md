@@ -103,11 +103,12 @@ pending.json         # { cn, sans, created_at }
 1. `MYCELIUM2_TLS_CERT`/`KEY` env mounts (unchanged priority 1).
 2. `uploaded-cert.pem` + `uploaded-key.pem` if both exist — an
    uploaded cert survives restarts without env config.
-3. Generated pair; regenerate if `sans.txt` differs from the
-   requested SAN set (env/flag, verbatim; localhost only the unset
-   default). Regeneration
-   under this step still happens when an uploaded pair is active —
-   the generated pair is the fallback and stays current; the
+3. Generated pair; regenerate when `sans.txt` differs from the
+   requested SAN set. The requested set is the env/flag value taken
+   verbatim (dedup, order-stable); `localhost` is only the default
+   when the value is unset/empty — never force-added. Regeneration
+   under this step still happens while an uploaded pair is active:
+   the generated pair is the fallback and stays current, while the
    uploaded pair remains the served cert.
 
 ### `AppState` changes
