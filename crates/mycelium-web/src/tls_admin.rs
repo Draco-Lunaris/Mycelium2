@@ -167,6 +167,106 @@ pub fn read_pending_csr_key(tls_dir: &std::path::Path) -> Result<Option<String>,
     }
 }
 
+/// The metadata of an outstanding (pending) CSR: what the admin asked
+/// for, when, and enough to rebuild the CSR PEM for re-download from the
+/// persisted pending key. The CSR PEM itself is NOT persisted — the
+/// re-download rebuilds it from `pending-csr-key.pem` + this record.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingCsr {
+    pub cn: String,
+    pub sans: Vec<String>,
+    pub created_at: String,
+}
+
+/// Build a CSR (and its fresh ECDSA P-256 key) for cn + sans.
+/// Unset/empty sans → `localhost` default; otherwise verbatim.
+pub fn build_csr(cn: &str, sans: &[String]) -> Result<(String, String), TlsAdminError> {
+    let key = rcgen::KeyPair::generate().map_err(|e| TlsAdminError::CertParse(e.to_string()))?;
+    let key_pem = key.serialize_pem();
+    let csr = build_csr_from_pending(&key_pem, cn, sans)?;
+    Ok((csr, key_pem))
+}
+
+/// The same CSR shape, from an existing (pending) key PEM — the
+/// re-download path. rcgen's `serialize_request` is documented as not
+/// byte-stable across invocations, so callers compare structure, never
+/// bytes.
+pub fn build_csr_from_pending(
+    key_pem: &str,
+    cn: &str,
+    sans: &[String],
+) -> Result<String, TlsAdminError> {
+    let cn = cn.trim();
+    if cn.is_empty() {
+        return Err(TlsAdminError::CertParse("common name is required".into()));
+    }
+    let key =
+        rcgen::KeyPair::from_pem(key_pem).map_err(|e| TlsAdminError::KeyParse(e.to_string()))?;
+    // Environment-agnostic (public-repo rule): the caller's SAN list is
+    // used verbatim — never force-merged. The localhost default applies
+    // only when the caller passes an empty list.
+    let merged = if sans.is_empty() {
+        vec![DEFAULT_SAN.to_string()]
+    } else {
+        sans.to_vec()
+    };
+    let mut params = rcgen::CertificateParams::new(merged)
+        .map_err(|e| TlsAdminError::CertParse(e.to_string()))?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let request = params
+        .serialize_request(&key)
+        .map_err(|e| TlsAdminError::CertParse(e.to_string()))?;
+    request
+        .pem()
+        .map_err(|e| TlsAdminError::CertParse(e.to_string()))
+}
+
+/// Read the pending CSR metadata; `None` when none is pending (absent
+/// or unparseable — a corrupt sidecar behaves like none, the same
+/// fail-open posture the upload path takes for a missing pending key,
+/// which fails closed only when the file EXISTS but is unreadable).
+pub fn read_pending(data_dir: &std::path::Path) -> Option<PendingCsr> {
+    let meta = std::fs::read_to_string(data_dir.join("config/tls/pending.json")).ok()?;
+    serde_json::from_str(&meta).ok()
+}
+
+/// Persist a pending CSR: metadata JSON + its 0600 key, replacing any
+/// prior pending pair (last-one-wins). The key file is created fresh
+/// (`create_new`) so its mode can never be inherited from an existing
+/// file.
+pub fn save_pending(
+    data_dir: &std::path::Path,
+    meta: &PendingCsr,
+    key_pem: &str,
+) -> std::io::Result<()> {
+    let tls_dir = data_dir.join("config/tls");
+    std::fs::create_dir_all(&tls_dir)?;
+    std::fs::write(
+        tls_dir.join("pending.json"),
+        serde_json::to_string(meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
+    )?;
+    // Key 0600; replace any prior pending key (last-one-wins).
+    std::fs::remove_file(tls_dir.join("pending-csr-key.pem")).ok();
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tls_dir.join("pending-csr-key.pem"))?;
+    f.write_all(key_pem.as_bytes())
+}
+
+/// Remove both pending CSR files. Missing files are fine.
+pub fn clear_pending(data_dir: &std::path::Path) {
+    let tls_dir = data_dir.join("config/tls");
+    std::fs::remove_file(tls_dir.join("pending-csr-key.pem")).ok();
+    std::fs::remove_file(tls_dir.join("pending.json")).ok();
+}
+
 /// Parse the MYCELIUM2_TLS_SANS / --tls-sans value: comma-separated,
 /// trimmed, empties dropped, order-stable dedup. None/empty → the
 /// `localhost` default; a configured set is returned verbatim.
@@ -438,6 +538,152 @@ mod tests {
                     .and_then(|l| l.split_whitespace().nth(1).map(|v| v == "0"))
             })
             .unwrap_or(false)
+    }
+
+    // ---------- CSR generation + pending lifecycle (Task 5) ----------
+
+    /// The DER of the single PEM block of a CSR PEM.
+    fn csr_der(csr_pem: &str) -> Vec<u8> {
+        x509_parser::pem::Pem::iter_from_buffer(csr_pem.as_bytes())
+            .next()
+            .expect("one PEM block")
+            .expect("PEM parses")
+            .contents
+    }
+
+    /// The SAN names carried by a CSR's extension-request attribute
+    /// (GeneralName Display form, e.g. `DNSName(localhost)`).
+    fn csr_sans(csr_pem: &str) -> Vec<String> {
+        use x509_parser::prelude::*;
+        let der = csr_der(csr_pem);
+        let (_, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        csr.requested_extensions()
+            .expect("extension request attribute")
+            .filter_map(|ext| match ext {
+                x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => Some(
+                    san.general_names
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn csr_builds_with_cn_and_sans_and_re_parses() {
+        let (csr_pem, key_pem) = build_csr(
+            "mycelium2.example",
+            &["localhost".to_string(), "mycelium2.example".to_string()],
+        )
+        .unwrap();
+        assert!(csr_pem.contains("BEGIN CERTIFICATE REQUEST"), "{csr_pem}");
+        assert!(key_pem.contains("BEGIN PRIVATE KEY") || key_pem.contains("BEGIN EC PRIVATE KEY"));
+        // Re-parse: subject CN round-trips (x509-parser 0.16 exposes the
+        // subject as `certification_request_info.subject`, not the older
+        // `requested_subject()`).
+        use x509_parser::prelude::*;
+        let der = csr_der(&csr_pem);
+        let (_, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        let subject = format!("{}", csr.certification_request_info.subject);
+        assert!(subject.contains("mycelium2.example"), "{subject}");
+        // SANs round-trip verbatim.
+        let sans = csr_sans(&csr_pem);
+        assert!(sans.iter().any(|s| s == "DNSName(localhost)"), "{sans:?}");
+        assert!(
+            sans.iter().any(|s| s == "DNSName(mycelium2.example)"),
+            "{sans:?}"
+        );
+    }
+
+    #[test]
+    fn csr_from_pending_key_reuses_the_pending_key() {
+        let (_csr1, key_pem) = build_csr("a.example", &["a.example".to_string()]).unwrap();
+        let csr2 = build_csr_from_pending(&key_pem, "a.example", &["a.example".to_string()])
+            .expect("rebuild from pending key");
+        assert!(csr2.contains("BEGIN CERTIFICATE REQUEST"));
+        // "Re-download must reuse the pending key, not generate": the
+        // rebuilt CSR carries the pending key's SPKI.
+        let key = rcgen::KeyPair::from_pem(&key_pem).unwrap();
+        use x509_parser::prelude::*;
+        let der = csr_der(&csr2);
+        let (_, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        assert_eq!(
+            csr.certification_request_info.subject_pki.raw,
+            key.public_key_der(),
+            "re-download must reuse the pending key, not generate"
+        );
+    }
+
+    #[test]
+    fn csr_missing_cn_rejected() {
+        assert!(build_csr("", &["localhost".to_string()]).is_err());
+        assert!(build_csr("   ", &["localhost".to_string()]).is_err());
+        // Same guard on the pending-key builder (the GET re-download
+        // path reads its CN from pending.json).
+        let (_csr, key_pem) = build_csr("a.example", &["a.example".to_string()]).unwrap();
+        assert!(build_csr_from_pending(&key_pem, "  ", &["a.example".to_string()]).is_err());
+    }
+
+    #[test]
+    fn csr_empty_sans_is_the_only_localhost_default() {
+        let (_csr, key_pem) = build_csr("d.example", &["d.example".to_string()]).unwrap();
+        // Empty caller list → the localhost default.
+        let sans =
+            csr_sans(&build_csr_from_pending(&key_pem, "d.example", &[]).expect("empty sans list"));
+        assert_eq!(sans, vec!["DNSName(localhost)".to_string()]);
+        // A non-empty list is verbatim — localhost is never force-added.
+        let sans = csr_sans(
+            &build_csr_from_pending(&key_pem, "d.example", &["d.example".to_string()])
+                .expect("verbatim sans list"),
+        );
+        assert_eq!(sans, vec!["DNSName(d.example)".to_string()]);
+    }
+
+    #[test]
+    fn pending_lifecycle_save_read_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        // None when absent (fresh dir, no config/tls at all).
+        assert!(read_pending(dir.path()).is_none());
+        let meta = PendingCsr {
+            cn: "mycelium2.example".to_string(),
+            sans: vec!["localhost".to_string(), "mycelium2.example".to_string()],
+            created_at: "2026-10-14T00:00:00+00:00".to_string(),
+        };
+        save_pending(dir.path(), &meta, "-----BEGIN PRIVATE KEY-----\nfirst\n").unwrap();
+        let got = read_pending(dir.path()).expect("pending meta round-trips");
+        assert_eq!(got.cn, "mycelium2.example");
+        assert_eq!(got.sans, meta.sans);
+        assert_eq!(got.created_at, meta.created_at);
+        // Key file: 0600, under config/tls/ next to the meta.
+        let key_path = dir.path().join("config/tls/pending-csr-key.pem");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "-----BEGIN PRIVATE KEY-----\nfirst\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Last-one-wins: a second save replaces the prior key + meta.
+        let meta2 = PendingCsr {
+            cn: "second.example".to_string(),
+            sans: vec!["second.example".to_string()],
+            created_at: "2026-10-14T01:00:00+00:00".to_string(),
+        };
+        save_pending(dir.path(), &meta2, "-----BEGIN PRIVATE KEY-----\nsecond\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "-----BEGIN PRIVATE KEY-----\nsecond\n"
+        );
+        assert_eq!(read_pending(dir.path()).unwrap().cn, "second.example");
+        // Clear removes both files; idempotent; meta reads None after.
+        clear_pending(dir.path());
+        assert!(!key_path.exists());
+        assert!(!dir.path().join("config/tls/pending.json").exists());
+        assert!(read_pending(dir.path()).is_none());
+        clear_pending(dir.path());
     }
 
     #[test]

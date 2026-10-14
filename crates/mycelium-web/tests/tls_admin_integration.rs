@@ -685,6 +685,351 @@ async fn upload_without_csrf_header_is_rejected_before_buffering() {
     );
 }
 
+// ---------- CSR generation + pending lifecycle + reset (Task 5) ----------
+
+/// POST /admin/tls/csr (urlencoded form); returns the response.
+async fn post_csr(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    cn: &str,
+    sans: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/admin/tls/csr"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(&[("cn", cn), ("sans", sans)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// POST a TLS admin action that answers with a flash redirect; returns
+/// the decoded flash query.
+async fn post_flash(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+) -> String {
+    let resp = client
+        .post(format!("{base}{path}"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303, "POST {path} must flash-redirect");
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(loc.starts_with("/admin/system?"), "{loc}");
+    percent_decode(&loc)
+}
+
+#[tokio::test]
+async fn csr_flow_generate_download_upload_match_discard() {
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    // Generate → PEM download response + pending files on disk.
+    let resp = post_csr(
+        &cl,
+        &base,
+        &cookie,
+        &csrf,
+        "mycelium2.example",
+        "mycelium2.example",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-pem-file")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok()),
+        Some("attachment; filename=\"csr.pem\"")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let csr_pem = resp.text().await.unwrap();
+    assert!(csr_pem.contains("BEGIN CERTIFICATE REQUEST"), "{csr_pem}");
+    assert!(!csr_pem.contains("PRIVATE KEY"), "key never in body");
+    let pending_key_path = dir.path().join("config/tls/pending-csr-key.pem");
+    let pending_meta_path = dir.path().join("config/tls/pending.json");
+    assert!(pending_key_path.exists());
+    assert!(pending_meta_path.exists());
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&pending_key_path)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pending_meta_path).unwrap()).unwrap();
+    assert_eq!(meta["cn"], "mycelium2.example");
+    assert_eq!(meta["sans"][0], "mycelium2.example");
+    assert!(meta["created_at"].as_str().unwrap().contains('T'));
+    // Re-download (GET) rebuilds from the pending key — same key, so the
+    // CSR carries it (rcgen's serialize_request is not byte-stable, so
+    // structure, not bytes, is the contract).
+    let resp = cl
+        .get(format!("{base}/admin/tls/csr"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let csr2 = resp.text().await.unwrap();
+    assert!(csr2.contains("BEGIN CERTIFICATE REQUEST"));
+    let spki_of = |pem: &str| -> Vec<u8> {
+        use x509_parser::prelude::*;
+        let der = x509_parser::pem::Pem::iter_from_buffer(pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .contents;
+        let (_, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        csr.certification_request_info.subject_pki.raw.to_vec()
+    };
+    assert_eq!(
+        spki_of(&csr2),
+        spki_of(&csr_pem),
+        "re-download must reuse the pending key"
+    );
+    // Fulfill: issue a cert FROM the pending key locally (the CA's role),
+    // upload it — the pending flow must accept and clear.
+    let key_pem = std::fs::read_to_string(&pending_key_path).unwrap();
+    let key = rcgen::KeyPair::from_pem(&key_pem).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["mycelium2.example".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "mycelium2.example");
+    let cert = params.self_signed(&key).unwrap();
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "cert_pem",
+            reqwest::multipart::Part::bytes(cert.pem().into_bytes()).file_name("cert.pem"),
+        )
+        .part(
+            "key_pem",
+            reqwest::multipart::Part::bytes(key_pem.as_bytes().to_vec()).file_name("key.pem"),
+        )
+        .text("label", "from-csr".to_string());
+    let resp = cl
+        .post(format!("{base}/admin/tls/upload"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(percent_decode(&loc).contains("ok="), "{loc}");
+    // Pending cleared (both files).
+    assert!(!pending_key_path.exists());
+    assert!(!pending_meta_path.exists());
+    // An upload with a DIFFERENT key while a CSR is pending is refused
+    // and the pending pair survives (the admin still needs it to retry).
+    post_csr(&cl, &base, &cookie, &csrf, "x.example", "").await;
+    assert!(pending_key_path.exists());
+    let (cert2, key2) = gen_pair("x.example");
+    let flash = upload(&cl, &base, &cookie, &csrf, cert2, key2, "wrong-key").await;
+    assert!(flash.contains("error="), "{flash}");
+    assert!(
+        flash.contains("pending CSR key"),
+        "pending-key mismatch must name the pending key: {flash}"
+    );
+    assert!(pending_key_path.exists(), "rejection keeps the pending key");
+    // Discard path.
+    let flash = post_flash(&cl, &base, &cookie, &csrf, "/admin/tls/pending/discard").await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert!(!pending_key_path.exists());
+    assert!(!pending_meta_path.exists());
+    // GET with nothing pending → flash-not-found redirect, not a 200.
+    let resp = cl
+        .get(format!("{base}/admin/tls/csr"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(percent_decode(&loc).contains("error="), "{loc}");
+}
+
+#[tokio::test]
+async fn csr_generate_replaces_prior_pending_last_one_wins() {
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let key_path = dir.path().join("config/tls/pending-csr-key.pem");
+    post_csr(&cl, &base, &cookie, &csrf, "first.example", "").await;
+    let first_key = std::fs::read_to_string(&key_path).unwrap();
+    let resp = post_csr(&cl, &base, &cookie, &csrf, "second.example", "").await;
+    assert_eq!(resp.status(), 200);
+    let second_key = std::fs::read_to_string(&key_path).unwrap();
+    assert_ne!(first_key, second_key, "a new CSR replaces the pending key");
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("config/tls/pending.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["cn"], "second.example");
+    // Empty sans field → the localhost default in the persisted meta.
+    assert_eq!(meta["sans"][0], "localhost");
+    assert_eq!(meta["sans"].as_array().unwrap().len(), 1);
+    // A blank CN is refused with an error flash and leaves the pending
+    // pair untouched.
+    let flash_resp = post_csr(&cl, &base, &cookie, &csrf, "   ", "").await;
+    assert_eq!(flash_resp.status(), 303);
+    let loc = flash_resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(percent_decode(&loc).contains("error="), "{loc}");
+    assert_eq!(std::fs::read_to_string(&key_path).unwrap(), second_key);
+}
+
+#[tokio::test]
+async fn csr_endpoints_admin_only() {
+    let (base, _shutdown, _dir) = boot().await;
+    let cl = client();
+    // Unauthenticated GET/POST → the login gate redirect.
+    let resp = cl
+        .get(format!("{base}/admin/tls/csr"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
+    let resp = cl
+        .post(format!("{base}/admin/tls/csr"))
+        .form(&[("cn", "anon.example"), ("sans", "")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
+    let resp = cl
+        .post(format!("{base}/admin/tls/pending/discard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    let resp = cl
+        .post(format!("{base}/admin/tls/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+}
+
+#[tokio::test]
+async fn reset_returns_to_generated_pair() {
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let generated = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    let generated_key = std::fs::read_to_string(dir.path().join("config/tls/key.pem")).unwrap();
+    let (cert, key) = gen_pair("reset.example");
+    // Upload then reset.
+    let flash = upload(&cl, &base, &cookie, &csrf, cert, key, "tmp").await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert!(dir.path().join("config/tls/uploaded-cert.pem").exists());
+    let flash = post_flash(&cl, &base, &cookie, &csrf, "/admin/tls/reset").await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert!(!dir.path().join("config/tls/uploaded-cert.pem").exists());
+    assert!(!dir.path().join("config/tls/uploaded-key.pem").exists());
+    assert!(!dir.path().join("config/tls/uploaded.json").exists());
+    // The generated pair is NEVER deleted by reset.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap(),
+        generated
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/key.pem")).unwrap(),
+        generated_key
+    );
+    // Download serves the generated pair again.
+    let body = download_cert(&cl, &base, &cookie).await;
+    assert_eq!(normalize_pem(&body), normalize_pem(&generated));
+    // And the LIVE listener serves it too (the reload really happened):
+    // a real rustls client validates the leaf's SPKI against the chain,
+    // so a stale uploaded config would fail the handshake.
+    let live = reqwest::Client::builder()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = live
+        .get(format!("{base}/admin/tls/cert"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .expect("live TLS handshake after reset");
+    assert_eq!(resp.status(), 200);
+    // Reset with nothing uploaded is idempotent and still ok.
+    let flash = post_flash(&cl, &base, &cookie, &csrf, "/admin/tls/reset").await;
+    assert!(flash.contains("ok="), "{flash}");
+}
+
+#[tokio::test]
+async fn reset_never_touches_the_pending_csr() {
+    // reset is the uploaded-pair rollback action: pending is its own
+    // lifecycle (discard), and reset must not cost the admin a CSR key.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    post_csr(&cl, &base, &cookie, &csrf, "keep.example", "").await;
+    let key = std::fs::read_to_string(dir.path().join("config/tls/pending-csr-key.pem")).unwrap();
+    let flash = post_flash(&cl, &base, &cookie, &csrf, "/admin/tls/reset").await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/pending-csr-key.pem")).unwrap(),
+        key
+    );
+    assert!(dir.path().join("config/tls/pending.json").exists());
+}
+
 #[tokio::test]
 async fn tls_cert_download_admin_only_and_serves_generated_pem() {
     let (base, _shutdown, dir) = boot().await;

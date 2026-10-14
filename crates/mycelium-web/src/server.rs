@@ -147,6 +147,12 @@ pub fn build_router_with_shutdown(
             "/admin/tls/upload",
             post(api::tls_upload).layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)),
         )
+        .route(
+            "/admin/tls/csr",
+            get(api::tls_csr_download).post(api::tls_csr),
+        )
+        .route("/admin/tls/pending/discard", post(api::tls_pending_discard))
+        .route("/admin/tls/reset", post(api::tls_reset))
         // API + health + metrics.
         .nest("/api/v1", api_routes)
         .merge(health::routes())
