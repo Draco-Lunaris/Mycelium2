@@ -65,6 +65,14 @@ mounts exist (main.rs:27-32) but are undocumented on the admin side.
    mid-renewal are the ones uploading, and a hard reject would block
    the recovery path.
 3. SANs also as `--tls-sans` CLI flag (clap: env + flag, one line each).
+   **AMENDED 2026-10-14 (user ruling, supersedes any earlier text in
+   this spec and its plan): the repo is public — no pre-defined
+   environment details anywhere.** The SAN set is fully
+   operator-defined: when MYCELIUM2_TLS_SANS/--tls-sans is set, the
+   list is taken verbatim (dedup, order-stable); `localhost` is only
+   the DEFAULT when the value is unset/empty — never force-added to a
+   configured set. All test fixtures use RFC documentation values
+   (mycelium2.example, 192.0.2.10), never real hostnames/IPs.
 4. Env `MYCELIUM2_TLS_SANS` is boot-time (matches the
    `MYCELIUM2_WEBAUTHN_ORIGIN` precedent — cert built at boot, before
    any request exists).
