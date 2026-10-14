@@ -137,6 +137,7 @@ pub fn build_router_with_shutdown(
         .route("/admin/security", post(api::admin_save_security))
         .route("/admin/bookshelves", post(api::admin_create_bookshelf))
         .route("/admin/backup", post(api::admin_backup))
+        .route("/admin/tls/cert", get(api::tls_cert_download))
         // API + health + metrics.
         .nest("/api/v1", api_routes)
         .merge(health::routes())
@@ -266,11 +267,16 @@ pub async fn serve(
     sans: Vec<String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let router = build_router_with_shutdown(state, shutdown.clone());
     let (tls, tls_handle) =
         cert::load_or_create_tls_config(data_dir, cert_path, key_path, &sans).await?;
-    // stashed into AppState in the next task
-    let _tls_handle = tls_handle;
+    // Both returns are clones of one Arc-backed handle: stash the
+    // second into AppState so admin TLS reloads go through it, then
+    // build the router over the state that carries it.
+    let state = AppState {
+        tls: Some(Arc::new(tls_handle)),
+        ..state
+    };
+    let router = build_router_with_shutdown(state, shutdown.clone());
 
     // HTTP:80 → HTTPS redirect. Preserves the request Host (so the
     // redirect targets the hostname the client actually used) and the

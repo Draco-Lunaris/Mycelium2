@@ -2763,6 +2763,43 @@ pub async fn admin_backup(
     }
 }
 
+// ---------- TLS management (admin) ----------
+
+/// GET /admin/tls/cert — download the ACTIVE cert PEM: the uploaded
+/// cert when one is in effect, else the managed generated pair. Only
+/// the certificate is ever served — the private key is not readable
+/// through any route. `no-store`: the file is the live serving
+/// material's public half and changes under the admin's feet.
+pub async fn tls_cert_download(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    let tls_dir = state.data_dir.join("config/tls");
+    let uploaded = tls_dir.join("uploaded-cert.pem");
+    let path = if uploaded.exists() {
+        uploaded
+    } else {
+        tls_dir.join("cert.pem")
+    };
+    match tokio::fs::read_to_string(&path).await {
+        Ok(pem) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            pem,
+        )
+            .into_response(),
+        Err(e) => {
+            // The path is server-side config; log the detail, serve a
+            // generic body (the endpoint-wide convention).
+            tracing::error!(error = %e, "TLS cert read failed");
+            error_response(StatusCode::NOT_FOUND, "certificate not found")
+        }
+    }
+}
+
 // ---------- Phase 7: book ingest + passages ----------
 
 #[derive(Deserialize)]

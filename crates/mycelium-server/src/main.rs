@@ -87,7 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Assemble the app state.
     let login = mycelium_auth::login::LoginService::new(store.pool().clone());
-    let state = mycelium_web::AppState::new(store, service_key, login, assets_dir);
+    // `tls: None` here — serve() loads the pair and stashes the live
+    // handle into the state it is given.
+    let state = mycelium_web::AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        data_dir.clone(),
+        None,
+    );
 
     // Librarian boot sweep: fail jobs interrupted by a previous
     // shutdown, requeue pending ones.

@@ -44,7 +44,14 @@ async fn boot() -> (
     let assets_dir = dir.path().join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
     let login = LoginService::new(store.pool().clone());
-    let state = AppState::new(store, service_key, login, assets_dir);
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        dir.path().to_path_buf(),
+        None,
+    );
 
     let https: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let http: SocketAddr = "127.0.0.1:0".parse().unwrap();

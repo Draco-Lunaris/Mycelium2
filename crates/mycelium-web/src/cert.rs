@@ -81,6 +81,12 @@ pub fn generate_self_signed_with_sans(
     key_path: &Path,
     sans: &[String],
 ) -> Result<(), CertError> {
+    // rcgen emits a cert with NO SAN extension for an empty list —
+    // useless for TLS and a silent footgun for every caller that
+    // forgets to default. Fail loudly instead.
+    if sans.is_empty() {
+        return Err(CertError::Generate("SAN list must not be empty".into()));
+    }
     std::fs::create_dir_all(tls_dir)?;
     let subject_alt_names: Vec<String> = sans.to_vec();
     let cert = rcgen::generate_simple_self_signed(subject_alt_names)
@@ -194,6 +200,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn empty_sans_is_rejected_not_silently_unsanitised() {
+        // rcgen would emit a cert with no SAN extension; the guard
+        // refuses instead (protects every Task 4+ caller).
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        let err = generate_self_signed_with_sans(
+            &tls_dir,
+            &tls_dir.join("cert.pem"),
+            &tls_dir.join("key.pem"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, CertError::Generate(_)), "got {err:?}");
+        assert!(err.to_string().contains("SAN list must not be empty"));
+        // Nothing written — the refusal happens before any I/O.
+        assert!(!tls_dir.join("cert.pem").exists());
+        assert!(!tls_dir.join("key.pem").exists());
     }
 
     #[tokio::test]
