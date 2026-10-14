@@ -232,10 +232,17 @@ pub fn read_pending(data_dir: &std::path::Path) -> Option<PendingCsr> {
     serde_json::from_str(&meta).ok()
 }
 
-/// Persist a pending CSR: metadata JSON + its 0600 key, replacing any
-/// prior pending pair (last-one-wins). The key file is created fresh
+/// Persist a pending CSR: its 0600 key + the metadata JSON, replacing
+/// any prior pending pair (last-one-wins). The key file is created fresh
 /// (`create_new`) so its mode can never be inherited from an existing
 /// file.
+///
+/// Ordering (Review M1): the key is written FIRST, the meta LAST. The
+/// meta is the commit point — a key-write failure leaves the previous
+/// pending pair fully intact (the upload path's pending-key check reads
+/// only the key file, so a half-update that swapped the key under an
+/// old meta would be the dangerous direction; key-first makes that
+/// impossible).
 pub fn save_pending(
     data_dir: &std::path::Path,
     meta: &PendingCsr,
@@ -243,11 +250,6 @@ pub fn save_pending(
 ) -> std::io::Result<()> {
     let tls_dir = data_dir.join("config/tls");
     std::fs::create_dir_all(&tls_dir)?;
-    std::fs::write(
-        tls_dir.join("pending.json"),
-        serde_json::to_string(meta)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
-    )?;
     // Key 0600; replace any prior pending key (last-one-wins).
     std::fs::remove_file(tls_dir.join("pending-csr-key.pem")).ok();
     use std::io::Write;
@@ -257,7 +259,13 @@ pub fn save_pending(
         .create_new(true)
         .mode(0o600)
         .open(tls_dir.join("pending-csr-key.pem"))?;
-    f.write_all(key_pem.as_bytes())
+    f.write_all(key_pem.as_bytes())?;
+    // Meta last: the commit point (see the ordering note above).
+    std::fs::write(
+        tls_dir.join("pending.json"),
+        serde_json::to_string(meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
+    )
 }
 
 /// Remove both pending CSR files. Missing files are fine.
@@ -265,6 +273,105 @@ pub fn clear_pending(data_dir: &std::path::Path) {
     let tls_dir = data_dir.join("config/tls");
     std::fs::remove_file(tls_dir.join("pending-csr-key.pem")).ok();
     std::fs::remove_file(tls_dir.join("pending.json")).ok();
+}
+
+/// The display details of the ACTIVE certificate, parsed for the
+/// admin System page's TLS card. Every string is display-only and must
+/// be HTML-escaped at render time — subject/issuer/SANs come from an
+/// uploaded cert the server does not trust.
+#[derive(Debug, Clone)]
+pub struct CertDetails {
+    pub subject: String,
+    pub issuer: String,
+    pub sans: Vec<String>,
+    pub not_before: String,
+    pub not_after: String,
+    pub fingerprint_sha256: String,
+    /// `"generated"` or `"uploaded"`.
+    pub source: String,
+    /// The upload sidecar's label (uploaded source only).
+    pub label: Option<String>,
+    pub expired: bool,
+    pub expiring_soon: bool,
+}
+
+/// Parse the ACTIVE cert (uploaded pair when present, else the managed
+/// generated pair) into display details. `None` when neither file
+/// parses — the card then renders its "no certificate" state rather
+/// than fabricating values.
+pub fn active_cert_details(data_dir: &std::path::Path) -> Option<CertDetails> {
+    let tls_dir = data_dir.join("config/tls");
+    let up = tls_dir.join("uploaded-cert.pem");
+    let (pem, source, label) = if up.exists() {
+        let label = std::fs::read_to_string(tls_dir.join("uploaded.json"))
+            .ok()
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+            .and_then(|v| v.get("label").and_then(|l| l.as_str()).map(str::to_string));
+        (std::fs::read_to_string(&up).ok()?, "uploaded", label)
+    } else {
+        (
+            std::fs::read_to_string(tls_dir.join("cert.pem")).ok()?,
+            "generated",
+            None,
+        )
+    };
+    // The leaf is the FIRST PEM block (a CA chain is leaf-first); its
+    // DER is the fingerprint material — the same bytes
+    // `openssl x509 -fingerprint -sha256` hashes, matching
+    // validate_upload's fingerprint so the card and the upload flash
+    // agree.
+    let leaf_der = x509_parser::pem::Pem::iter_from_buffer(pem.as_bytes())
+        .filter_map(Result::ok)
+        .map(|block| block.contents)
+        .find(|der| x509_parser::parse_x509_certificate(der).is_ok())?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf_der).ok()?;
+    // ASN1Time wraps a `time::OffsetDateTime`; the expiry math runs on
+    // the inner value (ASN1Time's own Sub returns Option).
+    let now = time::OffsetDateTime::now_utc();
+    let not_after = cert.validity().not_after.to_datetime();
+    let expired = not_after < now;
+    let expiring_soon = !expired && not_after - now < time::Duration::days(30);
+    let sans: Vec<String> = cert
+        .extensions()
+        .iter()
+        .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+        .map(|e| match e.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
+                san.general_names.iter().map(format_general_name).collect()
+            }
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
+    Some(CertDetails {
+        subject: format!("{}", cert.subject()),
+        issuer: format!("{}", cert.issuer()),
+        sans,
+        not_before: cert.validity().not_before.to_string(),
+        not_after: cert.validity().not_after.to_string(),
+        fingerprint_sha256: hex::encode(Sha256::digest(&leaf_der)),
+        source: source.to_string(),
+        label,
+        expired,
+        expiring_soon,
+    })
+}
+
+/// A GeneralName in display form: DNS/e-mail/URI names as-is, IP
+/// addresses in their canonical text form (x509-parser hands back raw
+/// octets — 4 = v4, 16 = v6), anything else the parser's Debug shape.
+fn format_general_name(gn: &x509_parser::extensions::GeneralName) -> String {
+    use x509_parser::extensions::GeneralName;
+    match gn {
+        GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s) => s.to_string(),
+        GeneralName::IPAddress(bytes) => match <[u8; 4]>::try_from(*bytes) {
+            Ok(v4) => std::net::Ipv4Addr::from(v4).to_string(),
+            Err(_) => match <[u8; 16]>::try_from(*bytes) {
+                Ok(v6) => std::net::Ipv6Addr::from(v6).to_string(),
+                Err(_) => format!("{bytes:?}"),
+            },
+        },
+        other => format!("{other:?}"),
+    }
 }
 
 /// Parse the MYCELIUM2_TLS_SANS / --tls-sans value: comma-separated,
@@ -684,6 +791,174 @@ mod tests {
         assert!(!dir.path().join("config/tls/pending.json").exists());
         assert!(read_pending(dir.path()).is_none());
         clear_pending(dir.path());
+    }
+
+    // ---------- Active-cert details (Task 6) ----------
+
+    #[test]
+    fn save_pending_key_failure_leaves_prior_meta_untouched() {
+        // Review M1 (key-first ordering): the key is written BEFORE the
+        // meta, so a key-write failure cannot leave new-meta + old-key
+        // (or new-meta + no-key) on disk. Simulated failure: the key
+        // path is a directory, so remove + create_new both fail.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = PendingCsr {
+            cn: "first.example".to_string(),
+            sans: vec!["first.example".to_string()],
+            created_at: "2026-10-14T00:00:00+00:00".to_string(),
+        };
+        save_pending(dir.path(), &meta, "-----BEGIN PRIVATE KEY-----\nfirst\n").unwrap();
+        // Sabotage the key path, then attempt a second save.
+        let key_path = dir.path().join("config/tls/pending-csr-key.pem");
+        std::fs::remove_file(&key_path).unwrap();
+        std::fs::create_dir(&key_path).unwrap();
+        let meta2 = PendingCsr {
+            cn: "second.example".to_string(),
+            sans: vec!["second.example".to_string()],
+            created_at: "2026-10-14T01:00:00+00:00".to_string(),
+        };
+        assert!(save_pending(dir.path(), &meta2, "-----BEGIN PRIVATE KEY-----\nsecond\n").is_err());
+        // The prior meta survives untouched — the meta is the commit
+        // point, written only after the key succeeded.
+        let got = read_pending(dir.path()).expect("prior meta still readable");
+        assert_eq!(got.cn, "first.example");
+    }
+
+    #[test]
+    fn active_cert_details_parses_generated_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        crate::cert::generate_self_signed_with_sans(
+            &tls_dir,
+            &tls_dir.join("cert.pem"),
+            &tls_dir.join("key.pem"),
+            &["localhost".to_string(), "det.example".to_string()],
+        )
+        .unwrap();
+        let d = active_cert_details(dir.path()).expect("details parse");
+        assert_eq!(d.source, "generated");
+        assert!(
+            d.sans.iter().any(|s| s.contains("det.example")),
+            "{:?}",
+            d.sans
+        );
+        assert!(d.subject.contains("rcgen self signed cert") || !d.subject.is_empty());
+        assert!(!d.fingerprint_sha256.is_empty());
+        assert!(!d.expired);
+        assert!(!d.expiring_soon);
+        assert!(d.label.is_none());
+    }
+
+    #[test]
+    fn active_cert_details_prefers_uploaded_and_reads_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        // A generated pair AND an uploaded pair: the uploaded one wins
+        // (the same precedence the download handler and boot use).
+        crate::cert::generate_self_signed_with_sans(
+            &tls_dir,
+            &tls_dir.join("cert.pem"),
+            &tls_dir.join("key.pem"),
+            &["localhost".to_string()],
+        )
+        .unwrap();
+        let (cert, _key) = test_pair();
+        std::fs::write(tls_dir.join("uploaded-cert.pem"), &cert).unwrap();
+        std::fs::write(
+            tls_dir.join("uploaded.json"),
+            serde_json::json!({"label": "acme", "source": "uploaded"}).to_string(),
+        )
+        .unwrap();
+        let d = active_cert_details(dir.path()).expect("details parse");
+        assert_eq!(d.source, "uploaded");
+        assert_eq!(d.label.as_deref(), Some("acme"));
+        // The uploaded fixture's SAN (upload.example), not localhost.
+        assert!(
+            d.sans.iter().any(|s| s.contains("upload.example")),
+            "{:?}",
+            d.sans
+        );
+    }
+
+    #[test]
+    fn active_cert_details_expiry_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        let kp = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["gone.example".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "gone.example");
+        params.not_before = time::OffsetDateTime::UNIX_EPOCH;
+        params.not_after = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let cert = params.self_signed(&kp).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), cert.pem()).unwrap();
+        let d = active_cert_details(dir.path()).expect("expired parses");
+        assert!(d.expired);
+        assert!(!d.expiring_soon);
+
+        let mut params = rcgen::CertificateParams::new(vec!["soon.example".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "soon.example");
+        params.not_before = time::OffsetDateTime::now_utc();
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(10);
+        let cert = params.self_signed(&kp).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), cert.pem()).unwrap();
+        let d = active_cert_details(dir.path()).expect("soon parses");
+        assert!(!d.expired);
+        assert!(d.expiring_soon);
+    }
+
+    #[test]
+    fn active_cert_details_absent_or_garbage_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on disk at all.
+        assert!(active_cert_details(dir.path()).is_none());
+        // Garbage where the generated cert would be.
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), "not a pem").unwrap();
+        assert!(active_cert_details(dir.path()).is_none());
+    }
+
+    #[test]
+    fn active_cert_details_formats_ip_sans() {
+        // The GeneralName arms are pinned with a real IP SAN: v4 dotted
+        // and v6 compressed (x509-parser hands back raw octets).
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        let kp = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                "192.0.2.7".parse().unwrap(),
+            )));
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(std::net::IpAddr::V6(
+                "2001:db8::1".parse().unwrap(),
+            )));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "ip.example");
+        let cert = params.self_signed(&kp).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), cert.pem()).unwrap();
+        let d = active_cert_details(dir.path()).expect("ip SAN cert parses");
+        assert!(
+            d.sans.iter().any(|s| s == "192.0.2.7"),
+            "v4 SAN: {:?}",
+            d.sans
+        );
+        assert!(
+            d.sans.iter().any(|s| s == "2001:db8::1"),
+            "v6 SAN: {:?}",
+            d.sans
+        );
     }
 
     #[test]

@@ -2417,10 +2417,17 @@ pub async fn admin_system_view(
         llm_last_success_seconds: s.llm_last_success_seconds,
     };
     let admin = request_admin_user(&state, &session).await;
+    // The TLS card's inputs: the ACTIVE cert's parsed details and the
+    // outstanding CSR (both read from the data dir on every page view —
+    // cheap, and always current after an upload/reset/discard).
+    let cert = crate::tls_admin::active_cert_details(&state.data_dir);
+    let pending = crate::tls_admin::read_pending(&state.data_dir);
     pages::admin_system_page(
         &admin,
         &csrf,
         &stats,
+        cert.as_ref(),
+        pending.as_ref(),
         params.ok.as_deref(),
         params.error.as_deref(),
     )
@@ -3066,8 +3073,11 @@ pub async fn tls_csr(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     if let Err(e) = crate::tls_admin::save_pending(&state.data_dir, &meta, &key_pem) {
-        // Nothing durable happened; log the detail, flash the generic
-        // (the io error is not actionable for the admin).
+        // save_pending writes the key first and the meta last, so a
+        // failure here means the key write failed and the PREVIOUS
+        // pending pair (if any) is fully intact — the new CSR simply
+        // never became pending. Log the detail, flash the generic (the
+        // io error is not actionable for the admin).
         tracing::error!(error = %e, "pending CSR persist failed");
         return tls_flash_error("the pending CSR could not be saved");
     }

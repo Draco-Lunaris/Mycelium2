@@ -23,6 +23,7 @@ mycelium2 --data-dir ./data --https-addr 127.0.0.1:8443 --http-addr 127.0.0.1:80
 ## Documentation
 
 - [Deployment](deployment.md) — Docker, compose, TLS, reverse proxies
+- [TLS configuration](tls.md) — self-signed SANs, uploaded certs, CSR flow, trusting the cert
 - [Configuration](configuration.md) — env vars, runtime config, LLM backend
 - [Architecture](architecture.md) — crates, encryption model, data flow
 - [API](api.md) — REST `/api/v1` reference

@@ -15,14 +15,23 @@ use mycelium_web::AppState;
 /// Known admin password for the pre-seeded account.
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
 
-/// Boot the full server (real TLS via `serve`) over a tempdir data
-/// directory; returns (base URL, shutdown token, data dir).
+/// Boot the full server (real TLS via `serve`) over a fresh tempdir
+/// data directory; returns (base URL, shutdown token, data dir).
 async fn boot() -> (
     String,
     tokio_util::sync::CancellationToken,
     tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
+    let (base, shutdown) = boot_with_dir(&dir).await;
+    (base, shutdown, dir)
+}
+
+/// The boot body over a CALLER-SUPPLIED data dir — the boot-precedence
+/// test pre-seeds `config/tls/` before the server starts, which `boot()`
+/// (owning its own tempdir) cannot express. Returns (base URL, shutdown
+/// token); the caller keeps the tempdir alive.
+async fn boot_with_dir(dir: &tempfile::TempDir) -> (String, tokio_util::sync::CancellationToken) {
     let store = Store::open(dir.path()).await.unwrap();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
     let users = mycelium_auth::UserStore::new(store.pool().clone());
@@ -71,7 +80,7 @@ async fn boot() -> (
         .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    (format!("https://127.0.0.1:{https_port}"), shutdown, dir)
+    (format!("https://127.0.0.1:{https_port}"), shutdown)
 }
 
 fn client() -> reqwest::Client {
@@ -954,12 +963,20 @@ async fn csr_endpoints_admin_only() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 303);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
     let resp = cl
         .post(format!("{base}/admin/tls/reset"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 303);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
 }
 
 #[tokio::test]
@@ -991,9 +1008,12 @@ async fn reset_returns_to_generated_pair() {
     // Download serves the generated pair again.
     let body = download_cert(&cl, &base, &cookie).await;
     assert_eq!(normalize_pem(&body), normalize_pem(&generated));
-    // And the LIVE listener serves it too (the reload really happened):
-    // a real rustls client validates the leaf's SPKI against the chain,
-    // so a stale uploaded config would fail the handshake.
+    // And the LIVE listener still serves after the reload. This client
+    // accepts any cert, so the handshake itself is not the reload proof
+    // — the ok flash means `reload_from_pem_file` returned Ok, and
+    // Task 4's upload test pins that the same call swaps the served
+    // cert. What this request does prove: the reset reload did not
+    // break the listener.
     let live = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(true)
@@ -1028,6 +1048,193 @@ async fn reset_never_touches_the_pending_csr() {
         key
     );
     assert!(dir.path().join("config/tls/pending.json").exists());
+}
+
+// ---------- TLS card on the admin System page + boot precedence (Task 6) ----------
+
+#[tokio::test]
+async fn admin_system_page_shows_tls_card() {
+    let (base, _shutdown, _dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let _ = csrf;
+    let page = cl
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("TLS certificate"), "card missing: {html}");
+    assert!(html.contains("SHA-256"), "fingerprint label missing");
+    assert!(html.contains("generated"), "source chip missing");
+    assert!(html.contains("/admin/tls/cert"), "download link missing");
+    assert!(html.contains("Generate CSR"), "CSR form missing");
+    assert!(html.contains("/admin/tls/upload"), "upload form missing");
+    // The card's forms carry the app-wide csrf_token field (the name
+    // the CSRF middleware reads from native form bodies).
+    assert!(
+        html.contains("name=\"csrf_token\""),
+        "TLS forms must carry the csrf_token field"
+    );
+}
+
+#[tokio::test]
+async fn boot_precedence_uploaded_beats_generated_integration() {
+    // Pre-seed an uploaded pair in the tempdir BEFORE boot: the served
+    // cert must be the uploaded one, while the generated fallback pair
+    // is still created and kept current (Task 2's carried M-1 pin,
+    // proven over the wire rather than at the cert.rs unit level).
+    let dir = tempfile::tempdir().unwrap();
+    let tls_dir = dir.path().join("config/tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let kp = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["preseed.example".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "preseed.example");
+    let cert = params.self_signed(&kp).unwrap();
+    std::fs::write(tls_dir.join("uploaded-cert.pem"), cert.pem()).unwrap();
+    std::fs::write(tls_dir.join("uploaded-key.pem"), kp.serialize_pem()).unwrap();
+    std::fs::write(
+        tls_dir.join("uploaded.json"),
+        serde_json::json!({
+            "label": "preseed", "uploaded_at": "now", "fingerprint_sha256": "00", "source": "uploaded"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (base, _shutdown) = boot_with_dir(&dir).await;
+    let cl = client();
+    let (cookie, _csrf) = login_admin(&cl, &base).await;
+    // The download serves the UPLOADED cert (uploaded beats generated).
+    let body = download_cert(&cl, &base, &cookie).await;
+    let uploaded = std::fs::read_to_string(tls_dir.join("uploaded-cert.pem")).unwrap();
+    assert_eq!(
+        normalize_pem(&body),
+        normalize_pem(&uploaded),
+        "boot precedence: uploaded pair must serve, not generated"
+    );
+    // The generated fallback pair also exists (kept current at boot).
+    assert!(tls_dir.join("cert.pem").exists());
+    // And the card names the uploaded source with its label.
+    let page = cl
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let html = page.text().await.unwrap();
+    assert!(html.contains("uploaded"), "source must read uploaded");
+    assert!(html.contains("preseed"), "the sidecar label must render");
+}
+
+#[tokio::test]
+async fn tls_card_escapes_uploaded_cert_subject() {
+    // XSS pin: an uploaded cert's subject/issuer/SAN strings are
+    // attacker-influenced and must never reach the page unescaped.
+    let (base, _shutdown, _dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let payload = "<script>alert(1)</script>";
+    let kp = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![format!("x{payload}.example")]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, payload);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, payload);
+    let cert = params.self_signed(&kp).unwrap();
+    let flash = upload(
+        &cl,
+        &base,
+        &cookie,
+        &csrf,
+        cert.pem().into_bytes(),
+        kp.serialize_pem().into_bytes(),
+        payload,
+    )
+    .await;
+    // The upload itself may succeed or warn; either way the card must
+    // render the value escaped.
+    assert!(flash.contains("ok=") || flash.contains("error="), "{flash}");
+    let page = cl
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let html = page.text().await.unwrap();
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "raw script payload reached the page"
+    );
+    // The escaped form is present (the payload really did render, just
+    // escaped) — proves the escape path ran rather than the value being
+    // dropped.
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "escaped payload must be what renders"
+    );
+}
+
+/// M5: `AppState.tls == None` (a process that never served TLS) — the
+/// reset handler must flash the restart-required variant instead of
+/// claiming a live reload it cannot perform. Driven at the handler
+/// level: the session cookie is `Secure`, so a plain-HTTP harness
+/// cannot carry it, and booting a second TLS listener would not change
+/// `state.tls` (serve always sets Some).
+#[tokio::test]
+async fn tls_reset_without_live_listener_flashes_restart_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let login = mycelium_auth::login::LoginService::new(store.pool().clone());
+    let assets_dir = dir.path().join("assets");
+    mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        dir.path().to_path_buf(),
+        None, // no live TLS handle
+    );
+    // A generated pair must exist for reset to fall back to, plus an
+    // uploaded pair to remove.
+    let tls_dir = dir.path().join("config/tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let (cert, key) = gen_pair("reset-none.example");
+    std::fs::write(tls_dir.join("cert.pem"), &cert).unwrap();
+    std::fs::write(tls_dir.join("key.pem"), &key).unwrap();
+    std::fs::write(tls_dir.join("uploaded-cert.pem"), &cert).unwrap();
+    std::fs::write(tls_dir.join("uploaded-key.pem"), &key).unwrap();
+    std::fs::write(tls_dir.join("uploaded.json"), "{}").unwrap();
+
+    let resp = mycelium_web::api::tls_reset(
+        axum::extract::State(state),
+        mycelium_auth::rbac::RequireAdmin,
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let flash = percent_decode(&loc);
+    assert!(
+        flash.contains("takes effect after restart"),
+        "None-path must flash the restart-required variant: {flash}"
+    );
+    // The uploaded pair is gone from disk (the rollback is real), the
+    // generated pair survives.
+    assert!(!tls_dir.join("uploaded-cert.pem").exists());
+    assert!(tls_dir.join("cert.pem").exists());
 }
 
 #[tokio::test]
