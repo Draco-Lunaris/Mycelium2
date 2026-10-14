@@ -30,6 +30,13 @@ struct Args {
     /// Admin-supplied TLS key (PEM). Auto self-signed when absent.
     #[arg(long, env = "MYCELIUM2_TLS_KEY")]
     tls_key: Option<String>,
+
+    /// SANs (comma-separated) for the generated self-signed cert.
+    /// Unset → `localhost` only (the default). A set list is taken
+    /// verbatim — no forced additions. Regenerates the managed pair
+    /// when the set changes.
+    #[arg(long, env = "MYCELIUM2_TLS_SANS")]
+    tls_sans: Option<String>,
 }
 
 #[tokio::main]
@@ -46,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let data_dir = std::path::PathBuf::from(&args.data_dir);
     tracing::info!(data_dir = %args.data_dir, "starting Mycelium2");
+
+    let tls_sans = mycelium_web::tls_admin::sans_from_env(args.tls_sans.as_deref());
+    tracing::info!(sans = ?tls_sans, "TLS SAN configuration");
 
     // Open the store (creates layout + runs migrations).
     let store = mycelium_store::Store::open(&data_dir).await?;
