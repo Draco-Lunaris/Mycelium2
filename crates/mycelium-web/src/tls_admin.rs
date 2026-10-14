@@ -51,4 +51,12 @@ mod tests {
     fn sans_empty_entries_dropped() {
         assert_eq!(sans_from_env(Some(" , ,a,, b,")), vec!["a", "b"]);
     }
+
+    #[test]
+    fn sans_empty_string_is_localhost_only() {
+        // An empty value (env var set to "") is the unset case: the
+        // localhost default, not an empty verbatim list.
+        assert_eq!(sans_from_env(Some("")), vec!["localhost"]);
+        assert_eq!(sans_from_env(Some(" , ,")), vec!["localhost"]);
+    }
 }

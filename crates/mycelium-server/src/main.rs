@@ -151,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_addr,
         args.tls_cert.as_deref().map(std::path::Path::new),
         args.tls_key.as_deref().map(std::path::Path::new),
+        tls_sans,
         shutdown,
     )
     .await?;

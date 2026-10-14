@@ -2640,6 +2640,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "uuid",
+ "x509-parser",
  "zip",
 ]
 

@@ -251,6 +251,11 @@ async fn serve_asset(
 }
 
 /// Serve HTTPS on `https_addr`, redirecting HTTP on `http_addr` to it.
+/// `sans` is the SAN set for the generated self-signed pair (verbatim;
+/// `localhost` only when empty).
+// Boot-config list; collapses into AppState fields in the TLS-management
+// follow-up tasks.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     state: AppState,
     data_dir: &Path,
@@ -258,10 +263,14 @@ pub async fn serve(
     http_addr: SocketAddr,
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
+    sans: Vec<String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let router = build_router_with_shutdown(state, shutdown.clone());
-    let tls = cert::load_or_create_tls_config(data_dir, cert_path, key_path).await?;
+    let (tls, tls_handle) =
+        cert::load_or_create_tls_config(data_dir, cert_path, key_path, &sans).await?;
+    // stashed into AppState in the next task
+    let _tls_handle = tls_handle;
 
     // HTTP:80 → HTTPS redirect. Preserves the request Host (so the
     // redirect targets the hostname the client actually used) and the

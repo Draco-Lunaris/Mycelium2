@@ -77,6 +77,7 @@ async fn boot() -> (
             http,
             None,
             None,
+            vec!["localhost".to_string()],
             token,
         )
         .await;
