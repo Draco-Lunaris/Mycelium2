@@ -30,6 +30,13 @@ struct Args {
     /// Admin-supplied TLS key (PEM). Auto self-signed when absent.
     #[arg(long, env = "MYCELIUM2_TLS_KEY")]
     tls_key: Option<String>,
+
+    /// SANs (comma-separated) for the generated self-signed cert.
+    /// Unset → `localhost` only (the default). A set list is taken
+    /// verbatim — no forced additions. Regenerates the managed pair
+    /// when the set changes.
+    #[arg(long, env = "MYCELIUM2_TLS_SANS")]
+    tls_sans: Option<String>,
 }
 
 #[tokio::main]
@@ -46,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let data_dir = std::path::PathBuf::from(&args.data_dir);
     tracing::info!(data_dir = %args.data_dir, "starting Mycelium2");
+
+    let tls_sans = mycelium_web::tls_admin::sans_from_env(args.tls_sans.as_deref());
+    tracing::info!(sans = ?tls_sans, "TLS SAN configuration");
 
     // Open the store (creates layout + runs migrations).
     let store = mycelium_store::Store::open(&data_dir).await?;
@@ -77,7 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Assemble the app state.
     let login = mycelium_auth::login::LoginService::new(store.pool().clone());
-    let state = mycelium_web::AppState::new(store, service_key, login, assets_dir);
+    // `tls: None` here — serve() loads the pair and stashes the live
+    // handle into the state it is given.
+    let state = mycelium_web::AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        data_dir.clone(),
+        None,
+    );
 
     // Librarian boot sweep: fail jobs interrupted by a previous
     // shutdown, requeue pending ones.
@@ -141,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_addr,
         args.tls_cert.as_deref().map(std::path::Path::new),
         args.tls_key.as_deref().map(std::path::Path::new),
+        tls_sans,
         shutdown,
     )
     .await?;

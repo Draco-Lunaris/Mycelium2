@@ -137,6 +137,22 @@ pub fn build_router_with_shutdown(
         .route("/admin/security", post(api::admin_save_security))
         .route("/admin/bookshelves", post(api::admin_create_bookshelf))
         .route("/admin/backup", post(api::admin_backup))
+        .route("/admin/tls/cert", get(api::tls_cert_download))
+        // Third-party cert upload. The route body limit (5 MiB) is just
+        // above 2 × the handler's 2 MiB per-field cap plus multipart
+        // framing, so the handler's check — with its clear flash — is
+        // what rejects an oversized field (axum's 2 MiB default would
+        // otherwise reject the whole request first).
+        .route(
+            "/admin/tls/upload",
+            post(api::tls_upload).layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)),
+        )
+        .route(
+            "/admin/tls/csr",
+            get(api::tls_csr_download).post(api::tls_csr),
+        )
+        .route("/admin/tls/pending/discard", post(api::tls_pending_discard))
+        .route("/admin/tls/reset", post(api::tls_reset))
         // API + health + metrics.
         .nest("/api/v1", api_routes)
         .merge(health::routes())
@@ -251,6 +267,11 @@ async fn serve_asset(
 }
 
 /// Serve HTTPS on `https_addr`, redirecting HTTP on `http_addr` to it.
+/// `sans` is the SAN set for the generated self-signed pair (verbatim;
+/// `localhost` only when empty).
+// Boot-config list; collapses into AppState fields in the TLS-management
+// follow-up tasks.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     state: AppState,
     data_dir: &Path,
@@ -258,10 +279,19 @@ pub async fn serve(
     http_addr: SocketAddr,
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
+    sans: Vec<String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (tls, tls_handle) =
+        cert::load_or_create_tls_config(data_dir, cert_path, key_path, &sans).await?;
+    // Both returns are clones of one Arc-backed handle: stash the
+    // second into AppState so admin TLS reloads go through it, then
+    // build the router over the state that carries it.
+    let state = AppState {
+        tls: Some(Arc::new(tls_handle)),
+        ..state
+    };
     let router = build_router_with_shutdown(state, shutdown.clone());
-    let tls = cert::load_or_create_tls_config(data_dir, cert_path, key_path).await?;
 
     // HTTP:80 → HTTPS redirect. Preserves the request Host (so the
     // redirect targets the hostname the client actually used) and the

@@ -209,12 +209,25 @@ pub struct AppState {
     pub queue_worker: Arc<mycelium_librarian::queue_worker::QueueWorker>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
+    /// The server's data directory — the root that holds `config/tls/`
+    /// (the managed cert pair) and backups. Kept separate from
+    /// `assets_dir` rather than derived from it: the two are independent
+    /// boot inputs, and reaching the cert dir through an asset path's
+    /// parent is fragile.
+    pub data_dir: std::path::PathBuf,
     /// Librarian chat history per session (multi-turn memory).
     pub chat_history: Arc<ChatHistory>,
     /// WebAuthn ceremony manager — built once per process (Task 4
     /// hoists what Task 3 constructed per request). RP config:
     /// [`webauthn_origin_from_env`].
     pub webauthn: Arc<WebAuthnManager>,
+    /// The live TLS config handle (None in tests that never serve TLS).
+    /// Both values returned by
+    /// [`crate::cert::load_or_create_tls_config`] are clones of one
+    /// Arc-backed handle, so admin reloads through this Arc swap the
+    /// cert the running HTTPS listener serves. `None` means the admin
+    /// TLS controls cannot hot-reload (restart required).
+    pub tls: Option<Arc<axum_server::tls_rustls::RustlsConfig>>,
 }
 
 impl AppState {
@@ -223,6 +236,8 @@ impl AppState {
         service_key: ServiceKey,
         login: LoginService,
         assets_dir: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        tls: Option<Arc<axum_server::tls_rustls::RustlsConfig>>,
     ) -> Self {
         let pool = store.pool().clone();
         let store = Arc::new(store);
@@ -283,8 +298,10 @@ impl AppState {
             librarian,
             queue_worker,
             assets_dir,
+            data_dir,
             chat_history: Arc::new(ChatHistory::default()),
             webauthn,
+            tls,
         }
     }
 

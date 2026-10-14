@@ -17,6 +17,10 @@ services:
       # Optional: supply real TLS certs (auto self-signed when absent).
       # MYCELIUM2_TLS_CERT: /opt/mycelium2/tls/fullchain.pem
       # MYCELIUM2_TLS_KEY: /opt/mycelium2/tls/privkey.pem
+      # Optional: SANs for the built-in self-signed cert — comma-separated
+      # and taken verbatim (unset = localhost only). Regenerates the
+      # generated pair when the set changes. See docs/tls.md.
+      # MYCELIUM2_TLS_SANS: mycelium.example,localhost
       # Optional: WebAuthn relying-party origin — passkey ceremonies are
       # refused by the browser unless this matches the HTTPS origin you
       # browse from (default https://localhost).
