@@ -40,8 +40,14 @@ hex = "0.4"
 # graph (rustls/jsonwebtoken/mycelium-auth); promoted to a direct dep.
 sha2.workspace = true
 # Cert validity math in validate_upload (expiry warnings). Already in the
-# graph (yasna/asn1-rs/leptos); promoted to a direct dep.
-time = "0.3"
+# graph (yasna/asn1-rs/leptos); promoted to a direct dep. Features are
+# declared explicitly rather than inherited: what this crate uses is
+# `OffsetDateTime::now_utc` (feature "std"), `Duration::days`,
+# `OffsetDateTime` subtraction and `Display` (all unconditional), so
+# default-features off + "std" is the exact requirement — verified by
+# building with nothing else's features unified in. A future transitive
+# drop of time's default features cannot break this build.
+time = { version = "0.3", default-features = false, features = ["std"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

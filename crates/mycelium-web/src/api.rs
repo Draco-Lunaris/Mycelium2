@@ -2853,9 +2853,20 @@ pub async fn tls_upload(
         _ => return tls_flash_error("both cert and key files are required"),
     };
     // Pending CSR key, when one exists (Decision 1: the uploaded key
-    // must be exactly the key the CSR was generated with).
+    // must be exactly the key the CSR was generated with). Fail CLOSED:
+    // a pending key that exists but cannot be read must not be treated
+    // as "no pending CSR" — that would silently open the one check that
+    // binds the upload to the key the CSR was made for.
     let tls_dir = state.data_dir.join("config/tls");
-    let pending = std::fs::read_to_string(tls_dir.join("pending-csr-key.pem")).ok();
+    let pending = match crate::tls_admin::read_pending_csr_key(&tls_dir) {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::error!(error = %e, "pending CSR key unreadable — refusing TLS upload");
+            return tls_flash_error(
+                "the pending CSR key could not be read — resolve it before uploading",
+            );
+        }
+    };
     let validation =
         match crate::tls_admin::validate_upload(&cert_pem, &key_pem, pending.as_deref()) {
             Ok(v) => v,
@@ -2863,9 +2874,35 @@ pub async fn tls_upload(
             // the admin which half of the pair is wrong.
             Err(e) => return tls_flash_error(&format!("upload rejected: {e}")),
         };
+    // The sidecar body is built BEFORE any write: serializing it cannot
+    // realistically fail (four string fields), and building it up front
+    // means a failure there leaves nothing on disk at all.
+    let meta = serde_json::json!({
+        "label": label,
+        "uploaded_at": chrono::Utc::now().to_rfc3339(),
+        "fingerprint_sha256": validation.fingerprint_sha256,
+        "source": "uploaded",
+    });
+    let meta = match serde_json::to_string(&meta) {
+        Ok(meta) => meta,
+        Err(e) => {
+            tracing::error!(error = %e, "uploaded sidecar serialization failed");
+            return tls_flash_error("internal error");
+        }
+    };
     // ---- Writes: one synchronous sequence, cert → key → sidecar. ----
     // No awaits in this block: the pair-invariant (both files exist
     // together, or neither) holds for the download handler and boot.
+    //
+    // Concurrency guarantee, stated precisely: validation→write is NOT
+    // atomic across requests, so two concurrent uploads can interleave at
+    // the await points before this block (both validate, then both write).
+    // What the synchronous sequence guarantees is that a reader never
+    // observes a cert/key PAIR that does not match: every failure exit
+    // below removes all three files together, and the last writer's three
+    // files are mutually consistent. A concurrent request's orphan key can
+    // briefly coexist with this request's sidecar; the serving pair never
+    // mismatches.
     let up_cert = tls_dir.join("uploaded-cert.pem");
     let up_key = tls_dir.join("uploaded-key.pem");
     let up_meta = tls_dir.join("uploaded.json");
@@ -2873,8 +2910,19 @@ pub async fn tls_upload(
         tracing::error!(error = %e, "TLS upload dir creation failed");
         return tls_flash_error("internal error");
     }
+    // One rollback path for every failure exit: a partially written
+    // upload must leave NOTHING behind. A truncated uploaded-cert.pem
+    // would otherwise be served by tls_cert_download (it prefers that
+    // file whenever it exists), and an orphan 0600 key is a stale secret
+    // with no owner.
+    let rollback = || {
+        for path in crate::tls_admin::remove_uploaded_pair(&tls_dir) {
+            tracing::error!(path = %path.display(), "TLS upload rollback could not remove a file");
+        }
+    };
     if let Err(e) = std::fs::write(&up_cert, &cert_pem) {
         tracing::error!(error = %e, "uploaded cert write failed");
+        rollback();
         return tls_flash_error("internal error");
     }
     // Key 0600: replace any prior key, then create fresh with the mode
@@ -2882,45 +2930,51 @@ pub async fn tls_upload(
     // file). The key is never served, rendered, or logged.
     if let Err(e) = write_key_0600(&up_key, &key_pem) {
         tracing::error!(error = %e, "uploaded key write failed");
-        let _ = std::fs::remove_file(&up_cert);
+        rollback();
         return tls_flash_error("internal error");
     }
-    let meta = serde_json::json!({
-        "label": label,
-        "uploaded_at": chrono::Utc::now().to_rfc3339(),
-        "fingerprint_sha256": validation.fingerprint_sha256,
-        "source": "uploaded",
-    });
-    if let Err(e) = std::fs::write(&up_meta, serde_json::to_string(&meta).unwrap()) {
+    if let Err(e) = std::fs::write(&up_meta, &meta) {
         tracing::error!(error = %e, "uploaded sidecar write failed");
-        let _ = std::fs::remove_file(&up_cert);
-        let _ = std::fs::remove_file(&up_key);
+        rollback();
         return tls_flash_error("internal error");
     }
     // ---- Live hot-swap (the Arc handle is shared with the listener). ----
     // No partial state: if the reload fails, remove the just-written
     // files and flash the error — the files are worthless if the live
     // listener cannot load them.
-    if let Some(tls) = &state.tls
-        && let Err(e) = tls.reload_from_pem_file(&up_cert, &up_key).await
-    {
-        tracing::error!(error = %e, "TLS reload after upload failed");
-        let _ = std::fs::remove_file(&up_cert);
-        let _ = std::fs::remove_file(&up_key);
-        let _ = std::fs::remove_file(&up_meta);
-        return tls_flash_error("upload rejected: the server could not load the pair");
+    //
+    // `state.tls` is None only when the server was not started through
+    // `serve` (no TLS listener to hot-swap — tests). The install is then
+    // real but not live: flash the restart-required variant rather than
+    // plain success, which would claim an effect that has not happened.
+    let mut restart_required = false;
+    match &state.tls {
+        Some(tls) => {
+            if let Err(e) = tls.reload_from_pem_file(&up_cert, &up_key).await {
+                tracing::error!(error = %e, "TLS reload after upload failed");
+                rollback();
+                return tls_flash_error("upload rejected: the server could not load the pair");
+            }
+        }
+        None => restart_required = true,
     }
-    // The pair is live: a pending CSR it matched is now fulfilled.
-    // Cleared only after success — a failed reload must not cost the
-    // admin the CSR key they would need to retry.
+    // The pair is installed (live, or pending a restart when there is no
+    // listener): a pending CSR it matched is now fulfilled. Cleared only
+    // after success — a failed reload must not cost the admin the CSR key
+    // they would need to retry.
     if pending.is_some() {
         let _ = std::fs::remove_file(tls_dir.join("pending-csr-key.pem"));
         let _ = std::fs::remove_file(tls_dir.join("pending.json"));
     }
     let mut msg = format!(
-        "TLS certificate installed — fingerprint {}…",
+        "TLS certificate installed — fingerprint {}…{}",
         // SHA-256 hex is always 64 chars (validate_upload's fingerprint).
-        &validation.fingerprint_sha256[..16]
+        &validation.fingerprint_sha256[..16],
+        if restart_required {
+            " — takes effect after restart (no live TLS listener in this process)"
+        } else {
+            ""
+        }
     );
     for w in &validation.warnings {
         msg.push_str(&format!(" WARNING: {w}"));

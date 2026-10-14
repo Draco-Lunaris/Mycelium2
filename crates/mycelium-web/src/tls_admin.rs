@@ -126,6 +126,47 @@ fn spki_matches(cert_spki: &[u8], key: &rcgen::KeyPair) -> bool {
     }
 }
 
+/// The three files an installed upload owns, in write order: the cert
+/// (+chain), the 0600 key, and the sidecar. One list so every failure
+/// path removes exactly the same set — a leftover `uploaded-cert.pem`
+/// would otherwise be served by the download handler (it prefers that
+/// file whenever it exists) and a leftover key is a stale secret.
+pub fn uploaded_pair_paths(tls_dir: &std::path::Path) -> [std::path::PathBuf; 3] {
+    [
+        tls_dir.join("uploaded-cert.pem"),
+        tls_dir.join("uploaded-key.pem"),
+        tls_dir.join("uploaded.json"),
+    ]
+}
+
+/// Remove every uploaded-pair file. Missing files are fine (a failure
+/// can leave any subset). Returns the paths whose removal failed for
+/// another reason — the caller logs those; a leftover is an operator
+/// problem, never a user-facing one.
+pub fn remove_uploaded_pair(tls_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    uploaded_pair_paths(tls_dir)
+        .into_iter()
+        .filter(|path| match std::fs::remove_file(path) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        })
+        .collect()
+}
+
+/// Read the pending CSR key (Decision 1). `Ok(None)` only when no CSR is
+/// pending (the file is absent); `Err` when the file exists but cannot be
+/// read — the caller must fail closed, because treating an unreadable
+/// pending key as "none pending" would silently skip the one check that
+/// binds the upload to the key the CSR was generated with.
+pub fn read_pending_csr_key(tls_dir: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    match std::fs::read_to_string(tls_dir.join("pending-csr-key.pem")) {
+        Ok(pem) => Ok(Some(pem)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse the MYCELIUM2_TLS_SANS / --tls-sans value: comma-separated,
 /// trimmed, empties dropped, order-stable dedup. None/empty → the
 /// `localhost` default; a configured set is returned verbatim.
@@ -308,6 +349,95 @@ mod tests {
         let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let err = validate_upload(&cert, &other.serialize_pem(), None).unwrap_err();
         assert!(matches!(err, TlsAdminError::KeyMismatch));
+    }
+
+    #[test]
+    fn uploaded_pair_paths_are_the_three_names() {
+        // The names are a contract with the download handler and boot
+        // precedence (Task 2/3), so they are pinned here, not just used.
+        let paths = uploaded_pair_paths(std::path::Path::new("/d/config/tls"));
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["uploaded-cert.pem", "uploaded-key.pem", "uploaded.json"]
+        );
+    }
+
+    #[test]
+    fn remove_uploaded_pair_removes_exactly_its_three_files() {
+        // The rollback's file set is the whole guarantee (Review I-2):
+        // every failure exit must leave NOTHING of the upload, and must
+        // not touch anything else in the TLS dir — the managed pair and
+        // the pending CSR live there too.
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path();
+        let upload = ["uploaded-cert.pem", "uploaded-key.pem", "uploaded.json"];
+        let keep = ["cert.pem", "key.pem", "pending-csr-key.pem", "pending.json"];
+        for name in upload.iter().chain(keep.iter()) {
+            std::fs::write(tls.join(name), "x").unwrap();
+        }
+        let leftovers = remove_uploaded_pair(tls);
+        assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+        for name in upload {
+            assert!(!tls.join(name).exists(), "{name} must be gone");
+        }
+        for name in keep {
+            assert!(tls.join(name).exists(), "{name} must survive");
+        }
+        // Idempotent: a partial set (any subset, or none) is not an error.
+        std::fs::write(tls.join("uploaded.json"), "x").unwrap();
+        assert!(remove_uploaded_pair(tls).is_empty());
+        assert!(remove_uploaded_pair(tls).is_empty());
+    }
+
+    #[test]
+    fn read_pending_csr_key_absent_is_none_but_unreadable_is_err() {
+        // Review M-2: the pending-key check must never silently open.
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path();
+        // Absent → Ok(None) ("no CSR pending").
+        assert_eq!(read_pending_csr_key(tls).unwrap(), None);
+        // Readable → Ok(Some(pem)).
+        std::fs::write(tls.join("pending-csr-key.pem"), "-----BEGIN KEY-----\n").unwrap();
+        assert!(
+            read_pending_csr_key(tls)
+                .unwrap()
+                .unwrap()
+                .contains("BEGIN KEY")
+        );
+        // Present but unreadable → Err (fail closed). Running as root
+        // would defeat the chmod, so that half is skipped there.
+        use std::os::unix::fs::PermissionsExt;
+        if !running_as_root() {
+            std::fs::set_permissions(
+                tls.join("pending-csr-key.pem"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .expect("chmod fixture");
+            let err = read_pending_csr_key(tls);
+            assert!(err.is_err(), "unreadable pending key must fail closed");
+            // Restore so the tempdir can be cleaned up.
+            let _ = std::fs::set_permissions(
+                tls.join("pending-csr-key.pem"),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+    }
+
+    /// True when the effective uid is 0 (a chmod-000 file is readable).
+    fn running_as_root() -> bool {
+        // No libc dep in this crate: read the uid from /proc/self/status.
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1).map(|v| v == "0"))
+            })
+            .unwrap_or(false)
     }
 
     #[test]

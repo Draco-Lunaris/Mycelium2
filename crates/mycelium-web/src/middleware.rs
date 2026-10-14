@@ -112,6 +112,52 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for SessionId {
     }
 }
 
+/// Hard ceiling on a multipart body this middleware will buffer for a
+/// path that is NOT a book upload: the TLS cert upload's own route limit
+/// (5 MiB, `server.rs`), rounded up.
+///
+/// Why this exists: the CSRF check has to read the body to find a form
+/// field, and it runs OUTSIDE every route — so without a path-scoped cap,
+/// a request to a small endpoint that omitted `x-csrf-token` would be
+/// buffered up to the book-upload ceiling (33 MiB default, 256 MiB max)
+/// before the route ever rejected it. That is a memory amplification
+/// available to any logged-in user, since authorization runs after this
+/// middleware. Book-upload paths keep their configured ceiling untouched.
+const SMALL_MULTIPART_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// A path whose multipart body may be as large as the book ceiling.
+/// `POST /api/v1/ingest` is the only book-upload route (the admin library
+/// page posts there); every other multipart endpoint is a small form.
+fn is_book_upload_path(path: &str) -> bool {
+    path.starts_with("/api/v1/ingest")
+}
+
+/// The body cap (bytes) the CSRF body-buffering branch will accept for
+/// this path. Book ingest is the only legitimate large multipart, so
+/// only its path gets the admin-configured book ceiling; everything else
+/// is capped at [`SMALL_MULTIPART_MAX_BYTES`].
+fn multipart_buffer_cap(path: &str, book_cap_bytes: usize) -> usize {
+    if is_book_upload_path(path) {
+        book_cap_bytes
+    } else {
+        SMALL_MULTIPART_MAX_BYTES
+    }
+}
+
+/// True when the declared `Content-Length` is already over the cap this
+/// path would buffer. Checked BEFORE reading a single body byte, so an
+/// oversized request costs nothing instead of being streamed in and then
+/// thrown away. A request with no Content-Length (chunked) is bounded by
+/// the streaming cap in the buffering branch instead.
+fn declared_length_too_large(parts: &axum::http::request::Parts, cap: usize) -> bool {
+    parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|len| len > cap as u64)
+}
+
 /// CSRF double-submit verification for state-changing requests (POST/PUT/
 /// DELETE). The token is accepted from the `x-csrf-token` header (fetch/
 /// API clients) OR the `csrf_token` form field (native browser forms —
@@ -197,13 +243,24 @@ pub async fn csrf_protect(
             }
         }
         None if is_multipart => {
-            // Multipart upload (book ingest): buffer the body (uploads
-            // are legitimately large), extract the csrf_token field
-            // with a boundary-aware parse, verify, restore. The cap is
-            // the admin-configured book limit + 1 MiB of multipart
-            // framing overhead (ConfigStore, not env).
-            let cap = (state.upload_config().await.max_book_mib + 1) * 1024 * 1024;
-            match axum::body::to_bytes(body, cap as usize).await {
+            // Multipart upload: buffer the body, extract the csrf_token
+            // field with a boundary-aware parse, verify, restore. Book
+            // ingest is the only legitimately large multipart, so only
+            // its path gets the admin-configured book limit + 1 MiB of
+            // framing overhead (ConfigStore, not env); every other
+            // multipart path is capped at the small-form ceiling so a
+            // request that never reaches the route's own limit cannot
+            // make this middleware buffer a book-sized body.
+            let book_cap = (state.upload_config().await.max_book_mib + 1) * 1024 * 1024;
+            let cap = multipart_buffer_cap(parts.uri.path(), book_cap as usize);
+            // Reject an over-capacity declared length before reading a
+            // byte of body (413, not the 403 the missing-token path
+            // returns after buffering — the size answer is the useful
+            // one, and it costs nothing).
+            if declared_length_too_large(&parts, cap) {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+            }
+            match axum::body::to_bytes(body, cap).await {
                 Ok(bytes) => {
                     let token = multipart_field(&bytes, content_type, "csrf_token");
                     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -386,4 +443,67 @@ pub async fn security_headers(request: Request<axum::body::Body>, next: Next) ->
         HeaderValue::from_static("max-age=63072000; includeSubDomains"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts_with_len(len: Option<&str>) -> axum::http::request::Parts {
+        let builder = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/admin/tls/upload");
+        let builder = match len {
+            Some(len) => builder.header(axum::http::header::CONTENT_LENGTH, len),
+            None => builder,
+        };
+        builder
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    #[test]
+    fn multipart_cap_is_small_except_for_book_ingest() {
+        let book = 33 * 1024 * 1024;
+        // The TLS upload route (and every other multipart endpoint) is
+        // capped small — that is the whole point of the path-scoped cap.
+        assert_eq!(
+            multipart_buffer_cap("/admin/tls/upload", book),
+            SMALL_MULTIPART_MAX_BYTES
+        );
+        assert_eq!(
+            multipart_buffer_cap("/admin/users", book),
+            SMALL_MULTIPART_MAX_BYTES
+        );
+        assert_eq!(
+            multipart_buffer_cap("/api/v1/concepts/x.md", book),
+            SMALL_MULTIPART_MAX_BYTES
+        );
+        // Book ingest keeps its configured ceiling, unchanged.
+        assert_eq!(multipart_buffer_cap("/api/v1/ingest", book), book);
+    }
+
+    #[test]
+    fn declared_length_reject_is_exact_and_conservative() {
+        let cap = 8 * 1024 * 1024;
+        // Over cap → reject before reading a byte.
+        assert!(declared_length_too_large(
+            &parts_with_len(Some("9000000")),
+            cap
+        ));
+        // Exactly at cap → allowed (the streaming cap is the backstop).
+        assert!(!declared_length_too_large(
+            &parts_with_len(Some("8388608")),
+            cap
+        ));
+        // No Content-Length (chunked) or a junk value → not an early
+        // reject; the streaming cap still bounds the read.
+        assert!(!declared_length_too_large(&parts_with_len(None), cap));
+        assert!(!declared_length_too_large(
+            &parts_with_len(Some("not-a-number")),
+            cap
+        ));
+    }
 }

@@ -453,6 +453,238 @@ async fn upload_reload_failure_rolls_back_all_files() {
     );
 }
 
+/// A leaf signed by a separate CA: (chain PEM leaf-first, leaf key PEM).
+/// Stands in for a real CA-issued chain — same PEM shape, same ordering.
+fn gen_chain() -> (Vec<u8>, Vec<u8>) {
+    let ca_kp = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec!["ca.example".to_string()]).unwrap();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ca.example");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_kp).unwrap();
+
+    let leaf_kp = rcgen::KeyPair::generate().unwrap();
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["chain.example".to_string()]).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "chain.example");
+    let leaf = leaf_params
+        .signed_by(&leaf_kp, &ca, &ca_kp)
+        .expect("CA-signed leaf");
+    // Leaf first, then the intermediate — the order a CA hands over.
+    (
+        format!("{}{}", leaf.pem(), ca.pem()).into_bytes(),
+        leaf_kp.serialize_pem().into_bytes(),
+    )
+}
+
+/// A self-signed cert that expired long ago.
+fn gen_expired_pair() -> (Vec<u8>, Vec<u8>) {
+    let kp = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["expired.example".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "expired.example");
+    params.not_before = time::OffsetDateTime::UNIX_EPOCH;
+    params.not_after = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+    let cert = params.self_signed(&kp).unwrap();
+    (cert.pem().into_bytes(), kp.serialize_pem().into_bytes())
+}
+
+/// SHA-256 hex of the first CERTIFICATE block's DER (the leaf fingerprint
+/// the handler flashes) — computed independently of the handler.
+fn leaf_fingerprint(chain_pem: &[u8]) -> String {
+    let der = x509_parser::pem::Pem::iter_from_buffer(chain_pem)
+        .next()
+        .unwrap()
+        .unwrap()
+        .contents;
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(der))
+}
+
+/// Log in as a freshly created non-admin; returns (cookie, csrf).
+async fn login_plain_user(
+    client: &reqwest::Client,
+    base: &str,
+    admin_cookie: &str,
+) -> (String, String) {
+    let csrf = csrf_from_page(client, &format!("{base}/admin/users"), admin_cookie).await;
+    let created = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", admin_cookie)
+        .form(&[
+            ("csrf_token", csrf.as_str()),
+            ("username", "plain"),
+            ("email", "plain@example.invalid"),
+            ("password", "a plain user password for tests!"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    // Success renders the users page (200); any bounce is a 303.
+    assert_eq!(created.status(), 200, "user creation must succeed");
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", "plain"),
+            ("password", "a plain user password for tests!"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = cookie_from(&login);
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
+}
+
+#[tokio::test]
+async fn upload_keeps_full_chain_and_flashes_leaf_fingerprint() {
+    // Review M-5(1): a leaf+intermediate upload must survive on disk as
+    // the WHOLE chain (a server that drops the intermediate breaks every
+    // client that does not already trust it), while the fingerprint the
+    // admin is shown is the LEAF's (what a CA publishes).
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let (chain, key) = gen_chain();
+    let flash = upload(&cl, &base, &cookie, &csrf, chain.clone(), key, "chained").await;
+    assert!(flash.contains("ok="), "{flash}");
+    let on_disk = std::fs::read_to_string(dir.path().join("config/tls/uploaded-cert.pem")).unwrap();
+    assert_eq!(
+        normalize_pem(&on_disk),
+        normalize_pem(&String::from_utf8_lossy(&chain)),
+        "the whole chain must be stored verbatim"
+    );
+    assert_eq!(
+        on_disk.matches("-----BEGIN CERTIFICATE-----").count(),
+        2,
+        "expected two CERTIFICATE blocks on disk"
+    );
+    // The flash names the LEAF's fingerprint, not the chain's or the
+    // intermediate's.
+    let leaf_fp = leaf_fingerprint(&chain);
+    assert!(
+        flash.contains(&leaf_fp[..16]),
+        "flash must carry the leaf fingerprint {}…: {flash}",
+        &leaf_fp[..16]
+    );
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("config/tls/uploaded.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["fingerprint_sha256"], leaf_fp);
+    // And the download serves the whole chain too.
+    let body = download_cert(&cl, &base, &cookie).await;
+    assert_eq!(body.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+}
+
+#[tokio::test]
+async fn upload_expired_cert_succeeds_with_notafter_warning() {
+    // Review M-5(2) / Decision 2: expiry is warn-only, and the warning
+    // must actually reach the admin's flash with the notAfter value.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let (cert, key) = gen_expired_pair();
+    let flash = upload(&cl, &base, &cookie, &csrf, cert.clone(), key, "expired").await;
+    // Success (ok=), not an error.
+    assert!(flash.contains("ok="), "expired must still install: {flash}");
+    assert!(
+        flash.contains("WARNING"),
+        "warning must be flashed: {flash}"
+    );
+    assert!(flash.contains("expired on"), "{flash}");
+    // The warning carries the leaf's notAfter date (1970-01-02 for the
+    // fixture), so the admin can see WHICH date the warning means.
+    let not_after = x509_parser::pem::Pem::iter_from_buffer(&cert)
+        .next()
+        .unwrap()
+        .unwrap()
+        .contents;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&not_after).unwrap();
+    let not_after = parsed.validity().not_after.to_datetime();
+    let date = format!(
+        "{:04}-{:02}-{:02}",
+        not_after.year(),
+        not_after.month() as u8,
+        not_after.day()
+    );
+    assert!(
+        flash.contains(&date),
+        "flash must contain notAfter date {date}: {flash}"
+    );
+    // Installed for real: the files exist and the download serves them.
+    assert!(dir.path().join("config/tls/uploaded-cert.pem").exists());
+    let body = download_cert(&cl, &base, &cookie).await;
+    assert_eq!(
+        normalize_pem(&body),
+        normalize_pem(&String::from_utf8_lossy(&cert))
+    );
+}
+
+#[tokio::test]
+async fn upload_without_csrf_header_is_rejected_before_buffering() {
+    // Review I-1: the CSRF middleware buffers a multipart body to find a
+    // form field, and it runs OUTSIDE the route's body limit and outside
+    // RequireAdmin — so before the path-scoped cap, ANY logged-in
+    // non-admin could make the server buffer up to the book ceiling
+    // (33 MiB default, 256 MiB max) per concurrent request. A
+    // non-admin's over-capacity upload is now refused up front: 413
+    // (declared length over the small cap) rather than 403 after the
+    // whole body was read, and 400 for a chunked body that trips the
+    // streaming cap.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (admin_cookie, _admin_csrf) = login_admin(&cl, &base).await;
+    let (cookie, _csrf) = login_plain_user(&cl, &base, &admin_cookie).await;
+
+    // 12 MiB declared: over the small multipart cap (8 MiB), under the
+    // book ceiling (33 MiB) — exactly the window the bug lived in.
+    let body = vec![b'A'; 12 * 1024 * 1024];
+    let resp = cl
+        .post(format!("{base}/admin/tls/upload"))
+        .header("cookie", &cookie)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "multipart/form-data; boundary=x",
+        )
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "declared over-capacity length must be rejected before buffering"
+    );
+    assert!(!dir.path().join("config/tls/uploaded-cert.pem").exists());
+
+    // The book-upload path is untouched: a 12 MiB body there is UNDER
+    // its 33 MiB ceiling, so it is still buffered and parsed (reaching
+    // the 403 missing-CSRF branch), proving the small cap did not leak
+    // onto the ingest path.
+    let resp = cl
+        .post(format!("{base}/api/v1/ingest"))
+        .header("cookie", &cookie)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "multipart/form-data; boundary=x",
+        )
+        .body(vec![b'A'; 12 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "book ingest keeps buffering up to its own ceiling"
+    );
+}
+
 #[tokio::test]
 async fn tls_cert_download_admin_only_and_serves_generated_pem() {
     let (base, _shutdown, dir) = boot().await;
