@@ -104,7 +104,8 @@ pending.json         # { cn, sans, created_at }
 2. `uploaded-cert.pem` + `uploaded-key.pem` if both exist — an
    uploaded cert survives restarts without env config.
 3. Generated pair; regenerate if `sans.txt` differs from the
-   requested SAN set (env/flag + always-localhost). Regeneration
+   requested SAN set (env/flag, verbatim; localhost only the unset
+   default). Regeneration
    under this step still happens when an uploaded pair is active —
    the generated pair is the fallback and stays current; the
    uploaded pair remains the served cert.
