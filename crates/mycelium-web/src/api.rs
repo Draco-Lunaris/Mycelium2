@@ -2765,6 +2765,188 @@ pub async fn admin_backup(
 
 // ---------- TLS management (admin) ----------
 
+/// Flash redirect back to /admin/system with an error message (the TLS
+/// card's error banner). Shared by the TLS admin POST handlers.
+fn tls_flash_error(msg: &str) -> Response {
+    Redirect::to(&format!(
+        "/admin/system?error={}",
+        pages::urlencoding_encode(msg)
+    ))
+    .into_response()
+}
+
+/// POST /admin/tls/upload — install a third-party cert(+chain)/key.
+///
+/// Validation-before-write (spec): every check — parse, key match,
+/// pending-CSR key match — runs against the in-memory pair BEFORE any
+/// disk write, so a rejected upload leaves no state. The three writes
+/// (cert, key, sidecar) then happen in one synchronous sequence with no
+/// await between them, so the download handler and the boot precedence
+/// can never observe a half-written pair. If the live reload fails the
+/// just-written files are removed again — a pair the live listener
+/// cannot load is worthless and must not survive as "active".
+///
+/// Multipart fields: `cert_pem` (file), `key_pem` (file), `label` (text,
+/// optional). Flashes to /admin/system.
+pub async fn tls_upload(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    // Per-field size cap: a cert chain plus its key is a few KiB, so 2
+    // MiB is already generous. axum's own 2 MiB default body limit
+    // normally trips first (surfaced through the same flash below); the
+    // explicit check keeps the message accurate if that limit is ever
+    // raised for this route.
+    const MAX_TLS_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+    let mut cert_pem: Option<String> = None;
+    let mut key_pem: Option<String> = None;
+    let mut label = String::new();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return tls_flash_error("uploaded file too large (max 2 MiB)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS upload multipart parse failed");
+                return tls_flash_error("upload could not be read");
+            }
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "cert_pem" | "key_pem" => {
+                let is_cert = name == "cert_pem";
+                let bytes = match field.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                        return tls_flash_error("uploaded file too large (max 2 MiB)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "TLS upload field read failed");
+                        return tls_flash_error("upload could not be read");
+                    }
+                };
+                if bytes.len() > MAX_TLS_UPLOAD_BYTES {
+                    return tls_flash_error("uploaded file too large (max 2 MiB)");
+                }
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if is_cert {
+                    cert_pem = Some(text);
+                } else {
+                    key_pem = Some(text);
+                }
+            }
+            // The label is display metadata for the TLS card; a long one
+            // is truncated rather than refused (it never affects the
+            // pair's validity).
+            "label" => {
+                label = field.text().await.unwrap_or_default();
+                label = label.trim().chars().take(120).collect();
+            }
+            _ => {}
+        }
+    }
+    let (cert_pem, key_pem) = match (cert_pem, key_pem) {
+        (Some(c), Some(k)) => (c, k),
+        _ => return tls_flash_error("both cert and key files are required"),
+    };
+    // Pending CSR key, when one exists (Decision 1: the uploaded key
+    // must be exactly the key the CSR was generated with).
+    let tls_dir = state.data_dir.join("config/tls");
+    let pending = std::fs::read_to_string(tls_dir.join("pending-csr-key.pem")).ok();
+    let validation =
+        match crate::tls_admin::validate_upload(&cert_pem, &key_pem, pending.as_deref()) {
+            Ok(v) => v,
+            // The exact parse/mismatch error is user-facing (spec): it tells
+            // the admin which half of the pair is wrong.
+            Err(e) => return tls_flash_error(&format!("upload rejected: {e}")),
+        };
+    // ---- Writes: one synchronous sequence, cert → key → sidecar. ----
+    // No awaits in this block: the pair-invariant (both files exist
+    // together, or neither) holds for the download handler and boot.
+    let up_cert = tls_dir.join("uploaded-cert.pem");
+    let up_key = tls_dir.join("uploaded-key.pem");
+    let up_meta = tls_dir.join("uploaded.json");
+    if let Err(e) = std::fs::create_dir_all(&tls_dir) {
+        tracing::error!(error = %e, "TLS upload dir creation failed");
+        return tls_flash_error("internal error");
+    }
+    if let Err(e) = std::fs::write(&up_cert, &cert_pem) {
+        tracing::error!(error = %e, "uploaded cert write failed");
+        return tls_flash_error("internal error");
+    }
+    // Key 0600: replace any prior key, then create fresh with the mode
+    // (create_new so the mode can never be inherited from an existing
+    // file). The key is never served, rendered, or logged.
+    if let Err(e) = write_key_0600(&up_key, &key_pem) {
+        tracing::error!(error = %e, "uploaded key write failed");
+        let _ = std::fs::remove_file(&up_cert);
+        return tls_flash_error("internal error");
+    }
+    let meta = serde_json::json!({
+        "label": label,
+        "uploaded_at": chrono::Utc::now().to_rfc3339(),
+        "fingerprint_sha256": validation.fingerprint_sha256,
+        "source": "uploaded",
+    });
+    if let Err(e) = std::fs::write(&up_meta, serde_json::to_string(&meta).unwrap()) {
+        tracing::error!(error = %e, "uploaded sidecar write failed");
+        let _ = std::fs::remove_file(&up_cert);
+        let _ = std::fs::remove_file(&up_key);
+        return tls_flash_error("internal error");
+    }
+    // ---- Live hot-swap (the Arc handle is shared with the listener). ----
+    // No partial state: if the reload fails, remove the just-written
+    // files and flash the error — the files are worthless if the live
+    // listener cannot load them.
+    if let Some(tls) = &state.tls
+        && let Err(e) = tls.reload_from_pem_file(&up_cert, &up_key).await
+    {
+        tracing::error!(error = %e, "TLS reload after upload failed");
+        let _ = std::fs::remove_file(&up_cert);
+        let _ = std::fs::remove_file(&up_key);
+        let _ = std::fs::remove_file(&up_meta);
+        return tls_flash_error("upload rejected: the server could not load the pair");
+    }
+    // The pair is live: a pending CSR it matched is now fulfilled.
+    // Cleared only after success — a failed reload must not cost the
+    // admin the CSR key they would need to retry.
+    if pending.is_some() {
+        let _ = std::fs::remove_file(tls_dir.join("pending-csr-key.pem"));
+        let _ = std::fs::remove_file(tls_dir.join("pending.json"));
+    }
+    let mut msg = format!(
+        "TLS certificate installed — fingerprint {}…",
+        // SHA-256 hex is always 64 chars (validate_upload's fingerprint).
+        &validation.fingerprint_sha256[..16]
+    );
+    for w in &validation.warnings {
+        msg.push_str(&format!(" WARNING: {w}"));
+    }
+    Redirect::to(&format!(
+        "/admin/system?ok={}",
+        pages::urlencoding_encode(&msg)
+    ))
+    .into_response()
+}
+
+/// Write the uploaded private key with mode 0600: remove any prior key,
+/// then create fresh with the mode (never reuse an existing file's
+/// permissions).
+fn write_key_0600(path: &std::path::Path, key_pem: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(key_pem.as_bytes())
+}
+
 /// GET /admin/tls/cert — download the ACTIVE cert PEM: the uploaded
 /// cert when one is in effect, else the managed generated pair. Only
 /// the certificate is ever served — the private key is not readable

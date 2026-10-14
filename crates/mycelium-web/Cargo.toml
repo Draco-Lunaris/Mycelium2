@@ -36,12 +36,18 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 x509-parser = "0.16"
 hex = "0.4"
+# TLS upload fingerprinting (tls_admin::validate_upload). Already in the
+# graph (rustls/jsonwebtoken/mycelium-auth); promoted to a direct dep.
+sha2.workspace = true
+# Cert validity math in validate_upload (expiry warnings). Already in the
+# graph (yasna/asn1-rs/leptos); promoted to a direct dep.
+time = "0.3"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 md-5 = "0.10"
 # Test-only: mint valid TOTP codes from an enrolled secret (the exact
 # parameters mycelium-auth builds for verification) — mirrors

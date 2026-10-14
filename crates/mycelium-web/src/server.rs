@@ -138,6 +138,15 @@ pub fn build_router_with_shutdown(
         .route("/admin/bookshelves", post(api::admin_create_bookshelf))
         .route("/admin/backup", post(api::admin_backup))
         .route("/admin/tls/cert", get(api::tls_cert_download))
+        // Third-party cert upload. The route body limit (5 MiB) is just
+        // above 2 × the handler's 2 MiB per-field cap plus multipart
+        // framing, so the handler's check — with its clear flash — is
+        // what rejects an oversized field (axum's 2 MiB default would
+        // otherwise reject the whole request first).
+        .route(
+            "/admin/tls/upload",
+            post(api::tls_upload).layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)),
+        )
         // API + health + metrics.
         .nest("/api/v1", api_routes)
         .merge(health::routes())
