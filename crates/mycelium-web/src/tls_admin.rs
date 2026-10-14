@@ -237,12 +237,21 @@ pub fn read_pending(data_dir: &std::path::Path) -> Option<PendingCsr> {
 /// (`create_new`) so its mode can never be inherited from an existing
 /// file.
 ///
-/// Ordering (Review M1): the key is written FIRST, the meta LAST. The
-/// meta is the commit point — a key-write failure leaves the previous
-/// pending pair fully intact (the upload path's pending-key check reads
-/// only the key file, so a half-update that swapped the key under an
-/// old meta would be the dangerous direction; key-first makes that
-/// impossible).
+/// Ordering (Review M1): the key is written FIRST, the meta LAST, so
+/// the meta is the commit point. The dangerous half-update — new meta
+/// describing a key that is not the one on disk (new-meta + old-key) —
+/// is now impossible: the meta only lands once the new key is fully
+/// written (pinned by `save_pending_key_failure_leaves_prior_meta_untouched`).
+///
+/// A key-write failure can still leave the OLD meta with no key, in one
+/// sub-case: the prior key's `remove_file` succeeds but the fresh
+/// `create_new` then fails. That is benign — the upload path's
+/// pending-key check reads only the key file, so a missing key reads as
+/// "no CSR pending" (the same fail-open the absent-key case already
+/// takes), and the GET rebuild flashes "no CSR is pending". The orphan
+/// meta is never acted on. The old-meta + old-key pair survives intact
+/// when the failure is at `remove_file` itself (the key path is not a
+/// removable file).
 pub fn save_pending(
     data_dir: &std::path::Path,
     meta: &PendingCsr,
@@ -910,6 +919,30 @@ mod tests {
         let d = active_cert_details(dir.path()).expect("soon parses");
         assert!(!d.expired);
         assert!(d.expiring_soon);
+
+        // Boundary (Review M-4): just past the 30-day window reads NOT
+        // expiring-soon. The margin is 30d + 1 minute rather than the
+        // review's literal +1s: ASN.1 validity times carry whole-second
+        // granularity (rcgen truncates the sub-second component) and the
+        // parser's own `now_utc()` runs microseconds after cert creation,
+        // so a 1s margin can be eaten by that timing and flake. A minute
+        // is comfortably outside the window while still pinning that the
+        // window does not extend past 30 days.
+        let mut params = rcgen::CertificateParams::new(vec!["edge.example".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "edge.example");
+        params.not_before = time::OffsetDateTime::now_utc();
+        params.not_after =
+            time::OffsetDateTime::now_utc() + time::Duration::days(30) + time::Duration::minutes(1);
+        let cert = params.self_signed(&kp).unwrap();
+        std::fs::write(tls_dir.join("cert.pem"), cert.pem()).unwrap();
+        let d = active_cert_details(dir.path()).expect("edge parses");
+        assert!(!d.expired);
+        assert!(
+            !d.expiring_soon,
+            "just past 30 days is outside the expiring-soon window"
+        );
     }
 
     #[test]

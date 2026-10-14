@@ -92,13 +92,32 @@ independent pair.
 
 ## Posture 3: reverse proxy terminates TLS
 
-Run your proxy (nginx, Caddy, …) with your real certificate and let it
-forward to Mycelium2's HTTP listener. Two things to get right:
+Run your proxy (nginx, Caddy, …) with your real certificate in front of
+Mycelium2. Mycelium2 always terminates its own TLS, so the proxy must
+forward to the **HTTPS** listener, not the HTTP one — the HTTP listener
+is redirect-only (it 307s every request to the HTTPS port), so proxying
+to it either loops or bypasses your proxy entirely. Bind Mycelium2 to
+loopback and point the proxy at it over TLS:
 
-- Point `MYCELIUM2_TLS_CERT`/`MYCELIUM2_TLS_KEY` at your proxy-issued
-  pair if you would rather Mycelium2 itself serve HTTPS with it, or
-  bind Mycelium2's HTTPS/HTTP listeners to loopback and terminate at
-  the proxy.
+```
+MYCELIUM2_HTTPS_ADDR=127.0.0.1:8443
+```
+
+```nginx
+# nginx: terminate TLS here, proxy to Mycelium2's HTTPS listener
+location / {
+    proxy_pass https://127.0.0.1:8443;
+    proxy_ssl_trusted_certificate /etc/mycelium2/cert.pem;  # the self-signed pair, or set proxy_ssl_verify off
+}
+```
+
+(See [deployment.md](deployment.md) — *Behind a reverse proxy* — for the
+full `proxy_pass https://…` recipe.) Two things to get right:
+
+- The proxy connects to Mycelium2 over TLS, so it must trust (or be told
+  to skip verifying) the backend certificate — the self-signed pair from
+  Admin → System → TLS, or the `MYCELIUM2_TLS_CERT`/`MYCELIUM2_TLS_KEY`
+  pair if you mounted one.
 - Pass `MYCELIUM2_WEBAUTHN_ORIGIN` as the public HTTPS origin your
   browser actually sees (e.g. `https://mycelium.example`) — passkey
   ceremonies are refused when the relying-party origin does not match.

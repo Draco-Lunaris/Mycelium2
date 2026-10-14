@@ -1183,9 +1183,12 @@ async fn tls_card_escapes_uploaded_cert_subject() {
 /// M5: `AppState.tls == None` (a process that never served TLS) — the
 /// reset handler must flash the restart-required variant instead of
 /// claiming a live reload it cannot perform. Driven at the handler
-/// level: the session cookie is `Secure`, so a plain-HTTP harness
-/// cannot carry it, and booting a second TLS listener would not change
-/// `state.tls` (serve always sets Some).
+/// level because that is what this test is pinning: the None branch's
+/// flash and the on-disk rollback, directly. The route wiring and
+/// auth/CSRF gates around this handler are already pinned over HTTP by
+/// the `tls: Some` tests (reset_returns_to_generated_pair,
+/// csr_endpoints_admin_only), so an HTTP round-trip here would add
+/// nothing the None branch needs.
 #[tokio::test]
 async fn tls_reset_without_live_listener_flashes_restart_required() {
     let dir = tempfile::tempdir().unwrap();
