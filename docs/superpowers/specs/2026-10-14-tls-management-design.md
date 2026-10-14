@@ -39,15 +39,20 @@ mounts exist (main.rs:27-32) but are undocumented on the admin side.
   `pub async fn reload_from_pem_file(&self, cert, key) -> io::Result<()>`
   — hot-swap with no restart; internally an ArcSwap-style store, so
   sharing the handle and reloading is race-safe.
-- `rcgen` 0.13 has NO CSR (CertificateSigningRequest) emission API —
-  CSR building needs `x509-cert` (RustCrypto) or manual DER assembly.
-  Resolution during implementation: prefer `x509-cert` (`Request`
-  builder, pure Rust, no new network/crypto providers — it uses the
-  same RustCrypto primitives already in the dependency graph); fall
-  back to hand-rolled DER only if the dep is rejected.
-- rcgen 0.13 CAN parse an existing key pair and emit params for
-  validation (cert/key match), and `rustls-pemfile` is already in the
-  tree for PEM parsing.
+- **CORRECTED 2026-10-14 (plan-time API verification):** rcgen 0.13
+  DOES have CSR emission — `CertificateParams::serialize_request(
+  &KeyPair) -> CertificateSigningRequest` with `.pem()` and
+  `.der()`, `distinguished_name.push(DnType::CommonName, …)`, and
+  `subject_alt_names: Vec<SanType>` (cert.rs:525, csr.rs:41-57). The
+  earlier claim that x509-cert was needed was wrong: CSR building
+  stays entirely in rcgen; no new dependency. The x509-cert fallback
+  note below is obsolete and kept only as history.
+- rcgen 0.13 CAN parse an existing key pair (`KeyPair::from_pem`) and
+  exposes `public_key_raw`/`public_key_der` for cert/key match
+  validation; `rustls-pemfile` 2.2 is already in the tree for PEM
+  framing, and `x509-parser` 0.16 is already transitive (via
+  webauthn-rs-core) for cert display parsing — promote it to a direct
+  dep of mycelium-web (no version change, no new code in the graph).
 
 ## Decisions (user-approved 2026-10-14)
 
