@@ -1334,3 +1334,109 @@ async fn chat_page_failed_error_bubble() {
 
     shutdown.cancel();
 }
+
+/// Task 7: the chat page's JS rides the session endpoints — the version
+/// bump invalidates the served-asset caches, the body carries the
+/// create/submit session URLs and the composer island's entry point,
+/// and the REMOVED legacy stream route is gone from the asset entirely
+/// (the Task-4 carry-forward: the pre-rewrite JS still POSTed a route
+/// that no longer exists — the runtime submit path was broken until
+/// this rewrite).
+#[tokio::test]
+async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
+    let llm_url = "http://127.0.0.1:1/v1".to_string(); // dead; no turn runs
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+
+    // The versioned URL the page emits: 200, served as JavaScript.
+    let resp = client
+        .get(format!("{base}/assets/chat.js?v=26"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "chat.js must serve");
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/javascript",
+        "chat.js content type"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/api/v1/chat/sessions"),
+        "chat.js must reference the session endpoints: {body}"
+    );
+    assert!(
+        body.contains("myceliumChatSend"),
+        "chat.js must keep the composer island's entry point: {body}"
+    );
+    assert!(
+        !body.contains("/api/v1/chat/stream"),
+        "the removed legacy stream route must not appear anywhere in chat.js: {body}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Task 7: the CONTRACT the JS's liveness poll implements (the meta
+/// endpoint's shape), pinned server-side — the JS's browser behavior is
+/// out of scope for the suite (the version + reference pins above and
+/// the Task-6 SSR contracts are the seam). A turn interrupted by a
+/// restart must reattach via the poll: the page renders the resume
+/// note (which the poll clears when the turn moves), and the meta
+/// endpoint reports `turn_status: "interrupted"` with
+/// `turn_resumable: true` — the resume worker owns the claim (then the
+/// poll's `running` flip reopens the stream with the cursor); the
+/// client only watches.
+#[tokio::test]
+async fn interrupted_turn_js_reattaches_via_poll() {
+    // The gate is never released: the turn stays held running — then
+    // interrupted after the sweep — for the whole test; the response's
+    // unread body is dropped at the end.
+    let (llm_url, _gate) = gated_mock_llm(vec![text_response("held reply.")]).await;
+    let (base, shutdown, dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = submit_draft(&client, &base, &cookie, &csrf, "poll me after the restart").await;
+    assert_eq!(resp.status(), 200);
+    let session_id = first_session_id(&client, &base, &cookie).await;
+
+    // Navigate away (drop the unsent stream) + simulate the restart
+    // (what main.rs calls at boot): running → interrupted, attempts 0.
+    drop(resp);
+    let store = Store::open(dir.path()).await.unwrap();
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let swept = chat.boot_sweep().await.unwrap();
+    assert_eq!(swept, 1, "the one held turn was swept");
+
+    // The page: the resume note rendered, the interrupted status, and
+    // the transcript cursor (the user row) — the load-time state the
+    // JS's poll entry reads.
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains(
+            r#"<div class="chat-msg chat-status-note">Interrupted by a server restart — it will resume automatically.</div>"#,
+        ),
+        "resumable note missing: {html}"
+    );
+    assert!(html.contains(r#"data-turn-status="interrupted""#), "{html}");
+    assert!(html.contains(r#"data-max-seq="1""#), "{html}");
+
+    // The meta endpoint — the poll's 5 s input: interrupted AND
+    // resumable (the worker has not claimed it here — the test's boot
+    // never spawns the worker), with the transcript cursor.
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(meta["id"], session_id);
+    assert_eq!(meta["turn_status"], "interrupted");
+    assert_eq!(meta["turn_resumable"], true);
+    assert_eq!(meta["max_seq"], 1, "only the user row persisted");
+
+    shutdown.cancel();
+}

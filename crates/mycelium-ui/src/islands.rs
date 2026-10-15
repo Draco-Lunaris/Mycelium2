@@ -16,13 +16,15 @@
 //!
 //! Task-7 split contract: the composer island owns the composer's
 //! EVENT wiring only (submit binding, Enter-to-send, auto-grow); the
-//! transport — the POST `/api/v1/chat/stream` + the SSE pump — and the
+//! transport — the session-scoped POST `/api/v1/chat/sessions` (draft)
+//! or `/api/v1/chat/sessions/{id}/messages` + the SSE pump — and the
 //! log's DOM rendering stay in chat.js, exposed here as
 //! `window.myceliumChatSend(message) -> bool`: `true` = the transport
 //! accepted the message, `false` = it refused (busy) — the island
 //! clears the composer only on `true`, so input typed while the
-//! librarian streams stays in the textarea. The streaming shape
-//! (tool-progress events, pending state) is what the chat_stream
+//! librarian streams stays in the textarea. The session-scoped stream
+//! shape (the draft's first `session` event, tool-progress events,
+//! seq-deduped transcript replay) is what the chat_sessions
 //! integration suite pins server-side and what the UI must keep.
 //!
 //! Prop note: island props must be owned (`String`) — the macro

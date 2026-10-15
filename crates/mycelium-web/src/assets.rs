@@ -946,32 +946,73 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 /// policy is script-src 'self' 'wasm-unsafe-eval' + nonce, so inline
 /// scripts are blocked; /assets/chat.js loads under 'self').
 ///
-/// Task-7 split: the composer's EVENT wiring (submit binding,
-/// Enter-to-send, textarea auto-grow) lives in the chat_composer
-/// hydration island (mycelium-ui `islands.rs`), which hands each send
-/// to `window.myceliumChatSend` below — the helper returns `true`
-/// when the transport accepted the message, `false` when it refused
-/// (busy, or empty after trim); the island clears the composer only
-/// on `true`, so input typed while the librarian streams stays in
-/// the textarea (the pre-split busy-gate behavior). What stays here
-/// is what the
-/// chat-stream integration suite pins: the POST /api/v1/chat/stream
-/// transport (form-encoded message + the CSRF header from the page's
-/// meta — app.js's same token source), the SSE pump (tool progress →
-/// the pending message, done → the reply, error → the error message),
-/// the busy gate, and the log's DOM structure (addMsg + the XSS-safe
-/// markdown renderer). Without the hydrate bundle the composer is an
-/// inert form and the helper is never called — the page degrades to
-/// SSR-only.
-pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management for
-// /api/v1/chat/stream. The chat_composer hydration island owns the
-// composer's event wiring and calls window.myceliumChatSend; this file
-// owns the fetch, the SSE pump, and the log rendering.
+/// Chat-session-history architecture, session-scoped: the page's
+/// #chat-log `data-*` attrs (Task 6's SSR contract) are the load-time
+/// snapshot — `data-session` (UUID, or "new" for the draft),
+/// `data-max-seq` (the transcript cursor), `data-turn-status`
+/// (running/done/failed/interrupted/none), `data-csrf` (the token the
+/// POSTs replay). What lives here: the session state, the shared SSE
+/// pump + transcript-seq dedup (the server double-sends across the
+/// snapshot/live overlap by design — the client drops duplicates by
+/// `seq`), the draft flow (POST /api/v1/chat/sessions; the stream's
+/// FIRST event is `session` and flips the URL via history.replaceState),
+/// submit into an existing session (POST
+/// /api/v1/chat/sessions/{id}/messages), load-time reattach (a turn
+/// the SSR page says is `running` reopens GET
+/// /api/v1/chat/sessions/{id}/stream?after=<cursor>; user rows never
+/// replay, and the pending bubble pre-exists from SSR), the
+/// stream-drop reopen loop (≤ 3 attempts, 2 s apart — the transcript
+/// is the fallback truth), and the meta liveness poll (GET
+/// /api/v1/chat/sessions/{id}, 5 s interval) that notices the resume
+/// worker's claim (turn_status → running → reopen the stream with the
+/// cursor) or a turn finishing elsewhere (done/failed → one final
+/// replay fetch collects the rows the page missed). The composer's
+/// EVENT wiring (submit binding, Enter-to-send, textarea auto-grow)
+/// lives in the chat_composer hydration island (mycelium-ui
+/// islands.rs), which hands each send to `window.myceliumChatSend` —
+/// `true` when the transport accepted the message, `false` when it
+/// refused (busy, or empty after trim); the island clears the composer
+/// only on `true`, so input typed while the librarian streams stays in
+/// the textarea. The log's DOM structure (addMsg + the XSS-safe
+/// markdown renderer) is unchanged from the pre-session chat.js.
+/// Without the hydrate bundle the composer is an inert form and the
+/// helper is never called — the page degrades to SSR-only (the
+/// sidebar, the transcript, and the native delete forms all work
+/// without JS).
+pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + log management
+// for /api/v1/chat/sessions (spec §3.5/§3.6). The chat_composer
+// hydration island owns the composer's event wiring and calls
+// window.myceliumChatSend; this file owns the session state, the
+// fetches, the SSE pump, the reattach/reopen/liveness-poll machinery,
+// and the log rendering.
 (function () {
   var log = document.getElementById("chat-log");
+  if (!log) return;
   var form = document.getElementById("chat-form");
   var sendBtn = form ? form.querySelector("button[type=submit]") : null;
+
+  // Session state. The SSR data-* attrs are the load-time snapshot;
+  // everything below re-derives from streams and meta responses.
+  var sessionId = log.dataset.session || "new";
+  var lastSeq = parseInt(log.dataset.maxSeq, 10) || 0;
+  var turnStatus = log.dataset.turnStatus || "none";
   var busy = false;
+  var seen = {}; // transcript-seq dedup across every stream
+  var pending = null; // the live "thinking…" bubble, if any
+  var steps = []; // its tool-progress lines
+  var reopenAttempts = 0;
+  var reopenTimer = null;
+  var pollTimer = null;
+
+  // Tunables (spec §4): ≤ 3 reopen attempts, 2 s apart; 5 s meta poll.
+  var REOPEN_MAX = 3;
+  var REOPEN_DELAY_MS = 2000;
+  var POLL_INTERVAL_MS = 5000;
+
+  function setBusy(state) {
+    busy = state;
+    if (sendBtn) sendBtn.disabled = state;
+  }
   function addMsg(text, who) {
     var div = document.createElement("div");
     div.className = "chat-msg " + who;
@@ -1075,90 +1116,318 @@ pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management f
       i++;
     }
   }
-  function setBusy(state) {
-    busy = state;
-    if (sendBtn) sendBtn.disabled = state;
+
+  // The pending bubble. send() creates a fresh one (it owns the turn);
+  // a reattach/reopen stream adopts the pre-existing one — SSR renders
+  // it for a running turn, and a mid-run reopen inherits the send()'s
+  // element via `pending` staying set.
+  function adoptPending() {
+    if (pending && pending.isConnected) return;
+    pending = log.querySelector(".chat-msg.librarian.pending");
   }
+  function renderPending() {
+    if (!pending) return;
+    var text = "The librarian is thinking…";
+    if (steps.length) text += "\n\n" + steps.join("\n");
+    pending.textContent = text;
+    log.scrollTop = log.scrollHeight;
+  }
+  function pendingRemove() {
+    if (pending) { pending.remove(); pending = null; }
+    steps = [];
+  }
+  function clearStatusNote() {
+    var note = log.querySelector(".chat-msg.chat-status-note");
+    if (note) note.remove();
+  }
+
+  // Shared event handling for every stream (submit, reattach, final
+  // replay). `state.sawTerminal` marks a replayed terminal row — its
+  // producing turn finalized, so this stream's end is not a drop.
+  function handleEvent(ev, state) {
+    // The draft flow's `session` event is handled by TYPE, before the
+    // seq gate: its seq 0 is an endpoint-generated sentinel (never a
+    // transcript row, never replayed), and keying the falsy 0 into
+    // the dedup map would special-case it. Only the draft flow emits
+    // this event.
+    if (ev.type === "session") {
+      sessionId = ev.session_id;
+      history.replaceState(null, "", "/chat?s=" + sessionId);
+      return;
+    }
+    // The dedup contract (spec §3.3): events double-send across the
+    // snapshot/live overlap by design — the transcript row's `seq` is
+    // the client-side dedup key.
+    if (ev.seq === undefined || ev.seq === null || seen[ev.seq]) return;
+    seen[ev.seq] = true;
+    if (ev.seq > lastSeq) lastSeq = ev.seq;
+    if (ev.type === "tool") {
+      adoptPending();
+      steps.push("· " + ev.name + (ev.detail ? " (" + ev.detail + ")" : ""));
+      renderPending();
+    } else if (ev.type === "assistant") {
+      // Replay vocabulary (a persisted reply row). Render like a live
+      // reply; it also proves the turn finalized — if the page still
+      // holds busy, settle it at the stream's end instead of
+      // reopening.
+      pendingRemove();
+      addMsg(ev.reply, "librarian");
+      state.sawTerminal = true;
+    } else if (ev.type === "done") {
+      pendingRemove();
+      addMsg(ev.reply, "librarian");
+      setBusy(false);
+    } else if (ev.type === "error") {
+      pendingRemove();
+      addMsg(ev.error, "error");
+      setBusy(false);
+      state.sawTerminal = true;
+    }
+  }
+
+  // SSE pump: split frames, parse each data line, dispatch.
+  function readStream(r, state) {
+    var reader = r.body.getReader();
+    var decoder = new TextDecoder();
+    var buf = "";
+    function pump() {
+      return reader.read().then(function (chunk) {
+        if (chunk.done) return;
+        buf += decoder.decode(chunk.value, { stream: true });
+        var parts = buf.split("\n\n");
+        buf = parts.pop();
+        parts.forEach(function (part) {
+          var line = part.replace(/^data: /, "");
+          if (!line) return;
+          var ev;
+          try { ev = JSON.parse(line); } catch (e) { return; }
+          handleEvent(ev, state);
+        });
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  // A stream ended. The transcript is the truth: a close with the
+  // turn still busy (and no replayed terminal row) is a drop —
+  // reopen against the store cursor; anything else settled inside
+  // the stream.
+  function onStreamEnd(state) {
+    if (!busy) return;
+    if (state.sawTerminal) {
+      // The producing turn finalized between the SSR render and the
+      // reattach stream (the terminal row replayed; the live Done was
+      // broadcast before this client could subscribe).
+      setBusy(false);
+      return;
+    }
+    scheduleReopen();
+  }
+
+  // Stream-drop reopen (spec §3.6/§4): ≤ 3 attempts, 2 s apart; the
+  // transcript fetched against the ?after= cursor is the fallback
+  // truth. Exhausted → the meta poll takes over.
+  function scheduleReopen() {
+    reopenAttempts += 1;
+    if (reopenTimer) return; // one chain at a time
+    if (reopenAttempts > REOPEN_MAX) {
+      turnStatus = "unknown";
+      startPoll();
+      return;
+    }
+    reopenTimer = setTimeout(function () {
+      reopenTimer = null;
+      openStream();
+    }, REOPEN_DELAY_MS);
+  }
+
+  // The reattach/reopen stream: replay every transcript row after the
+  // cursor (tool → pending steps, assistant/error → rendered bubbles,
+  // user rows never replay), then tail the live turn. A turn with no
+  // live entry replays and closes immediately (poll semantics).
+  function openStream() {
+    var url =
+      "/api/v1/chat/sessions/" + encodeURIComponent(sessionId) +
+      "/stream?after=" + lastSeq;
+    fetch(url, { headers: { "accept": "text/event-stream" } })
+      .then(function (r) {
+        if (!r.ok || !r.body) {
+          // Permanent: the endpoint refused (gone/owned-by-nobody/
+          // server error) — reopening never fixes it. Surface once,
+          // settle, and stop.
+          return r
+            .json()
+            .catch(function () { return {}; })
+            .then(function (j) {
+              throw { permanent: true, message: (j && j.error) || ("HTTP " + r.status) };
+            });
+        }
+        var state = { sawTerminal: false };
+        return readStream(r, state).then(function () { onStreamEnd(state); });
+      })
+      .catch(function (err) {
+        if (err && err.permanent) {
+          pendingRemove();
+          setBusy(false);
+          addMsg(err.message || "the chat session is unavailable", "error");
+          return;
+        }
+        // A network drop mid-stream (or a failed connect): transient
+        // — the reopen loop owns it.
+        onStreamEnd({ sawTerminal: false });
+      });
+  }
+
+  // Liveness poll (spec §3.6): watch the session meta until the turn
+  // moves — how an open page notices the resume worker's claim (then
+  // it reopens the stream with the cursor) or a turn finishing
+  // elsewhere (then one final replay collects the missed rows).
+  function startPoll() {
+    if (pollTimer) return;
+    pollTimer = setInterval(pollMeta, POLL_INTERVAL_MS);
+  }
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+  function metaUrl() {
+    return "/api/v1/chat/sessions/" + encodeURIComponent(sessionId);
+  }
+  function pollMeta() {
+    if (!sessionId || sessionId === "new") return; // drafts have no meta
+    fetch(metaUrl(), { headers: { "accept": "application/json" } })
+      .then(function (r) {
+        if (r.status === 404) throw { gone: true };
+        if (!r.ok) throw { transient: true };
+        return r.json();
+      })
+      .then(function (meta) {
+        if (meta.max_seq > lastSeq) lastSeq = meta.max_seq;
+        var st = meta.turn_status;
+        if (st === "running") {
+          // The resume worker claimed the turn: reattach with the
+          // cursor; the pending bubble pre-exists. Fresh reopen
+          // budget for the claimed turn.
+          stopPoll();
+          turnStatus = "running";
+          reopenAttempts = 0;
+          setBusy(true);
+          clearStatusNote();
+          openStream();
+        } else if (st === "done" || st === "failed") {
+          // The turn finished elsewhere: one replay fetch closes
+          // immediately (poll semantics) and collects every row
+          // missed since the cursor, then the page settles.
+          stopPoll();
+          finalReplay();
+        } else if (st === "interrupted" && meta.turn_resumable === false) {
+          // The worker will never claim this one (its resume attempt
+          // was spent): stop probing — a manual submit or a reload
+          // re-engages. Rows the spent attempt persisted (e.g. the
+          // LLM-down error row) are still collected; the turn stays
+          // interrupted, so the SSR note stays (finalReplay's
+          // note-clearing is only for a terminal transition).
+          stopPoll();
+          if (meta.max_seq > lastSeq) {
+            fetch(metaUrl() + "/stream?after=" + lastSeq, {
+              headers: { "accept": "text/event-stream" }
+            })
+              .then(function (r) {
+                if (!r.ok || !r.body) return;
+                return readStream(r, { sawTerminal: false });
+              })
+              .catch(function () { /* the next reload re-syncs */ });
+          } else {
+            setBusy(false);
+          }
+        }
+        // interrupted+resumable (or unknown/null): keep polling.
+      })
+      .catch(function (err) {
+        if (err && err.gone) {
+          stopPoll();
+          pendingRemove();
+          setBusy(false);
+          addMsg("this chat session is no longer available", "error");
+          return;
+        }
+        // Transient (network down mid-restart, server blip): the
+        // interval keeps probing; a restart heals it.
+      });
+  }
+  // The poll's terminal transition: one replay fetch (closes
+  // immediately — no live turn), then settle: release the composer,
+  // clear the resume note.
+  function finalReplay() {
+    fetch(metaUrl() + "/stream?after=" + lastSeq, {
+      headers: { "accept": "text/event-stream" }
+    })
+      .then(function (r) {
+        if (!r.ok || !r.body) return;
+        return readStream(r, { sawTerminal: false });
+      })
+      .catch(function () { /* the next reload re-syncs */ })
+      .then(function () {
+        setBusy(false);
+        clearStatusNote();
+      });
+  }
+
   // Returns true when the transport accepted the message (logged +
   // fetch kicked off), false when it refused (busy). The composer
   // island clears the textarea only on true.
   function send(msg) {
     if (busy) return false;
+    var draft = !sessionId || sessionId === "new";
+    var url = draft
+      ? "/api/v1/chat/sessions"
+      : "/api/v1/chat/sessions/" + encodeURIComponent(sessionId) + "/messages";
+    // The submit stream carries this turn's live tail itself: drop any
+    // liveness poll (a superseded interrupted turn is not watched) and
+    // any pending reopen timer, with a fresh reopen budget.
+    stopPoll();
+    if (reopenTimer) { clearTimeout(reopenTimer); reopenTimer = null; }
+    reopenAttempts = 0;
     addMsg(msg, "user");
     setBusy(true);
-    var pending = addMsg("The librarian is thinking…", "librarian pending");
-    var steps = [];
-    function renderPending() {
-      var text = "The librarian is thinking…";
-      if (steps.length) text += "\n\n" + steps.join("\n");
-      pending.textContent = text;
-      log.scrollTop = log.scrollHeight;
-    }
+    pending = addMsg("The librarian is thinking…", "librarian pending");
+    steps = [];
     var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+    var token = log.dataset.csrf || (csrfMeta ? csrfMeta.content : "");
     var body = new URLSearchParams();
     body.set("message", msg);
-    body.set("csrf_token", csrfMeta ? csrfMeta.content : "");
-    fetch("/api/v1/chat/stream", {
+    body.set("csrf_token", token);
+    fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
-        "x-csrf-token": csrfMeta ? csrfMeta.content : "",
+        "x-csrf-token": token,
         "accept": "text/event-stream"
       },
       body: body.toString()
-    }).then(function (r) {
-      if (!r.ok || !r.body) {
-        return r.json().then(function (j) {
-          throw new Error(j.error || ("HTTP " + r.status));
-        });
-      }
-      var reader = r.body.getReader();
-      var decoder = new TextDecoder();
-      var buf = "";
-      function pump() {
-        return reader.read().then(function (chunk) {
-          if (chunk.done) { finish(); return; }
-          buf += decoder.decode(chunk.value, { stream: true });
-          var parts = buf.split("\n\n");
-          buf = parts.pop();
-          parts.forEach(function (part) {
-            var line = part.replace(/^data: /, "");
-            if (!line) return;
-            var ev;
-            try { ev = JSON.parse(line); } catch (e) { return; }
-            if (ev.type === "tool") {
-              steps.push("· " + ev.name + (ev.detail ? " (" + ev.detail + ")" : ""));
-              renderPending();
-            } else if (ev.type === "done") {
-              pending.remove();
-              addMsg(ev.reply, "librarian");
-              setBusy(false);
-            } else if (ev.type === "error") {
-              pending.remove();
-              addMsg(ev.error, "error");
-              setBusy(false);
-            }
-          });
-          return pump();
-        });
-      }
-      function finish() {
-        // Stream ended without a done/error event (e.g. connection
-        // drop): clear the pending state.
-        if (busy) {
-          pending.remove();
-          addMsg("connection closed", "error");
-          setBusy(false);
+    })
+      .then(function (r) {
+        if (!r.ok || !r.body) {
+          return r
+            .json()
+            .catch(function () { return {}; })
+            .then(function (j) {
+              throw new Error((j && j.error) || ("HTTP " + r.status));
+            });
         }
-      }
-      return pump();
-    }).catch(function (err) {
-      pending.remove();
-      setBusy(false);
-      addMsg(err.message || "request failed", "error");
-    });
+        var state = { sawTerminal: false };
+        return readStream(r, state).then(function () {
+          onStreamEnd(state);
+        });
+      })
+      .catch(function (err) {
+        pendingRemove();
+        setBusy(false);
+        addMsg(err.message || "request failed", "error");
+      });
     return true;
   }
+
   // The composer island's entry point (Task 7): each trimmed message
   // arrives here. Returns the transport's verdict — false when busy
   // or empty after trim — so the island clears the composer only on
@@ -1169,6 +1438,18 @@ pub const CHAT_JS: &str = r#"// Librarian chat: SSE transport + log management f
     if (!m) return false;
     return send(m);
   };
+
+  // Load-time liveness: a turn the SSR page says is running reattaches
+  // immediately (the pending bubble pre-exists; the composer holds
+  // busy), an interrupted turn starts the meta poll (the resume worker
+  // owns the claim — its transition to running flips this page back to
+  // the stream), and done/failed/none need nothing.
+  if (turnStatus === "running") {
+    setBusy(true);
+    openStream();
+  } else if (turnStatus === "interrupted") {
+    startPoll();
+  }
 })();
 "#;
 
@@ -1367,7 +1648,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "25";
+pub const ASSETS_VERSION: &str = "26";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
