@@ -4,7 +4,7 @@
 //!
 //! `spawn_chat_run` registers the turn in `ChatRunRegistry`, then
 //! detaches: the spawned task owns its `Store` clone (scopes borrow
-//! it, so they are built inside the task — the `api_chat_stream`
+//! it, so they are built inside the task — the detached-task
 //! pattern), rebuilds the LLM history from the session's persisted
 //! rows, and drives `run_chat_streaming`. Every agent event is
 //! persisted as a transcript row FIRST and only then broadcast (D4):
@@ -38,8 +38,8 @@ const CHAT_CHANNEL_CAPACITY: usize = 256;
 /// user/assistant pairs. Tool and error rows never reach the model.
 const MAX_HISTORY_PAIRS: usize = 20;
 
-/// The user-facing LLM-down message (the existing `api_chat` /
-/// `api_chat_stream` wording — one message everywhere).
+/// The user-facing LLM-down message (the `api_chat` 503 wording —
+/// one message everywhere).
 const LLM_UNAVAILABLE: &str =
     "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal";
 
@@ -65,6 +65,10 @@ pub enum ChatSseKind {
     Tool { name: String, detail: String },
     /// The run finished with the assistant's reply.
     Done { reply: String },
+    /// Replay-only: a persisted assistant row (the reattach stream's
+    /// replay vocabulary — `done` means a live turn finished, so a
+    /// replayed reply says `assistant`; never broadcast live).
+    Assistant { reply: String },
     /// The run failed (the error row's message).
     Error { error: String },
 }
@@ -91,6 +95,10 @@ impl serde::Serialize for ChatSseEvent {
             }
             ChatSseKind::Done { reply } => {
                 map.serialize_entry("type", "done")?;
+                map.serialize_entry("reply", reply)?;
+            }
+            ChatSseKind::Assistant { reply } => {
+                map.serialize_entry("type", "assistant")?;
                 map.serialize_entry("reply", reply)?;
             }
             ChatSseKind::Error { error } => {
@@ -268,7 +276,7 @@ async fn run_chat_turn(
     let client = LlmClient::new(&ctx.llm);
     let cs = ConceptStore::for_user(&ctx.store, user_id, master.clone());
     // AgentScopes borrows the store — built here, inside the task that
-    // owns it (the api_chat_stream pattern).
+    // owns it (the detached-task pattern).
     let scopes = build_agent_scopes(
         &ctx.store,
         &ctx.service_key,
@@ -799,6 +807,19 @@ mod tests {
         assert_eq!(
             done,
             serde_json::json!({ "type": "done", "reply": "answer", "seq": 5 })
+        );
+        // Replay vocabulary: an assistant ROW replays as "assistant",
+        // never "done" (done means a live turn finished).
+        let assistant = serde_json::to_value(ChatSseEvent {
+            kind: ChatSseKind::Assistant {
+                reply: "answer".to_string(),
+            },
+            seq: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            assistant,
+            serde_json::json!({ "type": "assistant", "reply": "answer", "seq": 5 })
         );
         let error = serde_json::to_value(ChatSseEvent {
             kind: ChatSseKind::Error {
