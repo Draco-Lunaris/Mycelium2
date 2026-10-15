@@ -1350,7 +1350,7 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
 
     // The versioned URL the page emits: 200, served as JavaScript.
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=26"))
+        .get(format!("{base}/assets/chat.js?v=27"))
         .send()
         .await
         .unwrap();
