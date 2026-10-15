@@ -1440,3 +1440,66 @@ async fn interrupted_turn_js_reattaches_via_poll() {
 
     shutdown.cancel();
 }
+
+/// Spec D9/§6.16 standing guard: `POST /api/v1/chat` (the pre-session
+/// one-shot endpoint) carries NO memory — the second call's LLM request
+/// contains ONLY [system, user("<second message>")], never the first
+/// exchange. Callers manage their own context; multi-turn history is the
+/// session endpoints' job (`multi_turn_context_rebuilt_from_rows` pins
+/// THAT side). This pins the stateless half with the same
+/// request-capturing mock — the REAL second payload, not an inference.
+#[tokio::test]
+async fn api_chat_is_stateless_single_turn() {
+    let (llm_url, requests) = capturing_mock_llm(vec![
+        text_response("Second one-shot reply."),
+        text_response("First one-shot reply."),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Two consecutive POSTs to the one-shot endpoint.
+    for msg in ["first message", "second message"] {
+        let resp = client
+            .post(format!("{base}/api/v1/chat"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[("message", msg)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "one-shot chat ({msg})");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["reply"].as_str().unwrap().ends_with("reply."),
+            "one-shot reply shape: {body}"
+        );
+    }
+
+    // The captured payloads are the truth: request 2 must be
+    // [system, user("second message")] — two messages only.
+    let captured = requests.lock().await;
+    assert_eq!(captured.len(), 2, "one LLM call per one-shot POST");
+    let second = &captured[1];
+    let messages = second["messages"].as_array().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "the second request carries exactly system + this message: {messages:?}"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "second message");
+    let all = serde_json::to_string(&captured[1]).unwrap();
+    assert!(
+        !all.contains("first message"),
+        "no prior context may leak into the second one-shot request: {all}"
+    );
+    assert!(
+        !all.contains("First one-shot reply."),
+        "no prior assistant reply may leak into the second one-shot request: {all}"
+    );
+
+    shutdown.cancel();
+}
