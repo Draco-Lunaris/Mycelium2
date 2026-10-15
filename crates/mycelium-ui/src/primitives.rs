@@ -323,4 +323,36 @@ mod tests {
         // confirm.js's close hook (Task 7).
         assert!(html.contains("data-confirm-cancel"), "{html}");
     }
+
+    /// The chat sidebar's per-row delete dialog renders an EMPTY
+    /// static action (one shared dialog; its form starts with no
+    /// target — confirm.js copies the clicked trigger's own per-row
+    /// action onto it before showing). The empty action can never be
+    /// submitted without script: showModal only happens from
+    /// confirm.js's click handler. Pinned: the attribute renders as
+    /// `action=""` (present but empty — tachys emits `&str` attributes
+    /// unconditionally), not silently dropped.
+    #[test]
+    fn confirm_dialog_empty_action_renders_but_inert_without_js() {
+        let html = render(confirm_dialog(
+            "confirm-delete-chat",
+            "Delete this chat?",
+            "This cannot be undone.",
+            "Delete",
+            "danger",
+            "",
+            &[
+                ("id".to_string(), String::new()),
+                ("csrf_token".to_string(), "tok-123".to_string()),
+            ],
+        ));
+        assert!(html.contains("<dialog"), "{html}");
+        assert!(html.contains(r#"id="confirm-delete-chat""#), "{html}");
+        assert!(
+            html.contains(r#"action="""#),
+            "the dialog form's action attribute must RENDER (empty — confirm.js sets it per click before the dialog can submit): {html}"
+        );
+        assert!(html.contains(r#"name="id""#), "{html}");
+        assert!(html.contains("data-confirm-cancel"), "{html}");
+    }
 }

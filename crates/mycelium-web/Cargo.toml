@@ -36,6 +36,10 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 x509-parser = "0.16"
 hex = "0.4"
+# Sync bridge for the chat runner's Drop guard (async store calls from
+# Drop) — the same crate mycelium-store pins for search_index.rs's
+# `block_on` precedent.
+futures-executor = "0.3"
 # TLS upload fingerprinting (tls_admin::validate_upload). Already in the
 # graph (rustls/jsonwebtoken/mycelium-auth); promoted to a direct dep.
 sha2.workspace = true

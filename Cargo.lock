@@ -2613,6 +2613,7 @@ dependencies = [
  "axum",
  "axum-server",
  "chrono",
+ "futures-executor",
  "hex",
  "leptos",
  "md-5",

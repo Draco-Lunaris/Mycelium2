@@ -148,50 +148,6 @@ impl AppState {
     }
 }
 
-/// Per-session chat history for the librarian chat (multi-turn memory).
-/// Bounded: only the most recent `MAX_CHAT_HISTORY` turns are kept —
-/// the agent's context window is finite, and old turns age out
-/// naturally. In-memory by design: chat history is ephemeral UI state,
-/// not knowledge (the librarian persists anything worth keeping as
-/// concepts via the write tools).
-#[derive(Default)]
-pub struct ChatHistory {
-    inner: std::sync::Mutex<
-        std::collections::HashMap<uuid::Uuid, Vec<mycelium_librarian::llm::ConversationTurn>>,
-    >,
-}
-
-/// Turns kept per session (user + assistant pairs).
-const MAX_CHAT_HISTORY: usize = 20;
-
-impl ChatHistory {
-    /// Append a turn, trimming to the bound.
-    pub fn push(&self, session: uuid::Uuid, turn: mycelium_librarian::llm::ConversationTurn) {
-        let mut map = self.inner.lock().unwrap();
-        let turns = map.entry(session).or_default();
-        turns.push(turn);
-        let len = turns.len();
-        if len > MAX_CHAT_HISTORY {
-            turns.drain(0..len - MAX_CHAT_HISTORY);
-        }
-    }
-
-    /// The session's history (clone — cheap, bounded).
-    pub fn get(&self, session: uuid::Uuid) -> Vec<mycelium_librarian::llm::ConversationTurn> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Drop a session's history (logout hygiene).
-    pub fn clear(&self, session: uuid::Uuid) {
-        self.inner.lock().unwrap().remove(&session);
-    }
-}
-
 /// The axum router state.
 #[derive(Clone)]
 pub struct AppState {
@@ -215,12 +171,17 @@ pub struct AppState {
     /// boot inputs, and reaching the cert dir through an asset path's
     /// parent is fragile.
     pub data_dir: std::path::PathBuf,
-    /// Librarian chat history per session (multi-turn memory).
-    pub chat_history: Arc<ChatHistory>,
     /// WebAuthn ceremony manager — built once per process (Task 4
     /// hoists what Task 3 constructed per request). RP config:
     /// [`webauthn_origin_from_env`].
     pub webauthn: Arc<WebAuthnManager>,
+    /// Durable chat transcripts (sealed `chat_*` rows; chat session
+    /// history spec §3.1).
+    pub chat_sessions: Arc<mycelium_store::chat::ChatStore>,
+    /// Live chat runs: per-turn broadcast channels (spec §3.3) — the
+    /// submit endpoints register entries before spawning runners;
+    /// the runners remove them at finalization.
+    pub chat_runs: Arc<crate::chat_runner::ChatRunRegistry>,
     /// The live TLS config handle (None in tests that never serve TLS).
     /// Both values returned by
     /// [`crate::cert::load_or_create_tls_config`] are clones of one
@@ -286,6 +247,11 @@ impl AppState {
                 "invalid MYCELIUM2_WEBAUTHN_ORIGIN — must be an https:// URL with a DNS host",
             ),
         );
+        // Chat session history (spec §3.3): the sealed-transcript row
+        // store and the live-run registry share the pool with the
+        // other stores.
+        let chat_sessions = Arc::new(mycelium_store::chat::ChatStore::new(pool.clone()));
+        let chat_runs = Arc::new(crate::chat_runner::ChatRunRegistry::default());
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),
@@ -299,8 +265,9 @@ impl AppState {
             queue_worker,
             assets_dir,
             data_dir,
-            chat_history: Arc::new(ChatHistory::default()),
             webauthn,
+            chat_sessions,
+            chat_runs,
             tls,
         }
     }

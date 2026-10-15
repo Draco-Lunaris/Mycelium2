@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "mycelium2")]
@@ -152,6 +153,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Drain worker: long task, cancelled by the same shutdown token.
     let worker = state.queue_worker.clone();
     worker.spawn(shutdown.clone());
+
+    // Chat boot sweep + resume worker (chat session history spec §3.4):
+    // running → interrupted; the worker auto-resumes each once.
+    if let Err(e) = state.chat_sessions.boot_sweep().await {
+        tracing::warn!(error = %e, "chat boot sweep failed");
+    }
+    let resume = Arc::new(mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(
+        state.clone(),
+    )));
+    resume.spawn(shutdown.clone());
 
     mycelium_web::serve(
         state,
