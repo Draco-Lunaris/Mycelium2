@@ -1092,6 +1092,36 @@ async fn chat_page_sidebar_and_transcript_ssr() {
         html.contains(r#"name="csrf_token""#),
         "delete form must carry the CSRF hidden field: {html}"
     );
+    // The delete trigger rides the keys-page confirm-dialog pattern
+    // (final-review Finding 1): without JS the form POSTs directly;
+    // with JS confirm.js opens the shared dialog, copying this row's
+    // data-key-id AND its per-row form action onto the dialog form.
+    assert!(
+        html.contains(r##"data-confirm-dialog="confirm-delete-chat""##),
+        "delete trigger must name the shared dialog: {html}"
+    );
+    assert!(
+        html.contains(&format!(r##"data-key-id="{session_id}""##)),
+        "delete trigger must carry its session id: {html}"
+    );
+    assert!(
+        !html.contains(r#"data-confirm=""#) && html.contains(r#"data-confirm-dialog"#),
+        "bare unwired data-confirm must not survive (Finding 1): {html}"
+    );
+    // The shared dialog exists in the markup and confirm.js loads with
+    // the page (the guard chat.js alone doesn't provide).
+    assert!(
+        html.contains(r##"<dialog id="confirm-delete-chat""##),
+        "delete dialog missing: {html}"
+    );
+    assert!(
+        html.contains("/assets/confirm.js?v="),
+        "confirm.js must load on /chat: {html}"
+    );
+    assert!(
+        html.contains("/assets/chat.js?v="),
+        "chat.js must still load on /chat: {html}"
+    );
 
     // Transcript (the done tool turn): user bubble, tool note carrying
     // the sealed JSON's parts escaped, the reply as a markdown <p>.
@@ -1350,7 +1380,7 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
 
     // The versioned URL the page emits: 200, served as JavaScript.
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=27"))
+        .get(format!("{base}/assets/chat.js?v=28"))
         .send()
         .await
         .unwrap();

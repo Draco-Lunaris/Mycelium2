@@ -973,7 +973,8 @@ pub struct ChatActiveView {
 
 /// Chat page (two-pane, spec §3.6 — all SSR-first): the sessions
 /// sidebar (newest-first links, the active one highlighted, a native
-/// per-session delete form — works without JS) and the selected
+/// per-session delete form — works without JS, and with confirm.js the
+/// shared delete dialog guards the destructive click) and the selected
 /// session's transcript rendered in seq order with the SAME bubble
 /// markup chat.js builds, so JS appends seamlessly. The composer is
 /// the untouched chat_composer hydration island; its SSR markup IS
@@ -1004,7 +1005,13 @@ pub fn chat_page(
     let csrf_esc = html_escape(csrf);
     // Sidebar: "+ New chat" then one link + delete form per session
     // (the list arrives newest-first from `list_sessions`). The
-    // active link matches the selected session id.
+    // active link matches the selected session id. The delete
+    // trigger rides the keys-page confirm-dialog pattern
+    // (`data-confirm-dialog` + `data-key-id`): without JS it POSTs
+    // the form directly (the per-session action URL in the path);
+    // with JS, confirm.js's preventDefault opens the shared dialog,
+    // copying the trigger's form action (the SAME per-session URL)
+    // onto the dialog form before submitting.
     let mut sidebar = String::from(r#"<a class="chat-new" href="/chat?s=new">+ New chat</a>"#);
     for session in sessions {
         let is_active = active.is_some_and(|a| a.id == session.id);
@@ -1015,8 +1022,8 @@ pub fn chat_page(
             html_escape(&session.title)
         ));
         sidebar.push_str(&format!(
-            r#"<form class="chat-session-delete" method="post" action="/api/v1/chat/sessions/{}/delete"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" data-confirm="Delete this chat?">Delete</button></form>"#,
-            session.id
+            r#"<form class="chat-session-delete" method="post" action="/api/v1/chat/sessions/{}/delete"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" data-confirm-dialog="confirm-delete-chat" data-key-id="{}">Delete</button></form>"#,
+            session.id, session.id
         ));
     }
 
@@ -1091,6 +1098,26 @@ pub fn chat_page(
     let composer = mycelium_ui::render::render(mycelium_ui::chat_composer(
         "Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)",
     ));
+    // One delete dialog for the whole sidebar: the hidden csrf_token
+    // rides server-rendered; the `id` hidden field starts empty and
+    // confirm.js copies the clicked trigger's `data-key-id` into it,
+    // and (chat-only) the trigger's own per-row form action onto the
+    // dialog form — one dialog serves every row (the keys-page
+    // pattern with the action copy chat's per-row URLs require).
+    // Without script the dialog never opens and the trigger's native
+    // form POSTs directly (the concept-delete precedent).
+    let dialog = mycelium_ui::render::render(mycelium_ui::confirm_dialog(
+        "confirm-delete-chat",
+        "Delete this chat?",
+        "This cannot be undone.",
+        "Delete",
+        "danger",
+        "",
+        &[
+            ("id".to_string(), String::new()),
+            ("csrf_token".to_string(), csrf.to_string()),
+        ],
+    ));
     let body = format!(
         r#"<div class="chat-shell chat-two-pane">
   <nav class="chat-sessions" aria-label="Chat sessions">{sidebar}</nav>
@@ -1098,7 +1125,7 @@ pub fn chat_page(
     <div id="chat-log" class="chat-log" aria-live="polite" data-session="{session_attr}" data-max-seq="{max_seq}" data-turn-status="{status_attr}" data-csrf="{csrf_esc}">{log}{status_bubble}</div>
     {composer}
   </section>
-</div>"#
+</div>{dialog}"#
     );
     layout_full(
         "Librarian",
@@ -1106,7 +1133,11 @@ pub fn chat_page(
         csrf,
         "/chat",
         body,
-        &["/assets/chat.js", "/assets/islands.js"],
+        &[
+            "/assets/chat.js",
+            "/assets/confirm.js",
+            "/assets/islands.js",
+        ],
         &["/assets/mycelium_ui.js"],
         "chat-page",
     )

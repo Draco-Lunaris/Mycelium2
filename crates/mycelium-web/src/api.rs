@@ -12,7 +12,8 @@ use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
 use mycelium_core::search::SearchQuery;
 use mycelium_store::{
-    ConceptStore, FileRepo, Scope, SkillBundleError, SkillGroup, bundle_skill_files, group_skills,
+    ConceptStore, FileRepo, Scope, SkillBundleError, SkillGroup, bundle_skill_files,
+    chat::ChatError, group_skills,
 };
 
 use crate::middleware::SessionId;
@@ -3215,7 +3216,20 @@ async fn load_active(
         .await
     {
         Ok(m) => m,
-        Err(_) => return None,
+        // NotFound (a session deleted between the list and this read,
+        // or a foreign id the caller redirects) is a normal outcome;
+        // anything else (store/crypto failure) is logged server-side —
+        // the 303/empty behaviors below stay identical either way.
+        Err(ChatError::NotFound) => return None,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                session_id = %session_id,
+                error = %e,
+                "chat session load failed"
+            );
+            return None;
+        }
     };
     let messages = state
         .chat_sessions
