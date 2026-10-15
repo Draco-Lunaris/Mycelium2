@@ -1120,7 +1120,11 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
   // The pending bubble. send() creates a fresh one (it owns the turn);
   // a reattach/reopen stream adopts the pre-existing one — SSR renders
   // it for a running turn, and a mid-run reopen inherits the send()'s
-  // element via `pending` staying set.
+  // element via `pending` staying set. adoptPending() re-queries the
+  // SSR-rendered bubble when the module-level var is stale (page
+  // loaded mid-run: pending is null) — every terminal-branch removal
+  // goes through pendingRemove's fallback, so a zero-tool turn's
+  // replayed/collections reply still replaces the stuck SSR bubble.
   function adoptPending() {
     if (pending && pending.isConnected) return;
     pending = log.querySelector(".chat-msg.librarian.pending");
@@ -1133,6 +1137,7 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
     log.scrollTop = log.scrollHeight;
   }
   function pendingRemove() {
+    adoptPending();
     if (pending) { pending.remove(); pending = null; }
     steps = [];
   }
@@ -1229,13 +1234,14 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
   // transcript fetched against the ?after= cursor is the fallback
   // truth. Exhausted → the meta poll takes over.
   function scheduleReopen() {
-    reopenAttempts += 1;
     if (reopenTimer) return; // one chain at a time
-    if (reopenAttempts > REOPEN_MAX) {
+    if (reopenAttempts >= REOPEN_MAX) {
+      // Budget exhausted: the meta poll takes over (3 attempts gone).
       turnStatus = "unknown";
       startPoll();
       return;
     }
+    reopenAttempts += 1;
     reopenTimer = setTimeout(function () {
       reopenTimer = null;
       openStream();
@@ -1295,9 +1301,15 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
   }
   function pollMeta() {
     if (!sessionId || sessionId === "new") return; // drafts have no meta
+    // THIS poll's replay cursor, captured before the max_seq refresh:
+    // rows persist before the status flips, so the terminal row's seq
+    // is ≤ the refreshed max_seq — a replay against the refreshed
+    // cursor would replay nothing (messages_after is strict >). The
+    // seen map absorbs any overlap with rows already streamed.
+    var cursor = lastSeq;
     fetch(metaUrl(), { headers: { "accept": "application/json" } })
       .then(function (r) {
-        if (r.status === 404) throw { gone: true };
+        if (r.status === 404) throw { gone: true, message: "not found" };
         if (!r.ok) throw { transient: true };
         return r.json();
       })
@@ -1317,19 +1329,25 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
         } else if (st === "done" || st === "failed") {
           // The turn finished elsewhere: one replay fetch closes
           // immediately (poll semantics) and collects every row
-          // missed since the cursor, then the page settles.
+          // missed since the PRE-BUMP cursor (rows persist before the
+          // status flips, so the terminal row sits at or below the
+          // refreshed max_seq — the refreshed cursor would replay
+          // nothing), then the page settles. The seen map absorbs any
+          // overlap with rows already streamed.
           stopPoll();
-          finalReplay();
+          finalReplay(cursor);
         } else if (st === "interrupted" && meta.turn_resumable === false) {
           // The worker will never claim this one (its resume attempt
           // was spent): stop probing — a manual submit or a reload
           // re-engages. Rows the spent attempt persisted (e.g. the
-          // LLM-down error row) are still collected; the turn stays
-          // interrupted, so the SSR note stays (finalReplay's
-          // note-clearing is only for a terminal transition).
+          // LLM-down error row) are still collected — replayed
+          // against the PRE-BUMP cursor (strict >; the seen map
+          // absorbs re-delivered rows); the turn stays interrupted,
+          // so the SSR note stays (finalReplay's note-clearing is
+          // only for a terminal transition).
           stopPoll();
-          if (meta.max_seq > lastSeq) {
-            fetch(metaUrl() + "/stream?after=" + lastSeq, {
+          if (meta.max_seq > cursor) {
+            fetch(metaUrl() + "/stream?after=" + cursor, {
               headers: { "accept": "text/event-stream" }
             })
               .then(function (r) {
@@ -1345,10 +1363,12 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
       })
       .catch(function (err) {
         if (err && err.gone) {
+          // Deleted elsewhere — the same surfaced body both paths
+          // show ("not found", the endpoint's generic body).
           stopPoll();
           pendingRemove();
           setBusy(false);
-          addMsg("this chat session is no longer available", "error");
+          addMsg(err.message || "this chat session is no longer available", "error");
           return;
         }
         // Transient (network down mid-restart, server blip): the
@@ -1356,10 +1376,10 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
       });
   }
   // The poll's terminal transition: one replay fetch (closes
-  // immediately — no live turn), then settle: release the composer,
-  // clear the resume note.
-  function finalReplay() {
-    fetch(metaUrl() + "/stream?after=" + lastSeq, {
+  // immediately — no live turn) against the CALLER's pre-bump cursor,
+  // then settle: release the composer, clear the resume note.
+  function finalReplay(cursor) {
+    fetch(metaUrl() + "/stream?after=" + cursor, {
       headers: { "accept": "text/event-stream" }
     })
       .then(function (r) {
