@@ -1003,27 +1003,31 @@ pub fn chat_page(
     active: Option<&ChatActiveView>,
 ) -> Html<String> {
     let csrf_esc = html_escape(csrf);
-    // Sidebar: "+ New chat" then one link + delete form per session
-    // (the list arrives newest-first from `list_sessions`). The
-    // active link matches the selected session id. The delete
-    // trigger rides the keys-page confirm-dialog pattern
-    // (`data-confirm-dialog` + `data-key-id`): without JS it POSTs
-    // the form directly (the per-session action URL in the path);
-    // with JS, confirm.js's preventDefault opens the shared dialog,
-    // copying the trigger's form action (the SAME per-session URL)
-    // onto the dialog form before submitting.
-    let mut sidebar = String::from(r#"<a class="chat-new" href="/chat?s=new">+ New chat</a>"#);
+    // Sidebar: "+ New chat" then one row per session (the list arrives
+    // newest-first from `list_sessions`). Each row is [trash icon]
+    // [title link] — the delete trigger is a compact icon button
+    // (aria-label carries the accessible name; the SVG is decorative)
+    // riding the keys-page confirm-dialog pattern
+    // (`data-confirm-dialog` + `data-key-id`): without JS it POSTs the
+    // form directly (the per-session action URL in the path); with JS,
+    // confirm.js's preventDefault opens the shared dialog, copying the
+    // trigger's form action (the SAME per-session URL) onto the dialog
+    // form before submitting. The pane carries the `chat-sessions`
+    // collapse hook (chat.js flips `chat-sessions--collapsed` + persists
+    // per browser); the toggle sits at the pane's top so it stays
+    // reachable in both states.
+    let mut sidebar = String::from(
+        r#"<button type="button" id="chat-sidebar-toggle" class="chat-sidebar-toggle" aria-label="Toggle chat history sidebar" title="Toggle chat history"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M10 2 4 8l6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><a class="chat-new" href="/chat?s=new">+ New chat</a>"#,
+    );
     for session in sessions {
         let is_active = active.is_some_and(|a| a.id == session.id);
         sidebar.push_str(&format!(
-            r#"<a class="chat-session-link{}" href="/chat?s={}">{}</a>"#,
+            r#"<div class="chat-session-row{}"><a class="chat-session-link" href="/chat?s={}">{}</a><form class="chat-session-delete" method="post" action="/api/v1/chat/sessions/{}/delete"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" class="chat-delete-btn" aria-label="Delete chat" title="Delete chat" data-confirm-dialog="confirm-delete-chat" data-key-id="{}"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 4.5h11m-9 0v9a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-9m-6.5 0v-1.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1.5m-4 3v5m2.5-5v5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button></form></div>"#,
             if is_active { " active" } else { "" },
             session.id,
-            html_escape(&session.title)
-        ));
-        sidebar.push_str(&format!(
-            r#"<form class="chat-session-delete" method="post" action="/api/v1/chat/sessions/{}/delete"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" data-confirm-dialog="confirm-delete-chat" data-key-id="{}">Delete</button></form>"#,
-            session.id, session.id
+            html_escape(&session.title),
+            session.id,
+            session.id
         ));
     }
 

@@ -146,8 +146,12 @@ body.chat-page main {
 }
 .chat-shell {
   display: flex; flex-direction: column; flex: 1;
-  min-height: 0; width: 100%; max-width: 60rem; margin: 0 auto;
-  padding: 0 1.2rem 1rem;
+  min-height: 0; width: 100%;
+  /* Full-width chat (layout fix #3): no 60rem cap on the shell — the
+     transcript pane scales with the browser window; readability is
+     kept per-message instead (chat-msg max-width below). */
+  max-width: none;
+  padding: 1rem 1.2rem 1rem;
 }
 .chat-log {
   display: flex; flex-direction: column; gap: 0.8rem;
@@ -162,12 +166,15 @@ body.chat-page main {
   padding: 0.6rem 0 0; background: var(--bg);
 }
 .chat-input-bar textarea {
-  flex: 1; min-height: 2.6rem; max-height: 10rem; resize: none;
+  flex: 1; min-height: 4.2rem; max-height: 16rem; resize: vertical;
   font-family: inherit; line-height: 1.4;
 }
 .chat-input-bar button { margin: 0; flex: 0 0 auto; height: 2.6rem; }
 .chat-msg {
-  max-width: 80%; padding: 0.6rem 0.9rem; border-radius: 10px;
+  /* Readability cap on wide panes (layout fix #3): the pane is full
+     width, but each bubble stays at most 80% of the pane and 48rem —
+     the standard chat-app shape. */
+  max-width: min(80%, 48rem); padding: 0.6rem 0.9rem; border-radius: 10px;
   white-space: pre-wrap; word-wrap: break-word; line-height: 1.45;
 }
 .chat-msg.user {
@@ -200,20 +207,45 @@ body.chat-page main {
   border: 1px solid var(--danger); color: var(--danger);
 }
 /* Two-pane chat (session history, spec §3.6): the sessions sidebar
-   beside the transcript pane, both inside the 60rem shell. */
+   beside the transcript pane. Collapsible (layout fix #5): the
+   toggle (in the pane's first slot) flips chat-sessions--collapsed,
+   which hides the pane; chat.js persists the state per browser.
+   Without JS the pane simply stays open. */
 .chat-two-pane { flex-direction: row; }
 .chat-sessions {
   width: 15rem; flex: 0 0 auto; overflow-y: auto;
   display: flex; flex-direction: column; gap: 0.3rem;
   border-right: 1px solid var(--border); padding: 1rem 0.6rem;
 }
-.chat-session-link { padding: 0.35rem 0.5rem; border-radius: 6px; text-decoration: none; }
-.chat-session-link.active { background: var(--panel); }
+.chat-sessions--collapsed { display: none; }
+.chat-sidebar-toggle {
+  align-self: flex-end; margin: 0 0 0.4rem; padding: 0.25rem 0.35rem;
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--muted); cursor: pointer; line-height: 0;
+}
+.chat-sidebar-toggle:hover { color: var(--accent); border-color: var(--accent); }
+.chat-session-row { display: flex; align-items: center; gap: 0.15rem; border-radius: 6px; }
+.chat-session-row.active { background: var(--panel); }
+.chat-session-link {
+  flex: 1 1 auto; min-width: 0; padding: 0.35rem 0.5rem;
+  border-radius: 6px; text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .chat-main {
   flex: 1; display: flex; flex-direction: column;
   min-width: 0; padding-left: 1.2rem;
 }
+/* The delete trigger is a 14px icon button at the start of each row
+   (layout fix #4): muted by default, danger on hover. The form wrapper
+   is a layout non-entity so the row's flex flow owns the geometry. */
 .chat-session-delete { display: contents; }
+.chat-delete-btn {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 1.7rem; height: 1.7rem; padding: 0;
+  background: none; border: none; border-radius: 4px;
+  color: var(--muted); cursor: pointer; line-height: 0;
+}
+.chat-delete-btn:hover { color: var(--danger); background: rgba(247,118,142,.12); }
 .chat-status-note {
   align-self: center; font-size: 0.8rem; color: var(--muted);
   font-style: italic;
@@ -1006,6 +1038,43 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
   var REOPEN_DELAY_MS = 2000;
   var POLL_INTERVAL_MS = 5000;
 
+  // ---- Layout fixes (2026-10-15) -------------------------------------
+  // Sidebar collapse (fix #5): the toggle flips the pane's
+  // chat-sessions--collapsed class; the state persists per browser
+  // (localStorage, per-viewer convenience only). Without JS the pane
+  // simply stays open.
+  var SIDEBAR_KEY = "myc2-chat-sidebar";
+  var sidebarPane = document.querySelector(".chat-sessions");
+  var sidebarToggle = document.getElementById("chat-sidebar-toggle");
+  function applySidebar(collapsed) {
+    if (!sidebarPane) return;
+    if (collapsed) sidebarPane.classList.add("chat-sessions--collapsed");
+    else sidebarPane.classList.remove("chat-sessions--collapsed");
+    if (sidebarToggle) sidebarToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  }
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener("click", function () {
+      var collapsed = !(sidebarPane && sidebarPane.classList.contains("chat-sessions--collapsed"));
+      applySidebar(collapsed);
+      try { localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) { /* private mode */ }
+    });
+  }
+  try {
+    if (localStorage.getItem(SIDEBAR_KEY) === "1") applySidebar(true);
+  } catch (e) { /* private mode: default open */ }
+
+  // Composer reset (fix #2 companion): the island fires
+  // chat-composer-reset when a send is accepted — drop any explicit
+  // height so the auto-grow ratchet starts fresh (a manual drag is
+  // the user's to keep until the next accepted send).
+  var composer = document.getElementById("chat-input");
+  if (composer) {
+    composer.addEventListener("chat-composer-reset", function () {
+      composer.style.height = "";
+    });
+  }
+  // --------------------------------------------------------------------
+
   function setBusy(state) {
     busy = state;
     if (sendBtn) sendBtn.disabled = state;
@@ -1675,7 +1744,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "28";
+pub const ASSETS_VERSION: &str = "29";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

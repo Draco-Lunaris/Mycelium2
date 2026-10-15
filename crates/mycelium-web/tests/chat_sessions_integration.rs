@@ -1087,10 +1087,11 @@ async fn chat_page_sidebar_and_transcript_ssr() {
         s2_pos < hostile_pos,
         "sidebar links must be newest-first: {html}"
     );
-    // The newest session is the ACTIVE one.
+    // The newest session is the ACTIVE one (the row container carries
+    // the active highlight now that the row is icon+link).
     assert!(
-        html.contains(r#"class="chat-session-link active""#),
-        "no active link: {html}"
+        html.contains(r#"class="chat-session-row active""#),
+        "no active row: {html}"
     );
 
     // The native delete form per session (works without JS).
@@ -1115,6 +1116,39 @@ async fn chat_page_sidebar_and_transcript_ssr() {
     assert!(
         !html.contains(r#"data-confirm=""#) && html.contains(r#"data-confirm-dialog"#),
         "bare unwired data-confirm must not survive (Finding 1): {html}"
+    );
+    // The trigger is a compact icon button, not a text button: the
+    // visible label is an aria-label (screen readers + the tooltip),
+    // never rendered text, and the button carries the trash icon class
+    // (the layout-fix contract: a small icon at the start of each
+    // session row, not a large text button beside the title).
+    assert!(
+        html.contains(r##"data-confirm-dialog="confirm-delete-chat""##)
+            && html.contains(r#"class="chat-delete-btn""#),
+        "delete trigger must be the icon button: {html}"
+    );
+    assert!(
+        html.contains(r#"aria-label="Delete chat""#),
+        "icon delete button must carry the accessible label: {html}"
+    );
+    // The row trigger is ICON-ONLY: its markup is the SVG alone. The
+    // shared dialog's own confirm button is legitimately labeled
+    // "Delete", so the negative pin is scoped to the row form: no
+    // text may sit between the icon button's tags.
+    assert!(
+        html.contains(r#"</svg></button></form></div>"#),
+        "row delete button must contain only the icon (no text): {html}"
+    );
+    // The sessions sidebar is collapsible (layout fix #5): the toggle
+    // button exists and the pane carries the collapse hook class; the
+    // JS (chat.js) flips the class + persists per browser.
+    assert!(
+        html.contains(r##"<button type="button" id="chat-sidebar-toggle""##),
+        "sidebar collapse toggle missing: {html}"
+    );
+    assert!(
+        html.contains(r#"class="chat-sessions""#),
+        "sessions pane carries the collapse hook: {html}"
     );
     // The shared dialog exists in the markup and confirm.js loads with
     // the page (the guard chat.js alone doesn't provide).
@@ -1387,8 +1421,24 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
     let client = client();
 
     // The versioned URL the page emits: 200, served as JavaScript.
+    // (The version is pinned twice on purpose: the served asset must
+    // be the NEW default (v=29 — the bumped const scaffolds to disk),
+    // and the PAGE must reference that version, so a stale ?v= in the
+    // shell or a missing version bump both fail here.)
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+    let page = client
+        .get(format!("{base}/chat"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let page_html = page.text().await.unwrap();
+    assert!(
+        page_html.contains("/assets/chat.js?v=29"),
+        "the /chat page must reference the bumped chat.js version: {page_html}"
+    );
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=28"))
+        .get(format!("{base}/assets/chat.js?v=29"))
         .send()
         .await
         .unwrap();

@@ -64,9 +64,12 @@ fn chat_send(msg: &str) -> bool {
     false
 }
 
-/// Auto-grow the composer textarea to its content, capped at 160px
-/// (the cap the old chat.js wiring used; the CSS max-height still
-/// applies). Runtime CSSOM writes are not CSP-governed the way markup
+/// Auto-grow the composer textarea to its content, capped at the CSS
+/// max-height — GROW-ONLY (layout fix #2): a keystroke never shrinks a
+/// box the user dragged taller (`resize: vertical` is now on); the
+/// height only ever ratchets up while typing, and resets when a send
+/// is accepted (chat.js clears the input and fires the reset event).
+/// Runtime CSSOM writes are not CSP-governed the way markup
 /// `style=` attributes are — the shipped markup carries no style.
 fn auto_grow() {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
@@ -80,9 +83,17 @@ fn auto_grow() {
     // brings a `style` trait method that would otherwise shadow the
     // web-sys accessor at method-resolution step zero.
     let style = web_sys::HtmlElement::style(&input);
-    let _ = style.set_property("height", "auto");
-    let capped = input.scroll_height().min(160);
-    let _ = style.set_property("height", &format!("{capped}px"));
+    // Grow-only: the natural content height, ratcheted against the
+    // current explicit height, capped by the CSS max-height (16rem).
+    let current = input.client_height();
+    let natural = {
+        let _ = style.set_property("height", "auto");
+        input.scroll_height()
+    };
+    let capped = natural.min(256);
+    if capped > current {
+        let _ = style.set_property("height", &format!("{capped}px"));
+    }
 }
 
 /// The deprecated-but-universal copy path: select the value element's
@@ -177,11 +188,21 @@ pub fn ChatComposer(#[prop(into)] placeholder: String) -> impl IntoView {
             let msg = input.value().trim().to_string();
             if !msg.is_empty() && chat_send(&msg) {
                 input.set_value("");
+                // Grow-only ratchet reset (layout fix #2): an accepted
+                // send is the one moment the composer may shrink back
+                // to its default height — the JS transport listens and
+                // drops the explicit height so a fresh draft starts at
+                // min-height (a manual drag stays untouched until the
+                // next accepted send).
+                input.dispatch_event(
+                    &web_sys::Event::new("chat-composer-reset").expect("event ctor"),
+                )
+                .ok();
             }
         }>
             <textarea
                 id="chat-input"
-                rows="1"
+                rows="3"
                 placeholder=placeholder
                 required
                 on:keydown=move |ev| {
