@@ -129,7 +129,7 @@ fn derive_hmac_key_service(service: &ServiceKey, info: &[u8]) -> Key {
     Key::new(HMAC_SHA256, &material)
 }
 
-fn derive_dek_from(master: &MasterKey, info: &[u8]) -> Dek {
+pub(crate) fn derive_dek_from(master: &MasterKey, info: &[u8]) -> Dek {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, master.as_bytes());
     let mut material = [0u8; 32];
     hk.expand(info, &mut material)

@@ -10,6 +10,7 @@
 //!   library stacks, and the global skills shelf.
 
 pub mod aead;
+pub mod chat_keys;
 pub mod envelope;
 pub mod file;
 pub mod keys;
