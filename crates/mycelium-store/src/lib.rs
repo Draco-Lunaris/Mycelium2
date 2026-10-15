@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod books;
+pub mod chat;
 pub mod concept_store;
 pub mod config;
 pub mod file_repo;
@@ -13,6 +14,10 @@ pub mod skill_bundle;
 pub mod skill_group;
 
 pub use books::{BookRow, BooksError};
+pub use chat::{
+    ChatError, ChatMessageRow, ChatRole, ChatSessionMeta, ChatSessionSummary, ChatStore,
+    ChatTurnRow, ChatTurnStatus, MAX_SESSIONS_PER_USER,
+};
 pub use concept_store::{ConceptEntry, ConceptScope, ConceptStore, ConceptStoreError};
 pub use config::ConfigError;
 pub use config::ConfigStore;
