@@ -1006,3 +1006,331 @@ async fn delete_own_sessions_and_refuse_while_running() {
 
     shutdown.cancel();
 }
+
+/// The /chat page's two-pane SSR (spec §3.6/§6.15): the sessions sidebar
+/// (newest-first links, the active one highlighted, the native delete
+/// form) and the selected session's transcript rendered with the same
+/// bubble markup chat.js builds — user/librarian bubbles, the tool row
+/// as a note, and NO pending bubble on a done turn. The `?s=` matrix:
+/// `new` → draft (no row, nothing selected), foreign/unknown/invalid
+/// id → 303 to /chat (the page redirects where the API 404s — both
+/// "not yours" with no oracle), absent + sessions → newest. A
+/// `<script>` first message renders its derived title (and the user
+/// bubble) HTML-escaped — never executable markup.
+#[tokio::test]
+async fn chat_page_sidebar_and_transcript_ssr() {
+    // LIFO script: the hostily-titled session (created first) pops the
+    // LAST response ("First reply."); the tool session (created second)
+    // pops the tool call, then — the agent's second request — the
+    // markdown reply.
+    let llm_url = mock_llm(vec![
+        text_response("Second reply with markdown."),
+        tool_call_response(
+            "call-1",
+            "search_knowledge",
+            serde_json::json!({ "query": "rust" }),
+        ),
+        text_response("First reply."),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Session A (created first, so the sidebar's OLDEST entry): its
+    // first message is the hostile title of spec §6.15.
+    let (hostile_id, _) = submit_draft_collect(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "<script>alert(1)</script> hostile probe",
+    )
+    .await;
+    poll_meta_until(&client, &base, &cookie, &hostile_id, "done").await;
+
+    // Session B (created second → newest): a tool-call turn.
+    let (session_id, _b) =
+        submit_draft_collect(&client, &base, &cookie, &csrf, "rust question").await;
+    poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+
+    // GET /chat (no ?s) → the NEWEST session's transcript rendered.
+    let page = client
+        .get(format!("{base}/chat"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+
+    // Sidebar: "+ New chat" and both session links, newest FIRST.
+    assert!(
+        html.contains(r##"<a class="chat-new" href="/chat?s=new">+ New chat</a>"##),
+        "{html}"
+    );
+    let s2_pos = html
+        .find(&format!(r##"href="/chat?s={session_id}""##))
+        .unwrap_or_else(|| panic!("newest session link missing: {html}"));
+    let hostile_pos = html
+        .find(&format!(r##"href="/chat?s={hostile_id}""##))
+        .unwrap_or_else(|| panic!("older session link missing: {html}"));
+    assert!(
+        s2_pos < hostile_pos,
+        "sidebar links must be newest-first: {html}"
+    );
+    // The newest session is the ACTIVE one.
+    assert!(
+        html.contains(r#"class="chat-session-link active""#),
+        "no active link: {html}"
+    );
+
+    // The native delete form per session (works without JS).
+    let form_action = format!(r#"action="/api/v1/chat/sessions/{session_id}/delete""#);
+    assert!(html.contains(&form_action), "delete form action: {html}");
+    assert!(
+        html.contains(r#"name="csrf_token""#),
+        "delete form must carry the CSRF hidden field: {html}"
+    );
+
+    // Transcript (the done tool turn): user bubble, tool note carrying
+    // the sealed JSON's parts escaped, the reply as a markdown <p>.
+    assert!(
+        html.contains(r#"<div class="chat-msg user">rust question</div>"#),
+        "user bubble: {html}"
+    );
+    assert!(
+        html.contains(r#"class="chat-msg tool-note">· search_knowledge ("#),
+        "tool note: {html}"
+    );
+    assert!(
+        html.contains(r#"{&quot;query&quot;:&quot;rust&quot;})</div>"#),
+        "tool detail escaped: {html}"
+    );
+    assert!(
+        html.contains("<div class=\"chat-msg librarian\"><p>Second reply with markdown.</p></div>"),
+        "assistant reply as a rendered <p>: {html}"
+    );
+    assert!(
+        !html.contains("The librarian is thinking…"),
+        "a done turn must NOT render the pending bubble: {html}"
+    );
+    assert!(
+        !html.contains("chat-status-note"),
+        "a done turn must NOT render a status note: {html}"
+    );
+
+    // The page's data-* state for chat.js (Task 7's contract).
+    assert!(
+        html.contains(&format!(r#"data-session="{session_id}""#)),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-max-seq="3""#), "max seq: {html}");
+    assert!(html.contains(r#"data-turn-status="done""#), "{html}");
+    assert!(
+        html.contains(&format!(r#"data-csrf="{csrf}""#)),
+        "data-csrf must carry the session token: {html}"
+    );
+
+    // GET /chat?s=new → the draft: empty log, nothing highlighted,
+    // no session row created (the sidebar still lists the two).
+    let draft = client
+        .get(format!("{base}/chat?s=new"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(draft.status(), 200);
+    let dh = draft.text().await.unwrap();
+    assert!(dh.contains(r#"+ New chat</a>"#), "{dh}");
+    assert!(dh.contains(r#"data-session="new""#), "{dh}");
+    assert!(dh.contains(r#"data-max-seq="0""#), "{dh}");
+    assert!(dh.contains(r#"data-turn-status="none""#), "{dh}");
+    assert!(!dh.contains("chat-msg user"), "empty log: {dh}");
+    assert!(
+        !dh.contains("The librarian is thinking…"),
+        "draft must not fake a running turn: {dh}"
+    );
+    assert!(
+        !dh.contains("chat-session-link active"),
+        "draft sidebar un-highlighted: {dh}"
+    );
+    assert!(
+        dh.contains(&format!(r#"href="/chat?s={hostile_id}""#)),
+        "sidebar still lists sessions on the draft view: {dh}"
+    );
+
+    // GET /chat?s=<hostile id>: the derived title and the user bubble
+    // ESCAPED (spec §6.15) — the marker text never renders raw.
+    let hpage = client
+        .get(format!("{base}/chat?s={hostile_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hpage.status(), 200);
+    let hh = hpage.text().await.unwrap();
+    assert!(
+        hh.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "escaped title missing: {hh}"
+    );
+    assert!(
+        !hh.contains("<script>alert(1)</script>"),
+        "raw script tag leaked: {hh}"
+    );
+    assert!(
+        hh.contains("<div class=\"chat-msg librarian\"><p>First reply.</p></div>"),
+        "the session's own reply (markdown <p>): {hh}"
+    );
+    assert!(!hh.contains(r#"data-session="new""#), "{hh}");
+
+    // GET /chat?s=<foreign uuid> → 303 to /chat (page redirects where
+    // the API 404s — same "not yours", no oracle difference).
+    let foreign = client
+        .get(format!("{base}/chat?s={}", uuid::Uuid::new_v4()))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 303, "foreign id must redirect");
+    assert_eq!(foreign.headers().get("location").unwrap(), "/chat");
+
+    // A non-UUID ?s value parses badly → the same 303.
+    let invalid = client
+        .get(format!("{base}/chat?s=not-a-uuid"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 303, "invalid id must redirect");
+    assert_eq!(invalid.headers().get("location").unwrap(), "/chat");
+
+    shutdown.cancel();
+}
+
+/// The page's status bubbles (spec §3.6): a RUNNING turn SSRs the
+/// pending "The librarian is thinking…" bubble; an interrupted+resumable
+/// turn (the navigate-away + boot-sweep shape) SSRs the resume note —
+/// and no longer the pending bubble. Rows land via the transcript, so
+/// the later re-render collects the tool-note + reply once the runner
+/// finishes.
+#[tokio::test]
+async fn chat_page_running_and_interrupted_notes() {
+    // The mock's response is never released — the turn stays held
+    // running (then interrupted after the sweep); the reader dropping
+    // the submit response is what lets the test end cleanly.
+    // The gate is never released: the turn stays held running (then
+    // interrupted after the sweep) for the whole test — the response's
+    // unread body is simply dropped at the end.
+    let (llm_url, _gate) = gated_mock_llm(vec![text_response("held reply.")]).await;
+    let (base, shutdown, dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = submit_draft(&client, &base, &cookie, &csrf, "run into the hold").await;
+    assert_eq!(resp.status(), 200);
+    let session_id = first_session_id(&client, &base, &cookie).await;
+
+    // Mid-run: the pending bubble IS server-rendered.
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains(
+            r#"<div class="chat-msg librarian pending">The librarian is thinking…</div>"#
+        ),
+        "running turn must SSR the pending bubble: {html}"
+    );
+    assert!(html.contains(r#"data-turn-status="running""#), "{html}");
+    assert!(
+        html.contains(r#"data-max-seq="1""#),
+        "user row only: {html}"
+    );
+    assert!(
+        !html.contains("chat-status-note"),
+        "a running turn is not interrupted: {html}"
+    );
+
+    // Navigate away + simulate the restart (what main.rs calls at boot):
+    // the held turn goes interrupted with attempts 0.
+    drop(resp);
+    let store = Store::open(dir.path()).await.unwrap();
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let swept = chat.boot_sweep().await.unwrap();
+    assert_eq!(swept, 1, "the one held turn was swept");
+
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains(
+            r#"<div class="chat-msg chat-status-note">Interrupted by a server restart — it will resume automatically.</div>"#,
+        ),
+        "resumable note missing: {html}"
+    );
+    assert!(
+        !html.contains("The librarian is thinking…"),
+        "an interrupted turn is not running: {html}"
+    );
+    assert!(html.contains(r#"data-turn-status="interrupted""#), "{html}");
+    assert!(html.contains(r#"data-max-seq="1""#), "{html}");
+
+    shutdown.cancel();
+}
+
+/// A failed turn renders its error row as an error bubble — the
+/// transcript already carries the message (no separate status note for
+/// `failed`), and the page's data-turn-status says so.
+#[tokio::test]
+async fn chat_page_failed_error_bubble() {
+    // An empty script exhausts on the first LLM request → the detached
+    // runner persists the error row + finalizes `failed`.
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let (session_id, _events) =
+        submit_draft_collect(&client, &base, &cookie, &csrf, "doomed question").await;
+    poll_meta_until(&client, &base, &cookie, &session_id, "failed").await;
+
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains(r#"data-turn-status="failed""#), "{html}");
+    assert!(!html.contains("chat-status-note"), "{html}");
+    assert!(
+        !html.contains("The librarian is thinking…"),
+        "a failed turn is not running: {html}"
+    );
+    // The error bubble exists and carries the row's message (non-empty).
+    let marker = r#"class="chat-msg error">"#;
+    let idx = html
+        .find(marker)
+        .unwrap_or_else(|| panic!("error bubble missing: {html}"));
+    let rest = &html[idx + marker.len()..];
+    let end = rest
+        .find("</div>")
+        .unwrap_or_else(|| panic!("unterminated error bubble: {html}"));
+    assert!(
+        !rest[..end].trim().is_empty(),
+        "the error row's message must render: {html}"
+    );
+
+    shutdown.cancel();
+}

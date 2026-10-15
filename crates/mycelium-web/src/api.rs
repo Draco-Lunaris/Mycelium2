@@ -3142,12 +3142,92 @@ pub async fn api_chat(
     }
 }
 
-/// GET /chat — the chat page (librarian agent over the user's bundle).
+/// GET /chat (?s=<id>|new) — the chat page with the session sidebar
+/// and the selected session's transcript (spec §3.6, SSR). No `?s` →
+/// the newest session (newest-by-default; an empty history renders the
+/// draft); `?s=new` → the draft (NO session row created — D2);
+/// foreign/unknown/non-UUID ids → 303 to `/chat` (the page redirects
+/// where the API 404s — the same "not yours" with no oracle
+/// difference). A master-key failure degrades to the sidebar-less
+/// shell renderable (house convention: key-unavailable pages still
+/// answer), never a 500.
 pub async fn chat_view(
     State(state): State<AppState>,
     user: SessionUser,
     session: SessionId,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
-    pages::chat_page(&user, &csrf).into_response()
+    let master = match state.master_key_for(user.user_id).await {
+        Ok(m) => m,
+        // Degraded but renderable: the empty sidebar + draft log.
+        Err(_) => return pages::chat_page(&user, &csrf, &[], None).into_response(),
+    };
+    let sessions = state
+        .chat_sessions
+        .list_sessions(user.user_id, &master)
+        .await
+        .unwrap_or_default();
+    let active = match params.get("s").map(|s| s.as_str()) {
+        // Absent → newest-by-default: sessions[0] when the history is
+        // non-empty, the draft otherwise. `new` → always the draft.
+        None => match sessions.first() {
+            Some(newest) => load_active(&state, user.user_id, &master, newest.id).await,
+            None => None,
+        },
+        Some("new") => None,
+        Some(id) => match Uuid::parse_str(id) {
+            Ok(id) => match load_active(&state, user.user_id, &master, id).await {
+                Some(view) => Some(view),
+                // Unknown/foreign: the store's NotFound (both ids land
+                // here) → redirect; the sidebar-less renderable path is
+                // only for the degraded key case above.
+                None => return Redirect::to("/chat").into_response(),
+            },
+            Err(_) => return Redirect::to("/chat").into_response(),
+        },
+    };
+    pages::chat_page(&user, &csrf, &sessions, active.as_ref()).into_response()
+}
+
+/// Load one session's transcript view for the page (meta + full
+/// transcript). Errors (including NotFound — a session deleted between
+/// the list and this read) collapse to None after the caller's
+/// redirect; here they mean a store/crypto failure → the draft view on
+/// a live page is wrong, so the NotFound-vs-error split is moot only
+/// for the absent-`?s` newest path, where the same redirect would
+/// recurse — instead None renders the draft.
+///
+/// The caller handles the redirect for an explicit `?s=<id>`; this
+/// helper returns None for both NotFound (explicit-id path redirects)
+/// and absent-path failures (renders the draft — a fresh boot with an
+/// unreadable newest session degrades to an empty log, never a
+/// redirect loop).
+async fn load_active(
+    state: &AppState,
+    user_id: Uuid,
+    master: &mycelium_crypto::keys::MasterKey,
+    session_id: Uuid,
+) -> Option<pages::ChatActiveView> {
+    let meta = match state
+        .chat_sessions
+        .session_meta(user_id, master, session_id)
+        .await
+    {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    let messages = state
+        .chat_sessions
+        .messages_after(user_id, master, session_id, 0)
+        .await
+        .unwrap_or_default();
+    Some(pages::ChatActiveView {
+        id: meta.id,
+        title: meta.title,
+        messages,
+        turn_status: meta.turn_status,
+        turn_resumable: meta.turn_resumable,
+        max_seq: meta.max_seq,
+    })
 }

@@ -202,6 +202,29 @@ body.chat-page main {
   align-self: flex-start; background: rgba(247,118,142,.12);
   border: 1px solid var(--danger); color: var(--danger);
 }
+/* Two-pane chat (session history, spec §3.6): the sessions sidebar
+   beside the transcript pane, both inside the 60rem shell. */
+.chat-two-pane { flex-direction: row; }
+.chat-sessions {
+  width: 15rem; flex: 0 0 auto; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 0.3rem;
+  border-right: 1px solid var(--border); padding: 1rem 0.6rem;
+}
+.chat-session-link { padding: 0.35rem 0.5rem; border-radius: 6px; text-decoration: none; }
+.chat-session-link.active { background: var(--panel); }
+.chat-main {
+  flex: 1; display: flex; flex-direction: column;
+  min-width: 0; padding-left: 1.2rem;
+}
+.chat-session-delete { display: contents; }
+.chat-status-note {
+  align-self: center; font-size: 0.8rem; color: var(--muted);
+  font-style: italic;
+}
+.chat-msg.tool-note {
+  align-self: flex-start; font-size: 0.8rem; color: var(--muted);
+  padding: 0.2rem 0.6rem;
+}
 /* Islands (Task 7): the leptos-island root is a pure hydration marker
    (never a layout box — display:contents keeps the composer's flex
    row and the minted banner's inline flow exactly as without it). */
@@ -1344,7 +1367,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "24";
+pub const ASSETS_VERSION: &str = "25";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

@@ -6,6 +6,7 @@ use axum::response::{Html, IntoResponse};
 use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
 use mycelium_ui::TrustedHtml;
+use uuid::Uuid;
 
 use crate::middleware::SessionId;
 
@@ -957,24 +958,146 @@ pub fn build_passage_html(passage_text: &str) -> String {
     render_minimal_body(passage_text)
 }
 
-/// Chat page: talk to the librarian agent (the same agent behind the
-/// MCP tools). Full-viewport layout: the conversation log fills the
-/// screen and scrolls; the composer is the chat_composer hydration
-/// island (Task 7) — its SSR markup IS the form, and with the hydrate
-/// bundle the island owns the submit/Enter/auto-grow wiring, handing
-/// sends to chat.js's `window.myceliumChatSend` (SSE transport + log).
-pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
+/// The chat page's selected-session state (the transcript pane's input).
+/// The handler builds it from `ChatStore::session_meta` +
+/// `messages_after(0)`; `None` is the draft (`?s=new`, or no sessions
+/// yet) — an empty log, no row created.
+pub struct ChatActiveView {
+    pub id: Uuid,
+    pub title: String,
+    pub messages: Vec<mycelium_store::chat::ChatMessageRow>,
+    pub turn_status: Option<mycelium_store::chat::ChatTurnStatus>,
+    pub turn_resumable: bool,
+    pub max_seq: i64,
+}
+
+/// Chat page (two-pane, spec §3.6 — all SSR-first): the sessions
+/// sidebar (newest-first links, the active one highlighted, a native
+/// per-session delete form — works without JS) and the selected
+/// session's transcript rendered in seq order with the SAME bubble
+/// markup chat.js builds, so JS appends seamlessly. The composer is
+/// the untouched chat_composer hydration island; its SSR markup IS
+/// the form, and with the hydrate bundle the island owns the
+/// submit/Enter/auto-grow wiring, handing sends to chat.js's
+/// `window.myceliumChatSend`.
+///
+/// Row rendering mirrors the client: user rows escape-then-set (the
+/// client's `textContent`), assistant rows go through
+/// [`render_minimal_body`] (escape-then-compose — the same minimal
+/// markdown `build_passage_html` uses, structurally what the client's
+/// renderer produces for plain paragraphs), tool rows render as `·
+/// name (detail)` notes (their persisted content is sealed JSON,
+/// parsed then escaped field-by-field), error rows escape-then-set.
+/// Status bubbles: a `running` turn renders the pending "thinking…"
+/// bubble; an `interrupted` turn renders the restart note (resumability
+/// wording per D6/D7); a `failed` turn's error rows already carry the
+/// message — no separate note. The `data-*` attrs on #chat-log are
+/// chat.js's session state (Task 7's contract). `active: None` (the
+/// `?s=new` draft) renders an emptied log with `data-session="new"` and
+/// an un-highlighted sidebar.
+pub fn chat_page(
+    user: &SessionUser,
+    csrf: &str,
+    sessions: &[mycelium_store::chat::ChatSessionSummary],
+    active: Option<&ChatActiveView>,
+) -> Html<String> {
+    let csrf_esc = html_escape(csrf);
+    // Sidebar: "+ New chat" then one link + delete form per session
+    // (the list arrives newest-first from `list_sessions`). The
+    // active link matches the selected session id.
+    let mut sidebar = String::from(r#"<a class="chat-new" href="/chat?s=new">+ New chat</a>"#);
+    for session in sessions {
+        let is_active = active.is_some_and(|a| a.id == session.id);
+        sidebar.push_str(&format!(
+            r#"<a class="chat-session-link{}" href="/chat?s={}">{}</a>"#,
+            if is_active { " active" } else { "" },
+            session.id,
+            html_escape(&session.title)
+        ));
+        sidebar.push_str(&format!(
+            r#"<form class="chat-session-delete" method="post" action="/api/v1/chat/sessions/{}/delete"><input type="hidden" name="csrf_token" value="{csrf_esc}"><button type="submit" data-confirm="Delete this chat?">Delete</button></form>"#,
+            session.id
+        ));
+    }
+
+    // Transcript: the rows in seq order, then the status bubble for the
+    // turn's state (never a row — status lives in chat_turns).
+    let mut log = String::new();
+    let mut status_bubble = String::new();
+    if let Some(view) = active {
+        for row in &view.messages {
+            match row.role {
+                mycelium_store::chat::ChatRole::User => {
+                    log.push_str(&format!(
+                        r#"<div class="chat-msg user">{}</div>"#,
+                        html_escape(&row.content)
+                    ));
+                }
+                mycelium_store::chat::ChatRole::Assistant => {
+                    log.push_str(&format!(
+                        r#"<div class="chat-msg librarian">{}</div>"#,
+                        render_minimal_body(&row.content)
+                    ));
+                }
+                mycelium_store::chat::ChatRole::Tool => {
+                    let (name, detail) = parse_tool_row(&row.content);
+                    log.push_str(&format!(
+                        r#"<div class="chat-msg tool-note">· {} ({})</div>"#,
+                        html_escape(&name),
+                        html_escape(&detail)
+                    ));
+                }
+                mycelium_store::chat::ChatRole::Error => {
+                    log.push_str(&format!(
+                        r#"<div class="chat-msg error">{}</div>"#,
+                        html_escape(&row.content)
+                    ));
+                }
+            }
+        }
+        match view.turn_status {
+            Some(mycelium_store::chat::ChatTurnStatus::Running) => {
+                status_bubble =
+                    r#"<div class="chat-msg librarian pending">The librarian is thinking…</div>"#
+                        .to_string();
+            }
+            Some(mycelium_store::chat::ChatTurnStatus::Interrupted) => {
+                status_bubble = if view.turn_resumable {
+                    r#"<div class="chat-msg chat-status-note">Interrupted by a server restart — it will resume automatically.</div>"#
+                } else {
+                    r#"<div class="chat-msg chat-status-note">Interrupted by a server restart.</div>"#
+                }
+                .to_string();
+            }
+            // Done/failed: the transcript already shows the reply or the
+            // error row — no status bubble.
+            _ => {}
+        }
+    }
+
+    let (session_attr, max_seq, status_attr) = match active {
+        Some(view) => (
+            view.id.to_string(),
+            view.max_seq.to_string(),
+            view.turn_status
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        // The draft: no session row exists (spec D2) — `new` + a zero
+        // cursor + no turn.
+        None => ("new".to_string(), "0".to_string(), "none".to_string()),
+    };
+
     let composer = mycelium_ui::render::render(mycelium_ui::chat_composer(
         "Ask about your knowledge base, or say 'record that ...' (Enter to send, Shift+Enter for a new line)",
     ));
     let body = format!(
-        r#"<div class="chat-shell">
-  <div class="chat-intro">
-    <h1>Librarian</h1>
-    <p class="muted">Chat with the librarian agent over your private bundle. It searches, reads, and cites your concepts — and can record or change knowledge when you ask. Requires a reachable LLM backend (admin portal → LLM backend).</p>
-  </div>
-  <div id="chat-log" class="chat-log" aria-live="polite"></div>
-  {composer}
+        r#"<div class="chat-shell chat-two-pane">
+  <nav class="chat-sessions" aria-label="Chat sessions">{sidebar}</nav>
+  <section class="chat-main">
+    <div id="chat-log" class="chat-log" aria-live="polite" data-session="{session_attr}" data-max-seq="{max_seq}" data-turn-status="{status_attr}" data-csrf="{csrf_esc}">{log}{status_bubble}</div>
+    {composer}
+  </section>
 </div>"#
     );
     layout_full(
@@ -987,6 +1110,27 @@ pub fn chat_page(user: &SessionUser, csrf: &str) -> Html<String> {
         &["/assets/mycelium_ui.js"],
         "chat-page",
     )
+}
+
+/// Parse a persisted tool row's sealed JSON payload back to its
+/// `{"name","detail"}` parts (the SSR transcript's tool-note bubbles —
+/// chat_api's stream parser owns the same shape). A row that fails to
+/// parse degrades to the raw content as the detail, mirroring the
+/// stream side.
+fn parse_tool_row(content: &str) -> (String, String) {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(v) => (
+            v.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            v.get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Err(_) => (String::new(), content.to_string()),
+    }
 }
 
 /// API keys page (Task 8 rebuild — mockup 09): the page header's actions
