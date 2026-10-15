@@ -171,10 +171,10 @@ body.chat-page main {
 }
 .chat-input-bar button { margin: 0; flex: 0 0 auto; height: 2.6rem; }
 .chat-msg {
-  /* Readability cap on wide panes (layout fix #3): the pane is full
-     width, but each bubble stays at most 80% of the pane and 48rem —
-     the standard chat-app shape. */
-  max-width: min(80%, 48rem); padding: 0.6rem 0.9rem; border-radius: 10px;
+  /* Text scales with the window (user direction 2026-10-15): no
+     bubble width cap — the transcript pane is full width and the
+     bubbles fill it; window sizing is the user's adjustment knob. */
+  padding: 0.6rem 0.9rem; border-radius: 10px;
   white-space: pre-wrap; word-wrap: break-word; line-height: 1.45;
 }
 .chat-msg.user {
@@ -217,7 +217,18 @@ body.chat-page main {
   display: flex; flex-direction: column; gap: 0.3rem;
   border-right: 1px solid var(--border); padding: 1rem 0.6rem;
 }
-.chat-sessions--collapsed { display: none; }
+/* Collapsed (user fix 2026-10-15): the pane shrinks to a rail that
+   keeps ONLY the toggle visible — never display:none, which stranded
+   the restore button inside the hidden pane. The rail is one
+   toggle-width column with the border intact. */
+.chat-sessions--collapsed {
+  width: 2.2rem; min-width: 2.2rem; padding: 1rem 0.25rem; overflow: hidden;
+}
+.chat-sessions--collapsed > *:not(.chat-sidebar-toggle) { display: none; }
+.chat-sessions--collapsed .chat-sidebar-toggle {
+  align-self: center; margin: 0 0 0.4rem;
+}
+.chat-sessions--collapsed .chat-sidebar-toggle svg { transform: rotate(180deg); }
 .chat-sidebar-toggle {
   align-self: flex-end; margin: 0 0 0.4rem; padding: 0.25rem 0.35rem;
   background: none; border: 1px solid var(--border); border-radius: 6px;
@@ -1744,7 +1755,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "29";
+pub const ASSETS_VERSION: &str = "30";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
