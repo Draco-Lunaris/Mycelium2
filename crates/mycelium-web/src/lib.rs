@@ -13,6 +13,7 @@ pub mod pages;
 pub mod server;
 pub mod skill_zip;
 pub mod state;
+pub mod tls_admin;
 
 pub use server::serve;
 pub use state::{AppState, MasterKeyCache};

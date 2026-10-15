@@ -1953,16 +1953,133 @@ pub fn admin_library_page(
     layout("Library", Some(user), csrf, "/admin/library", body)
 }
 
+/// The TLS card on the admin System page: the ACTIVE certificate's
+/// parsed details (source chip, subject/issuer/SANs, validity with an
+/// expiry chip, SHA-256 fingerprint), the download link, the pending
+/// CSR block (re-download + discard) when one is outstanding, the
+/// revert-to-generated button when an upload is active, and the two
+/// forms (upload pair, generate CSR).
+///
+/// Escaping: every dynamic value — including the attacker-influenced
+/// subject/issuer/SAN strings of an uploaded cert — goes through
+/// `html_escape` here; the card body is composed only from escaped
+/// fragments and constant markup.
+pub fn tls_card(
+    details: Option<&crate::tls_admin::CertDetails>,
+    pending: Option<&crate::tls_admin::PendingCsr>,
+    csrf: &str,
+) -> String {
+    let csrf_field = format!(
+        r#"<input type="hidden" name="csrf_token" value="{}">"#,
+        html_escape(csrf)
+    );
+    let row = |label: &str, value: String| {
+        format!(
+            r#"<p><strong>{label}</strong> <span>{value}</span></p>"#,
+            label = label,
+            value = value
+        )
+    };
+    let mut body = String::new();
+    match details {
+        Some(d) => {
+            let source = match d.source.as_str() {
+                "uploaded" => match &d.label {
+                    Some(l) if !l.is_empty() => format!(
+                        "{} {}",
+                        mycelium_ui::render::render(mycelium_ui::chip("uploaded", "accent")),
+                        html_escape(l)
+                    ),
+                    _ => mycelium_ui::render::render(mycelium_ui::chip("uploaded", "accent")),
+                },
+                _ => mycelium_ui::render::render(mycelium_ui::chip("generated", "neutral")),
+            };
+            let expiry_chip = if d.expired {
+                mycelium_ui::render::render(mycelium_ui::chip("expired", "danger"))
+            } else if d.expiring_soon {
+                mycelium_ui::render::render(mycelium_ui::chip("expires soon", "warning"))
+            } else {
+                String::new()
+            };
+            body.push_str(&row("Source", source));
+            body.push_str(&row("Subject", html_escape(&d.subject)));
+            body.push_str(&row("Issuer", html_escape(&d.issuer)));
+            body.push_str(&row("SANs", html_escape(&d.sans.join(", "))));
+            body.push_str(&row("Valid from", html_escape(&d.not_before)));
+            body.push_str(&row(
+                "Valid until",
+                format!("{} {expiry_chip}", html_escape(&d.not_after)),
+            ));
+            body.push_str(&row(
+                "SHA-256 fingerprint",
+                format!("<code>{}</code>", html_escape(&d.fingerprint_sha256)),
+            ));
+            body.push_str(
+                r#"<p><a href="/admin/tls/cert">Download certificate</a></p>"#,
+            );
+            if d.source == "uploaded" {
+                body.push_str(&format!(
+                    r#"<form method="post" action="/admin/tls/reset">{csrf_field}<button type="submit">Revert to generated certificate</button></form>"#
+                ));
+            }
+        }
+        None => body.push_str(
+            r#"<p class="muted">No certificate could be parsed — the server may not have finished booting, or the certificate files are unreadable.</p>"#,
+        ),
+    }
+    if let Some(p) = pending {
+        body.push_str(&format!(
+            r#"<h3>Pending CSR</h3>
+{cn}
+{sans}
+{created}
+<p class="muted">The matching private key stays on this server at
+<code>&lt;data_dir&gt;/config/tls/pending-csr-key.pem</code> — the upload
+form needs it alongside the issued certificate.</p>
+<p><a href="/admin/tls/csr">Download CSR</a></p>
+<form method="post" action="/admin/tls/pending/discard">{csrf_field}<button type="submit">Discard CSR</button></form>"#,
+            cn = row("CN", html_escape(&p.cn)),
+            sans = row("SANs", html_escape(&p.sans.join(", "))),
+            created = row("Created", html_escape(&p.created_at)),
+        ));
+    }
+    body.push_str(&format!(
+        r#"<h3>Upload certificate</h3>
+<p class="muted">A third-party cert (+ optional chain, leaf first) and its private key. The pair is validated before it is installed, and the live listener hot-swaps on success.</p>
+<form method="post" action="/admin/tls/upload" enctype="multipart/form-data">
+  {csrf_field}
+  <label>Certificate (PEM)</label><input name="cert_pem" type="file" accept=".pem,application/x-pem-file" required>
+  <label>Private key (PEM)</label><input name="key_pem" type="file" accept=".pem,application/x-pem-file" required>
+  <label>Label (optional)</label><input name="label" maxlength="120">
+  <button type="submit">Upload certificate</button>
+</form>
+<h3>Generate CSR</h3>
+<p class="muted">Generates a fresh key (kept server-side until the matching cert is uploaded) and downloads the CSR for your CA. See <a href="https://github.com/Draco-Lunaris/Mycelium2/blob/master/docs/tls.md">the TLS guide</a>.</p>
+<form method="post" action="/admin/tls/csr">
+  {csrf_field}
+  <label>Common name</label><input name="cn" required>
+  <label>SANs (comma-separated; empty = localhost)</label><input name="sans">
+  <button type="submit">Generate CSR</button>
+</form>"#
+    ));
+    mycelium_ui::render::render(mycelium_ui::card(
+        "TLS certificate",
+        TrustedHtml::from_markup(body),
+    ))
+}
+
 /// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value) and the backup download (the existing
-/// POST /admin/backup button + the no-store rationale). The
-/// ingest-jobs table moved to /status (spec §8's PR-4 ruling —
+/// StatTiles (a tile per value), the TLS card, and the backup download
+/// (the existing POST /admin/backup button + the no-store rationale).
+/// The ingest-jobs table moved to /status (spec §8's PR-4 ruling —
 /// /status is the jobs-table home; the PR-3 placement here was a
 /// stopgap pending that page).
 pub fn admin_system_page(
     user: &SessionUser,
     csrf: &str,
     stats: &crate::api::SystemPageStats,
+    cert: Option<&crate::tls_admin::CertDetails>,
+    pending: Option<&crate::tls_admin::PendingCsr>,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
@@ -1999,7 +2116,8 @@ pub fn admin_system_page(
         TrustedHtml::from_markup(""),
     ));
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}",
+        "{header}{tabs}{flash}{stats_html}{}{}",
+        tls_card(cert, pending, csrf),
         mycelium_ui::render::render(mycelium_ui::card(
             "Maintenance",
             TrustedHtml::from_markup(backup_body),

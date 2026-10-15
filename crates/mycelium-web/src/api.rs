@@ -2444,10 +2444,17 @@ pub async fn admin_system_view(
         llm_last_success_seconds: s.llm_last_success_seconds,
     };
     let admin = request_admin_user(&state, &session).await;
+    // The TLS card's inputs: the ACTIVE cert's parsed details and the
+    // outstanding CSR (both read from the data dir on every page view —
+    // cheap, and always current after an upload/reset/discard).
+    let cert = crate::tls_admin::active_cert_details(&state.data_dir);
+    let pending = crate::tls_admin::read_pending(&state.data_dir);
     pages::admin_system_page(
         &admin,
         &csrf,
         &stats,
+        cert.as_ref(),
+        pending.as_ref(),
         params.ok.as_deref(),
         params.error.as_deref(),
     )
@@ -2786,6 +2793,459 @@ pub async fn admin_backup(
         Err(e) => {
             tracing::error!(error = %e, "backup task join failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "backup failed")
+        }
+    }
+}
+
+// ---------- TLS management (admin) ----------
+
+/// Flash redirect back to /admin/system with an error message (the TLS
+/// card's error banner). Shared by the TLS admin POST handlers.
+fn tls_flash_error(msg: &str) -> Response {
+    Redirect::to(&format!(
+        "/admin/system?error={}",
+        pages::urlencoding_encode(msg)
+    ))
+    .into_response()
+}
+
+/// POST /admin/tls/upload — install a third-party cert(+chain)/key.
+///
+/// Validation-before-write (spec): every check — parse, key match,
+/// pending-CSR key match — runs against the in-memory pair BEFORE any
+/// disk write, so a rejected upload leaves no state. The three writes
+/// (cert, key, sidecar) then happen in one synchronous sequence with no
+/// await between them, so the download handler and the boot precedence
+/// can never observe a half-written pair. If the live reload fails the
+/// just-written files are removed again — a pair the live listener
+/// cannot load is worthless and must not survive as "active".
+///
+/// Multipart fields: `cert_pem` (file), `key_pem` (file), `label` (text,
+/// optional). Flashes to /admin/system.
+pub async fn tls_upload(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    // Per-field size cap: a cert chain plus its key is a few KiB, so 2
+    // MiB is already generous. axum's own 2 MiB default body limit
+    // normally trips first (surfaced through the same flash below); the
+    // explicit check keeps the message accurate if that limit is ever
+    // raised for this route.
+    const MAX_TLS_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+    let mut cert_pem: Option<String> = None;
+    let mut key_pem: Option<String> = None;
+    let mut label = String::new();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return tls_flash_error("uploaded file too large (max 2 MiB)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS upload multipart parse failed");
+                return tls_flash_error("upload could not be read");
+            }
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "cert_pem" | "key_pem" => {
+                let is_cert = name == "cert_pem";
+                let bytes = match field.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                        return tls_flash_error("uploaded file too large (max 2 MiB)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "TLS upload field read failed");
+                        return tls_flash_error("upload could not be read");
+                    }
+                };
+                if bytes.len() > MAX_TLS_UPLOAD_BYTES {
+                    return tls_flash_error("uploaded file too large (max 2 MiB)");
+                }
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if is_cert {
+                    cert_pem = Some(text);
+                } else {
+                    key_pem = Some(text);
+                }
+            }
+            // The label is display metadata for the TLS card; a long one
+            // is truncated rather than refused (it never affects the
+            // pair's validity).
+            "label" => {
+                label = field.text().await.unwrap_or_default();
+                label = label.trim().chars().take(120).collect();
+            }
+            _ => {}
+        }
+    }
+    let (cert_pem, key_pem) = match (cert_pem, key_pem) {
+        (Some(c), Some(k)) => (c, k),
+        _ => return tls_flash_error("both cert and key files are required"),
+    };
+    // Pending CSR key, when one exists (Decision 1: the uploaded key
+    // must be exactly the key the CSR was generated with). Fail CLOSED:
+    // a pending key that exists but cannot be read must not be treated
+    // as "no pending CSR" — that would silently open the one check that
+    // binds the upload to the key the CSR was made for.
+    let tls_dir = state.data_dir.join("config/tls");
+    let pending = match crate::tls_admin::read_pending_csr_key(&tls_dir) {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::error!(error = %e, "pending CSR key unreadable — refusing TLS upload");
+            return tls_flash_error(
+                "the pending CSR key could not be read — resolve it before uploading",
+            );
+        }
+    };
+    let validation =
+        match crate::tls_admin::validate_upload(&cert_pem, &key_pem, pending.as_deref()) {
+            Ok(v) => v,
+            // The exact parse/mismatch error is user-facing (spec): it tells
+            // the admin which half of the pair is wrong.
+            Err(e) => return tls_flash_error(&format!("upload rejected: {e}")),
+        };
+    // The sidecar body is built BEFORE any write: serializing it cannot
+    // realistically fail (four string fields), and building it up front
+    // means a failure there leaves nothing on disk at all.
+    let meta = serde_json::json!({
+        "label": label,
+        "uploaded_at": chrono::Utc::now().to_rfc3339(),
+        "fingerprint_sha256": validation.fingerprint_sha256,
+        "source": "uploaded",
+    });
+    let meta = match serde_json::to_string(&meta) {
+        Ok(meta) => meta,
+        Err(e) => {
+            tracing::error!(error = %e, "uploaded sidecar serialization failed");
+            return tls_flash_error("internal error");
+        }
+    };
+    // ---- Writes: one synchronous sequence, cert → key → sidecar. ----
+    // No awaits in this block: the pair-invariant (both files exist
+    // together, or neither) holds for the download handler and boot.
+    //
+    // Concurrency guarantee, stated precisely: validation→write is NOT
+    // atomic across requests, so two concurrent uploads can interleave at
+    // the await points before this block (both validate, then both write).
+    // What the synchronous sequence guarantees is that a reader never
+    // observes a cert/key PAIR that does not match: every failure exit
+    // below removes all three files together, and the last writer's three
+    // files are mutually consistent. A concurrent request's orphan key can
+    // briefly coexist with this request's sidecar; the serving pair never
+    // mismatches.
+    let up_cert = tls_dir.join("uploaded-cert.pem");
+    let up_key = tls_dir.join("uploaded-key.pem");
+    let up_meta = tls_dir.join("uploaded.json");
+    if let Err(e) = std::fs::create_dir_all(&tls_dir) {
+        tracing::error!(error = %e, "TLS upload dir creation failed");
+        return tls_flash_error("internal error");
+    }
+    // One rollback path for every failure exit: a partially written
+    // upload must leave NOTHING behind. A truncated uploaded-cert.pem
+    // would otherwise be served by tls_cert_download (it prefers that
+    // file whenever it exists), and an orphan 0600 key is a stale secret
+    // with no owner.
+    let rollback = || {
+        for path in crate::tls_admin::remove_uploaded_pair(&tls_dir) {
+            tracing::error!(path = %path.display(), "TLS upload rollback could not remove a file");
+        }
+    };
+    if let Err(e) = std::fs::write(&up_cert, &cert_pem) {
+        tracing::error!(error = %e, "uploaded cert write failed");
+        rollback();
+        return tls_flash_error("internal error");
+    }
+    // Key 0600: replace any prior key, then create fresh with the mode
+    // (create_new so the mode can never be inherited from an existing
+    // file). The key is never served, rendered, or logged.
+    if let Err(e) = write_key_0600(&up_key, &key_pem) {
+        tracing::error!(error = %e, "uploaded key write failed");
+        rollback();
+        return tls_flash_error("internal error");
+    }
+    if let Err(e) = std::fs::write(&up_meta, &meta) {
+        tracing::error!(error = %e, "uploaded sidecar write failed");
+        rollback();
+        return tls_flash_error("internal error");
+    }
+    // ---- Live hot-swap (the Arc handle is shared with the listener). ----
+    // No partial state: if the reload fails, remove the just-written
+    // files and flash the error — the files are worthless if the live
+    // listener cannot load them.
+    //
+    // `state.tls` is None only when the server was not started through
+    // `serve` (no TLS listener to hot-swap — tests). The install is then
+    // real but not live: flash the restart-required variant rather than
+    // plain success, which would claim an effect that has not happened.
+    let mut restart_required = false;
+    match &state.tls {
+        Some(tls) => {
+            if let Err(e) = tls.reload_from_pem_file(&up_cert, &up_key).await {
+                tracing::error!(error = %e, "TLS reload after upload failed");
+                rollback();
+                return tls_flash_error("upload rejected: the server could not load the pair");
+            }
+        }
+        None => restart_required = true,
+    }
+    // The pair is installed (live, or pending a restart when there is no
+    // listener): a pending CSR it matched is now fulfilled. Cleared only
+    // after success — a failed reload must not cost the admin the CSR key
+    // they would need to retry.
+    if pending.is_some() {
+        let _ = std::fs::remove_file(tls_dir.join("pending-csr-key.pem"));
+        let _ = std::fs::remove_file(tls_dir.join("pending.json"));
+    }
+    let mut msg = format!(
+        "TLS certificate installed — fingerprint {}…{}",
+        // SHA-256 hex is always 64 chars (validate_upload's fingerprint).
+        &validation.fingerprint_sha256[..16],
+        if restart_required {
+            " — takes effect after restart (no live TLS listener in this process)"
+        } else {
+            ""
+        }
+    );
+    for w in &validation.warnings {
+        msg.push_str(&format!(" WARNING: {w}"));
+    }
+    Redirect::to(&format!(
+        "/admin/system?ok={}",
+        pages::urlencoding_encode(&msg)
+    ))
+    .into_response()
+}
+
+/// Write the uploaded private key with mode 0600: remove any prior key,
+/// then create fresh with the mode (never reuse an existing file's
+/// permissions).
+fn write_key_0600(path: &std::path::Path, key_pem: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(key_pem.as_bytes())
+}
+
+#[derive(Deserialize)]
+pub struct CsrForm {
+    pub cn: String,
+    #[serde(default)]
+    pub sans: String,
+}
+
+/// The CSR download response (POST generate and GET re-download share
+/// it): the PEM body with download headers, `no-store` — the CSR is
+/// pending state that discard/fulfill change under the admin's feet.
+fn csr_download_response(csr_pem: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"csr.pem\"",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        csr_pem,
+    )
+        .into_response()
+}
+
+/// POST /admin/tls/csr — generate a CSR for cn + sans; the response IS
+/// the CSR PEM download. Persists the pending key + metadata (Decision
+/// 1: the key stays on disk, 0600, until the matching cert is uploaded
+/// or the admin discards it). Replaces any prior pending CSR
+/// (last-one-wins).
+pub async fn tls_csr(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<CsrForm>,
+) -> Response {
+    let sans: Vec<String> = form
+        .sans
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // The localhost default for an empty list is applied HERE, before
+    // persisting, so pending.json records what the CSR actually contains
+    // (the card renders it; the rebuild path re-applies it defensively).
+    // A non-empty list is verbatim — never force-merged.
+    let sans = if sans.is_empty() {
+        vec![crate::tls_admin::DEFAULT_SAN.to_string()]
+    } else {
+        sans
+    };
+    let cn = form.cn.trim();
+    let (csr_pem, key_pem) = match crate::tls_admin::build_csr(cn, &sans) {
+        Ok(pair) => pair,
+        // The Display strings are user-facing (missing CN, parse
+        // failure) — same convention as the upload flash.
+        Err(e) => return tls_flash_error(&format!("CSR generation failed: {e}")),
+    };
+    let meta = crate::tls_admin::PendingCsr {
+        cn: cn.to_string(),
+        sans,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = crate::tls_admin::save_pending(&state.data_dir, &meta, &key_pem) {
+        // save_pending writes the key first and the meta last, so a
+        // failure here means the key write failed and the PREVIOUS
+        // pending pair (if any) is fully intact — the new CSR simply
+        // never became pending. Log the detail, flash the generic (the
+        // io error is not actionable for the admin).
+        tracing::error!(error = %e, "pending CSR persist failed");
+        return tls_flash_error("the pending CSR could not be saved");
+    }
+    csr_download_response(csr_pem)
+}
+
+/// GET /admin/tls/csr — re-download the outstanding pending CSR. The
+/// CSR PEM is not persisted; it is rebuilt from the pending key +
+/// metadata (rcgen's serialize_request is not byte-stable, so the
+/// rebuilt CSR is the same request, not the same bytes).
+pub async fn tls_csr_download(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    let tls_dir = state.data_dir.join("config/tls");
+    let Some(meta) = crate::tls_admin::read_pending(&state.data_dir) else {
+        return tls_flash_error("no CSR is pending");
+    };
+    // Absent key → "no CSR is pending"; present-but-unreadable → its own
+    // message (same fail-closed posture as the upload path — a broken
+    // key is never silently treated as no key).
+    let key_pem = match crate::tls_admin::read_pending_csr_key(&tls_dir) {
+        Ok(Some(key)) => key,
+        Ok(None) => return tls_flash_error("no CSR is pending"),
+        Err(e) => {
+            tracing::error!(error = %e, "pending CSR key unreadable");
+            return tls_flash_error("the pending CSR key could not be read");
+        }
+    };
+    match crate::tls_admin::build_csr_from_pending(&key_pem, &meta.cn, &meta.sans) {
+        Ok(csr_pem) => csr_download_response(csr_pem),
+        Err(e) => {
+            tracing::error!(error = %e, "pending CSR rebuild failed");
+            tls_flash_error("the pending CSR could not be rebuilt")
+        }
+    }
+}
+
+/// POST /admin/tls/pending/discard — drop the outstanding CSR (key +
+/// metadata). Idempotent: discarding nothing pending is fine.
+pub async fn tls_pending_discard(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    crate::tls_admin::clear_pending(&state.data_dir);
+    Redirect::to(&format!(
+        "/admin/system?ok={}",
+        pages::urlencoding_encode("pending CSR discarded")
+    ))
+    .into_response()
+}
+
+/// POST /admin/tls/reset — roll back to the managed generated pair:
+/// remove the uploaded pair + sidecar and reload the live listener from
+/// `cert.pem`/`key.pem`. The generated pair is NEVER deleted by this
+/// action (spec), and the pending CSR is untouched (its lifecycle is
+/// discard/fulfill, not reset).
+pub async fn tls_reset(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    let tls_dir = state.data_dir.join("config/tls");
+    let leftovers = crate::tls_admin::remove_uploaded_pair(&tls_dir);
+    if !leftovers.is_empty() {
+        // An undeletable uploaded file would keep being served (the
+        // download handler and boot prefer the uploaded pair whenever it
+        // exists), so this is a real failure, not a warning.
+        for path in &leftovers {
+            tracing::error!(path = %path.display(), "TLS reset could not remove an uploaded file");
+        }
+        return tls_flash_error("the uploaded certificate could not be removed");
+    }
+    // Reload from the generated pair. `state.tls` is None only when the
+    // server was not started through `serve` (tests): the rollback on
+    // disk is real but not live — flash the restart-required variant
+    // (Task 4's convention) rather than claim an effect that has not
+    // happened.
+    let (cert, key) = (tls_dir.join("cert.pem"), tls_dir.join("key.pem"));
+    match &state.tls {
+        Some(tls) => {
+            if let Err(e) = tls.reload_from_pem_file(&cert, &key).await {
+                tracing::error!(error = %e, "TLS reload after reset failed");
+                return tls_flash_error("the server could not load the generated pair");
+            }
+        }
+        None => {
+            return Redirect::to(&format!(
+                "/admin/system?ok={}",
+                pages::urlencoding_encode(
+                    "uploaded certificate removed — takes effect after restart (no live TLS listener in this process)"
+                )
+            ))
+            .into_response();
+        }
+    }
+    Redirect::to(&format!(
+        "/admin/system?ok={}",
+        pages::urlencoding_encode("reverted to the generated certificate")
+    ))
+    .into_response()
+}
+
+/// GET /admin/tls/cert — download the ACTIVE cert PEM: the uploaded
+/// cert when one is in effect, else the managed generated pair. Only
+/// the certificate is ever served — the private key is not readable
+/// through any route. `no-store`: the file is the live serving
+/// material's public half and changes under the admin's feet.
+pub async fn tls_cert_download(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    let tls_dir = state.data_dir.join("config/tls");
+    let uploaded = tls_dir.join("uploaded-cert.pem");
+    let path = if uploaded.exists() {
+        uploaded
+    } else {
+        tls_dir.join("cert.pem")
+    };
+    match tokio::fs::read_to_string(&path).await {
+        Ok(pem) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+                // Attachment disposition (same pattern as the CSR
+                // download): the PEM body is attacker-influenced when an
+                // uploaded cert is active, so never let a browser render
+                // it inline in the admin's tab.
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"cert.pem\"",
+                ),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            pem,
+        )
+            .into_response(),
+        Err(e) => {
+            // The path is server-side config; log the detail, serve a
+            // generic body (the endpoint-wide convention).
+            tracing::error!(error = %e, "TLS cert read failed");
+            error_response(StatusCode::NOT_FOUND, "certificate not found")
         }
     }
 }

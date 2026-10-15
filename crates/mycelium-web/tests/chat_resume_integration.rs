@@ -113,7 +113,14 @@ async fn boot(llm_url: String) -> (AppState, tempfile::TempDir) {
     let assets_dir = dir.path().join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
     let login = LoginService::new(store.pool().clone());
-    let state = AppState::new(store, service_key, login, assets_dir);
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        dir.path().to_path_buf(),
+        None,
+    );
     // Point the librarian at the mock LLM (the config row is what the
     // resume pass decrypts, same as the submit endpoints).
     state
