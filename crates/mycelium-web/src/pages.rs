@@ -1961,8 +1961,8 @@ pub fn admin_library_page(
 /// parsed details (source chip, subject/issuer/SANs, validity with an
 /// expiry chip, SHA-256 fingerprint), the download link, the pending
 /// CSR block (re-download + discard) when one is outstanding, the
-/// revert-to-generated button when an upload is active, and the two
-/// forms (upload pair, generate CSR).
+/// revert-to-generated button when an upload is active, and the three
+/// forms (upload pair, generate CSR, regenerate self-signed).
 ///
 /// Escaping: every dynamic value — including the attacker-influenced
 /// subject/issuer/SAN strings of an uploaded cert — goes through
@@ -2064,6 +2064,13 @@ form needs it alongside the issued certificate.</p>
   <label>Common name</label><input name="cn" required>
   <label>SANs (comma-separated; empty = localhost)</label><input name="sans">
   <button type="submit">Generate CSR</button>
+</form>
+<h3>Regenerate self-signed certificate</h3>
+<p class="muted">Mints a fresh self-signed key and certificate carrying the given SANs (comma-separated; empty = localhost) — even if the SANs are unchanged. The choice survives restarts; if an uploaded certificate is active it stays active and the fresh pair becomes its fallback. Clients that trusted the old certificate must re-trust the new one (its fingerprint changes).</p>
+<form method="post" action="/admin/tls/regenerate">
+  {csrf_field}
+  <label>SANs (comma-separated; empty = localhost)</label><input name="sans">
+  <button type="submit">Regenerate certificate</button>
 </form>"#
     ));
     mycelium_ui::render::render(mycelium_ui::card(

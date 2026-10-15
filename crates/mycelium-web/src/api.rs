@@ -3157,6 +3157,94 @@ pub async fn tls_pending_discard(
     .into_response()
 }
 
+/// The regenerate form: a comma-separated SAN list (empty → localhost
+/// via sans_from_env's semantics — trim, dedup, order-stable).
+#[derive(Deserialize)]
+pub struct RegenerateForm {
+    #[serde(default)]
+    pub sans: String,
+}
+
+/// POST /admin/tls/regenerate — regenerate the managed self-signed
+/// pair with a fresh key and the requested SANs. Identical SANs still
+/// mint a fresh key (the action is never a silent no-op).
+///
+/// Write ordering mirrors the upload path: the new pair + sans.txt
+/// sidecar land on disk in one synchronous sequence (no await between
+/// the writes) so no reader can observe a half-regenerated pair. The
+/// live reload runs last; a reload failure leaves the new pair on disk
+/// with the restart-required flash (the pair is the fallback either
+/// way — unlike a failed upload, nothing needs rolling back).
+///
+/// When an uploaded cert is active, the regenerated pair becomes the
+/// fallback only: the live listener keeps serving the uploaded cert,
+/// and the flash says so.
+pub async fn tls_regenerate(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<RegenerateForm>,
+) -> Response {
+    let tls_dir = state.data_dir.join("config/tls");
+    // The localhost default for an empty list is applied HERE (same
+    // convention as tls_csr), so the sidecar records what the cert
+    // actually carries; a non-empty list is verbatim.
+    let sans = crate::tls_admin::sans_from_env(Some(&form.sans));
+    // Cap the untrusted input BEFORE any regeneration (security review
+    // F1): a maxed-out form body must not mint a multi-megabyte
+    // permanent cert. The message is user-facing (validate_sans).
+    if let Err(e) = crate::tls_admin::validate_sans(&sans) {
+        return tls_flash_error(&format!("regeneration rejected: {e}"));
+    }
+    if let Err(e) = crate::cert::regenerate_managed_pair(&tls_dir, &sans) {
+        tracing::error!(error = %e, "generated pair regeneration failed");
+        return tls_flash_error("the generated certificate could not be regenerated");
+    }
+    // Which pair is live now?
+    let uploaded_active =
+        tls_dir.join("uploaded-cert.pem").exists() && tls_dir.join("uploaded-key.pem").exists();
+    let mut restart_required = false;
+    match (&state.tls, uploaded_active) {
+        // Generated pair is live → hot-swap to the fresh pair.
+        (Some(tls), false) => {
+            let (cert, key) = (tls_dir.join("cert.pem"), tls_dir.join("key.pem"));
+            if let Err(e) = tls.reload_from_pem_file(&cert, &key).await {
+                tracing::error!(error = %e, "TLS reload after regenerate failed");
+                return tls_flash_error("the server could not load the regenerated pair");
+            }
+        }
+        // Uploaded cert is active → it keeps serving; the fresh pair is
+        // the fallback. No reload, and the flash must say so.
+        (Some(_), true) => {}
+        // No live listener in this process (tests / a non-serving
+        // process): the disk state is real but takes effect at boot.
+        (None, _) => restart_required = true,
+    }
+    // Flash the new generated pair's fingerprint. NOT
+    // active_cert_details (it prefers the uploaded pair when one is
+    // active, and the flash must name the pair the action minted).
+    let fingerprint =
+        crate::tls_admin::generated_cert_fingerprint(&state.data_dir).unwrap_or_default();
+    let msg = format!(
+        "self-signed certificate regenerated with {} — fingerprint {}…{}",
+        sans.join(", "),
+        // SHA-256 hex is always 64 chars; the same 16-char prefix the
+        // upload flash shows.
+        &fingerprint[..16.min(fingerprint.len())],
+        if uploaded_active {
+            " — the uploaded certificate stays active; the regenerated pair is its fallback"
+        } else if restart_required {
+            " — takes effect after restart (no live TLS listener in this process)"
+        } else {
+            ""
+        }
+    );
+    Redirect::to(&format!(
+        "/admin/system?ok={}",
+        pages::urlencoding_encode(&msg)
+    ))
+    .into_response()
+}
+
 /// POST /admin/tls/reset — roll back to the managed generated pair:
 /// remove the uploaded pair + sidecar and reload the live listener from
 /// `cert.pem`/`key.pem`. The generated pair is NEVER deleted by this
