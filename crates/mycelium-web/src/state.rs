@@ -215,6 +215,13 @@ pub struct AppState {
     /// hoists what Task 3 constructed per request). RP config:
     /// [`webauthn_origin_from_env`].
     pub webauthn: Arc<WebAuthnManager>,
+    /// Durable chat transcripts (sealed `chat_*` rows; chat session
+    /// history spec §3.1).
+    pub chat_sessions: Arc<mycelium_store::chat::ChatStore>,
+    /// Live chat runs: per-turn broadcast channels (spec §3.3) — the
+    /// submit endpoints register entries before spawning runners;
+    /// the runners remove them at finalization.
+    pub chat_runs: Arc<crate::chat_runner::ChatRunRegistry>,
 }
 
 impl AppState {
@@ -271,6 +278,11 @@ impl AppState {
                 "invalid MYCELIUM2_WEBAUTHN_ORIGIN — must be an https:// URL with a DNS host",
             ),
         );
+        // Chat session history (spec §3.3): the sealed-transcript row
+        // store and the live-run registry share the pool with the
+        // other stores.
+        let chat_sessions = Arc::new(mycelium_store::chat::ChatStore::new(pool.clone()));
+        let chat_runs = Arc::new(crate::chat_runner::ChatRunRegistry::default());
         Self {
             store,
             users: Arc::new(UserStore::new(pool.clone())),
@@ -285,6 +297,8 @@ impl AppState {
             assets_dir,
             chat_history: Arc::new(ChatHistory::default()),
             webauthn,
+            chat_sessions,
+            chat_runs,
         }
     }
 

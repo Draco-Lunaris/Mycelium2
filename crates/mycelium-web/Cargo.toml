@@ -35,6 +35,10 @@ rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 hex = "0.4"
+# Sync bridge for the chat runner's Drop guard (async store calls from
+# Drop) — the same crate mycelium-store pins for search_index.rs's
+# `block_on` precedent.
+futures-executor = "0.3"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

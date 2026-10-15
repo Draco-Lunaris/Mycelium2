@@ -23,7 +23,7 @@ use crate::state::AppState;
 /// and service key (global skills + library + full-text book search).
 /// `visible_slugs` filters library access by bookshelf visibility
 /// (None = unrestricted, i.e. admin).
-fn build_agent_scopes<'a>(
+pub(crate) fn build_agent_scopes<'a>(
     store: &'a mycelium_store::Store,
     service_key: &'a mycelium_crypto::keys::ServiceKey,
     visible_slugs: Option<std::collections::HashSet<String>>,

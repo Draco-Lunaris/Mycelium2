@@ -3,6 +3,7 @@
 pub mod api;
 pub mod assets;
 pub mod cert;
+pub mod chat_runner;
 pub mod health;
 pub mod middleware;
 pub mod packaged_skills;
