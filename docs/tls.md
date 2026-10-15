@@ -22,16 +22,23 @@ At startup the server picks its certificate in this order:
    while an uploaded pair is active, so reverting always has a
    working fallback.
 
-The generated pair is **managed**: `config/tls/sans.txt` records the SAN
-set it was built for, and any mismatch between that sidecar and the
-requested set (including a missing sidecar) replaces the pair on boot.
-So a hand-placed `config/tls/cert.pem` + `key.pem` pair that predates
-this version — one you dropped in yourself, with no `sans.txt` beside it
-— is silently deleted and regenerated on the first boot after upgrade.
-Real certificates do not belong in that directory at all: mount them via
-`MYCELIUM2_TLS_CERT` / `MYCELIUM2_TLS_KEY` (precedence 1) or install
-them through the upload flow (precedence 2), neither of which the
-manager ever touches.
+The generated pair is **managed** with the sidecar as the source of
+truth: `config/tls/sans.txt` records the SAN set it was built for.
+Once that sidecar exists and the pair is complete, boot never
+regenerates the pair — the env/flag SAN list is only the FIRST-BOOT
+initializer. This is what makes the admin UI's **Regenerate
+self-signed certificate** action survive restarts (see below): the
+recorded set wins over whatever the environment says on a later boot.
+A hand-placed `config/tls/cert.pem` + `key.pem` pair that predates
+this version — one you dropped in yourself, with no `sans.txt` beside
+it — is silently deleted and regenerated on the first boot after
+upgrade. If the pair is incomplete (a crash between writes), boot
+rebuilds it from the **recorded** set. Removing `sans.txt` is the
+escape hatch that hands control back to the env/flag initializer.
+Real certificates do not belong in that directory at all: mount them
+via `MYCELIUM2_TLS_CERT` / `MYCELIUM2_TLS_KEY` (precedence 1) or
+install them through the upload flow (precedence 2), neither of which
+the manager ever touches.
 
 ## Posture 1: built-in self-signed (with your names)
 
@@ -47,10 +54,13 @@ mycelium2 --tls-sans "mycelium.example,192.0.2.10,localhost"
 
 The list is comma-separated and taken **verbatim** — nothing is
 force-added, so include `localhost` if you also browse via the loopback
-name. An unset or empty value means exactly `localhost`. The server
-records the requested set in `config/tls/sans.txt`; when the set
-changes across restarts it regenerates the generated pair (the
-uploaded pair is never regenerated or touched).
+name. An unset or empty value means exactly `localhost`. The env/flag
+list is the **first-boot initializer**: the server records it in
+`config/tls/sans.txt`, and from then on the sidecar — not the
+environment — owns the generated pair (see Boot precedence above). To
+change the names later, either regenerate from the admin UI
+(below) or delete `sans.txt` and restart. The uploaded pair is never
+regenerated or touched by any of this.
 
 ## Posture 2: uploaded third-party certificate
 
@@ -69,6 +79,16 @@ Admin → System → TLS is the whole workflow:
   clients that need to trust it.
 - **Revert to generated** — removes the uploaded pair and reloads the
   generated one. The generated pair is never deleted by this action.
+- **Regenerate self-signed certificate** — mints a fresh self-signed
+  key and certificate with the given SAN list (comma-separated; empty
+  means `localhost`; at most 64 names of 253 characters each), even
+  when the SANs are unchanged — the action is
+  never a silent no-op. The live listener hot-swaps to the fresh pair
+  when no uploaded cert is active; under an active upload the fresh
+  pair becomes the fallback and the uploaded cert keeps serving. The
+  choice is recorded in `sans.txt` and survives restarts (see Boot
+  precedence). Clients that trusted the old certificate must re-trust
+  the new one — its fingerprint changes.
 
 ### CSR → CA → upload walkthrough
 

@@ -153,6 +153,7 @@ pub fn build_router_with_shutdown(
         )
         .route("/admin/tls/pending/discard", post(api::tls_pending_discard))
         .route("/admin/tls/reset", post(api::tls_reset))
+        .route("/admin/tls/regenerate", post(api::tls_regenerate))
         // API + health + metrics.
         .nest("/api/v1", api_routes)
         .merge(health::routes())

@@ -6,6 +6,14 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_SAN: &str = "localhost";
 
+/// Cap on SAN count for untrusted inputs (the regenerate form). The
+/// MCP search cap (32) is the same convention: a bounded admin surface.
+pub const SAN_COUNT_MAX: usize = 64;
+
+/// Cap on a single SAN name's length for untrusted inputs: 253, the
+/// DNS name maximum.
+pub const SAN_NAME_MAX_LEN: usize = 253;
+
 /// Errors from the TLS admin pipeline (upload validation; Task 5's CSR
 /// flow extends this enum). The Display strings are user-visible: they
 /// are flashed verbatim on the /admin/system TLS card.
@@ -365,6 +373,21 @@ pub fn active_cert_details(data_dir: &std::path::Path) -> Option<CertDetails> {
     })
 }
 
+/// The SHA-256 fingerprint of the MANAGED generated pair's leaf
+/// (`config/tls/cert.pem`), regardless of whether an uploaded pair is
+/// active. The regenerate flash uses this: the action mints the
+/// generated pair, so the flashed fingerprint must name THAT pair even
+/// when an upload is what's serving. `None` when the file is absent or
+/// unparseable (the caller degrades gracefully).
+pub fn generated_cert_fingerprint(data_dir: &std::path::Path) -> Option<String> {
+    let pem = std::fs::read_to_string(data_dir.join("config/tls/cert.pem")).ok()?;
+    let leaf_der = x509_parser::pem::Pem::iter_from_buffer(pem.as_bytes())
+        .filter_map(Result::ok)
+        .map(|block| block.contents)
+        .find(|der| x509_parser::parse_x509_certificate(der).is_ok())?;
+    Some(hex::encode(Sha256::digest(leaf_der)))
+}
+
 /// A GeneralName in display form: DNS/e-mail/URI names as-is, IP
 /// addresses in their canonical text form (x509-parser hands back raw
 /// octets — 4 = v4, 16 = v6), anything else the parser's Debug shape.
@@ -381,6 +404,36 @@ fn format_general_name(gn: &x509_parser::extensions::GeneralName) -> String {
         },
         other => format!("{other:?}"),
     }
+}
+
+/// Cap the SAN list on untrusted surfaces (the regenerate form; NOT
+/// the env/flag initializer, which is trusted operator input). Returns
+/// the first violation as a user-facing message: max
+/// [`SAN_COUNT_MAX`] names, max [`SAN_NAME_MAX_LEN`] chars each — no
+/// multi-megabyte permanent cert from a maxed-out form body (the
+/// upload field cap and the MCP search-term cap are the same
+/// convention).
+pub fn validate_sans(sans: &[String]) -> Result<(), String> {
+    if sans.is_empty() {
+        return Err("the SAN list is empty".to_string());
+    }
+    if sans.len() > SAN_COUNT_MAX {
+        return Err(format!(
+            "too many SANs: {n} (max {SAN_COUNT_MAX})",
+            n = sans.len()
+        ));
+    }
+    for name in sans {
+        if name.chars().count() > SAN_NAME_MAX_LEN {
+            // Char-boundary-safe prefix (a multi-byte name must not
+            // panic the error path that reports it).
+            let prefix: String = name.chars().take(20).collect();
+            return Err(format!(
+                "SAN too long: {prefix}… (max {SAN_NAME_MAX_LEN} chars)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse the MYCELIUM2_TLS_SANS / --tls-sans value: comma-separated,
@@ -992,6 +1045,79 @@ mod tests {
             "v6 SAN: {:?}",
             d.sans
         );
+    }
+
+    #[test]
+    fn generated_cert_fingerprint_names_generated_pair_not_uploaded() {
+        // The regenerate flash must fingerprint the pair the action
+        // minted (cert.pem) — even when an uploaded pair is active and
+        // active_cert_details would report the upload's fingerprint.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        crate::cert::generate_self_signed_with_sans(
+            &tls_dir,
+            &tls_dir.join("cert.pem"),
+            &tls_dir.join("key.pem"),
+            &["gen-fp.example".to_string()],
+        )
+        .unwrap();
+        // An uploaded pair (a distinct second pair) is now ALSO on
+        // disk: the generated-only fingerprint must stay the
+        // generated pair's.
+        let (up_cert, up_key) = test_pair();
+        std::fs::write(tls_dir.join("uploaded-cert.pem"), &up_cert).unwrap();
+        std::fs::write(tls_dir.join("uploaded-key.pem"), up_key).unwrap();
+        let fp = generated_cert_fingerprint(dir.path()).expect("fingerprint");
+        // It equals the SHA-256 of the generated cert's DER.
+        let pem = std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap();
+        let leaf_der = x509_parser::pem::Pem::iter_from_buffer(pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .contents;
+        assert_eq!(fp, hex::encode(Sha256::digest(leaf_der)));
+        // And it is NOT the uploaded pair's fingerprint.
+        let up_der = x509_parser::pem::Pem::iter_from_buffer(up_cert.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .contents;
+        assert_ne!(fp, hex::encode(Sha256::digest(up_der)));
+        // Absent/garbage → None (the caller degrades gracefully).
+        std::fs::remove_file(tls_dir.join("cert.pem")).unwrap();
+        assert!(generated_cert_fingerprint(dir.path()).is_none());
+        std::fs::write(tls_dir.join("cert.pem"), "not a pem").unwrap();
+        assert!(generated_cert_fingerprint(dir.path()).is_none());
+    }
+
+    #[test]
+    fn sans_validation_caps_count_and_name_length() {
+        // Security review F1: the regenerate form is an untrusted
+        // admin-input surface feeding a permanent disk write + live
+        // reload (the env/flag path is a trusted initializer and is
+        // not capped). 64 names max (the MCP search cap is the same
+        // order), 253 chars per name (the DNS name maximum).
+        let many: Vec<String> = (0..64).map(|i| format!("n{i}.example")).collect();
+        assert!(validate_sans(&many).is_ok(), "64 names is allowed");
+        let mut over = many.clone();
+        over.push("one-too-many.example".to_string());
+        let err = validate_sans(&over).unwrap_err();
+        assert!(err.contains("too many"), "{err}");
+        // Exactly at the cap is allowed: 245 a's + ".example" = 253.
+        let max_len = "a".repeat(245) + ".example";
+        assert_eq!(max_len.chars().count(), 253);
+        assert!(
+            validate_sans(&[max_len]).is_ok(),
+            "a 253-char name is allowed"
+        );
+        let long = vec!["x".repeat(300)];
+        let err = validate_sans(&long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        // Empty is refused (the handler defaults to localhost first;
+        // this is the direct-caller guard).
+        let err = validate_sans(&[]).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
     }
 
     #[test]

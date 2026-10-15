@@ -1290,3 +1290,352 @@ async fn tls_cert_download_admin_only_and_serves_generated_pem() {
         normalize_pem(&served_file)
     );
 }
+
+// ---------- Regenerate self-signed certificate (SANs from the UI) ----------
+
+/// POST /admin/tls/regenerate with a SAN list; returns the decoded
+/// flash query. `sans: None` posts an empty (absent) field.
+async fn post_regenerate(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    sans: Option<&str>,
+) -> String {
+    let resp = client
+        .post(format!("{base}/admin/tls/regenerate"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(&[("sans", sans.unwrap_or(""))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303, "regenerate must flash-redirect");
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(loc.starts_with("/admin/system?"), "{loc}");
+    percent_decode(&loc)
+}
+
+#[tokio::test]
+async fn regenerate_replaces_cert_key_and_sans_live() {
+    // The happy path end to end: new SANs on disk + sidecar, a fresh
+    // key, the live listener hot-swapped to the new pair, and the
+    // flash naming the new fingerprint.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let cert_before = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    let key_before = std::fs::read_to_string(dir.path().join("config/tls/key.pem")).unwrap();
+    let flash = post_regenerate(
+        &cl,
+        &base,
+        &cookie,
+        &csrf,
+        Some("regen.example, alt.example,regen.example"),
+    )
+    .await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert!(flash.contains("fingerprint"), "{flash}");
+    // The flash names the new SANs (design: "new SANs + fingerprint").
+    assert!(
+        flash.contains("regen.example") && flash.contains("alt.example"),
+        "flash must name the new SANs: {flash}"
+    );
+    // Sidecar: trimmed, deduped, order-stable.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/sans.txt")).unwrap(),
+        "regen.example\nalt.example\n"
+    );
+    // Fresh cert + key, carrying the new SANs.
+    let cert_after = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    let key_after = std::fs::read_to_string(dir.path().join("config/tls/key.pem")).unwrap();
+    assert_ne!(normalize_pem(&cert_after), normalize_pem(&cert_before));
+    assert_ne!(key_after, key_before, "must mint a fresh key");
+    // The minted cert actually carries the requested SANs.
+    let (_, p) = x509_parser::pem::parse_x509_pem(cert_after.as_bytes()).unwrap();
+    let cert = p.parse_x509().unwrap();
+    let san_text = format!(
+        "{:?}",
+        cert.extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+            .expect("SAN extension")
+    );
+    assert!(san_text.contains("regen.example"), "{san_text}");
+    assert!(san_text.contains("alt.example"), "{san_text}");
+    // Key perms stay 0600 across regeneration.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dir.path().join("config/tls/key.pem"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    // The download endpoint serves the NEW generated pair (the live
+    // reload happened; nothing uploaded is in the way).
+    let body = download_cert(&cl, &base, &cookie).await;
+    assert_eq!(normalize_pem(&body), normalize_pem(&cert_after));
+    assert_ne!(normalize_pem(&body), normalize_pem(&cert_before));
+    // And the listener still handshakes after the reload.
+    let live = reqwest::Client::builder()
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = live
+        .get(format!("{base}/admin/tls/cert"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .expect("live TLS handshake after regenerate");
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn regenerate_survives_restart_via_sidecar() {
+    // Sidecar-wins semantics over the wire: after a UI regeneration,
+    // boot's ensure_managed_pair(tls_dir, boot_sans) must NOT replace
+    // the UI's pair even though the requested set (localhost, from
+    // the test harness boot) differs. Proven by calling the same
+    // function serve wires in, over the post-regenerate disk state.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let flash = post_regenerate(&cl, &base, &cookie, &csrf, Some("ui.example")).await;
+    assert!(flash.contains("ok="), "{flash}");
+    let cert_after_ui = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    // The boot path: the env/flag set (localhost in this harness) is
+    // only an initializer — the sidecar keeps the UI's pair.
+    mycelium_web::cert::ensure_managed_pair(
+        &dir.path().join("config/tls"),
+        &["localhost".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap(),
+        cert_after_ui,
+        "boot must not regenerate a UI-chosen pair"
+    );
+}
+
+#[tokio::test]
+async fn regenerate_empty_sans_is_localhost_not_an_error() {
+    // Empty field → sans_from_env semantics: localhost only. NOT the
+    // empty-list refusal (the handler applies the default first).
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let flash = post_regenerate(&cl, &base, &cookie, &csrf, None).await;
+    assert!(flash.contains("ok="), "{flash}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/sans.txt")).unwrap(),
+        "localhost\n"
+    );
+    // The minted cert carries localhost.
+    let cert = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    let (_, p) = x509_parser::pem::parse_x509_pem(cert.as_bytes()).unwrap();
+    let parsed = p.parse_x509().unwrap();
+    let san_text = format!(
+        "{:?}",
+        parsed
+            .extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+            .expect("SAN extension")
+    );
+    assert!(san_text.contains("localhost"), "{san_text}");
+}
+
+#[tokio::test]
+async fn regenerate_refuses_over_limit_san_list() {
+    // Security review F1: an over-limit SAN list (more than 64 names)
+    // is refused with a clear flash and nothing on disk changes — no
+    // giant permanent cert minted from a 2 MiB form body.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let cert_before = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+    let sidecar_before = std::fs::read_to_string(dir.path().join("config/tls/sans.txt")).unwrap();
+    let many: Vec<String> = (0..100).map(|i| format!("n{i}.example")).collect();
+    let flash = post_regenerate(&cl, &base, &cookie, &csrf, Some(&many.join(","))).await;
+    assert!(flash.contains("error="), "{flash}");
+    assert!(flash.contains("too many"), "{flash}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap(),
+        cert_before,
+        "refused list must not touch the cert"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/sans.txt")).unwrap(),
+        sidecar_before,
+        "refused list must not touch the sidecar"
+    );
+}
+
+#[tokio::test]
+async fn regenerate_keeps_uploaded_cert_active() {
+    // Uploaded beats generated: a regeneration under an active upload
+    // mints the new fallback pair but the LIVE listener must keep
+    // serving the uploaded cert — and the flash must say so.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let (cert, key) = gen_pair("still-up.example");
+    let flash = upload(&cl, &base, &cookie, &csrf, cert.clone(), key, "up").await;
+    assert!(flash.contains("ok="), "{flash}");
+    let flash = post_regenerate(&cl, &base, &cookie, &csrf, Some("fallback.example")).await;
+    assert!(flash.contains("ok="), "{flash}");
+    // The generated pair WAS regenerated (fresh fallback)...
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/sans.txt")).unwrap(),
+        "fallback.example\n"
+    );
+    // ...but the download still serves the UPLOADED cert.
+    let body = download_cert(&cl, &base, &cookie).await;
+    assert_eq!(
+        normalize_pem(&body),
+        normalize_pem(&String::from_utf8_lossy(&cert)),
+        "uploaded pair must stay active under regeneration"
+    );
+}
+
+#[tokio::test]
+async fn regenerate_admin_and_csrf_gated() {
+    // Unauthenticated → the login gate. Logged-in non-admin → 403
+    // (RequireAdmin). Missing CSRF → 403 (middleware, outside
+    // RequireAdmin). None of these may touch the disk.
+    let (base, _shutdown, dir) = boot().await;
+    let cl = client();
+    let (admin_cookie, _admin_csrf) = login_admin(&cl, &base).await;
+    let cert_before = std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap();
+
+    // Unauthenticated: the session gate redirects to /login.
+    let resp = cl
+        .post(format!("{base}/admin/tls/regenerate"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login"
+    );
+
+    // Logged-in non-admin: 403 from RequireAdmin.
+    let (plain_cookie, _plain_csrf) = login_plain_user(&cl, &base, &admin_cookie).await;
+    let resp = cl
+        .post(format!("{base}/admin/tls/regenerate"))
+        .header("cookie", &plain_cookie)
+        .form(&[("sans", "nope.example")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Admin but missing CSRF token → 403 before the handler runs.
+    let resp = cl
+        .post(format!("{base}/admin/tls/regenerate"))
+        .header("cookie", &admin_cookie)
+        .form(&[("sans", "nope.example")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Nothing regenerated in any refusal path.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config/tls/cert.pem")).unwrap(),
+        cert_before,
+        "refused requests must not regenerate"
+    );
+}
+
+#[tokio::test]
+async fn regenerate_form_is_on_the_tls_card() {
+    let (base, _shutdown, _dir) = boot().await;
+    let cl = client();
+    let (cookie, _csrf) = login_admin(&cl, &base).await;
+    let page = cl
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains("/admin/tls/regenerate"),
+        "regenerate form action missing: {html}"
+    );
+    assert!(
+        html.contains("Regenerate self-signed certificate"),
+        "regenerate form heading missing"
+    );
+}
+
+#[tokio::test]
+async fn tls_regenerate_without_live_listener_flashes_restart_required() {
+    // The None branch (a process that never served TLS): disk state is
+    // real but not live — flash the restart-required variant instead
+    // of claiming a hot-swap that cannot happen. Driven at the
+    // handler level for the same reasons as the reset M5 test above.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let login = mycelium_auth::login::LoginService::new(store.pool().clone());
+    let assets_dir = dir.path().join("assets");
+    mycelium_web::assets::scaffold_defaults(&assets_dir).unwrap();
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        assets_dir,
+        dir.path().to_path_buf(),
+        None, // no live TLS handle
+    );
+    let resp = mycelium_web::api::tls_regenerate(
+        axum::extract::State(state),
+        mycelium_auth::rbac::RequireAdmin,
+        axum::Form(mycelium_web::api::RegenerateForm {
+            sans: "none.example".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let flash = percent_decode(&loc);
+    assert!(
+        flash.contains("takes effect after restart"),
+        "None-path must flash the restart-required variant: {flash}"
+    );
+    // The pair on disk was regenerated with the requested SANs.
+    let tls_dir = dir.path().join("config/tls");
+    assert_eq!(
+        std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+        "none.example\n"
+    );
+    let cert = std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap();
+    let (_, p) = x509_parser::pem::parse_x509_pem(cert.as_bytes()).unwrap();
+    let parsed = p.parse_x509().unwrap();
+    let san_text = format!(
+        "{:?}",
+        parsed
+            .extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME)
+            .expect("SAN extension")
+    );
+    assert!(san_text.contains("none.example"), "{san_text}");
+}

@@ -119,30 +119,88 @@ fn write_pair(
     Ok(())
 }
 
-/// The managed generated pair: create if absent, regenerate if the
-/// requested SAN set changed (sidecar sans.txt). Never touches an
-/// uploaded pair.
+/// The managed generated pair, with sidecar-wins boot semantics:
+///
+/// - sans.txt + complete pair  → no-op. The sidecar is the desired-state
+///   record: the env/flag requested set is only the FIRST-BOOT
+///   initializer, so a set chosen in the admin UI survives restarts
+///   even when the env var still says something else.
+/// - sans.txt + incomplete pair → regenerate from the RECORDED set
+///   (restores what was recorded, not what the env says today).
+/// - no sidecar (absent, blank, or garbage) → regenerate from the
+///   requested set and write the sidecar. Removing sans.txt is the
+///   documented escape hatch that hands control back to the env/flag.
+///
+/// Never touches an uploaded pair.
 pub fn ensure_managed_pair(tls_dir: &Path, sans: &[String]) -> Result<(), CertError> {
     let cert = tls_dir.join("cert.pem");
     let key = tls_dir.join("key.pem");
-    let sidecar = tls_dir.join("sans.txt");
+    let sidecar_content = std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap_or_default();
+    let recorded = parse_sidecar(&sidecar_content);
+    match recorded {
+        // Sidecar is authoritative and the pair is complete → nothing
+        // to do, whatever the requested set says.
+        Some(_) if cert.exists() && key.exists() => Ok(()),
+        // Sidecar exists but the pair is incomplete → rebuild from the
+        // recorded set (restores what was recorded, not what the env
+        // says today).
+        Some(recorded_sans) => regenerate_managed_pair(tls_dir, &recorded_sans),
+        // No sidecar → the requested set initializes.
+        None => regenerate_managed_pair(tls_dir, sans),
+    }
+}
+
+/// Parse a sans.txt sidecar into a SAN list. Blank/garbage/unreadable
+/// content reads as no sidecar (None); a non-empty list of names is
+/// the recorded set, order-stable.
+fn parse_sidecar(content: &str) -> Option<Vec<String>> {
+    let names: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// Unconditionally regenerate the managed generated pair: a fresh key
+/// (the old key is treated as suspect — identical SANs still mint a
+/// new pair) and a fresh self-signed cert carrying `sans`, plus the
+/// sans.txt sidecar. The admin Regenerate action and every
+/// ensure_managed_pair regen branch run through here so the write
+/// sequence exists exactly once. Never touches an uploaded pair or a
+/// pending CSR.
+///
+/// Ordering (security review F2): the new pair is minted IN MEMORY
+/// before anything is removed — rcgen validates the SAN names there
+/// (e.g. non-ASCII is rejected), so a refused call is a plain error
+/// and the existing pair is never destroyed. Only after the mint
+/// succeeds do the removes + writes run.
+pub fn regenerate_managed_pair(tls_dir: &Path, sans: &[String]) -> Result<(), CertError> {
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+    // Mint first: everything rcgen can refuse (empty list, non-ASCII
+    // names) is refused HERE, before any existing file is touched.
+    if sans.is_empty() {
+        return Err(CertError::Generate("SAN list must not be empty".into()));
+    }
+    std::fs::create_dir_all(tls_dir)?;
+    let cert = rcgen::generate_simple_self_signed(sans.to_vec())
+        .map_err(|e| CertError::Generate(e.to_string()))?;
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    // Remove the old pair only now (regeneration replaces; the key is
+    // create_new so a stale key must not block the fresh write).
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+    write_pair(&cert_pem, &key_pem, &cert_path, &key_path)?;
     let requested: String = sans
         .iter()
         .map(|s| s.as_str())
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let regenerate = !matches!(
-        std::fs::read_to_string(&sidecar),
-        Ok(existing) if existing == requested && cert.exists() && key.exists()
-    );
-    if regenerate {
-        // Remove the old generated pair first (regeneration replaces).
-        let _ = std::fs::remove_file(&cert);
-        let _ = std::fs::remove_file(&key);
-        generate_self_signed_with_sans(tls_dir, &cert, &key, sans)?;
-        std::fs::write(&sidecar, &requested)?;
-    }
+    std::fs::write(tls_dir.join("sans.txt"), &requested)?;
     Ok(())
 }
 
@@ -254,7 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn sans_sidecar_written_and_regen_on_change() {
+    fn sans_sidecar_is_authoritative_once_written() {
+        // Sidecar-wins boot semantics: once sans.txt records a set,
+        // it — not the env/flag requested set — is the desired state.
+        // Boot never regenerates a complete pair (the UI's decision
+        // survives restarts); the env/flag set is only the first-boot
+        // initializer.
         let dir = tempfile::tempdir().unwrap();
         let tls_dir = dir.path().join("config/tls");
         let sans_a = vec!["localhost".to_string()];
@@ -264,19 +327,211 @@ mod tests {
             std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
             "localhost\n"
         );
-        // Different requested set → regenerate.
-        ensure_managed_pair(&tls_dir, &sans_b).unwrap();
-        let text = cert_dns_sans(&tls_dir.join("cert.pem")).join(",");
-        assert!(
-            text.contains("example.com"),
-            "regenerated cert must carry new SAN: {text}"
-        );
-        // Same set → no regenerate (mtime-based check is flaky; assert
-        // by content: writing sans_b again is a no-op that keeps the file).
+        // Different REQUESTED set with a complete pair on disk →
+        // no-op (the sidecar is authoritative, the initializer loses).
         let before = std::fs::read(tls_dir.join("cert.pem")).unwrap();
         ensure_managed_pair(&tls_dir, &sans_b).unwrap();
         let after = std::fs::read(tls_dir.join("cert.pem")).unwrap();
-        assert_eq!(before, after, "same SAN set must not regenerate");
+        assert_eq!(before, after, "complete pair + sidecar must not regenerate");
+        // Same set → still no-op.
+        ensure_managed_pair(&tls_dir, &sans_a).unwrap();
+        assert_eq!(
+            before,
+            std::fs::read(tls_dir.join("cert.pem")).unwrap(),
+            "same set must not regenerate"
+        );
+        // The sidecar keeps its recorded content.
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "localhost\n"
+        );
+    }
+
+    #[test]
+    fn incomplete_pair_regenerates_from_sidecar_not_requested() {
+        // sans.txt exists but the pair is incomplete (a crash between
+        // writes, or an operator removed one half): boot rebuilds from
+        // the RECORDED set — not the env set — so it restores what was
+        // recorded, not what the environment happens to say today.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["sidecar.example".to_string()]).unwrap();
+        std::fs::remove_file(tls_dir.join("cert.pem")).unwrap();
+        ensure_managed_pair(&tls_dir, &["env.example".to_string()]).unwrap();
+        let text = cert_dns_sans(&tls_dir.join("cert.pem")).join(",");
+        assert!(text.contains("sidecar.example"), "{text}");
+        assert!(!text.contains("env.example"), "{text}");
+        // The sidecar keeps its recorded set.
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "sidecar.example\n"
+        );
+    }
+
+    #[test]
+    fn absent_sidecar_uses_requested_set_and_writes_it() {
+        // No sidecar (fresh boot, or the operator removed sans.txt to
+        // hand control back to the env/flag initializer): the requested
+        // set initializes the pair and the sidecar records it.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["fresh.example".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "fresh.example\n"
+        );
+        let text = cert_dns_sans(&tls_dir.join("cert.pem")).join(",");
+        assert!(text.contains("fresh.example"), "{text}");
+    }
+
+    #[test]
+    fn empty_or_garbage_sidecar_reads_as_absent() {
+        // A sidecar that parses to an empty list (blank file) or is
+        // unreadable behaves like no sidecar: the requested set
+        // initializes. This must never fail boot.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("sans.txt"), "\n \n").unwrap();
+        ensure_managed_pair(&tls_dir, &["fallback.example".to_string()]).unwrap();
+        let text = cert_dns_sans(&tls_dir.join("cert.pem")).join(",");
+        assert!(text.contains("fallback.example"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "fallback.example\n"
+        );
+    }
+
+    // ---------- regenerate_managed_pair (admin Regenerate action) ----------
+
+    #[test]
+    fn regenerate_mints_fresh_key_even_for_identical_sans() {
+        // The action is never a silent no-op: identical SANs still mint
+        // a fresh key (the "old key is suspect" use case). A random
+        // P-256 key makes the byte comparison decisive.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["same.example".to_string()]).unwrap();
+        let key_before = std::fs::read_to_string(tls_dir.join("key.pem")).unwrap();
+        let cert_before = std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap();
+        regenerate_managed_pair(&tls_dir, &["same.example".to_string()]).unwrap();
+        let key_after = std::fs::read_to_string(tls_dir.join("key.pem")).unwrap();
+        assert_ne!(key_before, key_after, "regenerate must mint a fresh key");
+        assert_ne!(
+            std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap(),
+            cert_before,
+            "fresh key means a fresh certificate too"
+        );
+        // The key keeps 0600 (regeneration reuses the create_new path).
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(tls_dir.join("key.pem"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // The sidecar records the same set — content, not just mtime.
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "same.example\n"
+        );
+    }
+
+    #[test]
+    fn regenerate_writes_new_sans_into_cert_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["localhost".to_string()]).unwrap();
+        regenerate_managed_pair(
+            &tls_dir,
+            &["regen.example".to_string(), "alt.example".to_string()],
+        )
+        .unwrap();
+        // Sidecar: the requested set, one per line, trailing newline.
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            "regen.example\nalt.example\n"
+        );
+        // The minted cert actually carries the SANs.
+        let text = cert_dns_sans(&tls_dir.join("cert.pem")).join(",");
+        assert!(text.contains("regen.example"), "SAN missing: {text}");
+        assert!(text.contains("alt.example"), "SAN missing: {text}");
+    }
+
+    #[test]
+    fn regenerate_never_touches_uploaded_or_pending_files() {
+        // Regeneration owns exactly cert.pem/key.pem/sans.txt. The
+        // uploaded pair is never regenerated or touched (the boot
+        // precedence contract), and a pending CSR is its own lifecycle.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        let keep = [
+            "uploaded-cert.pem",
+            "uploaded-key.pem",
+            "uploaded.json",
+            "pending-csr-key.pem",
+            "pending.json",
+        ];
+        for name in keep {
+            std::fs::write(tls_dir.join(name), format!("{name} body")).unwrap();
+        }
+        regenerate_managed_pair(&tls_dir, &["keep.example".to_string()]).unwrap();
+        for name in keep {
+            assert_eq!(
+                std::fs::read_to_string(tls_dir.join(name)).unwrap(),
+                format!("{name} body"),
+                "{name} must survive regeneration byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn regenerate_empty_sans_refused_loudly_before_any_write() {
+        // generate_self_signed_with_sans refuses empty lists (rcgen
+        // would emit a SAN-less cert); regenerate inherits the guard.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["localhost".to_string()]).unwrap();
+        let err = regenerate_managed_pair(&tls_dir, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("SAN list must not be empty"),
+            "got {err:?}"
+        );
+        // The refused call must not have deleted the existing pair.
+        assert!(tls_dir.join("cert.pem").exists());
+        assert!(tls_dir.join("key.pem").exists());
+    }
+
+    #[test]
+    fn regenerate_rcgen_refusal_leaves_existing_pair_intact() {
+        // Security review F2: rcgen rejects non-ASCII SAN names
+        // (InvalidAsn1String) at generation time. The generation must
+        // happen in memory BEFORE the old pair is removed, so a refused
+        // name is a plain error — never the existing pair destroyed.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("config/tls");
+        ensure_managed_pair(&tls_dir, &["localhost".to_string()]).unwrap();
+        let cert_before = std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap();
+        let key_before = std::fs::read_to_string(tls_dir.join("key.pem")).unwrap();
+        let sidecar_before = std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap();
+        let err = regenerate_managed_pair(&tls_dir, &["café.example".to_string()]).unwrap_err();
+        assert!(!err.to_string().is_empty(), "a refusal is an error");
+        // rcgen's message names the offending IA5String encoding.
+        assert!(err.to_string().contains("IA5String"), "got {err:?}");
+        // Nothing was removed or overwritten by the refused call.
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("cert.pem")).unwrap(),
+            cert_before,
+            "refused regeneration must leave the cert intact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("key.pem")).unwrap(),
+            key_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(tls_dir.join("sans.txt")).unwrap(),
+            sidecar_before
+        );
     }
 
     #[tokio::test]
