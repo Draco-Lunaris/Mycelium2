@@ -385,10 +385,14 @@ async fn run_chat_turn(
         Err(e) => {
             // Hard error (step cap, …). A run that emitted its own
             // Failed event already persisted + broadcast the error
-            // row in the loop above — exactly one error row either
-            // way.
+            // row in the loop above — a second row here would double
+            // it, so the detail is appended only when the run did NOT
+            // emit its own event (`failed_seen` false = the error took
+            // a path with no event, e.g. an LLM-transport class error
+            // surfaced as a hard error): exactly one error row either
+            // way (D4 — Task 5's step-cap pin caught the polarity).
             tracing::error!(error = %e, turn_id = %turn_id, "chat run failed");
-            let row = failed_seen.then(|| e.to_string());
+            let row = (!failed_seen).then(|| e.to_string());
             finish_turn(
                 &ctx,
                 &master,
