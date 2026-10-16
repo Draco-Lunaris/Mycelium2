@@ -12,11 +12,14 @@
 //! replays and closes immediately — poll semantics, so a
 //! poll-shaped reopen is well-defined.
 //!
-//! Both submission endpoints funnel through `submit_turn`, which first
-//! clears the LLM gate's queue-depth cap ([`check_queue_depth`], LLM
-//! concurrency spec §3.3): at the cap the submit is refused 429 +
-//! `Retry-After: 5` BEFORE any session or turn row exists, so a full
-//! queue never strands rows nobody will run.
+//! Both submission endpoints clear the LLM gate's queue-depth cap
+//! ([`check_queue_depth`], LLM concurrency spec §3.3) as their first act
+//! after input validation — once per submission, ahead of every row
+//! that submission writes: at the cap the submit is refused 429 +
+//! `Retry-After: 5` while no session or turn row exists, so a full queue
+//! never strands rows nobody will run. The admitted config then travels
+//! into the shared `submit_turn`, which never re-checks (a second look
+//! at a live depth could refuse after a row was committed).
 
 use std::sync::Arc;
 
@@ -115,18 +118,21 @@ pub async fn api_chat_create_session(
     if form.message.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty message");
     }
+    // The depth cap is checked ONCE per submission, here, ahead of every
+    // write this path makes — the session row included (spec §3.3: a
+    // refusal leaves nothing behind). A second check between the session
+    // and turn rows would re-read a live, mutating quantity and could
+    // refuse after the session was committed, which is exactly the empty
+    // draft session the cap exists to prevent; so the admitted config
+    // travels into `submit_turn` instead of being re-derived there.
+    let llm = match check_queue_depth(&state).await {
+        Admission::Admitted(llm) => llm,
+        Admission::Refused(refusal) => return refusal,
+    };
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     };
-    // The depth cap lands BEFORE the session row too (spec §3.3: a
-    // refusal leaves nothing behind — no empty draft session, no turn).
-    // `submit_turn` checks again for its own sake; both checks read the
-    // same stored config, so the draft path pays one extra config read
-    // to keep the refusal ahead of every write.
-    if let Admission::Refused(refusal) = check_queue_depth(&state).await {
-        return refusal;
-    }
     let title = mycelium_librarian::fallback::derive_title(&form.message);
     let session_id = match state
         .chat_sessions
@@ -146,6 +152,7 @@ pub async fn api_chat_create_session(
             seq: 0,
         }),
         form.message,
+        llm,
     )
     .await
 }
@@ -163,11 +170,16 @@ pub async fn api_chat_submit_session(
     if form.message.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty message");
     }
+    // One depth check per submission, before the turn row (spec §3.3).
+    let llm = match check_queue_depth(&state).await {
+        Admission::Admitted(llm) => llm,
+        Admission::Refused(refusal) => return refusal,
+    };
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     };
-    submit_turn(&state, &user, master, session_id, None, form.message).await
+    submit_turn(&state, &user, master, session_id, None, form.message, llm).await
 }
 
 /// GET /api/v1/chat/sessions/{id}/stream?after=n — reattach. `after`
@@ -246,9 +258,17 @@ pub async fn api_chat_delete_redirect(
 
 /// The shared submit path (draft-create and {id} submit): create the
 /// turn row (the double-submit guard), build the detached runner's
-/// context (LLM config + library visibility resolve HERE — they borrow
-/// `AppState`, which the task must not), spawn the run, then stream.
-/// `first_event` is the draft flow's `session` event.
+/// context (library visibility resolves HERE — it borrows `AppState`,
+/// which the task must not), spawn the run, then stream. `first_event`
+/// is the draft flow's `session` event.
+///
+/// `llm` is the clamped config the CALLER was admitted with
+/// ([`check_queue_depth`]): the depth check happens exactly once per
+/// submission, in the handler, ahead of every row that submission
+/// writes. Re-checking here would re-read a live quantity after the
+/// draft path's session row is already committed — the empty draft
+/// session spec §3.3 forbids — so this function is deliberately not an
+/// admission point.
 async fn submit_turn(
     state: &AppState,
     user: &SessionUser,
@@ -256,16 +276,8 @@ async fn submit_turn(
     session_id: Uuid,
     first_event: Option<ChatSseEvent>,
     message: String,
+    llm: crate::LlmConfig,
 ) -> Response {
-    // Admission check before the first row of this submit: at the gate's
-    // configured queue depth the submission is refused outright, so a
-    // full queue never leaves a turn row nobody will ever run (spec
-    // §3.3). The clamped config comes back for the runner's context —
-    // one load, the same row the runner would read.
-    let llm = match check_queue_depth(state).await {
-        Admission::Admitted(llm) => llm,
-        Admission::Refused(refusal) => return refusal,
-    };
     let turn = match state
         .chat_sessions
         .create_turn(user.user_id, &master, session_id, &message)
@@ -316,6 +328,11 @@ async fn submit_turn(
 /// configured depth. Returns the clamped config for the runner's
 /// context, or the 429 response.
 ///
+/// Called EXACTLY ONCE per submission, by the handler, before that
+/// submission's first row write — never again further down the path:
+/// the depth is a live quantity, so a second look could refuse after a
+/// row was already committed (the draft flow's empty session).
+///
 /// Best effort by design, not a lock: two submits racing at depth − 1
 /// can both pass. That is acceptable — each turn's wait is bounded, so
 /// the overshoot costs one extra waiter, never an unbounded queue — and
@@ -327,9 +344,12 @@ async fn check_queue_depth(state: &AppState) -> Admission {
             .unwrap_or_default()
             .clamp();
     llm.sync_gate();
-    if LLM_GATE.chat_queue_depth() >= llm.chat_queue_depth as usize {
+    // One read of the live depth: the comparison and the log line must
+    // report the same number.
+    let depth = LLM_GATE.chat_queue_depth();
+    if depth >= llm.chat_queue_depth as usize {
         tracing::warn!(
-            depth = LLM_GATE.chat_queue_depth(),
+            depth,
             limit = llm.chat_queue_depth,
             "chat submit refused: LLM queue at its depth cap"
         );
