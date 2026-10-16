@@ -2135,8 +2135,50 @@ form needs it alongside the issued certificate.</p>
     ))
 }
 
+/// The LLM-gate readout card on the admin System page (LLM-concurrency
+/// spec §3.6): the live admission state — runs holding a slot, waiters
+/// queued, the configured slot count — plus the gate's timeout counter.
+///
+/// "Recent timeouts" is rendered HONESTLY as the cumulative count since
+/// process start: the gate keeps no time-windowed counter, so the label
+/// says "since start" rather than implying a window that does not
+/// exist.
+///
+/// The values arrive already read: all four come from the single
+/// `LLM_GATE.stats()` read inside `health::system_stats`, carried here
+/// through `SystemPageStats`. This function never touches the gate, so
+/// the card and the StatTiles above it describe the same instant.
+///
+/// Escaping: every value is a typed `i64` formatted by this function —
+/// no caller-, config- or network-influenced text reaches the markup,
+/// so there is no attacker-controlled string to escape (contrast
+/// `tls_card`, which escapes its certificate strings). Follows that
+/// card's composition: a constant-label row helper, existing CSS
+/// (`card`, `muted`), no new classes.
+pub fn llm_card(stats: &crate::api::SystemPageStats) -> String {
+    let row = |label: &str, value: i64| {
+        format!(r#"<p><strong>{label}</strong> <span>{value}</span></p>"#)
+    };
+    let mut body = String::new();
+    body.push_str(&row("Active", stats.llm_active));
+    body.push_str(&row("Queued", stats.llm_queued));
+    body.push_str(&row("Capacity", stats.llm_capacity));
+    body.push_str(&row(
+        "Capacity timeouts (since start)",
+        stats.llm_timeouts_total,
+    ));
+    body.push_str(
+        r#"<p class="muted">Active runs hold one of the configured slots; queued runs are waiting for one. A timeout is a run whose wait bound elapsed before a slot came free — chat turns surface it to the user, searches fall back to keywords. Active may briefly exceed capacity after the limit is lowered: the gate never preempts a run in flight.</p>"#,
+    );
+    mycelium_ui::render::render(mycelium_ui::card(
+        "LLM runs",
+        TrustedHtml::from_markup(body),
+    ))
+}
+
 /// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value), the TLS card, and the backup download
+/// StatTiles (a tile per value), the LLM-gate readout card, the TLS
+/// card, and the backup download
 /// (the existing POST /admin/backup button + the no-store rationale).
 /// The ingest-jobs table moved to /status (spec §8's PR-4 ruling —
 /// /status is the jobs-table home; the PR-3 placement here was a
@@ -2182,8 +2224,12 @@ pub fn admin_system_page(
         "System",
         TrustedHtml::from_markup(""),
     ));
+    // The LLM card sits directly under the queue/health tiles (spec
+    // §3.6: "next to the existing queue table"), ahead of the TLS and
+    // maintenance cards.
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}{}",
+        "{header}{tabs}{flash}{stats_html}{}{}{}",
+        llm_card(stats),
         tls_card(cert, pending, csrf),
         mycelium_ui::render::render(mycelium_ui::card(
             "Maintenance",

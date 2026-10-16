@@ -2934,3 +2934,100 @@ async fn sync_llm_gate_from_store_applies_the_stored_limits() {
     mycelium_web::server::sync_llm_gate_from_store(&state).await;
     assert_eq!(LLM_GATE.capacity(), 64);
 }
+
+// ---------------------------------------------------------------------
+// /admin/system LLM readout card (LLM concurrency spec §3.6: "an LLM
+// card readout (active/queued/capacity, recent timeouts) next to the
+// existing queue table"). The card renders from the request's ONE
+// `LLM_GATE.stats()` read, so slots held here must show up in the
+// markup as live values — never the all-zero shape a hardcoded card
+// would print.
+// ---------------------------------------------------------------------
+
+/// The card's rendered stat row for `label`, as the page composes it.
+fn llm_stat_row(label: &str, value: &str) -> String {
+    format!("<strong>{label}</strong> <span>{value}</span>")
+}
+
+#[tokio::test]
+async fn admin_system_shows_llm_readout() {
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 2,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+
+    LLM_GATE.set_capacity(2);
+    // Both slots held: active == capacity == 2.
+    let _hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the first slot is free");
+    let _hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the second slot is free");
+
+    // One wait-class admission that cannot be served: its bound elapses
+    // against the full gate, so the cumulative timeout counter moves
+    // (proving the card's timeouts row is read, not printed as a 0).
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    assert!(
+        LLM_GATE
+            .enter(None, Duration::from_millis(50), |_| {})
+            .await
+            .is_err(),
+        "a full gate cannot admit within a 50ms bound"
+    );
+    let want_timeouts = timeouts_before + 1;
+    poll_gate_until(
+        || LLM_GATE.stats().timeouts_total == want_timeouts,
+        "the timeout counter advancing",
+    )
+    .await;
+
+    // …and one waiter still queued when the page renders.
+    let waiter =
+        tokio::spawn(async move { LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.is_ok() });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "one waiter queued").await;
+
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        html.contains("LLM runs"),
+        "the System page must carry the LLM runs card: {html}"
+    );
+    for row in [
+        llm_stat_row("Active", "2"),
+        llm_stat_row("Queued", "1"),
+        llm_stat_row("Capacity", "2"),
+        llm_stat_row(
+            "Capacity timeouts (since start)",
+            &want_timeouts.to_string(),
+        ),
+    ] {
+        assert!(
+            html.contains(&row),
+            "the LLM card must render the live gate value {row}: {html}"
+        );
+    }
+
+    waiter.abort();
+    shutdown.cancel();
+}

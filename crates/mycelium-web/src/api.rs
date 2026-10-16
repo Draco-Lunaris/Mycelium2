@@ -2279,6 +2279,13 @@ pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
 /// shared computation). Renamed SystemPageStats in PR 4 (the Task-1
 /// review's ruling) so only the health-side struct carries the
 /// SystemStats name.
+///
+/// The four `llm_*` gate values carry the LLM-concurrency spec §3.6
+/// readout card. They ride through as the `i64`s `SystemStats` already
+/// holds (no second conversion) and all four come from that struct's
+/// ONE `LLM_GATE.stats()` read — neither this DTO nor the page reads
+/// the gate again, so the card cannot disagree with the tiles beside
+/// it.
 #[derive(Debug)]
 pub struct SystemPageStats {
     pub users: i64,
@@ -2286,6 +2293,10 @@ pub struct SystemPageStats {
     pub oldest_pending_age_seconds: Option<i64>,
     pub queue_dead_count: usize,
     pub llm_last_success_seconds: Option<i64>,
+    pub llm_active: i64,
+    pub llm_queued: i64,
+    pub llm_capacity: i64,
+    pub llm_timeouts_total: i64,
 }
 
 /// GET /admin/users — the users table + create-user side card
@@ -2442,6 +2453,10 @@ pub async fn admin_system_view(
         oldest_pending_age_seconds: s.oldest_pending_age_seconds,
         queue_dead_count: s.queue_dead_count as usize,
         llm_last_success_seconds: s.llm_last_success_seconds,
+        llm_active: s.llm_active,
+        llm_queued: s.llm_queued,
+        llm_capacity: s.llm_capacity,
+        llm_timeouts_total: s.llm_timeouts_total,
     };
     let admin = request_admin_user(&state, &session).await;
     // The TLS card's inputs: the ACTIVE cert's parsed details and the

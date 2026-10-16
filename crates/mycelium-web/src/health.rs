@@ -43,6 +43,14 @@ pub(crate) fn oldest_degraded_at_secs() -> i64 {
 /// given `SystemStats` sees one consistent point-in-time gate state.
 /// They are observability only: no degraded rule consults them — the
 /// gate never degrades health on its own.
+///
+/// `llm_timeouts_total` is the gate's CUMULATIVE wait-class timeout
+/// count since process start (the admin System card's "recent
+/// timeouts" readout — labeled there as "since start", because the gate
+/// keeps no windowed counter). It rides the same single `stats()` read
+/// as the three gauges beside it; it is DELIBERATELY not reported by
+/// the `/health` JSON, whose gate fields stay the three spec §4.2
+/// gauges.
 pub struct SystemStats {
     pub user_count: i64,
     pub queue_depth: i64,
@@ -52,6 +60,7 @@ pub struct SystemStats {
     pub llm_active: i64,
     pub llm_queued: i64,
     pub llm_capacity: i64,
+    pub llm_timeouts_total: i64,
     pub db_ok: bool,
 }
 
@@ -92,6 +101,7 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
         llm_active: gate.active as i64,
         llm_queued: gate.queued as i64,
         llm_capacity: gate.capacity as i64,
+        llm_timeouts_total: gate.timeouts_total as i64,
         db_ok,
     }
 }
