@@ -99,6 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
     );
 
+    // LLM admission gate first (LLM concurrency spec §3.2): every boot
+    // sweep and worker below admits on the process-global gate — the
+    // mutation-queue drain pass runs inline right here, and both
+    // long-lived workers tick immediately on spawn. Syncing the stored
+    // `max_parallel` before any of them is what keeps that boot burst
+    // inside the operator's capacity instead of the built-in default.
+    mycelium_web::server::sync_llm_gate_from_store(&state).await;
+
     // Librarian boot sweep: fail jobs interrupted by a previous
     // shutdown, requeue pending ones.
     match state.librarian.recover_on_boot().await {

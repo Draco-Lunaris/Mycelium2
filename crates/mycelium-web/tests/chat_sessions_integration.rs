@@ -2878,3 +2878,59 @@ async fn boot_syncs_gate_from_stored_config() {
     .await;
     shutdown.cancel();
 }
+
+#[tokio::test]
+async fn sync_llm_gate_from_store_applies_the_stored_limits() {
+    // The shared boot-sync entry point (`main` calls it before the
+    // queue drain pass and before either worker is spawned; `serve`
+    // calls it again, idempotently). Asserted WITHOUT a server: the
+    // function alone must make a stored row live, clamped, so the
+    // try-class boot work cannot run against the defaults.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let login = LoginService::new(store.pool().clone());
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        dir.path().join("assets"),
+        dir.path().to_path_buf(),
+        None,
+    );
+    // Stored out of range on purpose: the sync clamps as it applies.
+    state
+        .config
+        .set(
+            "llm",
+            &mycelium_web::LlmConfig {
+                url: "http://unused.invalid/v1".into(),
+                model: "mock".into(),
+                api_key: None,
+                max_parallel: 999,
+                per_user_active: 7,
+                chat_queue_depth: 11,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    mycelium_web::server::sync_llm_gate_from_store(&state).await;
+    assert_eq!(LLM_GATE.capacity(), 64, "clamped capacity applied");
+    assert_eq!(LLM_GATE.per_user_active(), 7, "per-user cap applied");
+    assert_eq!(
+        LLM_GATE.chat_queue_depth_limit(),
+        11,
+        "queue-depth cap applied"
+    );
+
+    // Idempotent: calling it again (as `serve` does after `main`) is a
+    // no-op on the same row.
+    mycelium_web::server::sync_llm_gate_from_store(&state).await;
+    assert_eq!(LLM_GATE.capacity(), 64);
+}
