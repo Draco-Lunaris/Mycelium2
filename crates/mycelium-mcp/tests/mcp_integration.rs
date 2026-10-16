@@ -2,15 +2,46 @@
 //! exercise the 2026-07-28 stateless MCP protocol end-to-end —
 //! auth rejection, tools/list, tools/call (memory + skills), and
 //! per-user isolation.
+//!
+//! `memory_query` now admits through the process-global
+//! `llm_gate::LLM_GATE`, so every test in this binary that runs a query
+//! — or holds/reconfigures gate slots — serializes on [`TEST_LOCK`] and
+//! restores the gate's defaults through [`GateDefaults`] (declared after
+//! the lock guard, so the restore happens while the lock is still held).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use axum::response::IntoResponse;
 use mycelium_auth::login::LoginService;
+use mycelium_librarian::llm_gate::{
+    DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
+};
 use mycelium_store::Store;
 use mycelium_web::AppState;
 
 /// Known admin password for the pre-seeded account (tests log in with it).
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
+
+/// Serializes all gate-sensitive tests in this binary (every test that
+/// runs `memory_query`, since a query now takes gate capacity).
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Wait bound for the gate holds this suite takes.
+const GATE_BOUND: Duration = Duration::from_secs(10);
+
+/// Restores the process-global gate's tunables on drop, so a failing
+/// assertion cannot leak a reconfigured gate into the next test.
+struct GateDefaults;
+
+impl Drop for GateDefaults {
+    fn drop(&mut self) {
+        LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+        LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
+        LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
+    }
+}
 
 /// Boot a test server on an ephemeral HTTPS port; returns the base URL,
 /// the shutdown token, and the temp data dir.
@@ -256,6 +287,9 @@ fn request_meta() -> serde_json::Value {
 
 #[tokio::test]
 async fn mcp_full_flow() {
+    // This flow runs memory_query, which admits through the shared gate.
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
     let (base, shutdown, dir, pool) = boot().await;
     let client = client();
 
@@ -1184,4 +1218,330 @@ async fn private_shelf_gets_the_same_grouping() {
     );
 
     shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: memory_query's bounded gate wait.
+//
+// These cases call `tools::memory_query` directly: the tool takes
+// `&McpState` + `&McpUser`, so no HTTP server is needed — and with no
+// server the only gate traffic is the test's own. They need a REACHABLE
+// mock LLM: `boot()`'s default config points at an unreachable Ollama,
+// so a "falls back" assertion would pass vacuously against it.
+// ---------------------------------------------------------------------------
+
+/// A minimal OpenAI-compatible mock (the file-local mock helper the
+/// librarian test suite established — copied per test binary by
+/// convention): serves scripted responses LIFO, captures every request.
+type MockShared = Arc<tokio::sync::Mutex<MockLlmState>>;
+struct MockLlmState {
+    responses: Vec<serde_json::Value>,
+    requests: Vec<serde_json::Value>,
+}
+
+async fn mock_llm(responses: Vec<serde_json::Value>) -> (String, MockShared) {
+    let state: MockShared = Arc::new(tokio::sync::Mutex::new(MockLlmState {
+        responses,
+        requests: Vec::new(),
+    }));
+    let handler_state = Arc::clone(&state);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |body: String| {
+            let state = handler_state;
+            async move {
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let mut guard = state.lock().await;
+                guard.requests.push(parsed);
+                match guard.responses.pop() {
+                    Some(resp) => axum::Json(resp).into_response(),
+                    None => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "script exhausted",
+                    )
+                        .into_response(),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), state)
+}
+
+fn text_response(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{ "message": { "role": "assistant", "content": text } }]
+    })
+}
+
+/// How many requests the mock LLM has served.
+async fn llm_requests(mock: &MockShared) -> usize {
+    mock.lock().await.requests.len()
+}
+
+/// A direct-invocation harness for `tools::memory_query`.
+struct QueryHarness {
+    _dir: tempfile::TempDir,
+    state: mycelium_mcp::McpState,
+    user: mycelium_mcp::auth::McpUser,
+}
+
+/// Build a harness whose sealed "llm" config points at `llm_url` with
+/// the given gate limits, and whose private bundle holds one concept (so
+/// the deterministic keyword fallback has something to rank).
+async fn query_harness(llm_url: &str, max_parallel: u32, query_wait_secs: u32) -> QueryHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let config = mycelium_store::ConfigStore::new(store.pool().clone());
+    let llm = mycelium_librarian::llm::LlmConfig {
+        url: llm_url.to_string(),
+        model: "mock".into(),
+        max_parallel,
+        query_wait_secs,
+        ..Default::default()
+    };
+    // Sealed shape (what the admin surface writes); the tool reads it
+    // back through config::get_sealed.
+    config
+        .set(
+            "llm",
+            &mycelium_store::config::seal_config(&service_key, "llm", &llm),
+        )
+        .await
+        .unwrap();
+
+    let user_id = uuid::Uuid::new_v4();
+    let master = mycelium_crypto::generate_master_key();
+    let cs = mycelium_store::concept_store::ConceptStore::for_user(&store, user_id, master.clone());
+    cs.put(
+        &mycelium_core::concept::Concept::parse(
+            "/notes/zebras.md",
+            "---\ntype: Note\ntitle: Zebra Facts\n---\n\nZebras have distinctive stripes.\n",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // The master key is primed in the cache, so no user row (and no
+    // service seal) is needed for the tool's key lookup.
+    let master_keys = Arc::new(mycelium_mcp::MasterKeyCache::default());
+    master_keys.insert(user_id, master);
+    let state = mycelium_mcp::McpState {
+        store: Arc::new(store),
+        service_key: Arc::new(service_key),
+        master_keys,
+        config: Arc::new(config),
+        notify: Arc::new(tokio::sync::Notify::new()),
+        enqueue_depth_cap: 50,
+    };
+    let user = mycelium_mcp::auth::McpUser {
+        user_id,
+        username: "gate-test".into(),
+        role: mycelium_auth::rbac::Role::User,
+    };
+    QueryHarness {
+        _dir: dir,
+        state,
+        user,
+    }
+}
+
+fn query_args(question: &str) -> mycelium_mcp::tools::MemoryQueryArgs {
+    mycelium_mcp::tools::MemoryQueryArgs {
+        question: question.to_string(),
+        limit: None,
+    }
+}
+
+/// Poll a gate condition with a deadline (never a bare sleep — the poll
+/// target is observable gate state).
+async fn poll_gate_until<F: FnMut() -> bool>(mut want: F, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if want() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw {what}: {:?}",
+            LLM_GATE.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Spec §3.3: with every slot taken, the query waits its bound and then
+/// the deterministic keyword fallback answers. The mock LLM proves the
+/// fallback came from the gate and not from an unreachable backend: it
+/// is reachable and sees ZERO requests.
+#[tokio::test]
+async fn memory_query_falls_back_when_gate_saturated() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let (llm_url, mock) = mock_llm(vec![text_response("the agent would have answered")]).await;
+    let h = query_harness(&llm_url, DEFAULT_CAPACITY as u32, 1).await;
+
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    let hold1 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    let hold2 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    assert_eq!(LLM_GATE.stats().active, DEFAULT_CAPACITY);
+
+    let out = mycelium_mcp::tools::memory_query(
+        &h.state,
+        &h.user,
+        &query_args("zebra stripes under a saturated gate"),
+    )
+    .await
+    .expect("a saturated gate never errors the tool");
+
+    match out {
+        mycelium_mcp::tools::QueryOutput::Hits(hits) => {
+            assert!(
+                !hits.is_empty(),
+                "the keyword fallback must still rank the bundle"
+            );
+        }
+        mycelium_mcp::tools::QueryOutput::Answer(a) => {
+            panic!(
+                "a saturated gate must degrade to the keyword fallback, got: {}",
+                a.answer
+            )
+        }
+    }
+    assert_eq!(
+        llm_requests(&mock).await,
+        0,
+        "the reachable mock LLM must never be called: the gate, not the backend, caused the fallback"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before + 1,
+        "exactly one wait-class timeout"
+    );
+
+    drop(hold1);
+    drop(hold2);
+}
+
+/// The wait is a wait, not a refusal: a query queued behind a full gate
+/// is admitted the moment a slot frees, and the agent's answer comes
+/// back rather than the fallback.
+#[tokio::test]
+async fn memory_query_admits_when_slot_frees() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let (llm_url, mock) = mock_llm(vec![text_response(
+        "Zebras are striped.\n\nSources:\n- /notes/zebras.md",
+    )])
+    .await;
+    // One slot, a generous wait bound: the query must queue, not time out.
+    let h = query_harness(&llm_url, 1, 60).await;
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+
+    let state = h.state.clone();
+    let user = h.user.clone();
+    let task = tokio::spawn(async move {
+        mycelium_mcp::tools::memory_query(
+            &state,
+            &user,
+            &query_args("what do you know about zebras while a slot is busy"),
+        )
+        .await
+    });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "the query queued").await;
+    assert_eq!(
+        llm_requests(&mock).await,
+        0,
+        "a queued query has not reached the LLM yet"
+    );
+
+    drop(hold);
+    let out = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("the admitted query must finish")
+        .expect("task joined")
+        .expect("query must succeed");
+    match out {
+        mycelium_mcp::tools::QueryOutput::Answer(a) => {
+            assert!(
+                a.answer.contains("Zebras are striped"),
+                "the agent's answer must come back: {}",
+                a.answer
+            );
+        }
+        mycelium_mcp::tools::QueryOutput::Hits(hits) => {
+            panic!("a freed slot must admit the agent, not fall back: {hits:?}")
+        }
+    }
+    assert_eq!(llm_requests(&mock).await, 1, "exactly one agent LLM call");
+}
+
+/// A cached answer costs no LLM time, so it must never wait on the gate:
+/// the same question answers promptly even with every slot taken, with
+/// no new LLM call and no new timeout.
+#[tokio::test]
+async fn memory_query_cache_hit_never_waits() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let question = "which animal has distinctive stripes in this bundle";
+    let (llm_url, mock) = mock_llm(vec![text_response(
+        "Zebras do.\n\nSources:\n- /notes/zebras.md",
+    )])
+    .await;
+    // A long bound: a gate wait would be unmistakable against it.
+    let h = query_harness(&llm_url, DEFAULT_CAPACITY as u32, 60).await;
+
+    // Prime the exact cache with one successful agent answer.
+    let primed = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args(question))
+        .await
+        .expect("priming query must succeed");
+    let primed = match primed {
+        mycelium_mcp::tools::QueryOutput::Answer(a) => a.answer,
+        mycelium_mcp::tools::QueryOutput::Hits(hits) => {
+            panic!("priming query must reach the agent: {hits:?}")
+        }
+    };
+    assert_eq!(llm_requests(&mock).await, 1);
+
+    // Saturate the gate, then ask the identical question.
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    let hold1 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    let hold2 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    assert_eq!(LLM_GATE.stats().active, DEFAULT_CAPACITY);
+
+    let started = Instant::now();
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args(question))
+        .await
+        .expect("a cache hit must answer");
+    let elapsed = started.elapsed();
+    match out {
+        mycelium_mcp::tools::QueryOutput::Answer(a) => assert_eq!(a.answer, primed),
+        mycelium_mcp::tools::QueryOutput::Hits(hits) => {
+            panic!("the cached answer must be returned, not the fallback: {hits:?}")
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a cache hit must not wait on the gate (took {elapsed:?} of a 60s bound)"
+    );
+    assert_eq!(
+        llm_requests(&mock).await,
+        1,
+        "a cache hit makes no new LLM call"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before,
+        "a cache hit never queues, so it never times out"
+    );
+
+    drop(hold1);
+    drop(hold2);
 }

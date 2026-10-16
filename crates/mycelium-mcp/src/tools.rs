@@ -104,15 +104,29 @@ async fn agent_scopes<'a>(
 /// The librarian agent's LLM client from the runtime config (admin-
 /// managed via ConfigStore key "llm"; Ollama default). Sealed rows
 /// decrypt under the service key; legacy plaintext rows read as before.
-async fn agent_client(state: &McpState) -> Option<mycelium_librarian::llm::LlmClient> {
+///
+/// The clamped config comes back with the client: the caller needs its
+/// `query_wait_secs` for the gate's wait bound. Clamping on load (plus
+/// `sync_gate`) is what makes a stored row's limits apply without an
+/// admin re-save — and keeps a hand-edited row from opening an
+/// unbounded gate.
+async fn agent_client(
+    state: &McpState,
+) -> Option<(
+    mycelium_librarian::llm::LlmClient,
+    mycelium_librarian::llm::LlmConfig,
+)> {
     let cfg = mycelium_store::config::get_sealed::<mycelium_librarian::llm::LlmConfig>(
         &state.config,
         &state.service_key,
         "llm",
     )
     .await
-    .unwrap_or_default();
-    Some(mycelium_librarian::llm::LlmClient::new(&cfg))
+    .unwrap_or_default()
+    .clamp();
+    cfg.sync_gate();
+    let client = mycelium_librarian::llm::LlmClient::new(&cfg);
+    Some((client, cfg))
 }
 
 /// Render a store error for the caller: expected failures (not found,
@@ -188,24 +202,55 @@ pub async fn memory_query(
 
     // Agent path: the v1 architecture — all queries flow through the
     // librarian. Unreachable LLM → deterministic fallback below.
-    // The cached wrapper (v1 parity) answers identical repeats from
-    // the fingerprint-invalidated cache — no agent run, no tokens.
-    if let Some(client) = agent_client(state).await {
-        match mycelium_librarian::query_cache::run_query_cached(
-            &client,
-            &cs,
-            &agent_scopes(state, user).await,
-            &args.question,
-        )
-        .await
+    if let Some((client, llm_cfg)) = agent_client(state).await {
+        // The cached wrapper's layer 1 (v1 parity) answers identical
+        // repeats from the fingerprint-invalidated cache — no agent
+        // run, no tokens. It costs no LLM time, so it is served before
+        // any admission: a cache hit must never wait on the gate, even
+        // a saturated one.
+        if let Some(hit) = mycelium_librarian::query_cache::cached_answer(&cs, &args.question).await
         {
-            Ok(result) => {
-                return Ok(QueryOutput::Answer(AgentAnswer {
-                    answer: result.answer,
-                }));
+            return Ok(QueryOutput::Answer(AgentAnswer { answer: hit.answer }));
+        }
+
+        // Spec §3.3: admission is bounded by `query_wait_secs`. The
+        // permit is held across the whole cached run — both the hot
+        // lookup's call and the deep agent loop talk to the LLM. No
+        // slot within the bound → the deterministic fallback answers:
+        // the tool degrades, never hangs, and never errors on capacity.
+        match mycelium_librarian::llm_gate::LLM_GATE
+            .enter(
+                Some(user.user_id),
+                std::time::Duration::from_secs(u64::from(llm_cfg.query_wait_secs)),
+                |_| {},
+            )
+            .await
+        {
+            Ok(_permit) => {
+                match mycelium_librarian::query_cache::run_query_cached(
+                    &client,
+                    &cs,
+                    &agent_scopes(state, user).await,
+                    &args.question,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        return Ok(QueryOutput::Answer(AgentAnswer {
+                            answer: result.answer,
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "librarian agent query failed — falling back to search");
+                    }
+                }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "librarian agent query failed — falling back to search");
+                tracing::warn!(
+                    error = %e,
+                    wait_secs = llm_cfg.query_wait_secs,
+                    "llm gate: no slot for memory_query within the wait bound — falling back to search"
+                );
             }
         }
     }
