@@ -191,6 +191,7 @@ async fn boot(
                 url: llm_url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await

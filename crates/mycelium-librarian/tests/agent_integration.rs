@@ -64,6 +64,7 @@ async fn mock_llm(responses: Vec<serde_json::Value>) -> (LlmClient, Shared) {
         url: format!("http://{addr}/v1"),
         model: "mock".into(),
         api_key: None,
+        ..Default::default()
     });
     (client, state)
 }
@@ -232,6 +233,7 @@ async fn unreachable_llm_errors_cleanly() {
         url: "http://127.0.0.1:1/v1".into(),
         model: "m".into(),
         api_key: None,
+        ..Default::default()
     });
     assert!(
         agent::run_query(&client, &cs, &no_scopes(), "anything")

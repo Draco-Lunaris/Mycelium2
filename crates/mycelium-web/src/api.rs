@@ -2604,13 +2604,16 @@ pub async fn admin_save_llm(
             .await
             .unwrap_or_default();
     let api_key = match form.api_key.as_deref().map(str::trim) {
-        None | Some("") => existing.api_key,
+        None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
+    // The concurrency fields carry over from the stored row: this form
+    // edits url/model/api_key only, so saving it must not reset them.
     let cfg = crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),
         api_key,
+        ..existing
     };
     // Seal (serialize + AEAD); a failure must not land plaintext.
     let sealed = crate::state::seal_config(&state.service_key, "llm", &cfg);
@@ -2642,13 +2645,14 @@ pub async fn admin_test_llm(
             .await
             .unwrap_or_default();
     let api_key = match form.api_key.as_deref().map(str::trim) {
-        None | Some("") => existing.api_key,
+        None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
     let client = mycelium_librarian::llm::LlmClient::new(&crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),
         api_key,
+        ..existing
     });
     let verdict = match client
         .chat_system(Some("You are a connectivity probe."), "Reply with OK", 0.0)

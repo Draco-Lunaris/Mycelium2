@@ -36,9 +36,63 @@ pub struct LlmConfig {
     /// absent (keyless endpoints keep working).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Concurrent admitted LLM runs (the gate's slot count). 1–64.
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
+    /// Admitted wait-class runs allowed per user. 1–16.
+    #[serde(default = "default_per_user_active")]
+    pub per_user_active: u32,
+    /// Wait bound for MCP queries and stateless chat, in seconds. 1–600.
+    #[serde(default = "default_query_wait_secs")]
+    pub query_wait_secs: u32,
+    /// Wait bound for chat turns, in seconds. 1–7200.
+    #[serde(default = "default_chat_wait_secs")]
+    pub chat_wait_secs: u32,
+    /// Cap on total gate waiters; submissions beyond it are rejected by
+    /// the surface. 1–1024.
+    #[serde(default = "default_chat_queue_depth")]
+    pub chat_queue_depth: u32,
 }
 
-debug_redacted!(LlmConfig { url, model }, key: api_key);
+debug_redacted!(
+    LlmConfig {
+        url,
+        model,
+        max_parallel,
+        per_user_active,
+        query_wait_secs,
+        chat_wait_secs,
+        chat_queue_depth,
+    },
+    key: api_key
+);
+
+/// Accepted range for [`LlmConfig::max_parallel`].
+pub const MAX_PARALLEL_RANGE: (u32, u32) = (1, 64);
+/// Accepted range for [`LlmConfig::per_user_active`].
+pub const PER_USER_ACTIVE_RANGE: (u32, u32) = (1, 16);
+/// Accepted range for [`LlmConfig::query_wait_secs`].
+pub const QUERY_WAIT_SECS_RANGE: (u32, u32) = (1, 600);
+/// Accepted range for [`LlmConfig::chat_wait_secs`].
+pub const CHAT_WAIT_SECS_RANGE: (u32, u32) = (1, 7200);
+/// Accepted range for [`LlmConfig::chat_queue_depth`].
+pub const CHAT_QUEUE_DEPTH_RANGE: (u32, u32) = (1, 1024);
+
+fn default_max_parallel() -> u32 {
+    2
+}
+fn default_per_user_active() -> u32 {
+    2
+}
+fn default_query_wait_secs() -> u32 {
+    30
+}
+fn default_chat_wait_secs() -> u32 {
+    600
+}
+fn default_chat_queue_depth() -> u32 {
+    64
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -46,7 +100,58 @@ impl Default for LlmConfig {
             url: "http://localhost:11434/v1".into(),
             model: "default".into(),
             api_key: None,
+            max_parallel: default_max_parallel(),
+            per_user_active: default_per_user_active(),
+            query_wait_secs: default_query_wait_secs(),
+            chat_wait_secs: default_chat_wait_secs(),
+            chat_queue_depth: default_chat_queue_depth(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// A copy with every concurrency field forced into its documented
+    /// range. Applied on save *and* on load: a row stored by an older
+    /// (or hand-edited) build can never open an unbounded gate. Clamping
+    /// is idempotent — `cfg.clamp().clamp() == cfg.clamp()`.
+    #[must_use]
+    pub fn clamp(&self) -> LlmConfig {
+        LlmConfig {
+            url: self.url.clone(),
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+            max_parallel: self
+                .max_parallel
+                .clamp(MAX_PARALLEL_RANGE.0, MAX_PARALLEL_RANGE.1),
+            per_user_active: self
+                .per_user_active
+                .clamp(PER_USER_ACTIVE_RANGE.0, PER_USER_ACTIVE_RANGE.1),
+            query_wait_secs: self
+                .query_wait_secs
+                .clamp(QUERY_WAIT_SECS_RANGE.0, QUERY_WAIT_SECS_RANGE.1),
+            chat_wait_secs: self
+                .chat_wait_secs
+                .clamp(CHAT_WAIT_SECS_RANGE.0, CHAT_WAIT_SECS_RANGE.1),
+            chat_queue_depth: self
+                .chat_queue_depth
+                .clamp(CHAT_QUEUE_DEPTH_RANGE.0, CHAT_QUEUE_DEPTH_RANGE.1),
+        }
+    }
+
+    /// Push the clamped limits onto `gate`. `query_wait_secs` and
+    /// `chat_wait_secs` are deliberately not applied: they are the
+    /// calling surface's wait bounds, not gate state.
+    pub fn apply_to_gate(&self, gate: &crate::llm_gate::LlmGate) {
+        let cfg = self.clamp();
+        gate.set_capacity(cfg.max_parallel as usize);
+        gate.set_per_user_active(cfg.per_user_active as usize);
+        gate.set_chat_queue_depth(cfg.chat_queue_depth as usize);
+    }
+
+    /// [`LlmConfig::apply_to_gate`] against the process-global gate, so
+    /// a stored config takes effect without an admin re-save.
+    pub fn sync_gate(&self) {
+        self.apply_to_gate(&crate::llm_gate::LLM_GATE);
     }
 }
 
@@ -407,6 +512,7 @@ mod tests {
             url: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
             api_key: None,
+            ..Default::default()
         });
         assert!(client.chat("hi").await.is_err());
     }
@@ -449,6 +555,7 @@ mod tests {
             url: url.clone(),
             model: "m".into(),
             api_key: Some("test-secret".into()),
+            ..Default::default()
         });
         assert_eq!(client.chat("hi").await.unwrap(), "ok");
         let seen = captured.lock().await.clone();
@@ -476,6 +583,7 @@ mod tests {
             url,
             model: "m".into(),
             api_key: None,
+            ..Default::default()
         });
         assert_eq!(client.chat("hi").await.unwrap(), "ok");
         let seen = captured.lock().await.clone();
@@ -502,6 +610,7 @@ mod tests {
             url: "http://b/v1".into(),
             model: "m".into(),
             api_key: Some("super-secret".into()),
+            ..Default::default()
         };
         let rendered = format!("{cfg:?}");
         assert!(
@@ -513,5 +622,164 @@ mod tests {
         let rendered = format!("{client:?}");
         assert!(rendered.contains("***"));
         assert!(!rendered.contains("super-secret"));
+    }
+
+    #[test]
+    fn defaults_parse_when_absent() {
+        // A sealed row written before the concurrency fields existed:
+        // every new field must fall back to its documented default.
+        let cfg: LlmConfig =
+            serde_json::from_str(r#"{"url": "http://b/v1", "model": "m"}"#).unwrap();
+        assert_eq!(cfg.max_parallel, 2);
+        assert_eq!(cfg.per_user_active, 2);
+        assert_eq!(cfg.query_wait_secs, 30);
+        assert_eq!(cfg.chat_wait_secs, 600);
+        assert_eq!(cfg.chat_queue_depth, 64);
+
+        // Default::default() agrees with the serde defaults.
+        let d = LlmConfig::default();
+        assert_eq!(d.max_parallel, cfg.max_parallel);
+        assert_eq!(d.per_user_active, cfg.per_user_active);
+        assert_eq!(d.query_wait_secs, cfg.query_wait_secs);
+        assert_eq!(d.chat_wait_secs, cfg.chat_wait_secs);
+        assert_eq!(d.chat_queue_depth, cfg.chat_queue_depth);
+    }
+
+    #[test]
+    fn clamp_high_and_low() {
+        let high = LlmConfig {
+            max_parallel: 999,
+            per_user_active: 999,
+            query_wait_secs: 10_000,
+            chat_wait_secs: 100_000,
+            chat_queue_depth: 99_999,
+            ..LlmConfig::default()
+        }
+        .clamp();
+        assert_eq!(high.max_parallel, 64);
+        assert_eq!(high.per_user_active, 16);
+        assert_eq!(high.query_wait_secs, 600);
+        assert_eq!(high.chat_wait_secs, 7200);
+        assert_eq!(high.chat_queue_depth, 1024);
+
+        let low = LlmConfig {
+            max_parallel: 0,
+            per_user_active: 0,
+            query_wait_secs: 0,
+            chat_wait_secs: 0,
+            chat_queue_depth: 0,
+            ..LlmConfig::default()
+        }
+        .clamp();
+        assert_eq!(low.max_parallel, 1);
+        assert_eq!(low.per_user_active, 1);
+        assert_eq!(low.query_wait_secs, 1);
+        assert_eq!(low.chat_wait_secs, 1);
+        assert_eq!(low.chat_queue_depth, 1);
+
+        // url/model/api_key pass through untouched.
+        let cfg = LlmConfig {
+            url: "http://b/v1".into(),
+            model: "m".into(),
+            api_key: Some("k".into()),
+            max_parallel: 0,
+            ..LlmConfig::default()
+        }
+        .clamp();
+        assert_eq!(cfg.url, "http://b/v1");
+        assert_eq!(cfg.model, "m");
+        assert_eq!(cfg.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn clamp_is_idempotent() {
+        for cfg in [
+            LlmConfig::default(),
+            LlmConfig {
+                max_parallel: 999,
+                per_user_active: 0,
+                query_wait_secs: 0,
+                chat_wait_secs: 100_000,
+                chat_queue_depth: 7,
+                ..LlmConfig::default()
+            },
+        ] {
+            let once = cfg.clamp();
+            let twice = once.clamp();
+            assert_eq!(twice.max_parallel, once.max_parallel);
+            assert_eq!(twice.per_user_active, once.per_user_active);
+            assert_eq!(twice.query_wait_secs, once.query_wait_secs);
+            assert_eq!(twice.chat_wait_secs, once.chat_wait_secs);
+            assert_eq!(twice.chat_queue_depth, once.chat_queue_depth);
+        }
+    }
+
+    #[test]
+    fn roundtrip_serialize() {
+        // Sealing is serialize + AEAD, so a serde roundtrip is what the
+        // stored row goes through: every field must survive it.
+        let cfg = LlmConfig {
+            url: "http://b/v1".into(),
+            model: "m".into(),
+            api_key: Some("k".into()),
+            max_parallel: 8,
+            per_user_active: 3,
+            query_wait_secs: 45,
+            chat_wait_secs: 900,
+            chat_queue_depth: 128,
+        };
+        let back: LlmConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.url, cfg.url);
+        assert_eq!(back.model, cfg.model);
+        assert_eq!(back.api_key, cfg.api_key);
+        assert_eq!(back.max_parallel, 8);
+        assert_eq!(back.per_user_active, 3);
+        assert_eq!(back.query_wait_secs, 45);
+        assert_eq!(back.chat_wait_secs, 900);
+        assert_eq!(back.chat_queue_depth, 128);
+    }
+
+    #[test]
+    fn apply_to_gate_sets_clamped_limits() {
+        // A fresh gate (never the LLM_GATE static — tests must not
+        // mutate process-global state).
+        let gate = crate::llm_gate::LlmGate::new(2);
+        LlmConfig {
+            max_parallel: 999,
+            per_user_active: 3,
+            chat_queue_depth: 10,
+            ..LlmConfig::default()
+        }
+        .apply_to_gate(&gate);
+        assert_eq!(gate.capacity(), 64, "capacity takes the clamped value");
+        assert_eq!(gate.per_user_active(), 3);
+        assert_eq!(gate.chat_queue_depth_limit(), 10);
+
+        // Out-of-range lows clamp up rather than opening a zero gate.
+        LlmConfig {
+            max_parallel: 0,
+            per_user_active: 0,
+            chat_queue_depth: 0,
+            ..LlmConfig::default()
+        }
+        .apply_to_gate(&gate);
+        assert_eq!(gate.capacity(), 1);
+        assert_eq!(gate.per_user_active(), 1);
+        assert_eq!(gate.chat_queue_depth_limit(), 1);
+    }
+
+    #[test]
+    fn debug_impl_shows_concurrency_fields() {
+        let rendered = format!(
+            "{:?}",
+            LlmConfig {
+                max_parallel: 7,
+                api_key: Some("super-secret".into()),
+                ..LlmConfig::default()
+            }
+        );
+        assert!(rendered.contains("max_parallel: 7"), "{rendered}");
+        assert!(rendered.contains("chat_queue_depth"), "{rendered}");
+        assert!(!rendered.contains("super-secret"), "key leaked: {rendered}");
     }
 }

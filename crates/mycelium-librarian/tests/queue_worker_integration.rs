@@ -264,6 +264,7 @@ fn dead_port_config() -> LlmConfig {
         url: "http://127.0.0.1:1/v1".into(),
         model: "m".into(),
         api_key: None,
+        ..Default::default()
     }
 }
 
@@ -365,6 +366,7 @@ async fn drain_integrates_queued_add() {
                 url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -654,6 +656,7 @@ async fn long_error_detail_is_bounded() {
                 url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1255,6 +1258,7 @@ async fn age_deadline_routes_to_fallback() {
                 url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1352,6 +1356,7 @@ async fn transient_errors_retry_then_integrate() {
                 url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1424,6 +1429,7 @@ async fn persistent_failure_goes_dead_then_recovers() {
                 url: url_a,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1487,6 +1493,7 @@ async fn persistent_failure_goes_dead_then_recovers() {
                 url: url_b,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1648,6 +1655,7 @@ async fn receipt_state_flips_pending_running_done() {
                 url,
                 model: "mock".into(),
                 api_key: None,
+                ..Default::default()
             },
         )
         .await
@@ -1731,6 +1739,7 @@ async fn drain_defers_while_queries_wait() {
         url,
         model: "mock".into(),
         api_key: None,
+        ..Default::default()
     });
     let mut handles = Vec::new();
     for q in ["first question", "second question", "third question"] {
