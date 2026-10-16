@@ -12,7 +12,8 @@
 //!   never runs ahead of interactive waiters and never blocks.
 //!
 //! Admission is per *run* (one permit per agent run, as the semaphore it
-//! replaces did), granted as a RAII [`GatePermit`] whose `Drop` releases
+//! replaces did — the agent entry points themselves acquire nothing),
+//! granted as a RAII [`GatePermit`] whose `Drop` releases
 //! the slot and dispatches the queue. Dispatch pops the FIFO head, but
 //! skips a waiter whose user already holds `per_user_active` slots — the
 //! skipped waiter keeps its place (head-of-line bypass for capped users,
@@ -33,7 +34,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Default concurrent admitted runs (the permit count of the
-/// `agent::LLM_RUNS` semaphore this gate replaces).
+/// two-permit agent semaphore this gate replaces).
 pub const DEFAULT_CAPACITY: usize = 2;
 /// Default admitted wait-class runs per user.
 pub const DEFAULT_PER_USER_ACTIVE: usize = 2;

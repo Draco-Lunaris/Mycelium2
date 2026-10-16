@@ -20,10 +20,6 @@ use crate::llm::{ConversationTurn, LlmClient, StepOutput, ToolCall, tool_spec};
 /// search, read, and synthesize across user + skills + library scopes).
 pub const MAX_STEPS: u32 = 30;
 
-/// Global cap on concurrent LLM runs (agent entries acquire one
-/// permit each; the queue drain try_acquires non-blockingly and holds
-/// at most one, so queries/chats always have spare permits).
-pub static LLM_RUNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 /// Bundles larger than this get a compact tree summary in the prompt
 /// (v1: LARGE_BUNDLE_THRESHOLD = 300).
 const LARGE_BUNDLE_THRESHOLD: usize = 300;
@@ -184,13 +180,16 @@ pub enum AgentMode {
 }
 
 /// Run the agent in read-only query mode.
+///
+/// Admission is the caller's: this performs none. Surfaces enter
+/// [`crate::llm_gate::LLM_GATE`] with their own class and wait bound
+/// and hold the permit across this call.
 pub async fn run_query(
     client: &LlmClient,
     store: &ConceptStore<'_>,
     scopes: &AgentScopes<'_>,
     question: &str,
 ) -> Result<QueryResult, AgentError> {
-    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
     let system = build_system_prompt(store, AgentMode::Query).await?;
     let tools = read_tool_specs();
     let answer = agent_loop(
@@ -202,18 +201,19 @@ pub async fn run_query(
 }
 
 /// Run the agent in mutation mode (write tools enabled) at the
-/// default `MAX_STEPS` cap, acquiring one global LLM permit.
+/// default `MAX_STEPS` cap. Admission is the caller's — this acquires
+/// nothing (see [`run_query`]).
 /// Intentional public API — the inline mutation entry point: the dream
 /// maintenance pass (`dream::run_dream`, POST /api/v1/dream) calls it
-/// in production. The queue drain does NOT use it — it runs
-/// `run_mutation_capped` instead, under its own permit and step cap.
+/// in production, under its own gate admission. The queue drain does
+/// NOT use it — it runs `run_mutation_capped` instead, under its own
+/// gate permit and step cap.
 pub async fn run_mutation(
     client: &LlmClient,
     store: &ConceptStore<'_>,
     scopes: &AgentScopes<'_>,
     instruction: &str,
 ) -> Result<MutationResult, AgentError> {
-    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
     let system = build_system_prompt(store, AgentMode::Mutate).await?;
     let tools = all_tool_specs();
     let (summary, files) = agent_loop_tracked(
@@ -236,8 +236,9 @@ pub async fn run_mutation(
 }
 
 /// Mutation run with a caller-supplied step cap (the queue drain's
-/// entry: the drain itself holds the single LLM permit from its
-/// capacity check through the mark, so this acquires none).
+/// entry: the drain itself holds the gate permit from its capacity
+/// check through the mark, so this acquires none — as no agent entry
+/// point does).
 pub async fn run_mutation_capped(
     client: &LlmClient,
     store: &ConceptStore<'_>,
@@ -290,7 +291,8 @@ pub async fn run_chat(
 
 /// Streaming chat: same loop as run_chat, but emits progress events to
 /// the caller's channel (the web layer streams them as SSE). The
-/// final reply is still returned.
+/// final reply is still returned. Admission is the caller's — this
+/// acquires nothing (see [`run_query`]).
 pub async fn run_chat_streaming(
     client: &LlmClient,
     store: &ConceptStore<'_>,
@@ -298,7 +300,6 @@ pub async fn run_chat_streaming(
     history: &[ConversationTurn],
     events: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<String, AgentError> {
-    let _permit = LLM_RUNS.acquire().await.expect("semaphore not closed");
     let emit = |event: AgentEvent| {
         if let Some(tx) = &events {
             let _ = tx.send(event);

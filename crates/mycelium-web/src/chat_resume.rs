@@ -12,10 +12,10 @@
 //! 1. **Key gate** — `master_key_for` (cache → service-key seal
 //!    recovery); on error the WHOLE user's turns are skipped this pass
 //!    (zero LLM cost; next tick retries).
-//! 2. **Capacity gate** — `agent::LLM_RUNS.try_acquire()` only; on
+//! 2. **Capacity gate** — `llm_gate::LLM_GATE.try_enter()` only; on
 //!    None the turn is skipped unclaimed (interactive use wins — the
 //!    Phase-11 query-priority invariant; nothing is ever held while
-//!    waiting: try_acquire comes BEFORE the claim).
+//!    waiting: try_enter comes BEFORE the claim).
 //! 3. **Claim gate** — `claim_resumable` (the store's atomic
 //!    attempts-guard, 0 → 1); on `false` the turn was raced or already
 //!    claimed — skipped.
@@ -154,12 +154,12 @@ impl ChatResumeWorker {
                 // Capacity BEFORE claim (the self-review rule): a
                 // claimed turn with no permit coming would sit
                 // `running` forever — no drop guard exists for a spawn
-                // that never happens. try_acquire only — the
+                // that never happens. try_enter only — the
                 // query-priority invariant: interactive use wins a
-                // full pool; the turn stays interrupted (attempts 0)
-                // for a later pass.
-                let permit = mycelium_librarian::agent::LLM_RUNS.try_acquire();
-                let Ok(permit) = permit else {
+                // full pool (and anything already queued wins too);
+                // the turn stays interrupted (attempts 0) for a later
+                // pass.
+                let Some(permit) = mycelium_librarian::llm_gate::LLM_GATE.try_enter() else {
                     continue;
                 };
                 // The once-guard: exactly the first claimer wins
@@ -183,16 +183,13 @@ impl ChatResumeWorker {
                     scopes_visible: scopes_visible.clone(),
                 };
                 spawn_chat_run(ctx, user_id, master.clone(), session_id, turn, true).await;
-                // Held from try_acquire to here: the claim + spawn
-                // window (both non-blocking awaits). The runner
-                // acquires its OWN permit inside `run_chat_streaming`
-                // — one left free by construction, so its acquire
-                // cannot deadlock against another resume spawn's
-                // lingering permit — and interactive traffic queues
-                // behind at most what this window holds. Dropped past
-                // the spawn: the resume's permit is a capacity check,
-                // not a run permit (queue_worker.rs's per-item hold is
-                // the mutation drain's different shape).
+                // Held from try_enter to here: the claim + spawn window
+                // (both non-blocking awaits). Dropped past the spawn:
+                // the resume's permit is a capacity check, not a run
+                // permit (queue_worker.rs's per-item hold is the
+                // mutation drain's different shape). The detached
+                // runner's own admission is the chat surface's, wired
+                // where it spawns the run — not here.
                 drop(permit);
             }
         }

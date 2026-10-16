@@ -2,9 +2,10 @@
 //! OpenAI-compatible LLM (copied from agent_integration.rs — the mock
 //! helpers are file-local per test binary), stub master-key recovery.
 //!
-//! `agent::LLM_RUNS` is process-global with exactly 2 permits, so every
-//! test in this file serializes on TEST_LOCK (T5.3 deliberately
-//! starves all permits).
+//! `llm_gate::LLM_GATE` is process-global with 2 slots by default, so
+//! every test in this file serializes on TEST_LOCK (T5.3 deliberately
+//! starves every slot) and every test that holds or reconfigures the
+//! gate restores its defaults through [`GateDefaults`].
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,12 +19,44 @@ use mycelium_crypto::store_keys::FileKeys;
 use mycelium_librarian::agent;
 use mycelium_librarian::fallback::derive_title;
 use mycelium_librarian::llm::{LlmClient, LlmConfig};
+use mycelium_librarian::llm_gate::{
+    DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
+};
 use mycelium_librarian::queue_worker::{MasterKeyRecovery, QueueLimits, QueueWorker};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use mycelium_store::{ConceptStore, ConfigStore, FileRepo, QueueStatus, QueueTool, Store};
 
-/// Serializes all tests in this binary around the shared LLM semaphore.
+/// Serializes all tests in this binary around the shared LLM gate.
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Wait bound for the gate holds these tests take: generous, because a
+/// hold that has to wait at all means a sibling leaked a slot.
+const GATE_BOUND: Duration = Duration::from_secs(10);
+
+/// Restores the process-global gate's tunables on drop, so a failing
+/// assertion in a test that reconfigured [`LLM_GATE`] cannot leak that
+/// configuration into the next test holding TEST_LOCK.
+struct GateDefaults;
+
+impl Drop for GateDefaults {
+    fn drop(&mut self) {
+        LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+        LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
+        LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
+    }
+}
+
+/// Poll until `cond` holds, bounded — never a fixed sleep as the
+/// assertion.
+async fn gate_wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("gate state never reached: {what}"));
+}
 
 // ---------- mock LLM (copied from agent_integration.rs) ----------
 
@@ -480,6 +513,7 @@ async fn dead_llm_retries_then_fallback() {
 #[tokio::test]
 async fn drain_defers_when_no_permit() {
     let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
     let (_dir, store) = test_store().await;
     let master = mycelium_crypto::generate_master_key();
     let uid = seed_user(&store, "t53").await;
@@ -503,16 +537,19 @@ async fn drain_defers_when_no_permit() {
     )
     .await;
 
-    // Starve every LLM permit: the drain must skip this wake entirely —
+    // Starve every gate slot: the drain must skip this wake entirely —
     // query priority, never block.
-    let permits = agent::LLM_RUNS.acquire_many(2).await.unwrap();
+    let hold1 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    let hold2 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    assert_eq!(LLM_GATE.stats().active, DEFAULT_CAPACITY);
     assert_eq!(worker.run_pending().await.unwrap(), 0);
     let row = store.queue_item(uid, id).await.unwrap().unwrap();
     assert_eq!(row.status, QueueStatus::Pending);
     assert_eq!(row.attempts, 0, "no claim may burn an attempt: {row:?}");
-    drop(permits);
+    drop(hold1);
+    drop(hold2);
 
-    // Permits released: the next pass integrates (deadline 0 → the
+    // Slots released: the next pass integrates (deadline 0 → the
     // deterministic fallback; no LLM needed).
     assert_eq!(worker.run_pending().await.unwrap(), 1);
     let row = store.queue_item(uid, id).await.unwrap().unwrap();
@@ -1710,22 +1747,33 @@ async fn receipt_state_flips_pending_running_done() {
     assert!(!done.detail.is_empty(), "agent summary as detail: {done:?}");
 }
 
-// T11.12 [spec §7.12 + §9.5 — query priority invariant]: with both
-// LLM permits held by in-flight query runs (and a third query queued
-// behind them), the drain's wake defers immediately — run_pending
-// returns Ok(0) without claiming (no attempt burned) and without
-// blocking; once the queries finish, the drain claims and integrates.
+// T11.12 [spec §7.12 + §9.5 — query priority invariant]: with every
+// gate slot held by interactive query admission, the drain's wake
+// defers immediately — run_pending returns Ok(0) without claiming (no
+// attempt burned) and without blocking; once the slots free, the drain
+// claims and integrates. Admission lives in the query surfaces now
+// (agent::run_query takes none), so the holds are explicit gate
+// entries standing in for those surfaces.
 #[tokio::test]
 async fn drain_defers_while_queries_wait() {
     let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
     let (_dir, store) = test_store().await;
     let master = mycelium_crypto::generate_master_key();
     let uid = seed_user(&store, "t1112").await;
     let cs = ConceptStore::for_user(&store, uid, master.clone());
 
-    // Three slow query runs: two hold the permits (inside the LLM
-    // call), the third waits on acquire — the exact state the drain
-    // must never preempt.
+    // Both slots held, deterministically — no racing a mock's hold
+    // window (a fixed sleep once failed CI: the queries finished, the
+    // slots freed, and the drain legitimately claimed, Ok(1) != 0).
+    let hold1 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    let hold2 = LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.unwrap();
+    let s = LLM_GATE.stats();
+    assert_eq!(s.active, DEFAULT_CAPACITY);
+    assert_eq!(s.active, s.capacity, "no slot is free for the drain");
+
+    // Three slow query runs alongside, in flight across the drain's
+    // wake — the exact traffic the drain must never preempt.
     let (url, _mock) = mock_llm_slow(
         vec![
             text_response("answer three"),
@@ -1752,21 +1800,6 @@ async fn drain_defers_while_queries_wait() {
             agent::run_query(&client, &cs, &scopes, q).await
         }));
     }
-    // Synchronize on the actual permit state, not on a fixed sleep:
-    // the drain must defer EXACTLY while both permits are held, and
-    // available_permits()==0 is the observable form of that state. A
-    // sleep races the mock's 400ms hold — on a slow runner the queries
-    // can finish and free the permits before the drain runs, which
-    // once failed CI (drain legitimately claimed, Ok(1) != 0).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while agent::LLM_RUNS.available_permits() > 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "query runs never acquired both permits"
-        );
-    }
-
     let limits = QueueLimits {
         age_deadline_secs: 0,
         ..QueueLimits::default()
@@ -1784,13 +1817,13 @@ async fn drain_defers_while_queries_wait() {
     )
     .await;
 
-    // The starved wake: no permit → no claim, and it returns promptly
-    // (timeout proves the drain never blocks on the semaphore).
+    // The starved wake: no slot → no claim, and it returns promptly
+    // (timeout proves the drain never blocks on the gate).
     let n = tokio::time::timeout(Duration::from_secs(2), worker.run_pending())
         .await
-        .expect("run_pending must never block on the semaphore")
+        .expect("run_pending must never block on the gate")
         .unwrap();
-    assert_eq!(n, 0, "no claim without a permit");
+    assert_eq!(n, 0, "no claim without a slot");
     let row = store.queue_item(uid, id).await.unwrap().unwrap();
     assert_eq!(row.status, QueueStatus::Pending);
     assert_eq!(
@@ -1798,15 +1831,100 @@ async fn drain_defers_while_queries_wait() {
         "a starved wake may not burn an attempt: {row:?}"
     );
 
-    // The queries all complete — the waiting one got the freed permit,
-    // not the drain.
+    // The query runs all complete while the drain stays deferred.
     for h in handles {
         let result = h.await.unwrap().unwrap();
         assert!(!result.answer.is_empty());
     }
 
-    // Permits free: the drain claims and integrates (deadline 0 → the
+    // Slots free: the drain claims and integrates (deadline 0 → the
     // fallback; the queries consumed the mock's script).
+    drop(hold1);
+    drop(hold2);
+    gate_wait_until("every slot released", || LLM_GATE.stats().active == 0).await;
+    assert_eq!(worker.run_pending().await.unwrap(), 1);
+    let done = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(done.status, QueueStatus::Done);
+}
+
+// T11.13 [spec §3.1 + §3.7 — the try class yields to a QUEUED waiter]:
+// a free slot is not enough. With one slot held, one slot FREE and a
+// single waiter queued behind the per-user cap, the drain's try_enter
+// returns None — background work never runs ahead of interactive work
+// that is already waiting (the stronger-than-permits form of the
+// query-priority invariant, which a bare "a permit is available" check
+// would have let through).
+#[tokio::test]
+async fn try_enter_defers_while_queue_nonempty() {
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t1113").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // The per-user cap is the lever that builds the shape: one user at
+    // its cap, a second run of theirs queued, and a slot still free.
+    LLM_GATE.set_per_user_active(1);
+    let holder = uuid::Uuid::new_v4();
+    let held = LLM_GATE
+        .enter(Some(holder), GATE_BOUND, |_| {})
+        .await
+        .unwrap();
+    // A waiting `enter` must be spawned — awaiting it here would wedge
+    // the test's own task until the hold drops.
+    let waiter = tokio::spawn(async move {
+        LLM_GATE
+            .enter(Some(holder), GATE_BOUND, |_| {})
+            .await
+            .map(drop)
+    });
+    gate_wait_until("one waiter queued", || LLM_GATE.stats().queued == 1).await;
+    let s = LLM_GATE.stats();
+    assert_eq!(s.active, 1);
+    assert!(
+        s.active < s.capacity,
+        "a slot is FREE — only the queued waiter may defer the drain: {s:?}"
+    );
+
+    let limits = QueueLimits {
+        age_deadline_secs: 0,
+        ..QueueLimits::default()
+    };
+    let (config, worker) = worker(&store, recovery(master.clone()), limits);
+    config.set("llm", &dead_port_config()).await.unwrap();
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "deferred behind a waiter" }),
+        "deferred behind a waiter",
+    )
+    .await;
+
+    let n = tokio::time::timeout(Duration::from_secs(2), worker.run_pending())
+        .await
+        .expect("run_pending must never block on the gate")
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "a queued waiter defers the drain even with a free slot"
+    );
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Pending);
+    assert_eq!(
+        row.attempts, 0,
+        "a deferred wake may not burn an attempt: {row:?}"
+    );
+
+    // Queue empty again (the waiter leaves on cancellation) and the
+    // hold released: the drain claims and integrates.
+    waiter.abort();
+    gate_wait_until("the queue drained", || LLM_GATE.stats().queued == 0).await;
+    drop(held);
+    gate_wait_until("every slot released", || LLM_GATE.stats().active == 0).await;
     assert_eq!(worker.run_pending().await.unwrap(), 1);
     let done = store.queue_item(uid, id).await.unwrap().unwrap();
     assert_eq!(done.status, QueueStatus::Done);
