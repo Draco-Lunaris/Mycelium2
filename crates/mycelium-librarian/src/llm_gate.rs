@@ -52,12 +52,22 @@ const QUEUE_DEPTH_MAX: usize = 1024;
 /// their own [`LlmGate::new`] instances instead.
 pub static LLM_GATE: LazyLock<LlmGate> = LazyLock::new(|| LlmGate::new(DEFAULT_CAPACITY));
 
-/// A wait-class admission did not get a slot: the wait bound elapsed,
-/// or the gate released its waiters on shutdown. Each surface maps this
-/// to its own contract (failed chat turn, keyword fallback, 429).
+/// A wait-class admission did not get a slot. The two causes are kept
+/// apart because the chat surface maps them to different turn states
+/// (spec §3.5 / ruling R31): a bound that elapsed is a failure the user
+/// must be told about, while a closing gate is the process exiting —
+/// the turn is left resumable. Surfaces that cannot resume anything
+/// (MCP fallback, the 429 endpoints) treat both the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("LLM gate: no slot became free within the wait bound")]
-pub struct GateTimeout;
+pub enum GateError {
+    /// The surface's wait bound elapsed with no slot free.
+    #[error("LLM gate: no slot became free within the wait bound")]
+    Timeout,
+    /// The gate released its queued waiters: the server is shutting
+    /// down, so this waiter will never be admitted by this process.
+    #[error("LLM gate: closed — the server is shutting down")]
+    Closed,
+}
 
 /// A point-in-time read of the gate, for `/health`, `/metrics` and the
 /// admin system card.
@@ -325,16 +335,17 @@ impl LlmGate {
     /// run admitted without queueing never had a position, so its
     /// callback is never called.
     ///
-    /// Returns [`GateTimeout`] when the bound elapses or the gate
-    /// releases its waiters; the waiter leaves the queue either way —
-    /// as it does when the returned future is dropped before admission
-    /// (a disconnected client, an aborted runner, a cancelled request).
+    /// Returns [`GateError::Timeout`] when the bound elapses and
+    /// [`GateError::Closed`] when [`LlmGate::close`] released the
+    /// queue; the waiter leaves the queue either way — as it does when
+    /// the returned future is dropped before admission (a disconnected
+    /// client, an aborted runner, a cancelled request).
     pub async fn enter<F>(
         &self,
         user: Option<Uuid>,
         bound: Duration,
         on_position: F,
-    ) -> Result<GatePermit<'_>, GateTimeout>
+    ) -> Result<GatePermit<'_>, GateError>
     where
         F: Fn(usize) + Send + Sync + 'static,
     {
@@ -377,10 +388,11 @@ impl LlmGate {
                 Ok(GatePermit::new(self, user))
             }
             // Closed waiters are already counted by `close`; a dropped
-            // sender can only mean the same.
+            // sender can only mean the same (nothing else takes a
+            // queued waiter out while its receiver is alive).
             Ok(Ok(Outcome::Closed) | Err(_)) => {
                 queued.disarm();
-                Err(GateTimeout)
+                Err(GateError::Closed)
             }
             Err(_) => {
                 {
@@ -390,7 +402,7 @@ impl LlmGate {
                         inner.timeouts_total += 1;
                         inner.notify_positions();
                         queued.disarm();
-                        return Err(GateTimeout);
+                        return Err(GateError::Timeout);
                     }
                 }
                 // A dispatch beat the bound: honor the admission instead
@@ -398,15 +410,22 @@ impl LlmGate {
                 queued.disarm();
                 match queued.rx.try_recv() {
                     Ok(Outcome::Admitted) => Ok(GatePermit::new(self, user)),
-                    Ok(Outcome::Closed) | Err(_) => Err(GateTimeout),
+                    // Left the queue without an admission, so `close`
+                    // took it — and already counted it.
+                    Ok(Outcome::Closed) | Err(_) => Err(GateError::Closed),
                 }
             }
         }
     }
 
-    /// Release every queued waiter with [`GateTimeout`] (shutdown).
-    /// Admitted runs keep their slots, and the gate is *not* latched
-    /// shut: later admissions work normally.
+    /// Release every queued waiter with [`GateError::Closed`]
+    /// (shutdown). Admitted runs keep their slots, and the gate is
+    /// *not* latched shut: later admissions work normally (ruling R7 —
+    /// this static is shared by the whole process, tests included).
+    ///
+    /// Drained waiters are counted in `timeouts_total` exactly as a
+    /// bound-elapsed waiter is: one counter for "a waiter gave up",
+    /// which is what the metric name promises.
     pub fn close(&self) {
         let mut inner = self.lock();
         let waiters: Vec<Waiter> = inner.queue.drain(..).collect();
@@ -616,7 +635,7 @@ mod tests {
         let held = g.enter(None, BOUND, |_| {}).await.unwrap();
 
         let outcome = g.enter(None, Duration::from_millis(50), |_| {}).await;
-        assert!(matches!(outcome, Err(GateTimeout)));
+        assert!(matches!(outcome, Err(GateError::Timeout)));
         let s = g.stats();
         assert_eq!(s.timeouts_total, 1);
         assert_eq!(s.queued, 0, "a timed-out waiter leaves the queue");
@@ -811,6 +830,43 @@ mod tests {
         drop(t);
     }
 
+    /// The two wait-class failure causes are distinguishable (ruling
+    /// R31): `close` resolves queued waiters with
+    /// [`GateError::Closed`], an elapsed bound yields
+    /// [`GateError::Timeout`], and `close` still does not latch the
+    /// gate (R7) — the very next `enter` is admitted.
+    #[tokio::test]
+    async fn close_and_timeout_are_distinct_and_close_does_not_latch() {
+        let g = gate(1);
+        let held = g.enter(None, BOUND, |_| {}).await.unwrap();
+        let w = tokio::spawn(async move { g.enter(None, BOUND, |_| {}).await });
+        wait_until(|| g.stats().queued == 1).await;
+
+        g.close();
+        assert_eq!(
+            timeout(SETTLE, w).await.unwrap().unwrap().err(),
+            Some(GateError::Closed),
+            "a waiter the gate released on shutdown reports Closed"
+        );
+
+        // Same saturated gate, a bound that simply elapses: Timeout,
+        // not Closed — and the previous `close` did not latch it shut.
+        assert_eq!(
+            g.enter(None, Duration::from_millis(50), |_| {}).await.err(),
+            Some(GateError::Timeout),
+            "an elapsed bound reports Timeout"
+        );
+
+        // Non-latching: once the slot frees, `enter` admits normally.
+        drop(held);
+        let p = g
+            .enter(None, BOUND, |_| {})
+            .await
+            .expect("a closed gate still admits — `close` is not a latch");
+        assert_eq!(g.stats().active, 1);
+        drop(p);
+    }
+
     #[tokio::test]
     async fn close_releases_all_waiters() {
         let g = gate(1);
@@ -823,11 +879,11 @@ mod tests {
         g.close();
         assert!(matches!(
             timeout(SETTLE, w1).await.unwrap().unwrap(),
-            Err(GateTimeout)
+            Err(GateError::Closed)
         ));
         assert!(matches!(
             timeout(SETTLE, w2).await.unwrap().unwrap(),
-            Err(GateTimeout)
+            Err(GateError::Closed)
         ));
         let s = g.stats();
         assert_eq!(s.queued, 0);
@@ -895,7 +951,7 @@ mod tests {
         g.close();
         assert!(matches!(
             timeout(SETTLE, w).await.unwrap().unwrap(),
-            Err(GateTimeout)
+            Err(GateError::Closed)
         ));
         drop(held);
     }

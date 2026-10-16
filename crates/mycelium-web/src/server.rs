@@ -377,6 +377,18 @@ pub async fn serve(
     let shutdown_token = shutdown.clone();
     tokio::spawn(async move {
         shutdown_token.cancelled().await;
+        // Release every queued LLM waiter BEFORE the graceful window
+        // opens (LLM concurrency spec §3.5): a chat runner still
+        // sitting on the gate would otherwise hold its SSE connection
+        // open for the rest of its wait bound — 600 s by default, up
+        // to 7200 — and burn the whole 10 s window before it could
+        // finalize its turn.
+        // Released waiters get `GateError::Closed`, which the chat
+        // runner finalizes as `interrupted` (resumable on the next
+        // boot). `close` is not a latch: admitted runs keep their
+        // slots and the gate stays usable for whatever is still
+        // draining.
+        mycelium_librarian::llm_gate::LLM_GATE.close();
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
     });
     tracing::info!("listening on https://{https_addr}");

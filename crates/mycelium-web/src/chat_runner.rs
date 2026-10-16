@@ -20,7 +20,10 @@
 //! `llm_gate::LLM_GATE` as a wait-class waiter bounded by the stored
 //! `chat_wait_secs`, holds the permit across the run and its
 //! persistence, and finalizes the turn `failed` with
-//! [`CHAT_CAPACITY_MSG`] if no slot comes. Fresh submits (`chat_api`)
+//! [`CHAT_CAPACITY_MSG`] if the bound elapses with no slot. A waiter
+//! the gate releases on shutdown instead (`GateError::Closed`, spec
+//! §3.5) finalizes `interrupted` with no error row — the resumable
+//! state a crash leaves. Fresh submits (`chat_api`)
 //! and resumed turns (`chat_resume`) both arrive here, so neither can
 //! start a run without a slot. While it waits it broadcasts `queued`
 //! (the observed queue position) and, on admission, `admitted` — the
@@ -38,7 +41,7 @@ use uuid::Uuid;
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_librarian::agent::{AgentError, AgentEvent, run_chat_streaming};
 use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig};
-use mycelium_librarian::llm_gate::{GatePermit, GateTimeout, LLM_GATE};
+use mycelium_librarian::llm_gate::{GateError, GatePermit, LLM_GATE};
 use mycelium_store::ConceptStore;
 use mycelium_store::Store;
 use mycelium_store::chat::{ChatError, ChatRole, ChatStore, ChatTurnRow, ChatTurnStatus};
@@ -361,13 +364,49 @@ async fn run_chat_turn(
             }
             p
         }
-        Err(GateTimeout) => {
+        Err(GateError::Closed) => {
+            // The gate released its queue because the server is
+            // shutting down (spec §3.5 / ruling R31). The run never
+            // started and the process is going away, so the turn is
+            // finalized `interrupted` with NO error row — byte for
+            // byte the state a crash leaves after the next boot's
+            // sweep (`interrupted`, `attempts` untouched), which is
+            // precisely what the resume path claims: a fresh turn
+            // (attempts 0) is resumed once on the next boot, and a
+            // turn that was already a resume (attempts 1) is final,
+            // since `claim_resumable` requires `attempts = 0`.
+            //
+            // Deliberately NOT the capacity message: nothing is at
+            // capacity and nothing failed. `finish_turn` removes the
+            // registry entry, which drops the broadcast sender — an
+            // attached SSE client sees the channel close, the same
+            // end-of-run signal every row-less finalize gives it —
+            // and the removal also defuses the `RunGuard`, so it
+            // cannot re-finalize this turn as `failed`.
+            tracing::info!(
+                turn_id = %turn_id, user_id = %user_id, resumed,
+                "chat turn released by the shutdown gate close — left resumable"
+            );
+            finish_turn(
+                &ctx,
+                &master,
+                user_id,
+                session_id,
+                turn_id,
+                ChatTurnStatus::Interrupted,
+                None,
+            )
+            .await;
+            return;
+        }
+        Err(GateError::Timeout) => {
             // No slot within the bound: the run never started, so there
             // is no side-effect doubt — the turn finalizes `failed`
             // with the capacity message on BOTH paths (a resumed turn
             // already carries attempts = 1, so `interrupted` would not
-            // buy it a retry; `interrupted` stays reserved for a run
-            // that reached an unreachable LLM).
+            // buy it a retry, and unlike the shutdown arm above there
+            // is no later boot that would retry a fresh one either:
+            // this process is still running and simply has no room).
             tracing::warn!(
                 turn_id = %turn_id, user_id = %user_id, resumed,
                 "chat turn gave up waiting for an LLM slot"
@@ -534,7 +573,7 @@ async fn admit(
     user_id: Uuid,
     bound: Duration,
     mut on_position: impl FnMut(usize),
-) -> Result<GatePermit<'static>, GateTimeout> {
+) -> Result<GatePermit<'static>, GateError> {
     let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<usize>();
     let gate: &'static _ = &*LLM_GATE;
     let enter = gate.enter(Some(user_id), bound, move |pos| {

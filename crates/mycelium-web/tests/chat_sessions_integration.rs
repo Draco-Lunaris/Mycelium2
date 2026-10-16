@@ -225,6 +225,23 @@ async fn boot_with(
     tokio_util::sync::CancellationToken,
     tempfile::TempDir,
 ) {
+    let (base, shutdown, dir, _serve) = boot_with_handle(llm).await;
+    // The handle is dropped (the task detaches, as it always has);
+    // only the shutdown test needs to observe `serve` returning.
+    (base, shutdown, dir)
+}
+
+/// [`boot_with`] that also hands back the `serve` task's join handle,
+/// so a test can assert the serve future itself COMPLETES after the
+/// shutdown token fires (the LLM-gate close path, spec §3.5).
+async fn boot_with_handle(
+    llm: mycelium_web::LlmConfig,
+) -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
@@ -262,7 +279,7 @@ async fn boot_with(
 
     let data_dir = dir.path().to_path_buf();
     let token = shutdown.clone();
-    tokio::spawn(async move {
+    let serve = tokio::spawn(async move {
         let _ = mycelium_web::serve(
             state,
             &data_dir,
@@ -276,7 +293,12 @@ async fn boot_with(
         .await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    (format!("https://127.0.0.1:{https_port}"), shutdown, dir)
+    (
+        format!("https://127.0.0.1:{https_port}"),
+        shutdown,
+        dir,
+        serve,
+    )
 }
 
 fn client() -> reqwest::Client {
@@ -1851,6 +1873,131 @@ async fn chat_capacity_timeout_fails_turn() {
     );
     drop(hold);
     shutdown.cancel();
+}
+
+#[tokio::test]
+async fn shutdown_releases_queued_turn_as_interrupted() {
+    // LLM concurrency spec §3.5 (controller ruling R31): when the
+    // shutdown token fires, `serve` closes the gate — every queued
+    // waiter is released at once rather than sitting out its wait
+    // bound inside the graceful-shutdown window. A turn released that
+    // way never ran, so it finalizes `interrupted` with NO error row:
+    // byte for byte the state a crash leaves behind after the boot
+    // sweep (`interrupted`, `attempts = 0`), which is exactly what the
+    // resume path claims. It is NOT `failed`, and it carries no
+    // capacity message — nothing was at capacity.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // A reachable mock with an empty script: a request would 500, so
+    // "no request recorded" proves the run never started.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, dir, serve) = boot_with_handle(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // One slot and a wait bound far longer than this test: a
+        // finalized turn here can only come from the close path, never
+        // from the bound elapsing, and a `serve` that waited the
+        // waiter out would blow the 15 s assertion below.
+        max_parallel: 1,
+        chat_wait_secs: 600,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    // A second pool over the same file: the turn row stays observable
+    // after the server is gone (no endpoint to ask).
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // Hold the single slot anonymously (the per-user cap must not be
+    // what queues this turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    // Submit: the runner queues on the gate. Its SSE stream stays open
+    // for the life of the turn, so drive it in a task.
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "queued when the server stops").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        // The stream ends when the runner drops its broadcast sender;
+        // a body cut short by the shutdown is fine here — the
+        // capacity-message assertion holds either way.
+        resp.text().await.unwrap_or_default()
+    });
+    poll_gate_until(
+        || LLM_GATE.stats().queued == 1,
+        "the submitted turn queued on the gate",
+    )
+    .await;
+
+    // Shut down. `serve` must come back promptly: the queued waiter is
+    // released by `close()`, not waited out for its 600 s bound.
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(15), serve)
+        .await
+        .expect("serve returned after the shutdown token fired")
+        .expect("the serve task did not panic");
+
+    // The turn is the resumable state, not a failure.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let turn = loop {
+        let row: (String, i64) = sqlx::query_as("SELECT status, attempts FROM chat_turns LIMIT 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        if row.0 != "running" {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued turn never left `running`: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        turn,
+        ("interrupted".to_string(), 0),
+        "a fresh turn released by the shutdown is interrupted with attempts = 0"
+    );
+
+    // No error row at all — so certainly not the capacity message
+    // (`role` is the one plaintext column; content is sealed).
+    let error_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE role = ?")
+        .bind("error")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        error_rows, 0,
+        "the shutdown path writes no error row (no capacity message)"
+    );
+    let body = submit.await.unwrap();
+    assert!(
+        !body.contains(CHAT_CAPACITY_MSG),
+        "the stream never carried the capacity message: {body}"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a turn that never got a slot never calls the LLM"
+    );
+
+    // And the resume path picks it up: `resumable_turns` is the exact
+    // predicate `claim_resumable` enforces (`interrupted`,
+    // `attempts = 0`).
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let resumable = chat.resumable_turns().await.unwrap();
+    assert_eq!(
+        resumable.len(),
+        1,
+        "the released turn is claimable by the resume worker: {resumable:?}"
+    );
+
+    drop(hold);
 }
 
 #[tokio::test]
