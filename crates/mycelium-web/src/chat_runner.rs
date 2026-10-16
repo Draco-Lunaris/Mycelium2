@@ -14,9 +14,19 @@
 //! died-without-finalizing failure mode: its Drop finalizes the turn
 //! and clears the registry entry, so a `running` row can never wedge
 //! a session.
+//!
+//! The runner is also the chat surface's single LLM-admission point
+//! (LLM concurrency spec §3.3): before the agent runs it enters
+//! `llm_gate::LLM_GATE` as a wait-class waiter bounded by the stored
+//! `chat_wait_secs`, holds the permit across the run and its
+//! persistence, and finalizes the turn `failed` with
+//! [`CHAT_CAPACITY_MSG`] if no slot comes. Fresh submits (`chat_api`)
+//! and resumed turns (`chat_resume`) both arrive here, so neither can
+//! start a run without a slot.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -24,6 +34,7 @@ use uuid::Uuid;
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_librarian::agent::{AgentError, AgentEvent, run_chat_streaming};
 use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig};
+use mycelium_librarian::llm_gate::{GatePermit, GateTimeout, LLM_GATE};
 use mycelium_store::ConceptStore;
 use mycelium_store::Store;
 use mycelium_store::chat::{ChatError, ChatRole, ChatStore, ChatTurnRow, ChatTurnStatus};
@@ -42,6 +53,12 @@ const MAX_HISTORY_PAIRS: usize = 20;
 /// one message everywhere).
 const LLM_UNAVAILABLE: &str =
     "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal";
+
+/// The user-facing message for a turn that never got an LLM slot within
+/// `chat_wait_secs` (LLM concurrency spec §3.3: the runner finalizes the
+/// turn as `failed` with a clear capacity message, persisted so a
+/// reconnecting client sees it).
+pub const CHAT_CAPACITY_MSG: &str = "LLM at capacity — turn not started (queue full)";
 
 /// One live-stream event for a chat turn (spec §3.3 vocabulary).
 ///
@@ -273,7 +290,44 @@ async fn run_chat_turn(
             }
         };
 
-    let client = LlmClient::new(&ctx.llm);
+    // Gate admission (LLM concurrency spec §3.3/§3.5). This is the
+    // chat surface's SINGLE admission point: fresh submits and resumed
+    // turns both arrive here, so neither can start an agent run without
+    // a slot. The stored tunables take effect on the way in (R12: the
+    // runner's own config row is the admin's, clamped — no new
+    // plumbing), and the permit is held across the whole run + persist
+    // loop below, released by its Drop on every exit including a panic.
+    let llm = ctx.llm.clamp();
+    llm.sync_gate();
+    let bound = Duration::from_secs(u64::from(llm.chat_wait_secs));
+    let _permit = match admit(user_id, bound).await {
+        Ok(p) => p,
+        Err(GateTimeout) => {
+            // No slot within the bound: the run never started, so there
+            // is no side-effect doubt — the turn finalizes `failed`
+            // with the capacity message on BOTH paths (a resumed turn
+            // already carries attempts = 1, so `interrupted` would not
+            // buy it a retry; `interrupted` stays reserved for a run
+            // that reached an unreachable LLM).
+            tracing::warn!(
+                turn_id = %turn_id, user_id = %user_id, resumed,
+                "chat turn gave up waiting for an LLM slot"
+            );
+            finish_turn(
+                &ctx,
+                &master,
+                user_id,
+                session_id,
+                turn_id,
+                ChatTurnStatus::Failed,
+                Some(CHAT_CAPACITY_MSG),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let client = LlmClient::new(&llm);
     let cs = ConceptStore::for_user(&ctx.store, user_id, master.clone());
     // AgentScopes borrows the store — built here, inside the task that
     // owns it (the detached-task pattern).
@@ -403,6 +457,38 @@ async fn run_chat_turn(
                 row.as_deref(),
             )
             .await;
+        }
+    }
+}
+
+/// Wait-class gate admission for one chat turn, shaped for the queue
+/// events Task 5 adds.
+///
+/// The gate's position callback is synchronous and runs under the
+/// gate's lock, so it must not block: it only pushes onto an unbounded
+/// channel (sends never block or drop), and the positions are consumed
+/// here — by the same `select!` that awaits admission, which is where
+/// the `queued` SSE event is emitted from once it exists. Dropping this
+/// future (an aborted runner) removes the waiter from the queue.
+async fn admit(user_id: Uuid, bound: Duration) -> Result<GatePermit<'static>, GateTimeout> {
+    let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<usize>();
+    let gate: &'static _ = &*LLM_GATE;
+    let enter = gate.enter(Some(user_id), bound, move |pos| {
+        let _ = pos_tx.send(pos);
+    });
+    tokio::pin!(enter);
+    loop {
+        tokio::select! {
+            res = &mut enter => return res,
+            pos = pos_rx.recv() => match pos {
+                // Task 5: broadcast a `queued` event carrying `_pos`.
+                Some(_pos) => {}
+                // The gate dropped this waiter's callback (admitted, or
+                // left the queue): nothing more to forward — the
+                // admission future alone decides the outcome, and
+                // polling a closed receiver again would spin.
+                None => return enter.await,
+            },
         }
     }
 }
