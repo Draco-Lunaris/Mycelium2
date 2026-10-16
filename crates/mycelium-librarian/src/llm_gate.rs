@@ -325,7 +325,9 @@ impl LlmGate {
     /// callback is never called.
     ///
     /// Returns [`GateTimeout`] when the bound elapses or the gate
-    /// releases its waiters; the waiter leaves the queue either way.
+    /// releases its waiters; the waiter leaves the queue either way —
+    /// as it does when the returned future is dropped before admission
+    /// (a disconnected client, an aborted runner, a cancelled request).
     pub async fn enter<F>(
         &self,
         user: Option<Uuid>,
@@ -335,7 +337,7 @@ impl LlmGate {
     where
         F: Fn(usize) + Send + Sync + 'static,
     {
-        let (id, mut rx) = {
+        let mut queued = {
             let mut inner = self.lock();
             // Fast path: an idle queue, a free slot, and room under the
             // user's cap. A non-empty queue always waits — jumping it
@@ -359,26 +361,41 @@ impl LlmGate {
             // A free slot may be sitting behind a capped head, in which
             // case this waiter is admitted right here.
             inner.dispatch();
-            (id, rx)
+            QueuedWaiter {
+                gate: self,
+                id,
+                user,
+                rx,
+                armed: true,
+            }
         };
 
-        match tokio::time::timeout(bound, &mut rx).await {
-            Ok(Ok(Outcome::Admitted)) => Ok(GatePermit::new(self, user)),
+        match tokio::time::timeout(bound, &mut queued.rx).await {
+            Ok(Ok(Outcome::Admitted)) => {
+                queued.disarm();
+                Ok(GatePermit::new(self, user))
+            }
             // Closed waiters are already counted by `close`; a dropped
             // sender can only mean the same.
-            Ok(Ok(Outcome::Closed) | Err(_)) => Err(GateTimeout),
+            Ok(Ok(Outcome::Closed) | Err(_)) => {
+                queued.disarm();
+                Err(GateTimeout)
+            }
             Err(_) => {
-                let mut inner = self.lock();
-                if let Some(pos) = inner.queue.iter().position(|w| w.id == id) {
-                    inner.queue.remove(pos);
-                    inner.timeouts_total += 1;
-                    inner.notify_positions();
-                    return Err(GateTimeout);
+                {
+                    let mut inner = self.lock();
+                    if let Some(pos) = inner.queue.iter().position(|w| w.id == queued.id) {
+                        inner.queue.remove(pos);
+                        inner.timeouts_total += 1;
+                        inner.notify_positions();
+                        queued.disarm();
+                        return Err(GateTimeout);
+                    }
                 }
-                drop(inner);
                 // A dispatch beat the bound: honor the admission instead
                 // of stranding the slot it already took.
-                match rx.try_recv() {
+                queued.disarm();
+                match queued.rx.try_recv() {
                     Ok(Outcome::Admitted) => Ok(GatePermit::new(self, user)),
                     Ok(Outcome::Closed) | Err(_) => Err(GateTimeout),
                 }
@@ -403,6 +420,60 @@ impl LlmGate {
         let mut inner = self.lock();
         inner.free_slot(user);
         inner.dispatch();
+    }
+}
+
+/// A waiter's seat in the queue, held by the `enter` future for as long
+/// as the waiter is neither admitted nor timed out.
+///
+/// Cancellation is the reason this exists: if the `enter` future is
+/// dropped while queued, nothing else would take the waiter out of the
+/// deque until some later dispatch happened to prune it — and on an
+/// idle gate nothing dispatches, so the try class (the mutation-queue
+/// drain, chat resume) would be starved by a waiter that will never
+/// wake, while `chat_queue_depth` and `stats().queued` over-reported.
+/// Departure is therefore eager: `Drop` takes the waiter out itself.
+struct QueuedWaiter<'a> {
+    gate: &'a LlmGate,
+    id: u64,
+    user: Option<Uuid>,
+    rx: oneshot::Receiver<Outcome>,
+    armed: bool,
+}
+
+impl QueuedWaiter<'_> {
+    /// The waiter has left the queue by an ordinary path (admitted,
+    /// closed, or timed out), so `Drop` has nothing to clean up.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueuedWaiter<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut inner = self.gate.lock();
+            if let Some(pos) = inner.queue.iter().position(|w| w.id == self.id) {
+                inner.queue.remove(pos);
+                // A cancelled wait is accounted exactly like a timeout:
+                // from the gate's side both are a waiter that gave up.
+                inner.timeouts_total += 1;
+                // Nothing freed a slot, but the waiters behind this one
+                // moved up and need their new positions.
+                inner.dispatch();
+                return;
+            }
+        }
+        // Not queued any more: a dispatch admitted this waiter and took
+        // a slot for it just before the future was dropped. No permit
+        // will ever be built from that admission, so hand the slot back
+        // rather than shrinking the gate for the life of the process.
+        if let Ok(Outcome::Admitted) = self.rx.try_recv() {
+            self.gate.release(self.user);
+        }
     }
 }
 
@@ -684,6 +755,59 @@ mod tests {
 
         drop(p2);
         assert_eq!(g.stats().active, 0, "the slot is released exactly once");
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_leaves_queue_without_a_release() {
+        // A free slot behind a per-user-capped waiter: the shape in
+        // which a phantom waiter would starve the try class outright.
+        let g = gate(2);
+        g.set_per_user_active(1);
+        let uid = Uuid::new_v4();
+        let held = g.enter(Some(uid), BOUND, |_| {}).await.unwrap();
+
+        let w = tokio::spawn(async move { g.enter(Some(uid), BOUND, |_| {}).await });
+        wait_until(|| g.stats().queued == 1).await;
+        assert!(g.try_enter().is_none(), "the try class yields to a waiter");
+
+        // Cancel the waiting future. Nothing releases a permit and
+        // nothing resizes the gate afterwards: the waiter has to leave
+        // the queue on its own.
+        w.abort();
+        wait_until(|| g.stats().queued == 0).await;
+        assert_eq!(g.chat_queue_depth(), 0, "depth stops over-reporting");
+
+        let t = g
+            .try_enter()
+            .expect("a cancelled waiter does not starve the try class");
+        assert_eq!(g.stats().active, 2);
+
+        drop(t);
+        drop(held);
+        assert_eq!(g.stats().active, 0, "no slot was leaked");
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_hands_back_an_admission_it_never_took() {
+        let g = gate(1);
+        let held = g.enter(None, BOUND, |_| {}).await.unwrap();
+        let w = tokio::spawn(async move { g.enter(None, BOUND, |_| {}).await });
+        wait_until(|| g.stats().queued == 1).await;
+
+        // Abort and release without awaiting in between: the aborted
+        // task cannot run yet, so the release dispatches the slot to a
+        // waiter that is about to be dropped and will never build a
+        // permit from it.
+        w.abort();
+        drop(held);
+        let s = g.stats();
+        assert_eq!((s.active, s.queued), (1, 0), "the slot went to the waiter");
+
+        wait_until(|| g.stats().active == 0).await;
+        let t = g
+            .try_enter()
+            .expect("the abandoned admission was handed back");
+        drop(t);
     }
 
     #[tokio::test]
