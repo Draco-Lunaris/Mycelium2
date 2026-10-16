@@ -2425,3 +2425,135 @@ async fn dream_429_when_saturated() {
     drop(hold_b);
     shutdown.cancel();
 }
+
+/// The value of a Prometheus sample line (the first line that starts
+/// with `<name> `), so a `# TYPE` line is never read as a sample.
+fn metric_sample(text: &str, name: &str) -> String {
+    let prefix = format!("{name} ");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("/metrics has no sample line for {name}:\n{text}"));
+    line[prefix.len()..].trim().to_string()
+}
+
+/// /health's `llm_*` fields and /metrics' gate lines report LIVE gate
+/// state (spec §3.6): with one slot held, both surfaces see an active
+/// run, and both go back to zero once the permit drops. The counters
+/// are asserted RELATIVELY (before/after) — LLM_GATE is process-global,
+/// so no absolute total is pinned. Runs under this binary's gate lock
+/// with a defaults guard (it holds a slot).
+#[tokio::test]
+async fn health_and_metrics_reflect_live_gate_state() {
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm = mock_llm(vec![]).await; // never called: no chat turn here
+    let (base, shutdown, _dir) = boot(llm).await;
+    let client = client();
+
+    let before = LLM_GATE.stats();
+    let permit = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("a slot is free with the whole gate to ourselves");
+    assert!(
+        LLM_GATE.stats().active >= 1,
+        "the held permit is active: {:?}",
+        LLM_GATE.stats()
+    );
+
+    let held: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        held["llm_active"].as_i64().unwrap() >= 1,
+        "/health shows the held slot: {held}"
+    );
+    assert_eq!(
+        held["llm_queued"].as_i64().unwrap(),
+        0,
+        "nothing is queued behind us: {held}"
+    );
+    assert_eq!(
+        held["llm_capacity"].as_i64().unwrap(),
+        DEFAULT_CAPACITY as i64,
+        "the configured slot count, not a literal: {held}"
+    );
+    assert_eq!(
+        held["status"], "ok",
+        "a held gate slot never degrades health: {held}"
+    );
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_active")
+            .parse::<u64>()
+            .unwrap()
+            >= 1,
+        "the active gauge shows the held slot:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_llm_gate_capacity"),
+        DEFAULT_CAPACITY.to_string(),
+        "the capacity gauge mirrors the gate"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_admissions_total")
+            .parse::<u64>()
+            .unwrap()
+            > before.admissions_total,
+        "our admission moved the counter (relative, not absolute):\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_wait_count")
+            .parse::<u64>()
+            .unwrap()
+            > before.wait_count,
+        "the wait-class admission recorded a wait sample:\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_wait_seconds_total")
+            .parse::<f64>()
+            .unwrap()
+            // 1e-6 slack: the line is rendered at six decimals.
+            >= before.wait_seconds_total - 1e-6,
+        "the cumulative wait never goes backwards:\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_timeouts_total")
+            .parse::<u64>()
+            .unwrap()
+            >= before.timeouts_total,
+        "the timeout counter never goes backwards:\n{text}"
+    );
+
+    drop(permit);
+    poll_gate_until(|| LLM_GATE.stats().active == 0, "the gate draining").await;
+    let drained: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        drained["llm_active"].as_i64().unwrap(),
+        0,
+        "the released slot is reported free: {drained}"
+    );
+
+    shutdown.cancel();
+}

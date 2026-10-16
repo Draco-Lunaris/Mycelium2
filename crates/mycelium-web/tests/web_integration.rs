@@ -3897,3 +3897,120 @@ async fn csrf_from_page(client: &reqwest::Client, url: &str, cookie: &str) -> St
 /// The Arc import is used by AppState::new's signature in tests.
 #[allow(dead_code)]
 type _Arc = Arc<()>;
+
+/// The seven gate metric names with their Prometheus types (spec §3.6).
+/// The flag marks the integral samples — `wait_seconds_total` is the
+/// one float.
+const GATE_METRICS: [(&str, &str, bool); 7] = [
+    ("mycelium2_llm_gate_active", "gauge", true),
+    ("mycelium2_llm_gate_queued", "gauge", true),
+    ("mycelium2_llm_gate_capacity", "gauge", true),
+    ("mycelium2_llm_gate_admissions_total", "counter", true),
+    ("mycelium2_llm_gate_timeouts_total", "counter", true),
+    ("mycelium2_llm_gate_wait_seconds_total", "counter", false),
+    ("mycelium2_llm_gate_wait_count", "counter", true),
+];
+
+/// The value of a Prometheus sample line (the first line that starts
+/// with `<name> `), so a `# TYPE` line is never mistaken for a sample.
+fn metric_sample(text: &str, name: &str) -> String {
+    let prefix = format!("{name} ");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("/metrics has no sample line for {name}:\n{text}"));
+    line[prefix.len()..].trim().to_string()
+}
+
+/// The PUBLIC /health JSON carries the three LLM-gate fields beside the
+/// write-queue ones (spec §3.6; `/api/v1/health` deliberately stays
+/// unchanged). Presence and types only: the gate is process-global, so
+/// nothing absolute is pinned here and no slot is held — the live-state
+/// assertion lives in chat_sessions_integration.rs, under that binary's
+/// gate lock.
+#[tokio::test]
+async fn health_reports_llm_gate_fields() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "a healthy boot is not degraded");
+    let body: serde_json::Value = health.json().await.unwrap();
+    for field in ["llm_active", "llm_queued", "llm_capacity"] {
+        let v = body
+            .get(field)
+            .unwrap_or_else(|| panic!("/health is missing {field}: {body}"));
+        assert!(
+            v.is_i64() || v.is_u64(),
+            "{field} must be an integer, got {v}"
+        );
+        assert!(
+            v.as_i64().unwrap() >= 0,
+            "{field} must be non-negative, got {v}"
+        );
+    }
+    assert!(
+        body["llm_capacity"].as_i64().unwrap() >= 1,
+        "the gate always has at least one slot: {body}"
+    );
+    // The gate never degrades health on its own (spec §3.6).
+    assert_eq!(body["status"], "ok", "gate fields do not change status");
+
+    // The detail endpoint keeps its old shape.
+    let detail: serde_json::Value = client
+        .get(format!("{base}/api/v1/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for field in ["llm_active", "llm_queued", "llm_capacity"] {
+        assert!(
+            detail.get(field).is_none(),
+            "/api/v1/health must stay unchanged, found {field}: {detail}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// /metrics carries the gate gauges and counters in the same
+/// `# TYPE`-then-sample shape the mutation-queue metrics use.
+#[tokio::test]
+async fn metrics_reports_llm_gate_lines() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    let metrics = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(metrics.status(), 200);
+    let text = metrics.text().await.unwrap();
+
+    for (name, kind, integral) in GATE_METRICS {
+        assert!(
+            text.contains(&format!("# TYPE {name} {kind}\n")),
+            "/metrics lacks the `# TYPE {name} {kind}` line:\n{text}"
+        );
+        let value = metric_sample(&text, name);
+        if integral {
+            assert!(
+                value.parse::<u64>().is_ok(),
+                "{name} sample {value:?} is not a non-negative integer"
+            );
+        } else {
+            let f: f64 = value
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} sample {value:?} is not a number: {e}"));
+            assert!(f >= 0.0, "{name} must be non-negative, got {f}");
+        }
+    }
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_capacity")
+            .parse::<u64>()
+            .unwrap()
+            >= 1,
+        "the gate always has at least one slot"
+    );
+
+    shutdown.cancel();
+}
