@@ -26,6 +26,7 @@ use mycelium_librarian::llm_gate::{
 };
 use mycelium_store::Store;
 use mycelium_web::AppState;
+use mycelium_web::chat_api::CHAT_QUEUE_FULL_MSG;
 use mycelium_web::chat_runner::CHAT_CAPACITY_MSG;
 
 /// Known admin password for the pre-seeded account (tests log in with it).
@@ -492,6 +493,41 @@ async fn poll_meta_until(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// POST /api/v1/chat/sessions/{id}/messages (the existing-session submit).
+async fn submit_into_session(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    session_id: &str,
+    message: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/api/v1/chat/sessions/{session_id}/messages"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(&[("message", message)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `(chat_sessions, chat_turns)` row counts read straight from the
+/// server's SQLite file (a second pool; WAL readers are concurrent).
+/// The depth-cap contract is "no row written", so it is asserted
+/// against the tables themselves, not an endpoint's view of them.
+async fn chat_row_counts(store: &Store) -> (i64, i64) {
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turns")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    (sessions, turns)
 }
 
 /// The user's single session id from the list endpoint — the draft
@@ -2014,5 +2050,224 @@ async fn chat_sse_emits_queued_then_admitted() {
         "the replay vocabulary is the persisted rows"
     );
 
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_submit_429_at_depth_cap() {
+    // LLM concurrency spec §3.3: with the gate's waiter queue at its
+    // configured depth, a NEW draft submit is refused 429 +
+    // `Retry-After: 5` BEFORE any row is written — no empty draft
+    // session, no zombie turn (the client can retry). The turn already
+    // queued is untouched and runs normally once a slot frees.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![text_response("answered once the queue drained")]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // One slot and room for exactly one waiter; a generous wait
+        // bound, so nothing here depends on the timeout path.
+        max_parallel: 1,
+        chat_queue_depth: 1,
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    // A second pool over the same file: the row-count observable.
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // Hold the single slot anonymously (the per-user cap must not be
+    // what queues the first turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    // Submit A: its runner takes the one queue place. The stream stays
+    // open until the turn finishes, so drive it in a task.
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit_a = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "first in the queue").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        resp.text().await.unwrap()
+    });
+    // The runner is async: wait for the REAL queue state, never assume it.
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "turn A queued on the gate").await;
+    let before = chat_row_counts(&store).await;
+    assert_eq!(
+        before,
+        (1, 1),
+        "A's session and turn rows exist: {before:?}"
+    );
+
+    // Submit B: the queue is full (depth 1) → refused, nothing written.
+    let refused = submit_draft(&client, &base, &cookie, &csrf, "second in the queue").await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "a submit beyond the depth cap is refused"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": CHAT_QUEUE_FULL_MSG }),
+        "the pinned 429 body"
+    );
+    assert_eq!(
+        chat_row_counts(&store).await,
+        before,
+        "the refusal wrote neither a session nor a turn row"
+    );
+    assert_eq!(
+        LLM_GATE.stats().queued,
+        1,
+        "the refused submit never enqueued: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // Release the slot: A is admitted and finishes normally.
+    drop(hold);
+    let events = sse_events(&submit_a.await.unwrap());
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("the queued turn still finishes: {events:?}"));
+    assert_eq!(done["reply"], "answered once the queue drained");
+    let session_id = first_session_id(&client, &base, &cookie).await;
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(meta["turn_status"], "done");
+    assert_eq!(
+        chat_row_counts(&store).await,
+        (1, 1),
+        "still exactly one session and one turn"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_submit_session_429_at_depth_cap() {
+    // The same cap on the existing-session endpoint (spec §3.3 applies
+    // to the submit surface, not just the draft flow): the target
+    // session has NO running turn, so a 409 cannot be what refuses this
+    // — it is the depth cap, and it lands before the turn row.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // LIFO script: the warm-up turn is served first, then turn A's.
+    let llm_url = mock_llm(vec![
+        text_response("answered once the queue drained"),
+        text_response("warm-up reply"),
+    ])
+    .await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        chat_queue_depth: 1,
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // A finished session to submit into later (no slot held yet, so it
+    // runs straight through).
+    let (session_id, events) =
+        submit_draft_collect(&client, &base, &cookie, &csrf, "warm up").await;
+    assert_eq!(
+        events.last().map(|e| e["type"].clone()),
+        Some(serde_json::json!("done")),
+        "the warm-up turn finishes: {events:?}"
+    );
+    let warm_meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(warm_meta["max_seq"], 2, "user + assistant rows");
+
+    // Fill the gate: one slot held, one waiter queued (a second,
+    // separate session's turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit_a = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "first in the queue").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        resp.text().await.unwrap()
+    });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "turn A queued on the gate").await;
+    let before = chat_row_counts(&store).await;
+    assert_eq!(before, (2, 2), "two sessions, two turns: {before:?}");
+
+    // Submit into the IDLE session while the queue is full → 429.
+    let refused = submit_into_session(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &session_id,
+        "a second turn in a quiet session",
+    )
+    .await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "the existing-session submit is capped too"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": CHAT_QUEUE_FULL_MSG }),
+        "the pinned 429 body"
+    );
+    assert_eq!(
+        chat_row_counts(&store).await,
+        before,
+        "the refusal wrote no turn row"
+    );
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(
+        meta["turn_status"], "done",
+        "the refused submit left the session's last turn alone: {meta}"
+    );
+    assert_eq!(meta["max_seq"], 2, "no new user row: {meta}");
+    assert_eq!(
+        LLM_GATE.stats().queued,
+        1,
+        "the refused submit never enqueued: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // Release: the queued turn finishes normally.
+    drop(hold);
+    let events = sse_events(&submit_a.await.unwrap());
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("the queued turn still finishes: {events:?}"));
+    assert_eq!(done["reply"], "answered once the queue drained");
     shutdown.cancel();
 }

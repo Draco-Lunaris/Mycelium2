@@ -11,6 +11,12 @@
 //! live broadcast until the terminal event. A turn with no live entry
 //! replays and closes immediately — poll semantics, so a
 //! poll-shaped reopen is well-defined.
+//!
+//! Both submission endpoints funnel through `submit_turn`, which first
+//! clears the LLM gate's queue-depth cap ([`check_queue_depth`], LLM
+//! concurrency spec §3.3): at the cap the submit is refused 429 +
+//! `Retry-After: 5` BEFORE any session or turn row exists, so a full
+//! queue never strands rows nobody will run.
 
 use std::sync::Arc;
 
@@ -21,6 +27,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 
 use mycelium_auth::rbac::SessionUser;
 use mycelium_crypto::keys::MasterKey;
+use mycelium_librarian::llm_gate::LLM_GATE;
 use mycelium_store::chat::{ChatError, ChatRole};
 use uuid::Uuid;
 
@@ -30,6 +37,12 @@ use crate::api::{
 use crate::chat_runner::{ChatRunContext, ChatSseEvent, ChatSseKind, spawn_chat_run};
 use crate::middleware::SessionId;
 use crate::state::AppState;
+
+/// The refusal body served when the LLM gate's waiter queue is already
+/// at its configured depth (`LlmConfig::chat_queue_depth`): the submit
+/// surface's 429 message, pinned by the integration tests (LLM
+/// concurrency spec §3.3).
+pub const CHAT_QUEUE_FULL_MSG: &str = "LLM at capacity — queue full";
 
 /// GET /api/v1/chat/sessions — the user's sessions, newest-first (the
 /// sidebar list). Titles decrypt under the caller's master key; a
@@ -106,6 +119,14 @@ pub async fn api_chat_create_session(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     };
+    // The depth cap lands BEFORE the session row too (spec §3.3: a
+    // refusal leaves nothing behind — no empty draft session, no turn).
+    // `submit_turn` checks again for its own sake; both checks read the
+    // same stored config, so the draft path pays one extra config read
+    // to keep the refusal ahead of every write.
+    if let Admission::Refused(refusal) = check_queue_depth(&state).await {
+        return refusal;
+    }
     let title = mycelium_librarian::fallback::derive_title(&form.message);
     let session_id = match state
         .chat_sessions
@@ -236,6 +257,15 @@ async fn submit_turn(
     first_event: Option<ChatSseEvent>,
     message: String,
 ) -> Response {
+    // Admission check before the first row of this submit: at the gate's
+    // configured queue depth the submission is refused outright, so a
+    // full queue never leaves a turn row nobody will ever run (spec
+    // §3.3). The clamped config comes back for the runner's context —
+    // one load, the same row the runner would read.
+    let llm = match check_queue_depth(state).await {
+        Admission::Admitted(llm) => llm,
+        Admission::Refused(refusal) => return refusal,
+    };
     let turn = match state
         .chat_sessions
         .create_turn(user.user_id, &master, session_id, &message)
@@ -247,10 +277,6 @@ async fn submit_turn(
     // The runner's own copies of everything AppState holds (the task
     // outlives the request). LLM failures never 503 here — the run is
     // detached; failures arrive as events (spec §5).
-    let llm =
-        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
-            .await
-            .unwrap_or_default();
     let ctx = ChatRunContext {
         store: (*state.store).clone(),
         service_key: (*state.service_key).clone(),
@@ -280,6 +306,58 @@ async fn submit_turn(
         Some(turn_id),
     )
     .await
+}
+
+/// The submit surface's admission check (spec §3.3's global queue depth
+/// cap). Loads the stored LLM row exactly as the runner does — clamped,
+/// then pushed onto the process-global gate, so an admin save (or a row
+/// written by another process) takes effect without a restart — and
+/// refuses when the gate's CURRENT waiter count has reached the
+/// configured depth. Returns the clamped config for the runner's
+/// context, or the 429 response.
+///
+/// Best effort by design, not a lock: two submits racing at depth − 1
+/// can both pass. That is acceptable — each turn's wait is bounded, so
+/// the overshoot costs one extra waiter, never an unbounded queue — and
+/// locking here would serialize every submit for nothing.
+async fn check_queue_depth(state: &AppState) -> Admission {
+    let llm =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default()
+            .clamp();
+    llm.sync_gate();
+    if LLM_GATE.chat_queue_depth() >= llm.chat_queue_depth as usize {
+        tracing::warn!(
+            depth = LLM_GATE.chat_queue_depth(),
+            limit = llm.chat_queue_depth,
+            "chat submit refused: LLM queue at its depth cap"
+        );
+        return Admission::Refused(queue_full_response());
+    }
+    Admission::Admitted(llm)
+}
+
+/// [`check_queue_depth`]'s outcome. An enum rather than a `Result`: the
+/// refusal is a whole `Response`, which a `Result` error variant would
+/// make a large-error return (clippy::result_large_err) for a path that
+/// is not an error at all — it is this surface's contract.
+enum Admission {
+    /// Under the cap — the clamped config for the runner's context.
+    Admitted(crate::LlmConfig),
+    /// At the cap — the ready 429 response.
+    Refused(Response),
+}
+
+/// The depth-cap refusal: 429 + `Retry-After: 5` with the endpoint-wide
+/// JSON error shape (spec §3.3 — the client can retry).
+fn queue_full_response() -> Response {
+    let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, CHAT_QUEUE_FULL_MSG);
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("5"),
+    );
+    response
 }
 
 /// The shared submit/reattach stream builder (spec §3.3's race-free
