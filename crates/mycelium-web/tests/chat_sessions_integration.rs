@@ -2271,3 +2271,157 @@ async fn chat_submit_session_429_at_depth_cap() {
     assert_eq!(done["reply"], "answered once the queue drained");
     shutdown.cancel();
 }
+
+#[tokio::test]
+async fn stateless_chat_429_when_saturated() {
+    // LLM concurrency spec §3.3: the stateless one-shot
+    // `POST /api/v1/chat` is wait class, bounded by `query_wait_secs`.
+    // With every slot held it waits the bound and then 429s with
+    // `Retry-After: 5` — distinguishable from the 503 it returns when
+    // the LLM is unreachable.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // A REACHABLE mock with an empty script: a request would 500, so
+    // "no request recorded" proves the run never started — and the
+    // 429 cannot be the unreachable-LLM 503 in disguise.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // Two slots (the default), a one-second wait bound: the handler
+        // syncs the gate from this row, as the admin page's save does.
+        max_parallel: 2,
+        query_wait_secs: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    // Saturate: anonymous holds, so the per-user cap is not what
+    // rejects this request — only the global capacity.
+    let hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 1 of 2 is free before the request");
+    let hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 2 of 2 is free before the request");
+
+    let resp = client
+        .post(format!("{base}/api/v1/chat"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("message", "asked while the gate is full")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "capacity, not 503 unreachable");
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": mycelium_web::api::LLM_CAPACITY_MSG }),
+        "the pinned 429 body"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a request that never got a slot never calls the LLM"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before + 1,
+        "exactly one gate timeout — the 429 came from the gate: {:?}",
+        LLM_GATE.stats()
+    );
+    drop(hold_a);
+    drop(hold_b);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn dream_429_when_saturated() {
+    // LLM concurrency spec §3.3/§5: dream is wait class with the chat
+    // bound. Saturated → the endpoint-wide JSON error shape with the
+    // capacity message and a 429, never a hang.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 2,
+        chat_wait_secs: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // No session → the login gate redirects, before any admission.
+    let no_auth = client
+        .post(format!("{base}/api/v1/dream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_auth.status(),
+        303,
+        "unauthenticated must hit the login gate"
+    );
+
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    let hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 1 of 2 is free before the request");
+    let hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 2 of 2 is free before the request");
+
+    let resp = client
+        .post(format!("{base}/api/v1/dream"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "capacity refusal, not a 500 or a hang");
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": mycelium_web::api::LLM_CAPACITY_MSG }),
+        "dream's error-envelope shape with the capacity message"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a dream that never got a slot never calls the LLM"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before + 1,
+        "exactly one gate timeout — the 429 came from the gate: {:?}",
+        LLM_GATE.stats()
+    );
+    drop(hold_a);
+    drop(hold_b);
+    shutdown.cancel();
+}

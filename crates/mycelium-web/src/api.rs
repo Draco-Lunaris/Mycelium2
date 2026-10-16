@@ -3612,6 +3612,24 @@ pub struct ChatMessageForm {
     pub message: String,
 }
 
+/// The capacity refusal both unbuffered LLM surfaces return when no
+/// gate slot comes free within their wait bound (LLM concurrency spec
+/// §3.3). Deliberately distinct from the LLM-unreachable 503 wording:
+/// "come back" is not "nothing is configured".
+pub const LLM_CAPACITY_MSG: &str = "LLM at capacity — try again shortly";
+
+/// The gate-timeout refusal: 429 + `Retry-After: 5` with the
+/// endpoint-wide `{"error": …}` shape (spec §3.3 — retryable, and no
+/// internal detail on the wire).
+fn llm_capacity_response() -> Response {
+    let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, LLM_CAPACITY_MSG);
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("5"),
+    );
+    response
+}
+
 /// POST /api/v1/dream — run a maintenance/consolidation pass over the
 /// caller's private bundle (v1 parity: orphans, broken links, likely
 /// duplicates, oversized concepts). Deterministic signals decide
@@ -3623,10 +3641,15 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    // The config load is also the gate's sync point (spec §3.2): the
+    // clamped row is the single source of both the gate's limits and
+    // this surface's wait bound — no separate plumbing.
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamp();
+    llm.sync_gate();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     let scopes = build_agent_scopes(
         &state.store,
@@ -3634,7 +3657,33 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
-    match mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await {
+    // Dream is wait class with the CHAT bound (spec §5): admin-triggered
+    // and rare, so it may wait for a slot — but it never jumps the
+    // queue, and it never hangs unbounded.
+    let permit = match mycelium_librarian::llm_gate::LLM_GATE
+        .enter(
+            Some(user.user_id),
+            std::time::Duration::from_secs(u64::from(llm.chat_wait_secs)),
+            |_| {},
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                wait_secs = llm.chat_wait_secs,
+                user_id = %user.user_id,
+                "llm gate: no slot for dream within the wait bound"
+            );
+            return llm_capacity_response();
+        }
+    };
+    let outcome = mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await;
+    // The slot is free the moment the run is: the response body is
+    // built after the release, not under the permit.
+    drop(permit);
+    match outcome {
         Ok(report) => Json(report).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "dream failed");
@@ -3664,10 +3713,13 @@ pub async fn api_chat(
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    // Config load doubles as the gate sync point (spec §3.2).
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamp();
+    llm.sync_gate();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Stateless by design (spec D9): single-shot — this message only.
     let history = vec![mycelium_librarian::llm::ConversationTurn::User(
@@ -3679,7 +3731,33 @@ pub async fn api_chat(
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
-    match mycelium_librarian::agent::run_chat(&client, &cs, &scopes, &history).await {
+    // Wait class, bounded by `query_wait_secs` (spec §3.3): this
+    // endpoint holds an HTTP request open, so its bound is the short
+    // one. No slot in time → 429 + Retry-After, which the caller can
+    // tell apart from the 503 below (nothing reachable to ask).
+    let permit = match mycelium_librarian::llm_gate::LLM_GATE
+        .enter(
+            Some(user.user_id),
+            std::time::Duration::from_secs(u64::from(llm.query_wait_secs)),
+            |_| {},
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                wait_secs = llm.query_wait_secs,
+                user_id = %user.user_id,
+                "llm gate: no slot for stateless chat within the wait bound"
+            );
+            return llm_capacity_response();
+        }
+    };
+    let outcome = mycelium_librarian::agent::run_chat(&client, &cs, &scopes, &history).await;
+    // Released before the response is built — see `api_dream`.
+    drop(permit);
+    match outcome {
         Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
         Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
             tracing::warn!(error = %e, "librarian chat LLM failure");
