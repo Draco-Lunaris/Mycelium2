@@ -292,6 +292,24 @@ pub async fn serve(
         tls: Some(Arc::new(tls_handle)),
         ..state
     };
+
+    // Boot sync of the LLM admission gate (LLM concurrency spec §3.2):
+    // the stored limits take effect BEFORE the listener accepts, so the
+    // try-class workers (mutation drain, chat resume) do not run against
+    // the default capacity until some request happens to sync. A missing
+    // or undecryptable row simply means the defaults.
+    let llm_cfg =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
+    llm_cfg.sync_gate();
+    tracing::info!(
+        capacity = mycelium_librarian::llm_gate::LLM_GATE.capacity(),
+        per_user_active = mycelium_librarian::llm_gate::LLM_GATE.per_user_active(),
+        chat_queue_depth = mycelium_librarian::llm_gate::LLM_GATE.chat_queue_depth_limit(),
+        "LLM gate synced from the stored config at boot"
+    );
+
     let router = build_router_with_shutdown(state, shutdown.clone());
 
     // HTTP:80 → HTTPS redirect. Preserves the request Host (so the

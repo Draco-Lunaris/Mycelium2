@@ -2557,3 +2557,324 @@ async fn health_and_metrics_reflect_live_gate_state() {
 
     shutdown.cancel();
 }
+
+// ---------------------------------------------------------------------
+// Admin LLM concurrency fields + live gate sync (LLM concurrency spec
+// §3.2/§3.6). The admin form carries the five tunables; saving clamps
+// them and pushes them onto the process-global gate immediately, and
+// boot syncs the stored row before the listener accepts traffic.
+// ---------------------------------------------------------------------
+
+/// POST /admin/llm with an arbitrary field set (the page's own flow:
+/// admin cookie + CSRF header). Fields are passed verbatim so a test
+/// can omit the concurrency inputs entirely (an old cached form).
+async fn post_admin_llm(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    fields: &[(&str, &str)],
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/admin/llm"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(fields)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Decrypt the stored "llm" row from the server's tempdir (the on-disk
+/// service key is idempotent: same file, same key).
+async fn stored_llm(dir: &std::path::Path) -> mycelium_web::LlmConfig {
+    let store = Store::open(dir).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir, None).unwrap();
+    let config = mycelium_store::config::ConfigStore::new(store.pool().clone());
+    mycelium_store::config::get_sealed(&config, &service_key, "llm")
+        .await
+        .expect("a stored llm row")
+}
+
+/// The `<input ...>` tag carrying `name="<field>"`, for attribute
+/// assertions that do not pin the whole rendered line.
+fn input_tag<'a>(html: &'a str, field: &str) -> &'a str {
+    let marker = format!(r#"name="{field}""#);
+    let idx = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no input named {field} in the admin LLM form"));
+    let start = html[..idx].rfind('<').expect("an opening tag");
+    let end = idx + html[idx..].find('>').expect("a closing bracket") + 1;
+    &html[start..end]
+}
+
+#[tokio::test]
+async fn admin_llm_form_has_concurrency_fields() {
+    // Spec §3.6: the five tunables render with their CURRENT stored
+    // value — clamped, so a stale out-of-range row can never put 999
+    // back in the box — plus the range as min/max attributes.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // Deliberately out of range: the form must render the clamp.
+        max_parallel: 999,
+        per_user_active: 5,
+        query_wait_secs: 45,
+        chat_wait_secs: 900,
+        chat_queue_depth: 128,
+    })
+    .await;
+    let client = client();
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+
+    let html = client
+        .get(format!("{base}/admin/llm"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    for (field, value, min, max) in [
+        ("max_parallel", "64", "1", "64"),
+        ("per_user_active", "5", "1", "16"),
+        ("query_wait_secs", "45", "1", "600"),
+        ("chat_wait_secs", "900", "1", "7200"),
+        ("chat_queue_depth", "128", "1", "1024"),
+    ] {
+        let tag = input_tag(&html, field);
+        assert!(
+            tag.contains(r#"type="number""#),
+            "{field} is a number input: {tag}"
+        );
+        assert!(
+            tag.contains(&format!(r#"value="{value}""#)),
+            "{field} renders the clamped stored value {value}: {tag}"
+        );
+        assert!(
+            tag.contains(&format!(r#"min="{min}""#)) && tag.contains(&format!(r#"max="{max}""#)),
+            "{field} carries its clamp range {min}..={max}: {tag}"
+        );
+    }
+    // The range is visible to a human too, not just to the browser.
+    assert!(
+        html.contains("1&ndash;64") || html.contains("1–64") || html.contains("1-64"),
+        "the max_parallel range hint is visible in the form"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_syncs_gate_immediately() {
+    // Spec §3.2: "admin_save_llm syncs immediately on save — the admin
+    // sees the effect without waiting for traffic. No restart." The
+    // queued waiter is admitted by the save itself: nothing releases a
+    // slot (the hold is still held when the assertion runs).
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the save");
+    // One waiter queued behind it.
+    let waiter =
+        tokio::spawn(async move { LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.is_ok() });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "one waiter queued").await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "2"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "admin save redirects");
+    assert_eq!(
+        LLM_GATE.capacity(),
+        2,
+        "the save synced the gate with no traffic: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // The raise admitted the waiter — while the first slot is STILL
+    // held (nothing was released).
+    let admitted = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the queued waiter is admitted by the capacity raise")
+        .unwrap();
+    assert!(admitted, "the waiter got a slot, not a timeout");
+    drop(hold);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_clamps_out_of_range() {
+    // Spec §3.2: server-side validation is clamping, never a 500 and
+    // never an unbounded gate.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "999"),
+            ("per_user_active", "99"),
+            ("chat_queue_depth", "99999"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.max_parallel, 64, "max_parallel clamped at rest");
+    assert_eq!(
+        stored.per_user_active, 16,
+        "per_user_active clamped at rest"
+    );
+    assert_eq!(
+        stored.chat_queue_depth, 1024,
+        "chat_queue_depth clamped at rest"
+    );
+    assert_eq!(LLM_GATE.capacity(), 64, "the gate took the clamped value");
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.max_parallel, 1, "zero clamps up to the floor");
+    assert_eq!(LLM_GATE.capacity(), 1, "the gate took the clamped floor");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_without_concurrency_fields_keeps_stored_values() {
+    // An old cached form (or a non-numeric value) must save url/model
+    // without resetting the tunables — and must not 500.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 5,
+        per_user_active: 3,
+        query_wait_secs: 45,
+        chat_wait_secs: 900,
+        chat_queue_depth: 128,
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[("url", "http://elsewhere.invalid/v1"), ("model", "other")],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "a form without the inputs still saves");
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.url, "http://elsewhere.invalid/v1");
+    assert_eq!(stored.model, "other");
+    assert_eq!(stored.max_parallel, 5);
+    assert_eq!(stored.per_user_active, 3);
+    assert_eq!(stored.query_wait_secs, 45);
+    assert_eq!(stored.chat_wait_secs, 900);
+    assert_eq!(stored.chat_queue_depth, 128);
+
+    // A non-numeric value is the same case: keep the stored value, no 500.
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", "http://elsewhere.invalid/v1"),
+            ("model", "other"),
+            ("max_parallel", "not a number"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "a junk value must not 500");
+    assert_eq!(stored_llm(dir.path()).await.max_parallel, 5);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn boot_syncs_gate_from_stored_config() {
+    // Spec §3.2 + R29(c): a stored `max_parallel` takes effect at boot,
+    // before the listener accepts — the try-class workers (drain, chat
+    // resume) would otherwise see the default capacity until some
+    // request happened to sync.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+    assert_ne!(DEFAULT_CAPACITY, 5, "the test value must differ");
+    let llm_url = mock_llm(vec![]).await;
+    let (_base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 5,
+        ..Default::default()
+    })
+    .await;
+    // No request has been made: boot alone must have applied the row.
+    poll_gate_until(
+        || LLM_GATE.capacity() == 5,
+        "boot syncing the stored capacity",
+    )
+    .await;
+    shutdown.cancel();
+}

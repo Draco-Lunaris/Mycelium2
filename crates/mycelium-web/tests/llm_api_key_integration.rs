@@ -306,3 +306,42 @@ async fn chat_sends_bearer_header_end_to_end() {
         "chat must send Authorization: Bearer <configured key>"
     );
 }
+
+#[tokio::test]
+async fn sealed_llm_config_roundtrips_every_field() {
+    // The sealed path the admin save uses (`seal_config`) must carry
+    // ALL five concurrency fields, not just url/model/api_key: the
+    // librarian crate's own tests can only cover serde, never the
+    // AEAD-envelope round trip through the config table.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let config = ConfigStore::new(store.pool().clone());
+
+    // Every field non-default (and in range, so no clamp is involved).
+    let cfg = mycelium_web::LlmConfig {
+        url: "http://roundtrip.invalid/v1".into(),
+        model: "roundtrip-model".into(),
+        api_key: Some(TEST_KEY.into()),
+        max_parallel: 7,
+        per_user_active: 4,
+        query_wait_secs: 123,
+        chat_wait_secs: 4567,
+        chat_queue_depth: 321,
+    };
+    let sealed = mycelium_web::state::seal_config(&service_key, "llm", &cfg);
+    config.set("llm", &sealed).await.unwrap();
+
+    let back: mycelium_web::LlmConfig =
+        mycelium_web::state::decrypt_config(&config, &service_key, "llm")
+            .await
+            .expect("the sealed row decrypts");
+    assert_eq!(back.url, cfg.url);
+    assert_eq!(back.model, cfg.model);
+    assert_eq!(back.api_key.as_deref(), Some(TEST_KEY));
+    assert_eq!(back.max_parallel, 7);
+    assert_eq!(back.per_user_active, 4);
+    assert_eq!(back.query_wait_secs, 123);
+    assert_eq!(back.chat_wait_secs, 4567);
+    assert_eq!(back.chat_queue_depth, 321);
+}

@@ -2350,18 +2350,18 @@ pub async fn admin_llm_view(
     Query(params): Query<AdminParams>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
+    // Clamped for rendering: a stale (or hand-edited) out-of-range row
+    // must not put an unenforceable value back in the box.
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
-    let llm_api_key_set = llm.api_key.is_some();
+            .unwrap_or_default()
+            .clamp();
     let admin = request_admin_user(&state, &session).await;
     pages::admin_llm_page(
         &admin,
         &csrf,
-        &llm.url,
-        &llm.model,
-        llm_api_key_set,
+        &llm,
         params.ok.as_deref(),
         params.error.as_deref(),
     )
@@ -2586,12 +2586,36 @@ pub struct LlmForm {
     /// admin re-entering the URL/model with the key field cleared only
     /// from a keyless state).
     pub api_key: Option<String>,
+    /// The five concurrency tunables (LLM concurrency spec §3.2/§3.6).
+    /// Carried as raw strings, not `u32`: a missing field (an old
+    /// cached form without the inputs) and a non-numeric one must both
+    /// mean "keep the stored value", never a 422/500 that loses the
+    /// url/model edit. Out-of-range values are clamped, not rejected.
+    pub max_parallel: Option<String>,
+    pub per_user_active: Option<String>,
+    pub query_wait_secs: Option<String>,
+    pub chat_wait_secs: Option<String>,
+    pub chat_queue_depth: Option<String>,
+}
+
+/// A submitted tunable, or `stored` when the field is absent, blank, or
+/// not a number. Range enforcement is [`crate::LlmConfig::clamp`]'s job.
+fn llm_field(submitted: Option<&String>, stored: u32) -> u32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(stored)
 }
 
 /// POST /admin/llm — save the LLM config (admin only). The whole config
 /// (api_key is the sensitive part) seals under the service key before
 /// storage, mirroring the OIDC secret handling. A blank api_key keeps
 /// the stored key; the key is never rendered back to the browser.
+///
+/// The concurrency tunables are clamped BEFORE sealing (a stored row can
+/// never hold an out-of-range limit) and pushed onto the process-global
+/// gate immediately after a successful save (spec §3.2: "the admin sees
+/// the effect without waiting for traffic. No restart.") — raising
+/// `max_parallel` admits queued waiters on the spot.
 pub async fn admin_save_llm(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -2607,14 +2631,21 @@ pub async fn admin_save_llm(
         None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
-    // The concurrency fields carry over from the stored row: this form
-    // edits url/model/api_key only, so saving it must not reset them.
+    // Any tunable the form did not carry (or carried as junk) keeps the
+    // stored value, so an old cached form still saves url/model without
+    // resetting the gate.
     let cfg = crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),
         api_key,
-        ..existing
-    };
+        max_parallel: llm_field(form.max_parallel.as_ref(), existing.max_parallel),
+        per_user_active: llm_field(form.per_user_active.as_ref(), existing.per_user_active),
+        query_wait_secs: llm_field(form.query_wait_secs.as_ref(), existing.query_wait_secs),
+        chat_wait_secs: llm_field(form.chat_wait_secs.as_ref(), existing.chat_wait_secs),
+        chat_queue_depth: llm_field(form.chat_queue_depth.as_ref(), existing.chat_queue_depth),
+    }
+    // Clamp before sealing: the row at rest is always in range.
+    .clamp();
     // Seal (serialize + AEAD); a failure must not land plaintext.
     let sealed = crate::state::seal_config(&state.service_key, "llm", &cfg);
     if let Err(e) = state.config.set("llm", &sealed).await {
@@ -2624,6 +2655,9 @@ pub async fn admin_save_llm(
         ))
         .into_response();
     }
+    // Only a persisted config becomes live (a failed write returned
+    // above): the gate and the stored row never disagree.
+    cfg.sync_gate();
     Redirect::to("/admin/llm?ok=LLM%20config%20saved").into_response()
 }
 
@@ -2648,6 +2682,10 @@ pub async fn admin_test_llm(
         None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
+    // The probe is a single direct call: the submitted concurrency
+    // tunables are deliberately ignored here (the gate is not entered,
+    // nothing is persisted, and `sync_gate` is never called — a test
+    // connection must not reconfigure a running server).
     let client = mycelium_librarian::llm::LlmClient::new(&crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),

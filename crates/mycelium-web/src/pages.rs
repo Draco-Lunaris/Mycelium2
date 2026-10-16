@@ -1804,27 +1804,83 @@ pub fn admin_sign_in_page(
 /// Admin: LLM backend — the LLM card on its own page (the existing
 /// POST /admin/llm form). The api-key STATUS renders; the key itself
 /// is never rendered back to the browser.
+/// `llm` is rendered as given — the caller hands in the CLAMPED config,
+/// so the boxes always show a value the gate would actually accept.
 pub fn admin_llm_page(
     user: &SessionUser,
     csrf: &str,
-    llm_url: &str,
-    llm_model: &str,
-    llm_api_key_set: bool,
+    llm: &crate::LlmConfig,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
-    let key_status = if llm_api_key_set { "stored" } else { "not set" };
+    use mycelium_librarian::llm::{
+        CHAT_QUEUE_DEPTH_RANGE, CHAT_WAIT_SECS_RANGE, MAX_PARALLEL_RANGE, PER_USER_ACTIVE_RANGE,
+        QUERY_WAIT_SECS_RANGE,
+    };
+    let key_status = if llm.api_key.is_some() {
+        "stored"
+    } else {
+        "not set"
+    };
+    // One labelled number input per tunable: the range is both a
+    // browser-enforced min/max and a visible hint (server-side the
+    // value is clamped, never rejected — LLM concurrency spec §3.2).
+    let number_field = |label: &str, name: &str, value: u32, range: (u32, u32)| {
+        format!(
+            r#"  <label>{label} ({lo}&ndash;{hi})</label><input name="{name}" type="number" min="{lo}" max="{hi}" value="{value}">
+"#,
+            label = html_escape(label),
+            name = html_escape(name),
+            lo = range.0,
+            hi = range.1,
+            value = html_escape(&value.to_string()),
+        )
+    };
+    let concurrency = [
+        number_field(
+            "Max parallel LLM runs",
+            "max_parallel",
+            llm.max_parallel,
+            MAX_PARALLEL_RANGE,
+        ),
+        number_field(
+            "Active runs per user",
+            "per_user_active",
+            llm.per_user_active,
+            PER_USER_ACTIVE_RANGE,
+        ),
+        number_field(
+            "Query wait bound (seconds)",
+            "query_wait_secs",
+            llm.query_wait_secs,
+            QUERY_WAIT_SECS_RANGE,
+        ),
+        number_field(
+            "Chat wait bound (seconds)",
+            "chat_wait_secs",
+            llm.chat_wait_secs,
+            CHAT_WAIT_SECS_RANGE,
+        ),
+        number_field(
+            "Max queued requests",
+            "chat_queue_depth",
+            llm.chat_queue_depth,
+            CHAT_QUEUE_DEPTH_RANGE,
+        ),
+    ]
+    .concat();
     let body_form = format!(
         r#"<p class="muted">API key: {key_status}</p>
 <form method="post" action="/admin/llm">
-  <label>OpenAI-compatible base URL</label><input name="url" value="{}">
-  <label>Model</label><input name="model" value="{}">
+  <label>OpenAI-compatible base URL</label><input name="url" value="{url}">
+  <label>Model</label><input name="model" value="{model}">
   <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
-  <button type="submit">Save LLM config</button>
+  <p class="muted">Concurrency — out-of-range values are clamped on save and applied to the running server immediately.</p>
+{concurrency}  <button type="submit">Save LLM config</button>
   <button type="submit" formaction="/admin/llm/test">Test connection</button>
 </form>"#,
-        html_escape(llm_url),
-        html_escape(llm_model)
+        url = html_escape(&llm.url),
+        model = html_escape(&llm.model),
     );
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
         "LLM backend",

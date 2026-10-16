@@ -143,9 +143,13 @@ impl LlmConfig {
     /// calling surface's wait bounds, not gate state.
     pub fn apply_to_gate(&self, gate: &crate::llm_gate::LlmGate) {
         let cfg = self.clamp();
-        gate.set_capacity(cfg.max_parallel as usize);
+        // Order matters: `set_capacity` is the only setter that runs a
+        // dispatch, so it goes LAST — a live reconfig that raises
+        // capacity while lowering `per_user_active` must admit its
+        // burst under the NEW per-user cap, not the stale one.
         gate.set_per_user_active(cfg.per_user_active as usize);
         gate.set_chat_queue_depth(cfg.chat_queue_depth as usize);
+        gate.set_capacity(cfg.max_parallel as usize);
     }
 
     /// [`LlmConfig::apply_to_gate`] against the process-global gate, so
