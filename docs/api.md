@@ -98,15 +98,142 @@ curl -fsSL -H "Authorization: Bearer myc2-..." \
 unzip pdf-to-markdown-skill.zip -d ~/.claude/skills/pdf-to-markdown/
 ```
 
+## Chat
+
+Two surfaces drive the librarian agent: the session-scoped SSE API
+(durable, multi-turn, one in-flight turn per session) and a stateless
+one-shot endpoint. Both admit through the process-global LLM gate —
+see [Configuration](configuration.md) for its tunables.
+
+Message bodies are form-encoded (`message=<text>`). The two submit
+endpoints and the stateless endpoint additionally require a browser
+session cookie (they are the chat UI's endpoints): a bearer-only
+client gets `401`.
+
+### `GET /api/v1/chat/sessions`
+The caller's sessions, newest-first by `updated_at`:
+
+```json
+{"sessions": [{"id": "...", "title": "...", "updated_at": "..."}]}
+```
+
+A title that will not decrypt renders as `(unreadable)` rather than
+failing the list.
+
+### `POST /api/v1/chat/sessions`
+Draft create: creates the session (title derived from the message)
+plus its first turn, then returns that turn's SSE stream. The
+stream's first event is `session`, carrying the new id. A blank
+message is `400 {"error": "empty message"}`.
+
+### `POST /api/v1/chat/sessions/{id}/messages`
+Submit into an existing session; returns the turn's SSE stream. Only
+one turn may run per session, so a second submit while one is running
+is `409 {"error": "a turn is already running in this session"}`.
+Unknown and foreign ids both answer `404 {"error": "not found"}` (no
+oracle).
+
+### `GET /api/v1/chat/sessions/{id}/stream?after=<seq>`
+Reattach to a session. `after` is the client's last-seen `seq`:
+persisted rows after it replay, then the live tail follows until the
+turn ends. An absent `after` is live-only (nothing replays). With no
+turn running the stream replays and closes — poll semantics. User
+rows never replay; a persisted assistant reply replays as
+`assistant`, not `done`.
+
+### `GET /api/v1/chat/sessions/{id}`
+Session meta (the UI's liveness poll):
+
+```json
+{"id": "...", "title": "...", "turn_status": "running",
+ "turn_resumable": false, "max_seq": 7}
+```
+
+`turn_status` is the latest non-abandoned turn's status (`running`,
+`done`, `failed`, `interrupted`) or `null`; `turn_resumable` is true
+only for an `interrupted` turn the resume worker may still claim;
+`max_seq` is the transcript's highest `seq` (the `?after=` base).
+
+### `DELETE /api/v1/chat/sessions/{id}`
+Delete a session and its transcript: `{"ok": true}`. `409` while a
+turn is running, `404` unknown/foreign.
+`POST /api/v1/chat/sessions/{id}/delete` is the native-form variant —
+same rules, `303` to `/chat` on success.
+
+### Stream format
+
+`text/event-stream` with `Cache-Control: no-store`. Each event is one
+`data: <json>` line followed by a blank line. Every event carries
+`type`. All but `queued` and `admitted` also carry `seq` — the
+transcript row the event was persisted as, which clients use to drop
+snapshot/live duplicates and as the `after` cursor when they reattach
+(the draft-create `session` event has no row of its own and carries
+`0`).
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `session` | `session_id`, `seq` | draft-create only: the new session's id (first event) |
+| `queued` | `position` | waiting for an LLM slot, at this 0-based queue position |
+| `admitted` | *(none)* | a slot was granted; the run begins |
+| `tool` | `name`, `detail`, `seq` | the agent invoked a tool |
+| `done` | `reply`, `seq` | the live run finished with this reply |
+| `assistant` | `reply`, `seq` | replay only: a persisted assistant reply |
+| `error` | `error`, `seq` | the run failed with this message |
+
+`queued` and `admitted` carry no `seq`: they are presentation, never
+transcript rows, and never replay. `queued` is emitted on enqueue and
+on every position change; `admitted` only for a turn that actually
+queued — a turn admitted straight away emits neither. The stream ends
+after `done` or `error` (or when the run's channel closes).
+
+### Capacity
+
+Both submit endpoints check the gate's waiter count once, before they
+write anything. At the configured depth (`chat_queue_depth`) the
+submit is refused with
+`429 {"error": "LLM at capacity — queue full"}` and `Retry-After: 5`
+— no session row and no turn row are created, so a full queue never
+strands rows nobody will run.
+
+An accepted turn waits up to `chat_wait_secs` for a slot. If that
+bound elapses the turn finalizes `failed` and its error row (and
+`error` event) reads
+`LLM at capacity — turn not started (queue full)`. A turn still
+queued when the server shuts down is finalized `interrupted` with no
+error row instead, and is resumed once on the next boot.
+
+### `POST /api/v1/chat`
+The stateless one-shot: one message in, one reply out, no cross-call
+memory. Returns `{"reply": "..."}`. Waits up to `query_wait_secs` for
+an LLM slot; on timeout
+`429 {"error": "LLM at capacity — try again shortly"}` with
+`Retry-After: 5`. `503` is reserved for an unreachable or
+unconfigured LLM backend — the two are deliberately distinct.
+
+## Dream
+
+### `POST /api/v1/dream`
+Run a maintenance pass over the caller's private bundle (orphans,
+broken links, likely duplicates, oversized concepts). Deterministic
+signals decide whether the agent runs at all. Returns
+`{"ran": true, "summary": "...", "files_changed": [...]}`, or
+`{"ran": false, "reason": "..."}` when nothing needed doing. It is
+wait-class on the LLM gate with the chat bound (`chat_wait_secs`); no
+slot within it answers
+`429 {"error": "LLM at capacity — try again shortly"}` with
+`Retry-After: 5`.
+
 ## Health
 
 ### `GET /api/v1/health`
 Detailed JSON health (authenticated). `GET /health` (public coarse
 status plus the mutation-queue fields `queue_depth`,
-`oldest_pending_age_seconds`, `queue_dead_count`, and
-`llm_last_success_seconds`; it answers 503 `degraded` when the
+`oldest_pending_age_seconds`, `queue_dead_count`,
+`llm_last_success_seconds`, and the LLM-gate fields `llm_active`,
+`llm_queued`, `llm_capacity`; it answers 503 `degraded` when the
 database is unreachable, any queued item is dead, or a pending item
-has waited past twice the integration deadline) and `GET /metrics`
+has waited past twice the integration deadline — the gate fields are
+observability only and never make it degraded) and `GET /metrics`
 (Prometheus text) live outside `/api/v1` and are public by design —
 for container orchestration and scrape endpoints.
 

@@ -135,3 +135,44 @@ Each phase lands green (fmt/clippy/full tests) and is independently shippable. P
 - **Slots are per-run, not per-token-call** — unchanged from today's semaphore semantics; agent multi-step loops hold one slot.
 - **Dream is wait-class** (admin-triggered, bounded by `chat_wait_secs`).
 - `LLM_RUNS` is deleted, not deprecated alongside the gate — one concurrency mechanism, no double-gating.
+
+## Implementation notes (2026-10-16)
+
+Where the shipped code diverges from the design above. The original
+text is left as written — this section is the correction.
+
+- **`GateError { Timeout, Closed }` replaced `GateTimeout`** (§3.5).
+  One error kind could not express the two causes a surface must tell
+  apart, so the gate returns `Timeout` when the wait bound elapsed and
+  `Closed` when `close()` released the queue. Surfaces that cannot
+  resume anything (the MCP fallback, the 429 endpoints) treat both
+  identically.
+- **A turn queued at shutdown becomes `interrupted`, not failed**
+  (§3.5). The shutdown token closes the gate *before* the graceful
+  window opens; a released chat waiter finalizes `interrupted` with no
+  error row — byte for byte the state a crash leaves after the next
+  boot's sweep — so it is resumed once on the next boot instead of
+  being reported as a failure. `close()` is not a latch: admitted runs
+  keep their slots and the gate stays usable for whatever is still
+  draining. The capacity message belongs only to the elapsed-bound
+  path.
+- **Queue SSE events are broadcast-only** (§3.3). `queued` and
+  `admitted` are never persisted as transcript rows, carry no `seq` on
+  the wire, and never appear in a replay: queue state is presentation,
+  not lifecycle. `admitted` is emitted only for a turn that actually
+  queued.
+- **The gate fields live on the public `/health`**, not
+  `/api/v1/health` (§3.6). `llm_active`/`llm_queued`/`llm_capacity`
+  sit beside the write-queue fields that are already there, from one
+  `stats()` read per request; `/api/v1/health` stays the short
+  status/database/users/version body it was. The cumulative
+  `timeouts_total` is reported by `/metrics` and the admin System card
+  only.
+- **Per-user admission applies to the stateless chat and dream
+  endpoints too** (§3.1/§3.3). Both enter as the calling user rather
+  than anonymously, so `per_user_active` binds there as well — one
+  user's API loop cannot hold every slot. Only the try class admits
+  anonymously (background work is not per-user capped).
+- **MCP cache hits bypass the gate** (§3.3). `memory_query` answers an
+  exact query-cache hit before any admission attempt: it costs no LLM
+  time, so it must not wait on a saturated gate.
