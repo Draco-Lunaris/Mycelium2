@@ -22,7 +22,11 @@
 //! persistence, and finalizes the turn `failed` with
 //! [`CHAT_CAPACITY_MSG`] if no slot comes. Fresh submits (`chat_api`)
 //! and resumed turns (`chat_resume`) both arrive here, so neither can
-//! start a run without a slot.
+//! start a run without a slot. While it waits it broadcasts `queued`
+//! (the observed queue position) and, on admission, `admitted` — the
+//! one deliberate exception to persist-before-broadcast: queue state is
+//! presentation, not lifecycle (spec §3.3), so these two events have no
+//! transcript row, carry no `seq`, and never appear in a replay.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,8 +67,13 @@ pub const CHAT_CAPACITY_MSG: &str = "LLM at capacity — turn not started (queue
 /// One live-stream event for a chat turn (spec §3.3 vocabulary).
 ///
 /// `seq` is the transcript row the event was persisted as — every
-/// broadcast carries it, so clients dedup snapshot/broadcast overlap
-/// by `seq` and a lagged receiver reattaches with `?after=<seq>`.
+/// broadcast of a PERSISTED event carries it, so clients dedup
+/// snapshot/broadcast overlap by `seq` and a lagged receiver reattaches
+/// with `?after=<seq>`. The two queue events
+/// ([`ChatSseKind::Queued`]/[`ChatSseKind::Admitted`]) are
+/// broadcast-only presentation with no row behind them: their `seq` is
+/// unused and the serializer omits the field entirely (the clients
+/// handle them by type, ahead of the dedup gate).
 #[derive(Debug, Clone)]
 pub struct ChatSseEvent {
     pub kind: ChatSseKind,
@@ -78,6 +87,16 @@ pub enum ChatSseKind {
     /// stream's first event; emitted by the submit endpoint, not the
     /// runner).
     Session(Uuid),
+    /// The turn is waiting for an LLM slot, at this 0-based queue
+    /// position (LLM concurrency spec §3.3/§3.4: emitted on enqueue
+    /// and on every position change). Presentation only — never a
+    /// transcript row, so never replayed; positions are advisory
+    /// (§3.4: the current observation, not a promise).
+    Queued { position: usize },
+    /// The turn got its LLM slot and the run begins. Emitted only for a
+    /// turn that actually queued — a fast-path admission never
+    /// announced a wait, so it has nothing to clear.
+    Admitted,
     /// The agent invoked a tool (progress).
     Tool { name: String, detail: String },
     /// The run finished with the assistant's reply.
@@ -101,6 +120,17 @@ impl serde::Serialize for ChatSseEvent {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(4))?;
         match &self.kind {
+            // The queue events return early: they have no transcript
+            // row, so no `seq` (§3.3 — presentation, not lifecycle).
+            ChatSseKind::Queued { position } => {
+                map.serialize_entry("type", "queued")?;
+                map.serialize_entry("position", position)?;
+                return map.end();
+            }
+            ChatSseKind::Admitted => {
+                map.serialize_entry("type", "admitted")?;
+                return map.end();
+            }
             ChatSseKind::Session(id) => {
                 map.serialize_entry("type", "session")?;
                 map.serialize_entry("session_id", id)?;
@@ -300,8 +330,37 @@ async fn run_chat_turn(
     let llm = ctx.llm.clamp();
     llm.sync_gate();
     let bound = Duration::from_secs(u64::from(llm.chat_wait_secs));
-    let _permit = match admit(user_id, bound).await {
-        Ok(p) => p,
+    // Queue events (§3.3): every observed position is broadcast as
+    // `queued` — presentation only, so nothing is persisted and the
+    // broadcast happens on the runner's own task (the gate's callback
+    // only pushes onto a channel, never blocks under the gate lock).
+    // `queued_seen` keeps `admitted` honest: a fast-path admission
+    // never announced a wait, so it announces no admission either.
+    let mut queued_seen = false;
+    let admission = admit(user_id, bound, |position| {
+        queued_seen = true;
+        ctx.runs.send_broadcast(
+            turn_id,
+            &ChatSseEvent {
+                kind: ChatSseKind::Queued { position },
+                seq: 0,
+            },
+        );
+    })
+    .await;
+    let _permit = match admission {
+        Ok(p) => {
+            if queued_seen {
+                ctx.runs.send_broadcast(
+                    turn_id,
+                    &ChatSseEvent {
+                        kind: ChatSseKind::Admitted,
+                        seq: 0,
+                    },
+                );
+            }
+            p
+        }
         Err(GateTimeout) => {
             // No slot within the bound: the run never started, so there
             // is no side-effect doubt — the turn finalizes `failed`
@@ -461,16 +520,21 @@ async fn run_chat_turn(
     }
 }
 
-/// Wait-class gate admission for one chat turn, shaped for the queue
-/// events Task 5 adds.
+/// Wait-class gate admission for one chat turn, reporting every queue
+/// position it observes to `on_position`.
 ///
-/// The gate's position callback is synchronous and runs under the
+/// The gate's own position callback is synchronous and runs under the
 /// gate's lock, so it must not block: it only pushes onto an unbounded
 /// channel (sends never block or drop), and the positions are consumed
-/// here — by the same `select!` that awaits admission, which is where
-/// the `queued` SSE event is emitted from once it exists. Dropping this
-/// future (an aborted runner) removes the waiter from the queue.
-async fn admit(user_id: Uuid, bound: Duration) -> Result<GatePermit<'static>, GateTimeout> {
+/// here — by the same `select!` that awaits admission, which calls
+/// `on_position` (the runner broadcasts the `queued` SSE event from
+/// there). Dropping this future (an aborted runner) removes the waiter
+/// from the queue.
+async fn admit(
+    user_id: Uuid,
+    bound: Duration,
+    mut on_position: impl FnMut(usize),
+) -> Result<GatePermit<'static>, GateTimeout> {
     let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<usize>();
     let gate: &'static _ = &*LLM_GATE;
     let enter = gate.enter(Some(user_id), bound, move |pos| {
@@ -481,8 +545,7 @@ async fn admit(user_id: Uuid, bound: Duration) -> Result<GatePermit<'static>, Ga
         tokio::select! {
             res = &mut enter => return res,
             pos = pos_rx.recv() => match pos {
-                // Task 5: broadcast a `queued` event carrying `_pos`.
-                Some(_pos) => {}
+                Some(pos) => on_position(pos),
                 // The gate dropped this waiter's callback (admitted, or
                 // left the queue): nothing more to forward — the
                 // admission future alone decides the outcome, and
@@ -922,5 +985,25 @@ mod tests {
             error,
             serde_json::json!({ "type": "error", "error": "nope", "seq": 6 })
         );
+        // Queue vocabulary (LLM concurrency spec §3.3/§3.4): the two
+        // queue events are broadcast-only presentation — never
+        // transcript rows — so they carry NO `seq` on the wire (the
+        // struct's field is ignored for them, which the `seq: 7` below
+        // pins), and chat.js handles them before its seq-dedup gate.
+        let queued = serde_json::to_value(ChatSseEvent {
+            kind: ChatSseKind::Queued { position: 2 },
+            seq: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            queued,
+            serde_json::json!({ "type": "queued", "position": 2 })
+        );
+        let admitted = serde_json::to_value(ChatSseEvent {
+            kind: ChatSseKind::Admitted,
+            seq: 7,
+        })
+        .unwrap();
+        assert_eq!(admitted, serde_json::json!({ "type": "admitted" }));
     }
 }

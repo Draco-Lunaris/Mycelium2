@@ -339,6 +339,78 @@ fn sse_events(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Incremental SSE reader over a still-open response body: parses
+/// complete frames as the chunks arrive, so a test can observe an event
+/// MID-stream. The queue events (`queued`/`admitted`) are live
+/// presentation — reading the whole body would prove only that they
+/// were somewhere in it, not that they reached the client before the
+/// run did.
+struct SseReader {
+    resp: reqwest::Response,
+    buf: String,
+    events: Vec<serde_json::Value>,
+}
+
+impl SseReader {
+    fn new(resp: reqwest::Response) -> Self {
+        Self {
+            resp,
+            buf: String::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Index of the first parsed event of this type, if any.
+    fn index_of(&self, kind: &str) -> Option<usize> {
+        self.events.iter().position(|e| e["type"] == kind)
+    }
+
+    fn kinds(&self) -> Vec<&str> {
+        self.events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or("?"))
+            .collect()
+    }
+
+    /// Read frames until an event of `kind` has been parsed; returns
+    /// its index. Bounded by a deadline (never a fixed sleep): the
+    /// stream ending first, or the deadline, fails the test.
+    async fn read_until(&mut self, kind: &str) -> usize {
+        if let Some(i) = self.index_of(kind) {
+            return i;
+        }
+        let read = async {
+            loop {
+                let chunk = self
+                    .resp
+                    .chunk()
+                    .await
+                    .expect("sse chunk")
+                    .unwrap_or_else(|| {
+                        panic!("stream ended before a `{kind}` event: {:?}", self.kinds())
+                    });
+                self.buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(end) = self.buf.find("\n\n") {
+                    let frame: String = self.buf.drain(..end + 2).collect();
+                    let frame = frame.trim();
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    let data = frame.strip_prefix("data: ").expect("sse data line");
+                    self.events
+                        .push(serde_json::from_str(data).expect("valid sse json"));
+                }
+                if let Some(i) = self.index_of(kind) {
+                    return i;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a `{kind}` sse event"))
+    }
+}
+
 /// POST /api/v1/chat/sessions (the draft-create submit).
 async fn submit_draft(
     client: &reqwest::Client,
@@ -1501,11 +1573,11 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
         .unwrap();
     let page_html = page.text().await.unwrap();
     assert!(
-        page_html.contains("/assets/chat.js?v=30"),
+        page_html.contains("/assets/chat.js?v=31"),
         "the /chat page must reference the bumped chat.js version: {page_html}"
     );
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=30"))
+        .get(format!("{base}/assets/chat.js?v=31"))
         .send()
         .await
         .unwrap();
@@ -1527,6 +1599,33 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
     assert!(
         !body.contains("/api/v1/chat/stream"),
         "the removed legacy stream route must not appear anywhere in chat.js: {body}"
+    );
+    // The queue events are handled BEFORE the seq-dedup gate (they
+    // carry no seq) and the note is built with textContent, never
+    // innerHTML (LLM concurrency spec §3.3).
+    for needle in [
+        "\"queued\"",
+        "\"admitted\"",
+        "setQueueNote",
+        "clearQueueNote",
+        "chat-queue-note",
+    ] {
+        assert!(
+            body.contains(needle),
+            "chat.js must carry the queue-status handling ({needle}): {body}"
+        );
+    }
+    let queued_at = body.find("ev.type === \"queued\"").expect("queued branch");
+    let dedup_at = body.find("seen[ev.seq]").expect("the seq dedup gate");
+    assert!(
+        queued_at < dedup_at,
+        "the queued branch must precede the seq-dedup gate in chat.js"
+    );
+    assert!(
+        body.find("ev.type === \"admitted\"")
+            .expect("admitted branch")
+            < dedup_at,
+        "the admitted branch must precede the seq-dedup gate in chat.js"
     );
 
     shutdown.cancel();
@@ -1778,5 +1877,142 @@ async fn chat_admits_after_slot_frees() {
     assert_eq!(done["reply"], "answered after the wait");
     let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
     assert_eq!(meta["turn_status"], "done");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_sse_emits_queued_then_admitted() {
+    // LLM concurrency spec §3.3/§3.4: a turn that waits for a slot
+    // streams `queued` with its position LIVE — before any step event —
+    // and `admitted` once a slot frees. Both are broadcast-only
+    // presentation: no `seq` on the wire, no transcript row, and so
+    // nothing for the reattach replay to carry.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // LIFO script: the tool call is served first, then the answer — so
+    // the run has a step event the queue events must precede.
+    let llm_url = mock_llm(vec![
+        text_response("answered after queueing"),
+        tool_call_response(
+            "call-1",
+            "search_knowledge",
+            serde_json::json!({ "query": "queue" }),
+        ),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        // Generous bound: this pins the queue events, not the timeout.
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // One slot, held anonymously (the per-user cap must not be what
+    // queues this turn): the submit's turn has to wait.
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    let resp = submit_draft(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "asked while the gate is full",
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the queued submit still streams");
+    let mut sse = SseReader::new(resp);
+
+    // `queued` arrives while the slot is still held — the run has not
+    // started, so no step event can have streamed yet.
+    let queued_at = sse.read_until("queued").await;
+    assert_eq!(
+        sse.events[queued_at]["position"], 0,
+        "the only waiter sits at the head of the queue: {:?}",
+        sse.events
+    );
+    assert!(
+        sse.events[queued_at].get("seq").is_none(),
+        "a queue event carries no seq: {:?}",
+        sse.events
+    );
+    assert!(
+        sse.index_of("tool").is_none()
+            && sse.index_of("done").is_none()
+            && sse.index_of("admitted").is_none(),
+        "nothing of the run streams before admission: {:?}",
+        sse.kinds()
+    );
+    let session_id = sse.events[0]["session_id"]
+        .as_str()
+        .expect("the first event is the draft session event")
+        .to_string();
+
+    // Release the slot: the turn is admitted and runs to done.
+    drop(hold);
+
+    let admitted_at = sse.read_until("admitted").await;
+    assert!(
+        admitted_at > queued_at,
+        "admitted follows queued: {:?}",
+        sse.kinds()
+    );
+    assert!(
+        sse.events[admitted_at].get("seq").is_none(),
+        "a queue event carries no seq: {:?}",
+        sse.events
+    );
+    let tool_at = sse.read_until("tool").await;
+    let done_at = sse.read_until("done").await;
+    assert!(
+        admitted_at < tool_at && tool_at < done_at,
+        "the queue events precede every step event: {:?}",
+        sse.kinds()
+    );
+    assert_eq!(sse.events[done_at]["reply"], "answered after queueing");
+    // The whole observed order, pinned.
+    assert_eq!(
+        sse.kinds(),
+        vec!["session", "queued", "admitted", "tool", "done"],
+        "the submit stream's event order"
+    );
+
+    // The transcript is untouched by the queue events: the reattach
+    // replay (?after=0) carries the persisted rows only.
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(meta["turn_status"], "done");
+    let replay = client
+        .get(format!(
+            "{base}/api/v1/chat/sessions/{session_id}/stream?after=0"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 200);
+    let revents = sse_events(&replay.text().await.unwrap());
+    let rkinds: Vec<&str> = revents
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(
+        !rkinds.contains(&"queued") && !rkinds.contains(&"admitted"),
+        "queue events are never replayed: {rkinds:?}"
+    );
+    assert_eq!(
+        rkinds,
+        vec!["tool", "assistant"],
+        "the replay vocabulary is the persisted rows"
+    );
+
     shutdown.cancel();
 }
