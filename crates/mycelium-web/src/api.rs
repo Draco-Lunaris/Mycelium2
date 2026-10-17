@@ -2279,6 +2279,13 @@ pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
 /// shared computation). Renamed SystemPageStats in PR 4 (the Task-1
 /// review's ruling) so only the health-side struct carries the
 /// SystemStats name.
+///
+/// The four `llm_*` gate values carry the LLM-concurrency spec §3.6
+/// readout card. They ride through as the `i64`s `SystemStats` already
+/// holds (no second conversion) and all four come from that struct's
+/// ONE `LLM_GATE.stats()` read — neither this DTO nor the page reads
+/// the gate again, so the card cannot disagree with the tiles beside
+/// it.
 #[derive(Debug)]
 pub struct SystemPageStats {
     pub users: i64,
@@ -2286,6 +2293,10 @@ pub struct SystemPageStats {
     pub oldest_pending_age_seconds: Option<i64>,
     pub queue_dead_count: usize,
     pub llm_last_success_seconds: Option<i64>,
+    pub llm_active: i64,
+    pub llm_queued: i64,
+    pub llm_capacity: i64,
+    pub llm_timeouts_total: i64,
 }
 
 /// GET /admin/users — the users table + create-user side card
@@ -2350,18 +2361,18 @@ pub async fn admin_llm_view(
     Query(params): Query<AdminParams>,
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
+    // Clamped for rendering: a stale (or hand-edited) out-of-range row
+    // must not put an unenforceable value back in the box.
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
-    let llm_api_key_set = llm.api_key.is_some();
+            .unwrap_or_default()
+            .clamp();
     let admin = request_admin_user(&state, &session).await;
     pages::admin_llm_page(
         &admin,
         &csrf,
-        &llm.url,
-        &llm.model,
-        llm_api_key_set,
+        &llm,
         params.ok.as_deref(),
         params.error.as_deref(),
     )
@@ -2442,6 +2453,10 @@ pub async fn admin_system_view(
         oldest_pending_age_seconds: s.oldest_pending_age_seconds,
         queue_dead_count: s.queue_dead_count as usize,
         llm_last_success_seconds: s.llm_last_success_seconds,
+        llm_active: s.llm_active,
+        llm_queued: s.llm_queued,
+        llm_capacity: s.llm_capacity,
+        llm_timeouts_total: s.llm_timeouts_total,
     };
     let admin = request_admin_user(&state, &session).await;
     // The TLS card's inputs: the ACTIVE cert's parsed details and the
@@ -2586,12 +2601,36 @@ pub struct LlmForm {
     /// admin re-entering the URL/model with the key field cleared only
     /// from a keyless state).
     pub api_key: Option<String>,
+    /// The five concurrency tunables (LLM concurrency spec §3.2/§3.6).
+    /// Carried as raw strings, not `u32`: a missing field (an old
+    /// cached form without the inputs) and a non-numeric one must both
+    /// mean "keep the stored value", never a 422/500 that loses the
+    /// url/model edit. Out-of-range values are clamped, not rejected.
+    pub max_parallel: Option<String>,
+    pub per_user_active: Option<String>,
+    pub query_wait_secs: Option<String>,
+    pub chat_wait_secs: Option<String>,
+    pub chat_queue_depth: Option<String>,
+}
+
+/// A submitted tunable, or `stored` when the field is absent, blank, or
+/// not a number. Range enforcement is [`crate::LlmConfig::clamp`]'s job.
+fn llm_field(submitted: Option<&String>, stored: u32) -> u32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(stored)
 }
 
 /// POST /admin/llm — save the LLM config (admin only). The whole config
 /// (api_key is the sensitive part) seals under the service key before
 /// storage, mirroring the OIDC secret handling. A blank api_key keeps
 /// the stored key; the key is never rendered back to the browser.
+///
+/// The concurrency tunables are clamped BEFORE sealing (a stored row can
+/// never hold an out-of-range limit) and pushed onto the process-global
+/// gate immediately after a successful save (spec §3.2: "the admin sees
+/// the effect without waiting for traffic. No restart.") — raising
+/// `max_parallel` admits queued waiters on the spot.
 pub async fn admin_save_llm(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -2604,14 +2643,24 @@ pub async fn admin_save_llm(
             .await
             .unwrap_or_default();
     let api_key = match form.api_key.as_deref().map(str::trim) {
-        None | Some("") => existing.api_key,
+        None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
+    // Any tunable the form did not carry (or carried as junk) keeps the
+    // stored value, so an old cached form still saves url/model without
+    // resetting the gate.
     let cfg = crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),
         api_key,
-    };
+        max_parallel: llm_field(form.max_parallel.as_ref(), existing.max_parallel),
+        per_user_active: llm_field(form.per_user_active.as_ref(), existing.per_user_active),
+        query_wait_secs: llm_field(form.query_wait_secs.as_ref(), existing.query_wait_secs),
+        chat_wait_secs: llm_field(form.chat_wait_secs.as_ref(), existing.chat_wait_secs),
+        chat_queue_depth: llm_field(form.chat_queue_depth.as_ref(), existing.chat_queue_depth),
+    }
+    // Clamp before sealing: the row at rest is always in range.
+    .clamp();
     // Seal (serialize + AEAD); a failure must not land plaintext.
     let sealed = crate::state::seal_config(&state.service_key, "llm", &cfg);
     if let Err(e) = state.config.set("llm", &sealed).await {
@@ -2621,6 +2670,9 @@ pub async fn admin_save_llm(
         ))
         .into_response();
     }
+    // Only a persisted config becomes live (a failed write returned
+    // above): the gate and the stored row never disagree.
+    cfg.sync_gate();
     Redirect::to("/admin/llm?ok=LLM%20config%20saved").into_response()
 }
 
@@ -2642,13 +2694,18 @@ pub async fn admin_test_llm(
             .await
             .unwrap_or_default();
     let api_key = match form.api_key.as_deref().map(str::trim) {
-        None | Some("") => existing.api_key,
+        None | Some("") => existing.api_key.clone(),
         Some(k) => Some(k.to_string()),
     };
+    // The probe is a single direct call: the submitted concurrency
+    // tunables are deliberately ignored here (the gate is not entered,
+    // nothing is persisted, and `sync_gate` is never called — a test
+    // connection must not reconfigure a running server).
     let client = mycelium_librarian::llm::LlmClient::new(&crate::LlmConfig {
         url: form.url.trim().to_string(),
         model: form.model.trim().to_string(),
         api_key,
+        ..existing
     });
     let verdict = match client
         .chat_system(Some("You are a connectivity probe."), "Reply with OK", 0.0)
@@ -3608,6 +3665,24 @@ pub struct ChatMessageForm {
     pub message: String,
 }
 
+/// The capacity refusal both unbuffered LLM surfaces return when no
+/// gate slot comes free within their wait bound (LLM concurrency spec
+/// §3.3). Deliberately distinct from the LLM-unreachable 503 wording:
+/// "come back" is not "nothing is configured".
+pub const LLM_CAPACITY_MSG: &str = "LLM at capacity — try again shortly";
+
+/// The gate-timeout refusal: 429 + `Retry-After: 5` with the
+/// endpoint-wide `{"error": …}` shape (spec §3.3 — retryable, and no
+/// internal detail on the wire).
+fn llm_capacity_response() -> Response {
+    let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, LLM_CAPACITY_MSG);
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("5"),
+    );
+    response
+}
+
 /// POST /api/v1/dream — run a maintenance/consolidation pass over the
 /// caller's private bundle (v1 parity: orphans, broken links, likely
 /// duplicates, oversized concepts). Deterministic signals decide
@@ -3619,10 +3694,15 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    // The config load is also the gate's sync point (spec §3.2): the
+    // clamped row is the single source of both the gate's limits and
+    // this surface's wait bound — no separate plumbing.
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamp();
+    llm.sync_gate();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     let scopes = build_agent_scopes(
         &state.store,
@@ -3630,7 +3710,33 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
-    match mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await {
+    // Dream is wait class with the CHAT bound (spec §5): admin-triggered
+    // and rare, so it may wait for a slot — but it never jumps the
+    // queue, and it never hangs unbounded.
+    let permit = match mycelium_librarian::llm_gate::LLM_GATE
+        .enter(
+            Some(user.user_id),
+            std::time::Duration::from_secs(u64::from(llm.chat_wait_secs)),
+            |_| {},
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                wait_secs = llm.chat_wait_secs,
+                user_id = %user.user_id,
+                "llm gate: no slot for dream within the wait bound"
+            );
+            return llm_capacity_response();
+        }
+    };
+    let outcome = mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await;
+    // The slot is free the moment the run is: the response body is
+    // built after the release, not under the permit.
+    drop(permit);
+    match outcome {
         Ok(report) => Json(report).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "dream failed");
@@ -3660,10 +3766,13 @@ pub async fn api_chat(
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    // Config load doubles as the gate sync point (spec §3.2).
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .clamp();
+    llm.sync_gate();
     let client = mycelium_librarian::llm::LlmClient::new(&llm);
     // Stateless by design (spec D9): single-shot — this message only.
     let history = vec![mycelium_librarian::llm::ConversationTurn::User(
@@ -3675,7 +3784,33 @@ pub async fn api_chat(
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
-    match mycelium_librarian::agent::run_chat(&client, &cs, &scopes, &history).await {
+    // Wait class, bounded by `query_wait_secs` (spec §3.3): this
+    // endpoint holds an HTTP request open, so its bound is the short
+    // one. No slot in time → 429 + Retry-After, which the caller can
+    // tell apart from the 503 below (nothing reachable to ask).
+    let permit = match mycelium_librarian::llm_gate::LLM_GATE
+        .enter(
+            Some(user.user_id),
+            std::time::Duration::from_secs(u64::from(llm.query_wait_secs)),
+            |_| {},
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                wait_secs = llm.query_wait_secs,
+                user_id = %user.user_id,
+                "llm gate: no slot for stateless chat within the wait bound"
+            );
+            return llm_capacity_response();
+        }
+    };
+    let outcome = mycelium_librarian::agent::run_chat(&client, &cs, &scopes, &history).await;
+    // Released before the response is built — see `api_dream`.
+    drop(permit);
+    match outcome {
         Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
         Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
             tracing::warn!(error = %e, "librarian chat LLM failure");

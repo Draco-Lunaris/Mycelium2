@@ -1,9 +1,16 @@
 //! Chat resume worker integration (spec §3.4/§6 cases 8–10): the boot
 //! sweep flips interrupted runs resumable and the worker resumes each
 //! ONCE — through the same runner + registry the submit endpoints use,
-//! under the query-priority (`try_acquire`) and key-recovery gates.
-//! The worker is NOT spawned by `boot()` here — tests call
+//! under the query-priority (`LLM_GATE.try_enter`) and key-recovery
+//! gates. The worker is NOT spawned by `boot()` here — tests call
 //! `run_pending` directly (one deterministic pass each).
+//!
+//! Every pass consumes capacity from the process-global
+//! `llm_gate::LLM_GATE` (the resume worker's try class), and the
+//! query-priority test holds its slots outright, so all tests here
+//! serialize on TEST_LOCK and restore the gate's defaults through
+//! [`GateDefaults`] — a held slot leaking into a sibling pass would
+//! make that pass defer and the sibling fail.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,12 +19,33 @@ use std::time::{Duration, Instant};
 use axum::response::IntoResponse;
 
 use mycelium_auth::login::LoginService;
+use mycelium_librarian::llm_gate::{
+    DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
+};
 use mycelium_store::Store;
 use mycelium_store::chat::{ChatRole, ChatTurnStatus};
 use mycelium_web::AppState;
 
 /// Known admin password for the pre-seeded account (tests log in with it).
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
+
+/// Serializes all tests in this binary around the shared LLM gate.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Wait bound for the gate holds this suite takes.
+const GATE_BOUND: Duration = Duration::from_secs(10);
+
+/// Restores the process-global gate's tunables on drop, so a failing
+/// assertion cannot leak a reconfigured gate into the next test.
+struct GateDefaults;
+
+impl Drop for GateDefaults {
+    fn drop(&mut self) {
+        LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+        LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
+        LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
+    }
+}
 
 /// A scripted mock LLM: pops responses LIFO.
 async fn mock_llm(responses: Vec<serde_json::Value>) -> String {
@@ -97,6 +125,19 @@ async fn endless_tool_mock() -> String {
 }
 
 async fn boot(llm_url: String) -> (AppState, tempfile::TempDir) {
+    boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        ..Default::default()
+    })
+    .await
+}
+
+/// `boot` with the full stored "llm" row, so a test can set the gate
+/// tunables the runner syncs from (`max_parallel`, `per_user_active`,
+/// `chat_wait_secs`) the way the admin page does.
+async fn boot_with(llm: mycelium_web::LlmConfig) -> (AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
@@ -123,18 +164,7 @@ async fn boot(llm_url: String) -> (AppState, tempfile::TempDir) {
     );
     // Point the librarian at the mock LLM (the config row is what the
     // resume pass decrypts, same as the submit endpoints).
-    state
-        .config
-        .set(
-            "llm",
-            &mycelium_web::LlmConfig {
-                url: llm_url,
-                model: "mock".into(),
-                api_key: None,
-            },
-        )
-        .await
-        .unwrap();
+    state.config.set("llm", &llm).await.unwrap();
 
     // Login populates the master-key cache + the service seal — the
     // production state where `master_key_for` succeeds. The tests
@@ -280,6 +310,7 @@ where
 
 #[tokio::test]
 async fn restart_marks_interrupted_and_resumes_once() {
+    let _g = TEST_LOCK.lock().await;
     // Mock: [answer] — the resume run consumes exactly one completion.
     let llm_url = mock_llm(vec![text_response("resumed reply")]).await;
     let (state, _dir) = boot(llm_url).await;
@@ -355,6 +386,7 @@ async fn restart_marks_interrupted_and_resumes_once() {
 
 #[tokio::test]
 async fn resume_llm_dead_returns_interrupted_final() {
+    let _g = TEST_LOCK.lock().await;
     // Dead URL (connection refused instantly): the resumed run fails
     // on the LLM → back to `interrupted` (attempts now 1 = final, no
     // loop), with the user-facing LLM-down error row.
@@ -416,6 +448,7 @@ async fn resume_llm_dead_returns_interrupted_final() {
 
 #[tokio::test]
 async fn resume_step_cap_marks_failed() {
+    let _g = TEST_LOCK.lock().await;
     // Spec §6.10 split: a resumed turn that RUNS but hits the step cap
     // is `failed` (it genuinely ran; no retry), with an error row —
     // every completion is a tool call, so the agent walks MAX_STEPS.
@@ -455,6 +488,7 @@ async fn resume_step_cap_marks_failed() {
 
 #[tokio::test]
 async fn resume_claim_vs_submit_race() {
+    let _g = TEST_LOCK.lock().await;
     // Review Focus 4: the accepted race is closed by the store — once
     // the resume worker claims the turn (running), the user's submit
     // on the same session hits the running-turn unique index →
@@ -544,40 +578,33 @@ async fn resume_claim_vs_submit_race() {
 
 #[tokio::test]
 async fn resume_defers_to_interactive_llm() {
-    // Query-priority invariant: both LLM_RUNS permits held → the pass
-    // never CLAIMS (claim-after-permit ordering — nothing is held
+    // Query-priority invariant: every LLM_GATE slot held → the pass
+    // never CLAIMS (claim-after-admission ordering — nothing is held
     // while waiting); the turn stays interrupted with attempts 0.
     // Release, and the next pass claims + completes it.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
     let llm_url = mock_llm(vec![text_response("ran after release")]).await;
     let (state, _dir) = boot(llm_url).await;
     let user = admin_id(&state).await;
     let session = submit_message(&state, user, "deferred question").await;
     state.chat_sessions.boot_sweep().await.unwrap();
 
-    // Hold both LLM permits — never assumed free (parallel tests in
-    // this suite share the one process-global semaphore; the
-    // queue_worker_integration.rs ci-flake precedent: poll the
-    // observable, never take it for granted). Each acquire waits its
-    // turn for a permit to free up; the timeout bounds it against a
-    // wedged sibling runner.
-    let p1 = tokio::time::timeout(
-        Duration::from_secs(10),
-        mycelium_librarian::agent::LLM_RUNS.acquire(),
-    )
-    .await
-    .expect("permit 1 free within the deadline")
-    .expect("semaphore not closed");
-    let p2 = tokio::time::timeout(
-        Duration::from_secs(10),
-        mycelium_librarian::agent::LLM_RUNS.acquire(),
-    )
-    .await
-    .expect("permit 2 free within the deadline")
-    .expect("semaphore not closed");
+    // Hold every gate slot — the wait class is what an interactive
+    // chat turn uses, and the bound guards against a sibling that
+    // leaked a slot (TEST_LOCK should already rule that out).
+    let p1 = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 1 free within the bound");
+    let p2 = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 2 free within the bound");
+    let stats = LLM_GATE.stats();
     assert_eq!(
-        mycelium_librarian::agent::LLM_RUNS.available_permits(),
-        0,
-        "both permits held — the deferred pass must find none"
+        stats.active, stats.capacity,
+        "every slot held — the deferred pass must find none: {stats:?}"
     );
     mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
         .run_pending()
@@ -612,7 +639,85 @@ async fn resume_defers_to_interactive_llm() {
 }
 
 #[tokio::test]
+async fn resumed_turn_waits_on_the_gate() {
+    // R17 / LLM concurrency spec §3.3: admission lives in the runner,
+    // the single path for fresh AND resumed turns — so a RESUMED turn
+    // queues on the gate too, and reaches the LLM only once a slot
+    // frees. The resume pass's own `try_enter` is a capacity CHECK it
+    // drops past the spawn, so the binding limit here is the user's
+    // own: `per_user_active = 1` plus a held per-user slot means the
+    // runner's `enter(Some(user), …)` must queue — no timing race.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![text_response("resumed after capacity")]).await;
+    let (state, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 2,
+        per_user_active: 1,
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "interrupted at capacity").await;
+    state.chat_sessions.boot_sweep().await.unwrap();
+
+    // The user's one admitted run (held by this test), so the resumed
+    // runner finds itself at its own cap. A free slot remains, which is
+    // what lets the pass's try_enter + claim proceed.
+    LLM_GATE.set_per_user_active(1);
+    let hold = LLM_GATE
+        .enter(Some(user), GATE_BOUND, |_| {})
+        .await
+        .expect("the user's slot is free before the pass");
+
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+    // The claim happened (the pass had capacity), but the run is
+    // waiting: the gate's queue is the observable.
+    poll_until(
+        || async { LLM_GATE.stats().queued >= 1 },
+        "the resumed runner queued on the gate",
+    )
+    .await;
+    let turn = latest_turn(&state, user, session).await;
+    assert_eq!(turn.status, ChatTurnStatus::Running, "claimed and queued");
+    assert_eq!(turn.attempts, 1, "the resume attempt is accounted");
+    // Nothing ran: no agent row exists while the turn is queued.
+    assert_eq!(
+        transcript(&state, user, session)
+            .await
+            .iter()
+            .filter(|r| !matches!(r.role, ChatRole::User))
+            .count(),
+        0,
+        "a queued resumed turn has not reached the LLM"
+    );
+
+    // Free the user's slot: the queued runner is dispatched and the
+    // resumed turn completes normally.
+    drop(hold);
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Done },
+        "resumed turn done after the slot frees",
+    )
+    .await;
+    let rows = transcript(&state, user, session).await;
+    let assistant: Vec<_> = rows
+        .iter()
+        .filter(|r| matches!(r.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(assistant.len(), 1, "exactly one reply");
+    assert_eq!(assistant[0].content, "resumed after capacity");
+}
+
+#[tokio::test]
 async fn resume_key_unavailable_skips_user() {
+    let _g = TEST_LOCK.lock().await;
     // A user with an unrecoverable key (garbage service seal): the
     // pass skips their turns (zero LLM cost) and stays Ok — the turns
     // are untouched and retried next tick.

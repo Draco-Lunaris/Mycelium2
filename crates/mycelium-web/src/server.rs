@@ -267,6 +267,37 @@ async fn serve_asset(
     }
 }
 
+/// Push the stored `"llm"` row's limits onto the process-global LLM
+/// admission gate (LLM concurrency spec §3.2), clamped by
+/// [`crate::LlmConfig::clamp`] inside `sync_gate`.
+///
+/// The ordering guarantee is the CALLER's: whoever boots the process
+/// must call this before anything can admit on the gate — the
+/// mutation-queue boot drain pass, the drain worker, and the chat
+/// resume worker all use try-class admission, and a `tokio::time::
+/// interval`'s first tick fires immediately, so a worker spawned before
+/// this call would take its first pass against `DEFAULT_CAPACITY`
+/// instead of the operator's `max_parallel`. `mycelium-server`'s `main`
+/// calls it right after `AppState` is built (before every boot sweep and
+/// every spawn); [`serve`] calls it again, which is idempotent and
+/// covers embedders that call `serve` directly (the test harness does).
+///
+/// A missing or undecryptable row simply means the defaults; nothing
+/// here can fail.
+pub async fn sync_llm_gate_from_store(state: &AppState) {
+    let llm_cfg =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+            .unwrap_or_default();
+    llm_cfg.sync_gate();
+    tracing::info!(
+        capacity = mycelium_librarian::llm_gate::LLM_GATE.capacity(),
+        per_user_active = mycelium_librarian::llm_gate::LLM_GATE.per_user_active(),
+        chat_queue_depth = mycelium_librarian::llm_gate::LLM_GATE.chat_queue_depth_limit(),
+        "LLM gate synced from the stored config"
+    );
+}
+
 /// Serve HTTPS on `https_addr`, redirecting HTTP on `http_addr` to it.
 /// `sans` is the SAN set for the generated self-signed pair (verbatim;
 /// `localhost` only when empty).
@@ -292,6 +323,15 @@ pub async fn serve(
         tls: Some(Arc::new(tls_handle)),
         ..state
     };
+
+    // LLM admission gate (LLM concurrency spec §3.2): the stored limits
+    // are live before this listener accepts a request. `main` already
+    // synced them ahead of the boot sweeps and the worker spawns — this
+    // call is the idempotent backstop for an embedder that calls `serve`
+    // directly without its own sync, and it claims nothing about work
+    // started before `serve` was entered.
+    sync_llm_gate_from_store(&state).await;
+
     let router = build_router_with_shutdown(state, shutdown.clone());
 
     // HTTP:80 → HTTPS redirect. Preserves the request Host (so the
@@ -337,6 +377,18 @@ pub async fn serve(
     let shutdown_token = shutdown.clone();
     tokio::spawn(async move {
         shutdown_token.cancelled().await;
+        // Release every queued LLM waiter BEFORE the graceful window
+        // opens (LLM concurrency spec §3.5): a chat runner still
+        // sitting on the gate would otherwise hold its SSE connection
+        // open for the rest of its wait bound — 600 s by default, up
+        // to 7200 — and burn the whole 10 s window before it could
+        // finalize its turn.
+        // Released waiters get `GateError::Closed`, which the chat
+        // runner finalizes as `interrupted` (resumable on the next
+        // boot). `close` is not a latch: admitted runs keep their
+        // slots and the gate stays usable for whatever is still
+        // draining.
+        mycelium_librarian::llm_gate::LLM_GATE.close();
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
     });
     tracing::info!("listening on https://{https_addr}");

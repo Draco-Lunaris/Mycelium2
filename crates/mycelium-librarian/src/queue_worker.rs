@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::agent::{self, AgentError, AgentScopes, MutationResult, TraceSink};
 use crate::fallback;
 use crate::llm::{LlmClient, LlmConfig};
+use crate::llm_gate;
 
 /// Recovery of a user's master key via the service-key seal.
 /// Implemented with MasterKeyCache::for_user at the binary seam
@@ -36,8 +37,9 @@ pub type MasterKeyRecovery = dyn Fn(
 /// defaults here to retune.
 #[derive(Debug, Clone)]
 pub struct QueueLimits {
-    /// Global concurrent LLM-run cap (agent.rs LLM_RUNS is built to
-    /// match; this field documents the number in one place).
+    /// Global concurrent LLM-run cap (the real cap is
+    /// `llm_gate::LLM_GATE`'s capacity, admin-configurable; this field
+    /// documents the default the drain was sized against).
     pub capacity: usize,
     /// Max agent steps for background mutation runs (inline runs
     /// keep agent::MAX_STEPS).
@@ -274,17 +276,18 @@ impl QueueWorker {
         Ok(())
     }
 
-    /// One user's next due item: capacity first (try_acquire — query
-    /// priority, never block), then claim, recover the key, read the
-    /// payload, and run — or take the fallback. Per-item LLM/agent
+    /// One user's next due item: capacity first (the gate's try class —
+    /// query priority, never block), then claim, recover the key, read
+    /// the payload, and run — or take the fallback. Per-item LLM/agent
     /// errors are classified here (retry/fallback/dead), never
     /// surfaced above the item.
     async fn process_next_for_user(&self, uid: Uuid) -> Result<bool, QueueWorkerError> {
         // Capacity first: don't claim anything we can't run now
         // (claiming then reverting would burn the retry's attempts
-        // accounting). try_acquire only — the query-priority
-        // invariant: no permit → skip this wake, never block.
-        let Ok(permit) = agent::LLM_RUNS.try_acquire() else {
+        // accounting). try_enter only — the query-priority invariant:
+        // no slot, or anything queued ahead of us, → skip this wake,
+        // never block.
+        let Some(permit) = llm_gate::LLM_GATE.try_enter() else {
             return Ok(false);
         };
         let Some(item) = self.store.claim_due_for_user(uid).await? else {

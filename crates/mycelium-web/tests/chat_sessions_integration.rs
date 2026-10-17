@@ -5,6 +5,14 @@
 //! watch channel holds the first request so a turn can be observed
 //! mid-run), and request-capturing (multi-turn payload pins) — pointed
 //! at via the ConfigStore "llm" key.
+//!
+//! Every chat turn now admits on the process-global
+//! `llm_gate::LLM_GATE` (LLM concurrency spec §3.3 — the runner is the
+//! chat surface's single admission point), so a turn here consumes gate
+//! capacity: ALL tests in this binary serialize on [`TEST_LOCK`], and
+//! the ones that hold slots or reconfigure the gate restore its
+//! defaults through [`GateDefaults`] (declared after the lock guard, so
+//! the restore happens while the lock is still held).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,14 +21,54 @@ use std::time::{Duration, Instant};
 use axum::response::IntoResponse;
 
 use mycelium_auth::login::LoginService;
+use mycelium_librarian::llm_gate::{
+    DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
+};
 use mycelium_store::Store;
 use mycelium_web::AppState;
+use mycelium_web::chat_api::CHAT_QUEUE_FULL_MSG;
+use mycelium_web::chat_runner::CHAT_CAPACITY_MSG;
 
 /// Known admin password for the pre-seeded account (tests log in with it).
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
 
 /// Password for the second (non-admin) user minted by the ownership test.
 const SECOND_PASSWORD: &str = "second user password known to the test suite!";
+
+/// Serializes all tests in this binary around the shared LLM gate.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Wait bound for the gate holds this suite takes.
+const GATE_BOUND: Duration = Duration::from_secs(10);
+
+/// Restores the process-global gate's tunables on drop, so a failing
+/// assertion cannot leak a reconfigured gate into the next test.
+struct GateDefaults;
+
+impl Drop for GateDefaults {
+    fn drop(&mut self) {
+        LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+        LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
+        LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
+    }
+}
+
+/// Poll a gate/stats condition with a deadline (never a bare sleep —
+/// the poll target is observable gate state).
+async fn poll_gate_until<F: FnMut() -> bool>(mut want: F, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if want() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw {what}: {:?}",
+            LLM_GATE.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 /// A scripted mock LLM: pops responses LIFO.
 async fn mock_llm(responses: Vec<serde_json::Value>) -> String {
@@ -158,6 +206,42 @@ async fn boot(
     tokio_util::sync::CancellationToken,
     tempfile::TempDir,
 ) {
+    boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        ..Default::default()
+    })
+    .await
+}
+
+/// `boot` with the full stored "llm" row, so a test can set the gate
+/// tunables the runner syncs from (`max_parallel`, `chat_wait_secs`, …)
+/// the way the admin page does — a config write, not a code change.
+async fn boot_with(
+    llm: mycelium_web::LlmConfig,
+) -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    tempfile::TempDir,
+) {
+    let (base, shutdown, dir, _serve) = boot_with_handle(llm).await;
+    // The handle is dropped (the task detaches, as it always has);
+    // only the shutdown test needs to observe `serve` returning.
+    (base, shutdown, dir)
+}
+
+/// [`boot_with`] that also hands back the `serve` task's join handle,
+/// so a test can assert the serve future itself COMPLETES after the
+/// shutdown token fires (the LLM-gate close path, spec §3.5).
+async fn boot_with_handle(
+    llm: mycelium_web::LlmConfig,
+) -> (
+    String,
+    tokio_util::sync::CancellationToken,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
@@ -183,18 +267,7 @@ async fn boot(
         None,
     );
     // Point the librarian at the mock LLM.
-    state
-        .config
-        .set(
-            "llm",
-            &mycelium_web::LlmConfig {
-                url: llm_url,
-                model: "mock".into(),
-                api_key: None,
-            },
-        )
-        .await
-        .unwrap();
+    state.config.set("llm", &llm).await.unwrap();
 
     let https: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let http: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -206,7 +279,7 @@ async fn boot(
 
     let data_dir = dir.path().to_path_buf();
     let token = shutdown.clone();
-    tokio::spawn(async move {
+    let serve = tokio::spawn(async move {
         let _ = mycelium_web::serve(
             state,
             &data_dir,
@@ -220,7 +293,12 @@ async fn boot(
         .await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    (format!("https://127.0.0.1:{https_port}"), shutdown, dir)
+    (
+        format!("https://127.0.0.1:{https_port}"),
+        shutdown,
+        dir,
+        serve,
+    )
 }
 
 fn client() -> reqwest::Client {
@@ -282,6 +360,78 @@ fn sse_events(body: &str) -> Vec<serde_json::Value> {
             serde_json::from_str(data).expect("valid sse json")
         })
         .collect()
+}
+
+/// Incremental SSE reader over a still-open response body: parses
+/// complete frames as the chunks arrive, so a test can observe an event
+/// MID-stream. The queue events (`queued`/`admitted`) are live
+/// presentation — reading the whole body would prove only that they
+/// were somewhere in it, not that they reached the client before the
+/// run did.
+struct SseReader {
+    resp: reqwest::Response,
+    buf: String,
+    events: Vec<serde_json::Value>,
+}
+
+impl SseReader {
+    fn new(resp: reqwest::Response) -> Self {
+        Self {
+            resp,
+            buf: String::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Index of the first parsed event of this type, if any.
+    fn index_of(&self, kind: &str) -> Option<usize> {
+        self.events.iter().position(|e| e["type"] == kind)
+    }
+
+    fn kinds(&self) -> Vec<&str> {
+        self.events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or("?"))
+            .collect()
+    }
+
+    /// Read frames until an event of `kind` has been parsed; returns
+    /// its index. Bounded by a deadline (never a fixed sleep): the
+    /// stream ending first, or the deadline, fails the test.
+    async fn read_until(&mut self, kind: &str) -> usize {
+        if let Some(i) = self.index_of(kind) {
+            return i;
+        }
+        let read = async {
+            loop {
+                let chunk = self
+                    .resp
+                    .chunk()
+                    .await
+                    .expect("sse chunk")
+                    .unwrap_or_else(|| {
+                        panic!("stream ended before a `{kind}` event: {:?}", self.kinds())
+                    });
+                self.buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(end) = self.buf.find("\n\n") {
+                    let frame: String = self.buf.drain(..end + 2).collect();
+                    let frame = frame.trim();
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    let data = frame.strip_prefix("data: ").expect("sse data line");
+                    self.events
+                        .push(serde_json::from_str(data).expect("valid sse json"));
+                }
+                if let Some(i) = self.index_of(kind) {
+                    return i;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a `{kind}` sse event"))
+    }
 }
 
 /// POST /api/v1/chat/sessions (the draft-create submit).
@@ -367,6 +517,41 @@ async fn poll_meta_until(
     }
 }
 
+/// POST /api/v1/chat/sessions/{id}/messages (the existing-session submit).
+async fn submit_into_session(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    session_id: &str,
+    message: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/api/v1/chat/sessions/{session_id}/messages"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(&[("message", message)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `(chat_sessions, chat_turns)` row counts read straight from the
+/// server's SQLite file (a second pool; WAL readers are concurrent).
+/// The depth-cap contract is "no row written", so it is asserted
+/// against the tables themselves, not an endpoint's view of them.
+async fn chat_row_counts(store: &Store) -> (i64, i64) {
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turns")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    (sessions, turns)
+}
+
 /// The user's single session id from the list endpoint — the draft
 /// create persists the session row before the stream yields anything,
 /// so this is the no-partial-read way to learn the id mid-run.
@@ -386,6 +571,7 @@ async fn first_session_id(client: &reqwest::Client, base: &str, cookie: &str) ->
 
 #[tokio::test]
 async fn submit_tool_done_flow_persists() {
+    let _g = TEST_LOCK.lock().await;
     // Script: (1) the final answer, (2) a search tool call — the agent
     // runs the tool, then answers. Draft-create: first event carries
     // the new session id, then tool progress, then done.
@@ -472,6 +658,7 @@ async fn submit_tool_done_flow_persists() {
 
 #[tokio::test]
 async fn double_submit_conflict() {
+    let _g = TEST_LOCK.lock().await;
     // Review Focus 1: a gated mock holds the runner at the LLM while
     // the second submit arrives — the unique running-turn index must
     // 409 it, never spawn a second run.
@@ -530,6 +717,7 @@ async fn double_submit_conflict() {
 
 #[tokio::test]
 async fn navigate_away_durability() {
+    let _g = TEST_LOCK.lock().await;
     // Today's-bug regression pin (spec §6.6): the client drops the
     // response mid-run (never reads the body); the detached runner
     // must still persist the reply and finalize the turn.
@@ -577,6 +765,7 @@ async fn navigate_away_durability() {
 
 #[tokio::test]
 async fn reattach_mid_run_tails_live() {
+    let _g = TEST_LOCK.lock().await;
     // Reattach while the turn runs: the replay is empty (no agent rows
     // yet; user rows never replay), the stream holds open, and the
     // live tool + done events arrive on the REATTACH stream after the
@@ -649,6 +838,7 @@ async fn reattach_mid_run_tails_live() {
 
 #[tokio::test]
 async fn csrf_auth_and_ownership() {
+    let _g = TEST_LOCK.lock().await;
     let llm_url = mock_llm(vec![text_response("owners reply")]).await;
     let (base, shutdown, dir) = boot(llm_url).await;
     let client = client();
@@ -777,6 +967,7 @@ async fn csrf_auth_and_ownership() {
 
 #[tokio::test]
 async fn draft_flow_first_session() {
+    let _g = TEST_LOCK.lock().await;
     // Review Focus 5: the first-ever session — the create POST's first
     // event is the session id, and the sidebar list shows exactly one
     // entry with the derived title.
@@ -827,6 +1018,7 @@ async fn draft_flow_first_session() {
 
 #[tokio::test]
 async fn multi_turn_context_rebuilt_from_rows() {
+    let _g = TEST_LOCK.lock().await;
     // The second turn's LLM request must carry the first exchange —
     // history rebuilt from persisted rows (D11), not memory.
     let (llm_url, requests) = capturing_mock_llm(vec![
@@ -925,6 +1117,7 @@ async fn multi_turn_context_rebuilt_from_rows() {
 
 #[tokio::test]
 async fn delete_own_sessions_and_refuse_while_running() {
+    let _g = TEST_LOCK.lock().await;
     // D12: delete refuses while a turn runs (409, both variants); the
     // owner's delete succeeds — the POST variant redirects (303
     // /chat, the native sidebar form) and the DELETE variant answers
@@ -1027,6 +1220,7 @@ async fn delete_own_sessions_and_refuse_while_running() {
 /// bubble) HTML-escaped — never executable markup.
 #[tokio::test]
 async fn chat_page_sidebar_and_transcript_ssr() {
+    let _g = TEST_LOCK.lock().await;
     // LIFO script: the hostily-titled session (created first) pops the
     // LAST response ("First reply."); the tool session (created second)
     // pops the tool call, then — the agent's second request — the
@@ -1288,6 +1482,7 @@ async fn chat_page_sidebar_and_transcript_ssr() {
 /// finishes.
 #[tokio::test]
 async fn chat_page_running_and_interrupted_notes() {
+    let _g = TEST_LOCK.lock().await;
     // The mock's response is never released — the turn stays held
     // running (then interrupted after the sweep); the reader dropping
     // the submit response is what lets the test end cleanly.
@@ -1365,6 +1560,7 @@ async fn chat_page_running_and_interrupted_notes() {
 /// `failed`), and the page's data-turn-status says so.
 #[tokio::test]
 async fn chat_page_failed_error_bubble() {
+    let _g = TEST_LOCK.lock().await;
     // An empty script exhausts on the first LLM request → the detached
     // runner persists the error row + finalizes `failed`.
     let llm_url = mock_llm(vec![]).await;
@@ -1416,6 +1612,7 @@ async fn chat_page_failed_error_bubble() {
 /// this rewrite).
 #[tokio::test]
 async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
+    let _g = TEST_LOCK.lock().await;
     let llm_url = "http://127.0.0.1:1/v1".to_string(); // dead; no turn runs
     let (base, shutdown, _dir) = boot(llm_url).await;
     let client = client();
@@ -1434,11 +1631,11 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
         .unwrap();
     let page_html = page.text().await.unwrap();
     assert!(
-        page_html.contains("/assets/chat.js?v=30"),
+        page_html.contains("/assets/chat.js?v=31"),
         "the /chat page must reference the bumped chat.js version: {page_html}"
     );
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=30"))
+        .get(format!("{base}/assets/chat.js?v=31"))
         .send()
         .await
         .unwrap();
@@ -1461,6 +1658,33 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
         !body.contains("/api/v1/chat/stream"),
         "the removed legacy stream route must not appear anywhere in chat.js: {body}"
     );
+    // The queue events are handled BEFORE the seq-dedup gate (they
+    // carry no seq) and the note is built with textContent, never
+    // innerHTML (LLM concurrency spec §3.3).
+    for needle in [
+        "\"queued\"",
+        "\"admitted\"",
+        "setQueueNote",
+        "clearQueueNote",
+        "chat-queue-note",
+    ] {
+        assert!(
+            body.contains(needle),
+            "chat.js must carry the queue-status handling ({needle}): {body}"
+        );
+    }
+    let queued_at = body.find("ev.type === \"queued\"").expect("queued branch");
+    let dedup_at = body.find("seen[ev.seq]").expect("the seq dedup gate");
+    assert!(
+        queued_at < dedup_at,
+        "the queued branch must precede the seq-dedup gate in chat.js"
+    );
+    assert!(
+        body.find("ev.type === \"admitted\"")
+            .expect("admitted branch")
+            < dedup_at,
+        "the admitted branch must precede the seq-dedup gate in chat.js"
+    );
 
     shutdown.cancel();
 }
@@ -1477,6 +1701,7 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
 /// client only watches.
 #[tokio::test]
 async fn interrupted_turn_js_reattaches_via_poll() {
+    let _g = TEST_LOCK.lock().await;
     // The gate is never released: the turn stays held running — then
     // interrupted after the sweep — for the whole test; the response's
     // unread body is dropped at the end.
@@ -1538,6 +1763,7 @@ async fn interrupted_turn_js_reattaches_via_poll() {
 /// request-capturing mock — the REAL second payload, not an inference.
 #[tokio::test]
 async fn api_chat_is_stateless_single_turn() {
+    let _g = TEST_LOCK.lock().await;
     let (llm_url, requests) = capturing_mock_llm(vec![
         text_response("Second one-shot reply."),
         text_response("First one-shot reply."),
@@ -1589,5 +1815,1366 @@ async fn api_chat_is_stateless_single_turn() {
         "no prior assistant reply may leak into the second one-shot request: {all}"
     );
 
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_capacity_timeout_fails_turn() {
+    // LLM concurrency spec §3.3: a turn that never gets a slot within
+    // `chat_wait_secs` finalizes `failed` with the capacity message —
+    // and the LLM is never called (the run never started).
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // A capturing mock with an empty script: a request would 500, so
+    // "no request recorded" is the no-run observable.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // One slot, a one-second wait bound: the runner syncs both from
+        // this row (no new plumbing — the admin page's own path).
+        max_parallel: 1,
+        chat_wait_secs: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Hold the single slot for the whole submit (anonymous hold — the
+    // per-user cap must not be what rejects this turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    let resp = submit_draft(&client, &base, &cookie, &csrf, "asked at capacity").await;
+    assert_eq!(resp.status(), 200, "the submit itself still streams");
+    let body = resp.text().await.unwrap();
+    let events = sse_events(&body);
+    let error = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .unwrap_or_else(|| panic!("a capacity error event: {events:?}"));
+    assert_eq!(
+        error["error"], CHAT_CAPACITY_MSG,
+        "the pinned capacity message: {events:?}"
+    );
+    let session_id = events[0]["session_id"].as_str().expect("session_id");
+
+    // Persisted: a reconnecting client sees the failed turn + the row.
+    let meta = poll_meta_until(&client, &base, &cookie, session_id, "failed").await;
+    assert_eq!(meta["turn_status"], "failed");
+    assert!(
+        requests.lock().await.is_empty(),
+        "a turn that never got a slot never calls the LLM"
+    );
+    drop(hold);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn shutdown_releases_queued_turn_as_interrupted() {
+    // LLM concurrency spec §3.5 (controller ruling R31): when the
+    // shutdown token fires, `serve` closes the gate — every queued
+    // waiter is released at once rather than sitting out its wait
+    // bound inside the graceful-shutdown window. A turn released that
+    // way never ran, so it finalizes `interrupted` with NO error row:
+    // byte for byte the state a crash leaves behind after the boot
+    // sweep (`interrupted`, `attempts = 0`), which is exactly what the
+    // resume path claims. It is NOT `failed`, and it carries no
+    // capacity message — nothing was at capacity.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // A reachable mock with an empty script: a request would 500, so
+    // "no request recorded" proves the run never started.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, dir, serve) = boot_with_handle(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // One slot and a wait bound far longer than this test: a
+        // finalized turn here can only come from the close path, never
+        // from the bound elapsing, and a `serve` that waited the
+        // waiter out would blow the 15 s assertion below.
+        max_parallel: 1,
+        chat_wait_secs: 600,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    // A second pool over the same file: the turn row stays observable
+    // after the server is gone (no endpoint to ask).
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // Hold the single slot anonymously (the per-user cap must not be
+    // what queues this turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    // Submit: the runner queues on the gate. Its SSE stream stays open
+    // for the life of the turn, so drive it in a task.
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "queued when the server stops").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        // The stream ends when the runner drops its broadcast sender;
+        // a body cut short by the shutdown is fine here — the
+        // capacity-message assertion holds either way.
+        resp.text().await.unwrap_or_default()
+    });
+    poll_gate_until(
+        || LLM_GATE.stats().queued == 1,
+        "the submitted turn queued on the gate",
+    )
+    .await;
+
+    // Shut down. `serve` must come back promptly: the queued waiter is
+    // released by `close()`, not waited out for its 600 s bound.
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(15), serve)
+        .await
+        .expect("serve returned after the shutdown token fired")
+        .expect("the serve task did not panic");
+
+    // The turn is the resumable state, not a failure.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let turn = loop {
+        let row: (String, i64) = sqlx::query_as("SELECT status, attempts FROM chat_turns LIMIT 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        if row.0 != "running" {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued turn never left `running`: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        turn,
+        ("interrupted".to_string(), 0),
+        "a fresh turn released by the shutdown is interrupted with attempts = 0"
+    );
+
+    // No error row at all — so certainly not the capacity message
+    // (`role` is the one plaintext column; content is sealed).
+    let error_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE role = ?")
+        .bind("error")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        error_rows, 0,
+        "the shutdown path writes no error row (no capacity message)"
+    );
+    let body = submit.await.unwrap();
+    assert!(
+        !body.contains(CHAT_CAPACITY_MSG),
+        "the stream never carried the capacity message: {body}"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a turn that never got a slot never calls the LLM"
+    );
+
+    // And the resume path picks it up: `resumable_turns` is the exact
+    // predicate `claim_resumable` enforces (`interrupted`,
+    // `attempts = 0`).
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let resumable = chat.resumable_turns().await.unwrap();
+    assert_eq!(
+        resumable.len(),
+        1,
+        "the released turn is claimable by the resume worker: {resumable:?}"
+    );
+
+    drop(hold);
+}
+
+#[tokio::test]
+async fn chat_admits_after_slot_frees() {
+    // The wait class, end to end: with every slot held the turn queues
+    // (observable: the gate's own `queued` count — Task 5 turns the
+    // same positions into SSE events), and it runs to `done` as soon as
+    // a slot frees.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![text_response("answered after the wait")]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        // Generous bound: this test pins admission-after-release, not
+        // the timeout path.
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    // The submit streams until the turn finishes — drive it in a task
+    // so the hold can be released mid-wait.
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "asked while queued").await;
+        assert_eq!(resp.status(), 200, "queued submit still streams");
+        resp.text().await.unwrap()
+    });
+
+    poll_gate_until(
+        || LLM_GATE.stats().queued >= 1,
+        "the turn queued on the gate",
+    )
+    .await;
+    // Still queued = nothing ran: the turn row is `running` (queue
+    // state is presentation, not lifecycle — spec §3.3).
+    let session_id = first_session_id(&client, &base, &cookie).await;
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(meta["turn_status"], "running", "queued turns stay running");
+
+    drop(hold);
+
+    let body = submit.await.unwrap();
+    let events = sse_events(&body);
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("the admitted turn finishes: {events:?}"));
+    assert_eq!(done["reply"], "answered after the wait");
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(meta["turn_status"], "done");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_sse_emits_queued_then_admitted() {
+    // LLM concurrency spec §3.3/§3.4: a turn that waits for a slot
+    // streams `queued` with its position LIVE — before any step event —
+    // and `admitted` once a slot frees. Both are broadcast-only
+    // presentation: no `seq` on the wire, no transcript row, and so
+    // nothing for the reattach replay to carry.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // LIFO script: the tool call is served first, then the answer — so
+    // the run has a step event the queue events must precede.
+    let llm_url = mock_llm(vec![
+        text_response("answered after queueing"),
+        tool_call_response(
+            "call-1",
+            "search_knowledge",
+            serde_json::json!({ "query": "queue" }),
+        ),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        // Generous bound: this pins the queue events, not the timeout.
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // One slot, held anonymously (the per-user cap must not be what
+    // queues this turn): the submit's turn has to wait.
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    let resp = submit_draft(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "asked while the gate is full",
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the queued submit still streams");
+    let mut sse = SseReader::new(resp);
+
+    // `queued` arrives while the slot is still held — the run has not
+    // started, so no step event can have streamed yet.
+    let queued_at = sse.read_until("queued").await;
+    assert_eq!(
+        sse.events[queued_at]["position"], 0,
+        "the only waiter sits at the head of the queue: {:?}",
+        sse.events
+    );
+    assert!(
+        sse.events[queued_at].get("seq").is_none(),
+        "a queue event carries no seq: {:?}",
+        sse.events
+    );
+    assert!(
+        sse.index_of("tool").is_none()
+            && sse.index_of("done").is_none()
+            && sse.index_of("admitted").is_none(),
+        "nothing of the run streams before admission: {:?}",
+        sse.kinds()
+    );
+    let session_id = sse.events[0]["session_id"]
+        .as_str()
+        .expect("the first event is the draft session event")
+        .to_string();
+
+    // Release the slot: the turn is admitted and runs to done.
+    drop(hold);
+
+    let admitted_at = sse.read_until("admitted").await;
+    assert!(
+        admitted_at > queued_at,
+        "admitted follows queued: {:?}",
+        sse.kinds()
+    );
+    assert!(
+        sse.events[admitted_at].get("seq").is_none(),
+        "a queue event carries no seq: {:?}",
+        sse.events
+    );
+    let tool_at = sse.read_until("tool").await;
+    let done_at = sse.read_until("done").await;
+    assert!(
+        admitted_at < tool_at && tool_at < done_at,
+        "the queue events precede every step event: {:?}",
+        sse.kinds()
+    );
+    assert_eq!(sse.events[done_at]["reply"], "answered after queueing");
+    // The whole observed order, pinned.
+    assert_eq!(
+        sse.kinds(),
+        vec!["session", "queued", "admitted", "tool", "done"],
+        "the submit stream's event order"
+    );
+
+    // The transcript is untouched by the queue events: the reattach
+    // replay (?after=0) carries the persisted rows only.
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(meta["turn_status"], "done");
+    let replay = client
+        .get(format!(
+            "{base}/api/v1/chat/sessions/{session_id}/stream?after=0"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 200);
+    let revents = sse_events(&replay.text().await.unwrap());
+    let rkinds: Vec<&str> = revents
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(
+        !rkinds.contains(&"queued") && !rkinds.contains(&"admitted"),
+        "queue events are never replayed: {rkinds:?}"
+    );
+    assert_eq!(
+        rkinds,
+        vec!["tool", "assistant"],
+        "the replay vocabulary is the persisted rows"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_submit_429_at_depth_cap() {
+    // LLM concurrency spec §3.3: with the gate's waiter queue at its
+    // configured depth, a NEW draft submit is refused 429 +
+    // `Retry-After: 5` BEFORE any row is written — no empty draft
+    // session, no zombie turn (the client can retry). The turn already
+    // queued is untouched and runs normally once a slot frees.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![text_response("answered once the queue drained")]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // One slot and room for exactly one waiter; a generous wait
+        // bound, so nothing here depends on the timeout path.
+        max_parallel: 1,
+        chat_queue_depth: 1,
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    // A second pool over the same file: the row-count observable.
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // Hold the single slot anonymously (the per-user cap must not be
+    // what queues the first turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+
+    // Submit A: its runner takes the one queue place. The stream stays
+    // open until the turn finishes, so drive it in a task.
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit_a = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "first in the queue").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        resp.text().await.unwrap()
+    });
+    // The runner is async: wait for the REAL queue state, never assume it.
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "turn A queued on the gate").await;
+    let before = chat_row_counts(&store).await;
+    assert_eq!(
+        before,
+        (1, 1),
+        "A's session and turn rows exist: {before:?}"
+    );
+
+    // Submit B: the queue is full (depth 1) → refused, nothing written.
+    let refused = submit_draft(&client, &base, &cookie, &csrf, "second in the queue").await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "a submit beyond the depth cap is refused"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": CHAT_QUEUE_FULL_MSG }),
+        "the pinned 429 body"
+    );
+    assert_eq!(
+        chat_row_counts(&store).await,
+        before,
+        "the refusal wrote neither a session nor a turn row"
+    );
+    assert_eq!(
+        LLM_GATE.stats().queued,
+        1,
+        "the refused submit never enqueued: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // Release the slot: A is admitted and finishes normally.
+    drop(hold);
+    let events = sse_events(&submit_a.await.unwrap());
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("the queued turn still finishes: {events:?}"));
+    assert_eq!(done["reply"], "answered once the queue drained");
+    let session_id = first_session_id(&client, &base, &cookie).await;
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(meta["turn_status"], "done");
+    assert_eq!(
+        chat_row_counts(&store).await,
+        (1, 1),
+        "still exactly one session and one turn"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn chat_submit_session_429_at_depth_cap() {
+    // The same cap on the existing-session endpoint (spec §3.3 applies
+    // to the submit surface, not just the draft flow): the target
+    // session has NO running turn, so a 409 cannot be what refuses this
+    // — it is the depth cap, and it lands before the turn row.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // LIFO script: the warm-up turn is served first, then turn A's.
+    let llm_url = mock_llm(vec![
+        text_response("answered once the queue drained"),
+        text_response("warm-up reply"),
+    ])
+    .await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        chat_queue_depth: 1,
+        chat_wait_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // A finished session to submit into later (no slot held yet, so it
+    // runs straight through).
+    let (session_id, events) =
+        submit_draft_collect(&client, &base, &cookie, &csrf, "warm up").await;
+    assert_eq!(
+        events.last().map(|e| e["type"].clone()),
+        Some(serde_json::json!("done")),
+        "the warm-up turn finishes: {events:?}"
+    );
+    let warm_meta = poll_meta_until(&client, &base, &cookie, &session_id, "done").await;
+    assert_eq!(warm_meta["max_seq"], 2, "user + assistant rows");
+
+    // Fill the gate: one slot held, one waiter queued (a second,
+    // separate session's turn).
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the submit");
+    let (c2, b2, ck2, cs2) = (client.clone(), base.clone(), cookie.clone(), csrf.clone());
+    let submit_a = tokio::spawn(async move {
+        let resp = submit_draft(&c2, &b2, &ck2, &cs2, "first in the queue").await;
+        assert_eq!(resp.status(), 200, "the queued submit still streams");
+        resp.text().await.unwrap()
+    });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "turn A queued on the gate").await;
+    let before = chat_row_counts(&store).await;
+    assert_eq!(before, (2, 2), "two sessions, two turns: {before:?}");
+
+    // Submit into the IDLE session while the queue is full → 429.
+    let refused = submit_into_session(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &session_id,
+        "a second turn in a quiet session",
+    )
+    .await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "the existing-session submit is capped too"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": CHAT_QUEUE_FULL_MSG }),
+        "the pinned 429 body"
+    );
+    assert_eq!(
+        chat_row_counts(&store).await,
+        before,
+        "the refusal wrote no turn row"
+    );
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(
+        meta["turn_status"], "done",
+        "the refused submit left the session's last turn alone: {meta}"
+    );
+    assert_eq!(meta["max_seq"], 2, "no new user row: {meta}");
+    assert_eq!(
+        LLM_GATE.stats().queued,
+        1,
+        "the refused submit never enqueued: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // Release: the queued turn finishes normally.
+    drop(hold);
+    let events = sse_events(&submit_a.await.unwrap());
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "done")
+        .unwrap_or_else(|| panic!("the queued turn still finishes: {events:?}"));
+    assert_eq!(done["reply"], "answered once the queue drained");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn stateless_chat_429_when_saturated() {
+    // LLM concurrency spec §3.3: the stateless one-shot
+    // `POST /api/v1/chat` is wait class, bounded by `query_wait_secs`.
+    // With every slot held it waits the bound and then 429s with
+    // `Retry-After: 5` — distinguishable from the 503 it returns when
+    // the LLM is unreachable.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    // A REACHABLE mock with an empty script: a request would 500, so
+    // "no request recorded" proves the run never started — and the
+    // 429 cannot be the unreachable-LLM 503 in disguise.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // Two slots (the default), a one-second wait bound: the handler
+        // syncs the gate from this row, as the admin page's save does.
+        max_parallel: 2,
+        query_wait_secs: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    // Saturate: anonymous holds, so the per-user cap is not what
+    // rejects this request — only the global capacity.
+    let hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 1 of 2 is free before the request");
+    let hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 2 of 2 is free before the request");
+
+    let resp = client
+        .post(format!("{base}/api/v1/chat"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("message", "asked while the gate is full")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "capacity, not 503 unreachable");
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": mycelium_web::api::LLM_CAPACITY_MSG }),
+        "the pinned 429 body"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a request that never got a slot never calls the LLM"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before + 1,
+        "exactly one gate timeout — the 429 came from the gate: {:?}",
+        LLM_GATE.stats()
+    );
+    drop(hold_a);
+    drop(hold_b);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn dream_429_when_saturated() {
+    // LLM concurrency spec §3.3/§5: dream is wait class with the chat
+    // bound. Saturated → the endpoint-wide JSON error shape with the
+    // capacity message and a 429, never a hang.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 2,
+        chat_wait_secs: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // No session → the login gate redirects, before any admission.
+    let no_auth = client
+        .post(format!("{base}/api/v1/dream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_auth.status(),
+        303,
+        "unauthenticated must hit the login gate"
+    );
+
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    let hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 1 of 2 is free before the request");
+    let hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("slot 2 of 2 is free before the request");
+
+    let resp = client
+        .post(format!("{base}/api/v1/dream"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "capacity refusal, not a 500 or a hang");
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("5"),
+        "the refusal carries Retry-After: 5"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": mycelium_web::api::LLM_CAPACITY_MSG }),
+        "dream's error-envelope shape with the capacity message"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a dream that never got a slot never calls the LLM"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        timeouts_before + 1,
+        "exactly one gate timeout — the 429 came from the gate: {:?}",
+        LLM_GATE.stats()
+    );
+    drop(hold_a);
+    drop(hold_b);
+    shutdown.cancel();
+}
+
+/// The value of a Prometheus sample line (the first line that starts
+/// with `<name> `), so a `# TYPE` line is never read as a sample.
+fn metric_sample(text: &str, name: &str) -> String {
+    let prefix = format!("{name} ");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("/metrics has no sample line for {name}:\n{text}"));
+    line[prefix.len()..].trim().to_string()
+}
+
+/// /health's `llm_*` fields and /metrics' gate lines report LIVE gate
+/// state (spec §3.6): with one slot held, both surfaces see an active
+/// run, and both go back to zero once the permit drops. The counters
+/// are asserted RELATIVELY (before/after) — LLM_GATE is process-global,
+/// so no absolute total is pinned. Runs under this binary's gate lock
+/// with a defaults guard (it holds a slot).
+#[tokio::test]
+async fn health_and_metrics_reflect_live_gate_state() {
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm = mock_llm(vec![]).await; // never called: no chat turn here
+    let (base, shutdown, _dir) = boot(llm).await;
+    let client = client();
+
+    let before = LLM_GATE.stats();
+    let permit = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("a slot is free with the whole gate to ourselves");
+    assert!(
+        LLM_GATE.stats().active >= 1,
+        "the held permit is active: {:?}",
+        LLM_GATE.stats()
+    );
+
+    let held: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        held["llm_active"].as_i64().unwrap() >= 1,
+        "/health shows the held slot: {held}"
+    );
+    assert_eq!(
+        held["llm_queued"].as_i64().unwrap(),
+        0,
+        "nothing is queued behind us: {held}"
+    );
+    assert_eq!(
+        held["llm_capacity"].as_i64().unwrap(),
+        DEFAULT_CAPACITY as i64,
+        "the configured slot count, not a literal: {held}"
+    );
+    assert_eq!(
+        held["status"], "ok",
+        "a held gate slot never degrades health: {held}"
+    );
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_active")
+            .parse::<u64>()
+            .unwrap()
+            >= 1,
+        "the active gauge shows the held slot:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_llm_gate_capacity"),
+        DEFAULT_CAPACITY.to_string(),
+        "the capacity gauge mirrors the gate"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_admissions_total")
+            .parse::<u64>()
+            .unwrap()
+            > before.admissions_total,
+        "our admission moved the counter (relative, not absolute):\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_wait_count")
+            .parse::<u64>()
+            .unwrap()
+            > before.wait_count,
+        "the wait-class admission recorded a wait sample:\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_wait_seconds_total")
+            .parse::<f64>()
+            .unwrap()
+            // 1e-6 slack: the line is rendered at six decimals.
+            >= before.wait_seconds_total - 1e-6,
+        "the cumulative wait never goes backwards:\n{text}"
+    );
+    assert!(
+        metric_sample(&text, "mycelium2_llm_gate_timeouts_total")
+            .parse::<u64>()
+            .unwrap()
+            >= before.timeouts_total,
+        "the timeout counter never goes backwards:\n{text}"
+    );
+
+    drop(permit);
+    poll_gate_until(|| LLM_GATE.stats().active == 0, "the gate draining").await;
+    let drained: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        drained["llm_active"].as_i64().unwrap(),
+        0,
+        "the released slot is reported free: {drained}"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------
+// Admin LLM concurrency fields + live gate sync (LLM concurrency spec
+// §3.2/§3.6). The admin form carries the five tunables; saving clamps
+// them and pushes them onto the process-global gate immediately, and
+// boot syncs the stored row before the listener accepts traffic.
+// ---------------------------------------------------------------------
+
+/// POST /admin/llm with an arbitrary field set (the page's own flow:
+/// admin cookie + CSRF header). Fields are passed verbatim so a test
+/// can omit the concurrency inputs entirely (an old cached form).
+async fn post_admin_llm(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    fields: &[(&str, &str)],
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/admin/llm"))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .form(fields)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Decrypt the stored "llm" row from the server's tempdir (the on-disk
+/// service key is idempotent: same file, same key).
+async fn stored_llm(dir: &std::path::Path) -> mycelium_web::LlmConfig {
+    let store = Store::open(dir).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir, None).unwrap();
+    let config = mycelium_store::config::ConfigStore::new(store.pool().clone());
+    mycelium_store::config::get_sealed(&config, &service_key, "llm")
+        .await
+        .expect("a stored llm row")
+}
+
+/// The `<input ...>` tag carrying `name="<field>"`, for attribute
+/// assertions that do not pin the whole rendered line.
+fn input_tag<'a>(html: &'a str, field: &str) -> &'a str {
+    let marker = format!(r#"name="{field}""#);
+    let idx = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no input named {field} in the admin LLM form"));
+    let start = html[..idx].rfind('<').expect("an opening tag");
+    let end = idx + html[idx..].find('>').expect("a closing bracket") + 1;
+    &html[start..end]
+}
+
+#[tokio::test]
+async fn admin_llm_form_has_concurrency_fields() {
+    // Spec §3.6: the five tunables render with their CURRENT stored
+    // value — clamped, so a stale out-of-range row can never put 999
+    // back in the box — plus the range as min/max attributes.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        // Deliberately out of range: the form must render the clamp.
+        max_parallel: 999,
+        per_user_active: 5,
+        query_wait_secs: 45,
+        chat_wait_secs: 900,
+        chat_queue_depth: 128,
+    })
+    .await;
+    let client = client();
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+
+    let html = client
+        .get(format!("{base}/admin/llm"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    for (field, value, min, max) in [
+        ("max_parallel", "64", "1", "64"),
+        ("per_user_active", "5", "1", "16"),
+        ("query_wait_secs", "45", "1", "600"),
+        ("chat_wait_secs", "900", "1", "7200"),
+        ("chat_queue_depth", "128", "1", "1024"),
+    ] {
+        let tag = input_tag(&html, field);
+        assert!(
+            tag.contains(r#"type="number""#),
+            "{field} is a number input: {tag}"
+        );
+        assert!(
+            tag.contains(&format!(r#"value="{value}""#)),
+            "{field} renders the clamped stored value {value}: {tag}"
+        );
+        assert!(
+            tag.contains(&format!(r#"min="{min}""#)) && tag.contains(&format!(r#"max="{max}""#)),
+            "{field} carries its clamp range {min}..={max}: {tag}"
+        );
+    }
+    // The range is visible to a human too, not just to the browser.
+    assert!(
+        html.contains("1&ndash;64") || html.contains("1–64") || html.contains("1-64"),
+        "the max_parallel range hint is visible in the form"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_syncs_gate_immediately() {
+    // Spec §3.2: "admin_save_llm syncs immediately on save — the admin
+    // sees the effect without waiting for traffic. No restart." The
+    // queued waiter is admitted by the save itself: nothing releases a
+    // slot (the hold is still held when the assertion runs).
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 1,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    LLM_GATE.set_capacity(1);
+    let hold = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the only slot is free before the save");
+    // One waiter queued behind it.
+    let waiter =
+        tokio::spawn(async move { LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.is_ok() });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "one waiter queued").await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "2"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "admin save redirects");
+    assert_eq!(
+        LLM_GATE.capacity(),
+        2,
+        "the save synced the gate with no traffic: {:?}",
+        LLM_GATE.stats()
+    );
+
+    // The raise admitted the waiter — while the first slot is STILL
+    // held (nothing was released).
+    let admitted = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the queued waiter is admitted by the capacity raise")
+        .unwrap();
+    assert!(admitted, "the waiter got a slot, not a timeout");
+    drop(hold);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_clamps_out_of_range() {
+    // Spec §3.2: server-side validation is clamping, never a 500 and
+    // never an unbounded gate.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "999"),
+            ("per_user_active", "99"),
+            ("chat_queue_depth", "99999"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.max_parallel, 64, "max_parallel clamped at rest");
+    assert_eq!(
+        stored.per_user_active, 16,
+        "per_user_active clamped at rest"
+    );
+    assert_eq!(
+        stored.chat_queue_depth, 1024,
+        "chat_queue_depth clamped at rest"
+    );
+    assert_eq!(LLM_GATE.capacity(), 64, "the gate took the clamped value");
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", llm_url.as_str()),
+            ("model", "mock"),
+            ("max_parallel", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.max_parallel, 1, "zero clamps up to the floor");
+    assert_eq!(LLM_GATE.capacity(), 1, "the gate took the clamped floor");
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn admin_save_without_concurrency_fields_keeps_stored_values() {
+    // An old cached form (or a non-numeric value) must save url/model
+    // without resetting the tunables — and must not 500.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url.clone(),
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 5,
+        per_user_active: 3,
+        query_wait_secs: 45,
+        chat_wait_secs: 900,
+        chat_queue_depth: 128,
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[("url", "http://elsewhere.invalid/v1"), ("model", "other")],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "a form without the inputs still saves");
+    let stored = stored_llm(dir.path()).await;
+    assert_eq!(stored.url, "http://elsewhere.invalid/v1");
+    assert_eq!(stored.model, "other");
+    assert_eq!(stored.max_parallel, 5);
+    assert_eq!(stored.per_user_active, 3);
+    assert_eq!(stored.query_wait_secs, 45);
+    assert_eq!(stored.chat_wait_secs, 900);
+    assert_eq!(stored.chat_queue_depth, 128);
+
+    // A non-numeric value is the same case: keep the stored value, no 500.
+    let resp = post_admin_llm(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        &[
+            ("url", "http://elsewhere.invalid/v1"),
+            ("model", "other"),
+            ("max_parallel", "not a number"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 303, "a junk value must not 500");
+    assert_eq!(stored_llm(dir.path()).await.max_parallel, 5);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn boot_syncs_gate_from_stored_config() {
+    // Spec §3.2 + R29(c): a stored `max_parallel` takes effect at boot,
+    // before the listener accepts — the try-class workers (drain, chat
+    // resume) would otherwise see the default capacity until some
+    // request happened to sync.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+    assert_ne!(DEFAULT_CAPACITY, 5, "the test value must differ");
+    let llm_url = mock_llm(vec![]).await;
+    let (_base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 5,
+        ..Default::default()
+    })
+    .await;
+    // No request has been made: boot alone must have applied the row.
+    poll_gate_until(
+        || LLM_GATE.capacity() == 5,
+        "boot syncing the stored capacity",
+    )
+    .await;
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn sync_llm_gate_from_store_applies_the_stored_limits() {
+    // The shared boot-sync entry point (`main` calls it before the
+    // queue drain pass and before either worker is spawned; `serve`
+    // calls it again, idempotently). Asserted WITHOUT a server: the
+    // function alone must make a stored row live, clamped, so the
+    // try-class boot work cannot run against the defaults.
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    LLM_GATE.set_capacity(DEFAULT_CAPACITY);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let login = LoginService::new(store.pool().clone());
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        dir.path().join("assets"),
+        dir.path().to_path_buf(),
+        None,
+    );
+    // Stored out of range on purpose: the sync clamps as it applies.
+    state
+        .config
+        .set(
+            "llm",
+            &mycelium_web::LlmConfig {
+                url: "http://unused.invalid/v1".into(),
+                model: "mock".into(),
+                api_key: None,
+                max_parallel: 999,
+                per_user_active: 7,
+                chat_queue_depth: 11,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    mycelium_web::server::sync_llm_gate_from_store(&state).await;
+    assert_eq!(LLM_GATE.capacity(), 64, "clamped capacity applied");
+    assert_eq!(LLM_GATE.per_user_active(), 7, "per-user cap applied");
+    assert_eq!(
+        LLM_GATE.chat_queue_depth_limit(),
+        11,
+        "queue-depth cap applied"
+    );
+
+    // Idempotent: calling it again (as `serve` does after `main`) is a
+    // no-op on the same row.
+    mycelium_web::server::sync_llm_gate_from_store(&state).await;
+    assert_eq!(LLM_GATE.capacity(), 64);
+}
+
+// ---------------------------------------------------------------------
+// /admin/system LLM readout card (LLM concurrency spec §3.6: "an LLM
+// card readout (active/queued/capacity, recent timeouts) next to the
+// existing queue table"). The card renders from the request's ONE
+// `LLM_GATE.stats()` read, so slots held here must show up in the
+// markup as live values — never the all-zero shape a hardcoded card
+// would print.
+// ---------------------------------------------------------------------
+
+/// The card's rendered stat row for `label`, as the page composes it.
+fn llm_stat_row(label: &str, value: &str) -> String {
+    format!("<strong>{label}</strong> <span>{value}</span>")
+}
+
+#[tokio::test]
+async fn admin_system_shows_llm_readout() {
+    let _g = TEST_LOCK.lock().await;
+    let _gate = GateDefaults;
+    let llm_url = mock_llm(vec![]).await;
+    let (base, shutdown, _dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        max_parallel: 2,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+
+    LLM_GATE.set_capacity(2);
+    // Both slots held: active == capacity == 2.
+    let _hold_a = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the first slot is free");
+    let _hold_b = LLM_GATE
+        .enter(None, GATE_BOUND, |_| {})
+        .await
+        .expect("the second slot is free");
+
+    // One wait-class admission that cannot be served: its bound elapses
+    // against the full gate, so the cumulative timeout counter moves
+    // (proving the card's timeouts row is read, not printed as a 0).
+    let timeouts_before = LLM_GATE.stats().timeouts_total;
+    assert!(
+        LLM_GATE
+            .enter(None, Duration::from_millis(50), |_| {})
+            .await
+            .is_err(),
+        "a full gate cannot admit within a 50ms bound"
+    );
+    let want_timeouts = timeouts_before + 1;
+    poll_gate_until(
+        || LLM_GATE.stats().timeouts_total == want_timeouts,
+        "the timeout counter advancing",
+    )
+    .await;
+
+    // …and one waiter still queued when the page renders.
+    let waiter =
+        tokio::spawn(async move { LLM_GATE.enter(None, GATE_BOUND, |_| {}).await.is_ok() });
+    poll_gate_until(|| LLM_GATE.stats().queued == 1, "one waiter queued").await;
+
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        html.contains("LLM runs"),
+        "the System page must carry the LLM runs card: {html}"
+    );
+    for row in [
+        llm_stat_row("Active", "2"),
+        llm_stat_row("Queued", "1"),
+        llm_stat_row("Capacity", "2"),
+        llm_stat_row(
+            "Capacity timeouts (since start)",
+            &want_timeouts.to_string(),
+        ),
+    ] {
+        assert!(
+            html.contains(&row),
+            "the LLM card must render the live gate value {row}: {html}"
+        );
+    }
+
+    waiter.abort();
     shutdown.cancel();
 }

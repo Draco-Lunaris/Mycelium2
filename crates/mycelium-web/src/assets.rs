@@ -257,7 +257,10 @@ body.chat-page main {
   color: var(--muted); cursor: pointer; line-height: 0;
 }
 .chat-delete-btn:hover { color: var(--danger); background: rgba(247,118,142,.12); }
-.chat-status-note {
+.chat-status-note,
+/* The LLM-queue status line (chat.js setQueueNote): same quiet
+   treatment as a restart note — it is status, not transcript. */
+.chat-queue-note {
   align-self: center; font-size: 0.8rem; color: var(--muted);
   font-style: italic;
 }
@@ -1002,7 +1005,9 @@ pub const GRAPH_JS: &str = r##"// Interactive force-directed graph for /graph: d
 /// /api/v1/chat/sessions/{id}/stream?after=<cursor>; user rows never
 /// replay, and the pending bubble pre-exists from SSR), the
 /// stream-drop reopen loop (≤ 3 attempts, 2 s apart — the transcript
-/// is the fallback truth), and the meta liveness poll (GET
+/// is the fallback truth), the LLM-queue status line (the `queued` /
+/// `admitted` events — handled by type ahead of the seq gate, since
+/// they carry no transcript row), and the meta liveness poll (GET
 /// /api/v1/chat/sessions/{id}, 5 s interval) that notices the resume
 /// worker's claim (turn_status → running → reopen the stream with the
 /// cursor) or a turn finishing elsewhere (done/failed → one final
@@ -1223,6 +1228,29 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
     if (note) note.remove();
   }
 
+  // The queue status line (LLM concurrency spec §3.3): one note
+  // element, created on the first `queued` event and updated in place
+  // as the position moves, removed on admitted/done/error. Positions
+  // are 0-based on the wire (spec §3.4) — displayed 1-based, how people
+  // count queues. textContent only (the note is server-sent data).
+  function setQueueNote(position) {
+    var note = log.querySelector(".chat-msg.chat-queue-note");
+    if (!note) {
+      note = document.createElement("div");
+      note.className = "chat-msg chat-queue-note";
+      log.appendChild(note);
+    }
+    var n = parseInt(position, 10);
+    note.textContent = isNaN(n)
+      ? "Waiting for an LLM slot…"
+      : "Waiting for an LLM slot — queued (position " + (n + 1) + ")";
+    log.scrollTop = log.scrollHeight;
+  }
+  function clearQueueNote() {
+    var note = log.querySelector(".chat-msg.chat-queue-note");
+    if (note) note.remove();
+  }
+
   // Shared event handling for every stream (submit, reattach, final
   // replay). `state.sawTerminal` marks a replayed terminal row — its
   // producing turn finalized, so this stream's end is not a drop.
@@ -1235,6 +1263,19 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
     if (ev.type === "session") {
       sessionId = ev.session_id;
       history.replaceState(null, "", "/chat?s=" + sessionId);
+      return;
+    }
+    // The queue events (LLM concurrency spec §3.3) are likewise handled
+    // by TYPE, before the seq gate: they are broadcast-only
+    // presentation — no transcript row, no `seq` — so the dedup map
+    // must never see (or swallow) them. The turn stays `running`
+    // throughout; only this status line moves.
+    if (ev.type === "queued") {
+      setQueueNote(ev.position);
+      return;
+    }
+    if (ev.type === "admitted") {
+      clearQueueNote();
       return;
     }
     // The dedup contract (spec §3.3): events double-send across the
@@ -1256,10 +1297,14 @@ pub const CHAT_JS: &str = r#"// Librarian chat: session-scoped SSE transport + l
       addMsg(ev.reply, "librarian");
       state.sawTerminal = true;
     } else if (ev.type === "done") {
+      clearQueueNote();
       pendingRemove();
       addMsg(ev.reply, "librarian");
       setBusy(false);
     } else if (ev.type === "error") {
+      // Also the capacity path: a turn that never got a slot ends here
+      // with the queue note still up.
+      clearQueueNote();
       pendingRemove();
       addMsg(ev.error, "error");
       setBusy(false);
@@ -1755,7 +1800,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "30";
+pub const ASSETS_VERSION: &str = "31";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version

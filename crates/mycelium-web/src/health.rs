@@ -37,12 +37,30 @@ pub(crate) fn oldest_degraded_at_secs() -> i64 {
 /// module — takes the struct directly; the `system_stats` constructor
 /// stays crate-only, so external code can name the type but only the
 /// crate produces real values).
+///
+/// The LLM-gate fields (`llm_*`) come from ONE `LLM_GATE.stats()` read
+/// per request (LLM-concurrency spec §3.6), so every consumer of a
+/// given `SystemStats` sees one consistent point-in-time gate state.
+/// They are observability only: no degraded rule consults them — the
+/// gate never degrades health on its own.
+///
+/// `llm_timeouts_total` is the gate's CUMULATIVE wait-class timeout
+/// count since process start (the admin System card's "recent
+/// timeouts" readout — labeled there as "since start", because the gate
+/// keeps no windowed counter). It rides the same single `stats()` read
+/// as the three gauges beside it; it is DELIBERATELY not reported by
+/// the `/health` JSON, whose gate fields stay the three spec §4.2
+/// gauges.
 pub struct SystemStats {
     pub user_count: i64,
     pub queue_depth: i64,
     pub oldest_pending_age_seconds: Option<i64>,
     pub queue_dead_count: i64,
     pub llm_last_success_seconds: Option<i64>,
+    pub llm_active: i64,
+    pub llm_queued: i64,
+    pub llm_capacity: i64,
+    pub llm_timeouts_total: i64,
     pub db_ok: bool,
 }
 
@@ -71,12 +89,19 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
     } else {
         Some(chrono::Utc::now().timestamp() - llm as i64)
     };
+    // ONE gate read per request (spec §3.6): a short internal mutex
+    // acquisition, no I/O, shared by every field below.
+    let gate = mycelium_librarian::llm_gate::LLM_GATE.stats();
     SystemStats {
         user_count,
         queue_depth,
         oldest_pending_age_seconds,
         queue_dead_count,
         llm_last_success_seconds,
+        llm_active: gate.active as i64,
+        llm_queued: gate.queued as i64,
+        llm_capacity: gate.capacity as i64,
+        llm_timeouts_total: gate.timeouts_total as i64,
         db_ok,
     }
 }
@@ -87,6 +112,11 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
 /// 503-only-on-DB-failure rule: dead queue items or an overdue pending
 /// item now also 503 — this is the spec's new contract, not a
 /// regression.
+///
+/// The gate fields (`llm_active`/`llm_queued`/`llm_capacity`) are
+/// reported beside the write-queue fields but are DELIBERATELY absent
+/// from the degraded rule below (spec §3.6): a saturated or queued gate
+/// is load, not ill health.
 async fn health(State(state): State<AppState>) -> Response {
     let stats = system_stats(&state).await;
     let degraded = !stats.db_ok
@@ -111,6 +141,9 @@ async fn health(State(state): State<AppState>) -> Response {
             "oldest_pending_age_seconds": stats.oldest_pending_age_seconds,
             "queue_dead_count": stats.queue_dead_count,
             "llm_last_success_seconds": stats.llm_last_success_seconds,
+            "llm_active": stats.llm_active,
+            "llm_queued": stats.llm_queued,
+            "llm_capacity": stats.llm_capacity,
         })),
     )
         .into_response()
@@ -218,6 +251,48 @@ async fn metrics(State(state): State<AppState>) -> Response {
         out,
         "# TYPE mycelium2_mutation_dead_total counter\nmycelium2_mutation_dead_total {}",
         totals.dead
+    );
+    // LLM-gate surfaces (LLM-concurrency spec §3.6). ONE gate read per
+    // request feeds all seven lines, so the gauges and counters below
+    // describe one consistent point in time.
+    let gate = mycelium_librarian::llm_gate::LLM_GATE.stats();
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_active gauge\nmycelium2_llm_gate_active {}",
+        gate.active
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_queued gauge\nmycelium2_llm_gate_queued {}",
+        gate.queued
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_capacity gauge\nmycelium2_llm_gate_capacity {}",
+        gate.capacity
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_admissions_total counter\nmycelium2_llm_gate_admissions_total {}",
+        gate.admissions_total
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_timeouts_total counter\nmycelium2_llm_gate_timeouts_total {}",
+        gate.timeouts_total
+    );
+    // Cumulative queue wait + its sample count: average wait =
+    // wait_seconds_total / wait_count. Fixed precision keeps the text
+    // deterministic (the crate-wide output rule).
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_wait_seconds_total counter\nmycelium2_llm_gate_wait_seconds_total {:.6}",
+        gate.wait_seconds_total
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_llm_gate_wait_count counter\nmycelium2_llm_gate_wait_count {}",
+        gate.wait_count
     );
     // Absent until the first LLM success (spec §4.3); 0 means none yet.
     let llm = mycelium_librarian::llm::LLM_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);

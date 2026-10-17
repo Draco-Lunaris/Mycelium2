@@ -1804,27 +1804,83 @@ pub fn admin_sign_in_page(
 /// Admin: LLM backend — the LLM card on its own page (the existing
 /// POST /admin/llm form). The api-key STATUS renders; the key itself
 /// is never rendered back to the browser.
+/// `llm` is rendered as given — the caller hands in the CLAMPED config,
+/// so the boxes always show a value the gate would actually accept.
 pub fn admin_llm_page(
     user: &SessionUser,
     csrf: &str,
-    llm_url: &str,
-    llm_model: &str,
-    llm_api_key_set: bool,
+    llm: &crate::LlmConfig,
     ok: Option<&str>,
     err: Option<&str>,
 ) -> Html<String> {
-    let key_status = if llm_api_key_set { "stored" } else { "not set" };
+    use mycelium_librarian::llm::{
+        CHAT_QUEUE_DEPTH_RANGE, CHAT_WAIT_SECS_RANGE, MAX_PARALLEL_RANGE, PER_USER_ACTIVE_RANGE,
+        QUERY_WAIT_SECS_RANGE,
+    };
+    let key_status = if llm.api_key.is_some() {
+        "stored"
+    } else {
+        "not set"
+    };
+    // One labelled number input per tunable: the range is both a
+    // browser-enforced min/max and a visible hint (server-side the
+    // value is clamped, never rejected — LLM concurrency spec §3.2).
+    let number_field = |label: &str, name: &str, value: u32, range: (u32, u32)| {
+        format!(
+            r#"  <label>{label} ({lo}&ndash;{hi})</label><input name="{name}" type="number" min="{lo}" max="{hi}" value="{value}">
+"#,
+            label = html_escape(label),
+            name = html_escape(name),
+            lo = range.0,
+            hi = range.1,
+            value = html_escape(&value.to_string()),
+        )
+    };
+    let concurrency = [
+        number_field(
+            "Max parallel LLM runs",
+            "max_parallel",
+            llm.max_parallel,
+            MAX_PARALLEL_RANGE,
+        ),
+        number_field(
+            "Active runs per user",
+            "per_user_active",
+            llm.per_user_active,
+            PER_USER_ACTIVE_RANGE,
+        ),
+        number_field(
+            "Query wait bound (seconds)",
+            "query_wait_secs",
+            llm.query_wait_secs,
+            QUERY_WAIT_SECS_RANGE,
+        ),
+        number_field(
+            "Chat wait bound (seconds)",
+            "chat_wait_secs",
+            llm.chat_wait_secs,
+            CHAT_WAIT_SECS_RANGE,
+        ),
+        number_field(
+            "Max queued requests",
+            "chat_queue_depth",
+            llm.chat_queue_depth,
+            CHAT_QUEUE_DEPTH_RANGE,
+        ),
+    ]
+    .concat();
     let body_form = format!(
         r#"<p class="muted">API key: {key_status}</p>
 <form method="post" action="/admin/llm">
-  <label>OpenAI-compatible base URL</label><input name="url" value="{}">
-  <label>Model</label><input name="model" value="{}">
+  <label>OpenAI-compatible base URL</label><input name="url" value="{url}">
+  <label>Model</label><input name="model" value="{model}">
   <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
-  <button type="submit">Save LLM config</button>
+  <p class="muted">Concurrency — out-of-range values are clamped on save and applied to the running server immediately.</p>
+{concurrency}  <button type="submit">Save LLM config</button>
   <button type="submit" formaction="/admin/llm/test">Test connection</button>
 </form>"#,
-        html_escape(llm_url),
-        html_escape(llm_model)
+        url = html_escape(&llm.url),
+        model = html_escape(&llm.model),
     );
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
         "LLM backend",
@@ -2079,8 +2135,50 @@ form needs it alongside the issued certificate.</p>
     ))
 }
 
+/// The LLM-gate readout card on the admin System page (LLM-concurrency
+/// spec §3.6): the live admission state — runs holding a slot, waiters
+/// queued, the configured slot count — plus the gate's timeout counter.
+///
+/// "Recent timeouts" is rendered HONESTLY as the cumulative count since
+/// process start: the gate keeps no time-windowed counter, so the label
+/// says "since start" rather than implying a window that does not
+/// exist.
+///
+/// The values arrive already read: all four come from the single
+/// `LLM_GATE.stats()` read inside `health::system_stats`, carried here
+/// through `SystemPageStats`. This function never touches the gate, so
+/// the card and the StatTiles above it describe the same instant.
+///
+/// Escaping: every value is a typed `i64` formatted by this function —
+/// no caller-, config- or network-influenced text reaches the markup,
+/// so there is no attacker-controlled string to escape (contrast
+/// `tls_card`, which escapes its certificate strings). Follows that
+/// card's composition: a constant-label row helper, existing CSS
+/// (`card`, `muted`), no new classes.
+pub fn llm_card(stats: &crate::api::SystemPageStats) -> String {
+    let row = |label: &str, value: i64| {
+        format!(r#"<p><strong>{label}</strong> <span>{value}</span></p>"#)
+    };
+    let mut body = String::new();
+    body.push_str(&row("Active", stats.llm_active));
+    body.push_str(&row("Queued", stats.llm_queued));
+    body.push_str(&row("Capacity", stats.llm_capacity));
+    body.push_str(&row(
+        "Capacity timeouts (since start)",
+        stats.llm_timeouts_total,
+    ));
+    body.push_str(
+        r#"<p class="muted">Active runs hold one of the configured slots; queued runs are waiting for one. A timeout is a run whose wait bound elapsed before a slot came free — chat turns surface it to the user, searches fall back to keywords. Active may briefly exceed capacity after the limit is lowered: the gate never preempts a run in flight.</p>"#,
+    );
+    mycelium_ui::render::render(mycelium_ui::card(
+        "LLM runs",
+        TrustedHtml::from_markup(body),
+    ))
+}
+
 /// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value), the TLS card, and the backup download
+/// StatTiles (a tile per value), the LLM-gate readout card, the TLS
+/// card, and the backup download
 /// (the existing POST /admin/backup button + the no-store rationale).
 /// The ingest-jobs table moved to /status (spec §8's PR-4 ruling —
 /// /status is the jobs-table home; the PR-3 placement here was a
@@ -2126,8 +2224,12 @@ pub fn admin_system_page(
         "System",
         TrustedHtml::from_markup(""),
     ));
+    // The LLM card sits directly under the queue/health tiles (spec
+    // §3.6: "next to the existing queue table"), ahead of the TLS and
+    // maintenance cards.
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}{}",
+        "{header}{tabs}{flash}{stats_html}{}{}{}",
+        llm_card(stats),
         tls_card(cert, pending, csrf),
         mycelium_ui::render::render(mycelium_ui::card(
             "Maintenance",

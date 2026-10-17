@@ -105,7 +105,12 @@ WantedBy=multi-user.target
   `queue_depth`, `oldest_pending_age_seconds`, `queue_dead_count`,
   `llm_last_success_seconds` — and answers 503 `degraded` when the
   database is unreachable, any queued item is dead, or a pending item
-  has waited past twice the integration deadline.
+  has waited past twice the integration deadline. Alongside those it
+  reports the LLM admission gate — `llm_active` (runs holding a slot),
+  `llm_queued` (waiters) and `llm_capacity` (configured slots). Those
+  three are
+  observability only — a saturated or queued gate is load, not ill
+  health, and never makes the status `degraded`.
 - `GET /api/v1/health` — detailed JSON status (authenticated).
 - `GET /metrics` — Prometheus counters (logins, searches, ingests,
   backups, mutation-queue totals, ...) plus gauges for the mutation
@@ -114,8 +119,39 @@ WantedBy=multi-user.target
   completion; absent until the first success) — public by design for
   scrape endpoints; put it behind a firewall or reverse-proxy auth if
   your threat model requires.
+- LLM-gate metric lines (all seven from one consistent read per
+  scrape):
+  - `mycelium2_llm_gate_active` (gauge) — runs holding a slot
+  - `mycelium2_llm_gate_queued` (gauge) — waiters in the FIFO queue
+  - `mycelium2_llm_gate_capacity` (gauge) — configured slot count
+  - `mycelium2_llm_gate_admissions_total` (counter) — slots granted
+    since start, both admission classes
+  - `mycelium2_llm_gate_timeouts_total` (counter) — wait-class
+    waiters that gave up, including the ones released at shutdown
+  - `mycelium2_llm_gate_wait_seconds_total` (counter) — cumulative
+    queue wait of admitted wait-class runs
+  - `mycelium2_llm_gate_wait_count` (counter) — samples behind that
+    total; average wait = `wait_seconds_total / wait_count`
 - Container healthcheck: the HTTP redirect listener answers on port
   80 (`curl http://127.0.0.1:80/`).
+
+### Sizing `max_parallel`
+
+`max_parallel` (Admin → LLM, default 2) is the number of agent runs
+allowed to talk to the backend at once — size it to what the backend
+actually serves in parallel, not to the number of users. A local
+Ollama or a single-GPU gateway usually runs one or two generations
+before latency collapses; a hosted multi-replica endpoint can take
+more. Raise it only while watching `mycelium2_llm_gate_active`
+against the backend's own throughput: beyond the backend's real
+parallelism, queueing at the gate is cheaper than queueing inside the
+model server, because waiters keep their FIFO place, report a
+position, and give up at a bound instead of timing out mid-request.
+If `mycelium2_llm_gate_queued` is persistently high while the backend
+is not saturated, the gate — not the model — is the limit; if
+`mycelium2_llm_gate_timeouts_total` is climbing, waiters are giving up
+and either the backend or the bounds need attention. Changes apply
+immediately, so tuning needs no restart.
 
 ## Upgrading
 

@@ -46,6 +46,53 @@ variables for runtime settings:
 - **OIDC SSO** — issuer URL, client ID/secret (encrypted at rest with
   the service key), redirect URI. Disabled until configured.
 
+## LLM concurrency (Admin → LLM)
+
+How many LLM runs may execute at once, and how long each surface will
+wait for a slot. These are **not** environment variables: they live in
+the sealed `llm` config row and are edited on `/admin/llm`, beside the
+backend URL and model.
+
+One process-global admission gate owns the slots. Chat turns, MCP
+queries, the stateless chat endpoint and dream are *wait class* — they
+join a FIFO queue and wait up to their surface's bound. The
+mutation-queue drain and the chat resume worker are *try class*: they
+take a slot only when nothing is queued and one is free, so
+background work never runs ahead of an interactive waiter and never
+blocks.
+
+| Field | Default | Range | Meaning | Used by |
+|---|---|---|---|---|
+| `max_parallel` | 2 | 1–64 | Concurrent admitted LLM runs (the gate's slot count) | every surface |
+| `per_user_active` | 2 | 1–16 | Admitted wait-class runs one user may hold at once; further turns keep their queue place rather than being rejected | every wait-class surface |
+| `query_wait_secs` | 30 | 1–600 | Wait bound before giving up on a slot | MCP `memory_query`, stateless `POST /api/v1/chat` |
+| `chat_wait_secs` | 600 | 1–7200 | Wait bound before giving up on a slot | chat-session turns, `POST /api/v1/dream` |
+| `chat_queue_depth` | 64 | 1–1024 | Cap on total queued waiters; a chat submit beyond it is refused `429` before any row is written | chat-session submits |
+
+Behavior:
+
+- **Clamped, never rejected.** Out-of-range values are clamped into
+  the range on save *and* on load, so a hand-edited or older row can
+  never open an unbounded gate.
+- **Blank keeps the stored value.** A field left empty — or carrying
+  something that is not a number — keeps what is stored, so an old
+  cached form still saves the URL/model without resetting the gate.
+- **Applies immediately.** A successful save pushes the new limits
+  onto the running gate: raising `max_parallel` admits queued waiters
+  on the spot, lowering it only holds future admissions (a running
+  agent is never preempted). No restart.
+- **Synced at boot**, before the boot sweeps and the background
+  workers start, so the stored row governs the first runs of the
+  process rather than the built-in defaults.
+
+What each bound does when it elapses: a chat turn finalizes `failed`
+with a capacity message; MCP `memory_query` falls back to the
+deterministic keyword search (it never errors on capacity); the
+stateless chat and dream endpoints answer `429` with `Retry-After: 5`.
+Exact bodies are in [API](api.md). Gate state is visible on `/health`,
+`/metrics` and the admin System page (see
+[Deployment](deployment.md)).
+
 ## Data directory layout
 
 ```
