@@ -4014,3 +4014,53 @@ async fn metrics_reports_llm_gate_lines() {
 
     shutdown.cancel();
 }
+
+/// Regression: a browser that still holds a live session cookie (bookmark,
+/// back button, restart) must be able to submit /login again. The login
+/// page has no session token to render, so app.js injects an empty
+/// `csrf_token`; the CSRF gate used to exempt /login only when NO session
+/// was present, answering 403 "CSRF token mismatch" otherwise.
+#[tokio::test]
+async fn login_post_with_live_session_cookie_succeeds() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    let first = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 303);
+    let cookie = first
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Second submit from the same browser: live cookie + app.js's empty field.
+    let again = client
+        .post(format!("{base}/login"))
+        .header("cookie", &cookie)
+        .form(&[
+            ("username", "admin"),
+            ("password", ADMIN_PASSWORD),
+            ("csrf_token", ""),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        303,
+        "login must not be CSRF-gated by an existing session"
+    );
+    assert_eq!(again.headers().get("location").unwrap(), "/");
+
+    shutdown.cancel();
+}

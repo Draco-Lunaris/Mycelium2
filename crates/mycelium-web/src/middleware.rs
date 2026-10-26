@@ -188,14 +188,17 @@ pub async fn csrf_protect(
     if request.extensions().get::<BearerAuth>().is_some() {
         return next.run(request).await;
     }
+    // Login and first-run setup are exempt WITH OR WITHOUT a session (both
+    // are path-checked BEFORE any body parsing — app.js injects an empty
+    // csrf field into every form, which this exemption ignores). Their
+    // pages have no session token to render, so a browser still holding a
+    // live cookie (bookmark, back button, restart) would otherwise be
+    // locked out with "CSRF token mismatch". Login mints a fresh session
+    // and authenticates by credentials, so there is nothing to forge.
+    if matches!(request.uri().path(), "/login" | "/setup") {
+        return next.run(request).await;
+    }
     let Some(session) = request.extensions().get::<SessionId>().copied() else {
-        // No session: only the login and first-run setup endpoints may
-        // proceed (no session exists to protect yet; both are path-checked
-        // BEFORE any body parsing — app.js injects an empty csrf field
-        // into every form, which this exemption ignores).
-        if matches!(request.uri().path(), "/login" | "/setup") {
-            return next.run(request).await;
-        }
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
 
