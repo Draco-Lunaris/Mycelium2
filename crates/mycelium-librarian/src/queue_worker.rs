@@ -20,6 +20,7 @@ use crate::agent::{self, AgentError, AgentScopes, MutationResult, TraceSink};
 use crate::fallback;
 use crate::llm::{LlmClient, LlmConfig};
 use crate::llm_gate;
+use crate::llm_health::short_detail;
 
 /// Recovery of a user's master key via the service-key seal.
 /// Implemented with MasterKeyCache::for_user at the binary seam
@@ -70,28 +71,8 @@ impl Default for QueueLimits {
     }
 }
 
-// ---- error-detail bounding (I1) ----
-
-/// Cap on error text persisted into `mutation_queue.detail` (and
-/// re-served through receipts): LLM status errors embed upstream HTTP
-/// bodies, so the drain bounds what it persists.
-const DETAIL_CAP: usize = 512;
-
-/// Bound an error's Display text for the `detail` column: byte-safe
-/// truncation at the cap, cut on a char boundary, with the marker
-/// appended only when something was actually cut. Short errors pass
-/// through unchanged.
-fn short_detail(e: impl std::fmt::Display) -> String {
-    let s = e.to_string();
-    if s.len() <= DETAIL_CAP {
-        return s;
-    }
-    let mut end = DETAIL_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [truncated]", &s[..end])
-}
+// `short_detail` (the byte-safe error-detail bound) moved to
+// `crate::llm_health` so one copy serves every bounded-detail site.
 
 // ---- worker ----
 
@@ -724,26 +705,5 @@ impl QueueWorker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::short_detail;
-
-    #[test]
-    fn short_detail_caps_byte_safe() {
-        // Under the cap: unchanged, no marker.
-        assert_eq!(short_detail("boom"), "boom");
-        assert_eq!(short_detail("x".repeat(512)), "x".repeat(512));
-        // Over the cap (ASCII): cut at the cap + marker.
-        let out = short_detail("x".repeat(600));
-        assert_eq!(out.len(), 512 + "… [truncated]".len());
-        assert!(out.ends_with("[truncated]"));
-        // Over the cap (multibyte): the cut backs off to a char
-        // boundary — no panic, never past the cap + marker. "€" is
-        // 3 bytes, so byte 512 lands mid-char and the back-off loop
-        // must move the cut to 510.
-        let out = short_detail("€".repeat(200)); // 600 bytes
-        assert!(out.ends_with("[truncated]"));
-        assert_eq!(out.len(), 510 + "… [truncated]".len());
-        assert!(out.starts_with(&"€".repeat(100)));
-    }
-}
+// The `short_detail` tests moved with the function to
+// `crate::llm_health::tests`.

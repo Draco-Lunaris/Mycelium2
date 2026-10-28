@@ -156,6 +156,22 @@ pub enum AgentError {
     BadToolArgs { name: String, reason: String },
 }
 
+impl AgentError {
+    /// Backend-down classification (outage-recovery spec §3.2): true only
+    /// for an LLM error that never reached a working model. Step cap,
+    /// tool-arg and store errors are real run outcomes and keep their
+    /// terminal handling.
+    #[must_use]
+    pub fn is_backend_down(&self) -> bool {
+        match self {
+            AgentError::Llm(e) => e.is_backend_down(),
+            AgentError::Store(_) | AgentError::StepCapExceeded | AgentError::BadToolArgs { .. } => {
+                false
+            }
+        }
+    }
+}
+
 /// The result of a query run: the grounded answer.
 #[derive(Debug, Clone)]
 pub struct QueryResult {

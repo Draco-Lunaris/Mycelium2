@@ -251,6 +251,25 @@ pub enum LlmError {
     Status { status: u16, body: String },
 }
 
+impl LlmError {
+    /// Backend-down classification (outage-recovery spec §3.2 / D1): this
+    /// error means the request **never reached a working model**, so it
+    /// says something about backend health, not about the run. A
+    /// transport failure never arrived; 5xx is the backend or its
+    /// upstream; 401/403 is misconfigured credentials (operator-
+    /// actionable, treated as down, not as weather). Everything else —
+    /// 4xx other than 401/403, an empty completion — is a real run
+    /// outcome from a model that was reachable.
+    #[must_use]
+    pub fn is_backend_down(&self) -> bool {
+        match self {
+            LlmError::Request(_) => true,
+            LlmError::Status { status, .. } => *status >= 500 || *status == 401 || *status == 403,
+            LlmError::EmptyResponse => false,
+        }
+    }
+}
+
 /// Unix timestamp of the last successful LLM completion (0 = none
 /// yet). Set inside the response-parsing paths of `chat_system` and
 /// `chat_with_tools` so every consumer (inline query/chat, the drain,
@@ -261,6 +280,24 @@ pub static LLM_LAST_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 fn record_llm_success() {
     let unix = chrono::Utc::now().timestamp().max(0) as u64;
     LLM_LAST_SUCCESS.store(unix, std::sync::atomic::Ordering::Relaxed);
+    // Spec §3.1: this choke point doubles as the health registry's ok
+    // note — a real completion is the strongest healthy observation
+    // there is, so the machine flips Green without waiting for a probe.
+    crate::llm_health::LLM_HEALTH.note_ok();
+}
+
+/// Passive failure hook (outage-recovery spec §3.1): called at every
+/// `LlmClient` completion with the run's outcome. Only the backend-down
+/// classification ([`LlmError::is_backend_down`]) feeds the health
+/// registry — a 400 from a reachable model is not backend health. Ok
+/// results note nothing: `record_llm_success` already noted them at the
+/// `LLM_LAST_SUCCESS` choke point.
+fn record_outcome<T>(result: &Result<T, LlmError>) {
+    if let Err(e) = result
+        && e.is_backend_down()
+    {
+        crate::llm_health::LLM_HEALTH.note_failure();
+    }
 }
 
 /// A client for one OpenAI-compatible endpoint.
@@ -306,12 +343,25 @@ impl LlmClient {
 
     /// Send a single user-message prompt; returns the assistant text.
     pub async fn chat(&self, prompt: &str) -> Result<String, LlmError> {
-        self.chat_system(None, prompt, 0.2).await
+        let result = self.chat_system_impl(None, prompt, 0.2).await;
+        record_outcome(&result);
+        result
     }
 
     /// One tool-free generation with an optional system prompt and
     /// explicit temperature (hot-memory lookups use system + temp 0).
     pub async fn chat_system(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        temperature: f32,
+    ) -> Result<String, LlmError> {
+        let result = self.chat_system_impl(system, prompt, temperature).await;
+        record_outcome(&result);
+        result
+    }
+
+    async fn chat_system_impl(
         &self,
         system: Option<&str>,
         prompt: &str,
@@ -365,6 +415,20 @@ impl LlmClient {
     /// as `role: "tool"` messages, and loops until a text answer or
     /// the step cap.
     pub async fn chat_with_tools(
+        &self,
+        system: &str,
+        conversation: &[ConversationTurn],
+        tools: &[ToolSpec<'_>],
+        temperature: f32,
+    ) -> Result<StepOutput, LlmError> {
+        let result = self
+            .chat_with_tools_impl(system, conversation, tools, temperature)
+            .await;
+        record_outcome(&result);
+        result
+    }
+
+    async fn chat_with_tools_impl(
         &self,
         system: &str,
         conversation: &[ConversationTurn],
@@ -510,8 +574,66 @@ mod tests {
         assert_eq!(strip_code_fence("  trimmed  "), "trimmed");
     }
 
+    /// D1 (§3.2) classifier pin: what counts as "never reached a working
+    /// model" (backend-down class) versus a real run outcome.
+    #[tokio::test]
+    async fn backend_down_class_pins() {
+        // Request-shaped: transport never reached the backend.
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/models")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            LlmError::from(reqwest_err).is_backend_down(),
+            "a transport failure is backend-down"
+        );
+
+        let status = |code: u16| LlmError::Status {
+            status: code,
+            body: String::new(),
+        };
+        for code in [500u16, 502, 503, 504, 401, 403] {
+            assert!(status(code).is_backend_down(), "{code} is backend-down");
+        }
+        for code in [404u16, 400, 429] {
+            assert!(
+                !status(code).is_backend_down(),
+                "{code} is a real run outcome, not backend health"
+            );
+        }
+        assert!(
+            !LlmError::EmptyResponse.is_backend_down(),
+            "an empty completion is a model outcome, not backend health"
+        );
+
+        use crate::agent::AgentError;
+        assert!(
+            !AgentError::Store(mycelium_store::ConceptStoreError::NotFound("/x.md".into()))
+                .is_backend_down()
+        );
+        assert!(!AgentError::StepCapExceeded.is_backend_down());
+        assert!(
+            !AgentError::BadToolArgs {
+                name: "t".into(),
+                reason: "r".into()
+            }
+            .is_backend_down()
+        );
+        // The Llm variant delegates to the classifier above.
+        assert!(
+            AgentError::from(LlmError::Status {
+                status: 503,
+                body: String::new()
+            })
+            .is_backend_down()
+        );
+        assert!(!AgentError::from(LlmError::EmptyResponse).is_backend_down());
+    }
+
     #[tokio::test]
     async fn unreachable_endpoint_errors() {
+        let _health = crate::llm_health::health_test_guard().await;
         let client = LlmClient::new(&LlmConfig {
             url: "http://127.0.0.1:1/v1".into(),
             model: "m".into(),
@@ -519,6 +641,50 @@ mod tests {
             ..Default::default()
         });
         assert!(client.chat("hi").await.is_err());
+    }
+
+    /// Passive health hooks (spec §3.1): every completion feeds the
+    /// registry — a transport failure notes one backend-down failure
+    /// exactly once (no double-count through `chat`'s delegation), and
+    /// a success flips the machine back to Green.
+    #[tokio::test]
+    async fn passive_hooks_feed_health() {
+        let _health = crate::llm_health::health_test_guard().await;
+        crate::llm_health::LLM_HEALTH.reset_for_test();
+
+        let dead = LlmClient::new(&LlmConfig {
+            url: "http://127.0.0.1:1/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            ..Default::default()
+        });
+        assert!(dead.chat("hi").await.is_err());
+        let s = crate::llm_health::LLM_HEALTH.snapshot();
+        assert_eq!(
+            s.consecutive_failures, 1,
+            "one failed completion notes exactly one backend-down failure"
+        );
+        assert_eq!(s.state, crate::llm_health::BackendState::Yellow);
+
+        let (url, _captured) = auth_echo_mock().await;
+        let live = LlmClient::new(&LlmConfig {
+            url,
+            model: "m".into(),
+            api_key: None,
+            ..Default::default()
+        });
+        assert_eq!(live.chat("hi").await.unwrap(), "ok");
+        let s = crate::llm_health::LLM_HEALTH.snapshot();
+        assert_eq!(
+            s.state,
+            crate::llm_health::BackendState::Green,
+            "a successful completion flips health back to Green"
+        );
+        assert_eq!(s.consecutive_failures, 0);
+        assert!(
+            s.last_observation.is_some(),
+            "the success noted an observation"
+        );
     }
 
     /// An axum mock that echoes back the request's Authorization header
@@ -554,6 +720,9 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_header_sent_when_key_configured() {
+        // Feeds the global health registry (success notes) — serialize
+        // against the tests that assert on it.
+        let _health = crate::llm_health::health_test_guard().await;
         let (url, captured) = auth_echo_mock().await;
         let client = LlmClient::new(&LlmConfig {
             url: url.clone(),
@@ -582,6 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_header_without_key() {
+        let _health = crate::llm_health::health_test_guard().await;
         let (url, captured) = auth_echo_mock().await;
         let client = LlmClient::new(&LlmConfig {
             url,
