@@ -284,6 +284,10 @@ Second chapter text.
 
     #[tokio::test]
     async fn submit_run_and_read() {
+        // run_pending drives a real LlmClient (unreachable default URL
+        // -> a backend-down note on the global health registry) —
+        // serialize against the health-state tests.
+        let _health = crate::llm_health::health_test_guard().await;
         let (_dir, worker, shelf) = setup().await;
         let user = Uuid::new_v4();
         // Seed the user row (FK requirement).
@@ -312,6 +316,7 @@ Second chapter text.
 
     #[tokio::test]
     async fn one_job_per_user_at_a_time() {
+        let _health = crate::llm_health::health_test_guard().await;
         let (_dir, worker, shelf) = setup().await;
         let user = Uuid::new_v4();
         seed_user(&worker.store, user).await;
@@ -330,6 +335,7 @@ Second chapter text.
 
     #[tokio::test]
     async fn different_users_can_submit_concurrently() {
+        let _health = crate::llm_health::health_test_guard().await;
         let (_dir, worker, shelf) = setup().await;
         let u1 = Uuid::new_v4();
         let u2 = Uuid::new_v4();
@@ -342,6 +348,7 @@ Second chapter text.
 
     #[tokio::test]
     async fn failed_job_records_detail() {
+        let _health = crate::llm_health::health_test_guard().await;
         let (_dir, worker, shelf) = setup().await;
         let user = Uuid::new_v4();
         seed_user(&worker.store, user).await;
@@ -383,6 +390,7 @@ Second chapter text.
     async fn concurrent_runners_cannot_double_run() {
         // Two run_pending passes over the same pending job: the second
         // must not clobber the first's result (atomic claim).
+        let _health = crate::llm_health::health_test_guard().await;
         let (_dir, worker, shelf) = setup().await;
         let user = Uuid::new_v4();
         seed_user(&worker.store, user).await;

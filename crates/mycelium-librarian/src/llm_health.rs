@@ -284,7 +284,7 @@ impl LlmHealth {
         if inner.consecutive_failures == 0 {
             inner.down_since = Some(now);
         }
-        inner.consecutive_failures += 1;
+        inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
         inner.checked_at = Some(now);
     }
 
@@ -381,12 +381,20 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 }
 
 /// Serializes the tests that *feed or read the global* `LLM_HEALTH`
-/// against the tests whose mock clients fire passive health notes
-/// (`llm.rs::unreachable_endpoint_errors`, `extract.rs::
-/// llm_failure_falls_back`). Success-path tests only note ok, which no
-/// health test's assertion depends on. An async mutex because the
-/// guarded tests hold it across awaits; tokio's mutex never poisons,
-/// so one failed test cannot wedge the rest.
+/// against every test whose client drives a passive health note:
+/// `llm_health::tests::public_wrappers_stamp_the_real_clock` and
+/// `probe_refused_is_unhealthy_and_never_feeds_the_machine`,
+/// `llm.rs::passive_hooks_feed_health`, `unreachable_endpoint_errors`,
+/// `bearer_header_sent_when_key_configured`, `no_header_without_key`,
+/// `extract.rs::llm_failure_falls_back`, and the five client-driving
+/// `worker.rs` tests (`submit_run_and_read`, `one_job_per_user_at_a_time`,
+/// `different_users_can_submit_concurrently`, `failed_job_records_detail`,
+/// `concurrent_runners_cannot_double_run` — `run_pending` → `ingest_one`
+/// hits the default URL and notes backend-down, or ok on a host with
+/// Ollama). Success-path tests only note ok, which no health test's
+/// assertion depends on. An async mutex because the guarded tests hold it
+/// across awaits; tokio's mutex never poisons, so one failed test cannot
+/// wedge the rest.
 #[cfg(test)]
 pub(crate) static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
