@@ -386,13 +386,14 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 /// `probe_refused_is_unhealthy_and_never_feeds_the_machine`,
 /// `llm.rs::passive_hooks_feed_health`, `unreachable_endpoint_errors`,
 /// `bearer_header_sent_when_key_configured`, `no_header_without_key`,
-/// `extract.rs::llm_failure_falls_back`, and the five client-driving
+/// `extract.rs::llm_failure_falls_back`, and the seven client-driving
 /// `worker.rs` tests (`submit_run_and_read`, `one_job_per_user_at_a_time`,
 /// `different_users_can_submit_concurrently`, `failed_job_records_detail`,
-/// `concurrent_runners_cannot_double_run` — `run_pending` → `ingest_one`
-/// hits the default URL and notes backend-down, or ok on a host with
-/// Ollama). Success-path tests only note ok, which no health test's
-/// assertion depends on. An async mutex because the guarded tests hold it
+/// `concurrent_runners_cannot_double_run`, `pending_job_runs_on_later_tick`,
+/// `spawn_wakes_on_notify` — `run_pending` → `ingest_one` hits the
+/// default URL and notes backend-down, or ok on a host with Ollama).
+/// Success-path tests only note ok, which no health test's assertion
+/// depends on. An async mutex because the guarded tests hold it
 /// across awaits; tokio's mutex never poisons, so one failed test cannot
 /// wedge the rest.
 #[cfg(test)]

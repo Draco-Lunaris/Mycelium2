@@ -162,6 +162,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let worker = state.queue_worker.clone();
     worker.spawn(shutdown.clone());
 
+    // Ingest sweep (outage-recovery spec §3.5): re-runs pending ingest
+    // jobs on a signal and a 60 s tick, so a failed boot pass above is
+    // not terminal for the queue. The boot block stays for immediacy.
+    state.librarian.clone().spawn(shutdown.clone());
+
     // Chat boot sweep + resume worker (chat session history spec §3.4):
     // running → interrupted; the worker auto-resumes each once.
     if let Err(e) = state.chat_sessions.boot_sweep().await {

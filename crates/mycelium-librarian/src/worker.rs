@@ -4,14 +4,20 @@
 //! `ingest_jobs` table; the worker polls for pending jobs, runs them
 //! (LLM-assisted catalog with heuristic fallback), and updates status.
 //! On boot, stale `running` jobs (previous process died) are failed and
-//! `pending` jobs are requeued.
+//! `pending` jobs are requeued. [`LibrarianWorker::spawn`] runs the same
+//! pending sweep on a wake signal and a periodic ticker, so a job left
+//! behind by a failed boot pass (or an LLM outage) is picked up on a
+//! later tick instead of waiting for the next restart (outage-recovery
+//! spec §3.5).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mycelium_crypto::keys::ServiceKey;
 use mycelium_store::{ConfigStore, IngestStatus, Store};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::extract::{self, BookCatalog};
@@ -38,6 +44,10 @@ pub struct SubmittedJob {
     pub slug: String,
 }
 
+/// Periodic pending-sweep interval for the spawn loop (spec §3.5; the
+/// same cadence the mutation-queue drain uses).
+const SWEEP_SECS: u64 = 60;
+
 /// The librarian worker.
 pub struct LibrarianWorker {
     store: Arc<Store>,
@@ -49,6 +59,9 @@ pub struct LibrarianWorker {
     staged: Arc<Mutex<HashMap<Uuid, StagedBook>>>,
     /// Runtime LLM config source (admin-editable; read per job).
     config: Arc<ConfigStore>,
+    /// Sweep-signal handle ([`LibrarianWorker::spawn`] wakes on it, the
+    /// queue worker's shape).
+    notify: Arc<tokio::sync::Notify>,
 }
 
 /// A staged book awaiting ingest.
@@ -67,7 +80,46 @@ impl LibrarianWorker {
             user_slots: Arc::new(Mutex::new(HashMap::new())),
             staged: Arc::new(Mutex::new(HashMap::new())),
             config,
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// The sweep-signal handle (callers that enqueue work can wake the
+    /// spawn loop immediately instead of waiting for the next tick).
+    pub fn notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    /// The wake loop: sweep pending ingest jobs on the signal, on the
+    /// periodic tick, or stop on shutdown (queue-worker shape, spec
+    /// §3.5). The boot block's inline pass stays for immediacy; this
+    /// loop is what makes a failed boot pass — or an LLM outage —
+    /// non-terminal for pending jobs, since ingest completes on the
+    /// heuristic outline fallback and a later tick re-runs anything
+    /// still pending. The only spawn signature (main.rs calls
+    /// `librarian.clone().spawn(shutdown.clone())` on the Arc'd
+    /// worker).
+    pub fn spawn(self: Arc<Self>, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(SWEEP_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = ticker.tick() => {}
+                    _ = shutdown.cancelled() => {
+                        // A job left pending at shutdown is picked up
+                        // by the next boot's sweep (or this loop's
+                        // first tick if the process comes back).
+                        tracing::info!("ingest sweep stopped");
+                        return;
+                    }
+                }
+                if let Err(e) = self.run_pending().await {
+                    tracing::error!(error = %e, "ingest sweep pass failed");
+                }
+            }
+        })
     }
 
     /// The current LLM config (admin-managed; Ollama default). Sealed
@@ -412,6 +464,126 @@ Second chapter text.
             "terminal status must not be clobbered: {}",
             status.detail
         );
+    }
+
+    #[tokio::test]
+    async fn pending_job_runs_on_later_tick() {
+        // Outage-recovery spec §3.5: a pending row the boot pass never
+        // ran must not be stranded — a later sweep pass picks it up and
+        // the job completes. run_pending drives a real LlmClient
+        // (unreachable default URL → heuristic fallback) — guarded.
+        let _health = crate::llm_health::health_test_guard().await;
+        let (_dir, worker, shelf) = setup().await;
+        let user = Uuid::new_v4();
+        seed_user(&worker.store, user).await;
+        // A pending row straight in the DB (not via submit — this is
+        // the row that survived a boot whose inline pass never ran),
+        // with its staged text supplied to the worker.
+        let book_id = worker
+            .store
+            .create_book(
+                shelf,
+                "my-book",
+                "My Book",
+                &ingest::stack_path_for("my-book"),
+            )
+            .await
+            .unwrap();
+        let job_id = worker
+            .store
+            .create_ingest_job(shelf, book_id, user)
+            .await
+            .unwrap();
+        worker.staged.lock().await.insert(
+            job_id,
+            StagedBook {
+                slug: "my-book".to_string(),
+                title: "My Book".to_string(),
+                text: BOOK.to_string(),
+            },
+        );
+
+        // Boot sweep: the pending row is reported as requeued, never
+        // terminalized — this pass does not run jobs.
+        let requeued = worker.recover_on_boot().await.unwrap();
+        assert!(
+            requeued.contains(&job_id),
+            "recover_on_boot must report the surviving pending row"
+        );
+        let status = worker.job_status(job_id).await.unwrap().unwrap();
+        assert_eq!(
+            status.status,
+            IngestStatus::Pending,
+            "the boot sweep must not terminalize a pending row"
+        );
+
+        // A later pass (what the spawn loop's tick now provides): the
+        // surviving row runs and completes. The LLM is unreachable
+        // here, so this asserts the heuristic-fallback path: an LLM
+        // error alone must NOT terminalize the job as failed.
+        assert_eq!(worker.run_pending().await.unwrap(), 1);
+        let status = worker.job_status(job_id).await.unwrap().unwrap();
+        assert_eq!(
+            status.status,
+            IngestStatus::Done,
+            "an LLM error must not terminalize the job: {}",
+            status.detail
+        );
+        assert!(status.detail.contains("3 catalog concepts"));
+    }
+
+    #[tokio::test]
+    async fn spawn_wakes_on_notify() {
+        // The queue-worker wake loop, end to end: spawn → notify →
+        // job processed → cancel → clean stop (JoinHandle resolves).
+        // The pass drives a real LlmClient — guarded.
+        let _health = crate::llm_health::health_test_guard().await;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let (_dir, worker, shelf) = setup().await;
+        let worker = Arc::new(worker);
+        let user = Uuid::new_v4();
+        seed_user(&worker.store, user).await;
+
+        let shutdown = CancellationToken::new();
+        let handle = worker.clone().spawn(shutdown.clone());
+
+        // Let the loop's immediate first tick run (finds no jobs), so
+        // the processing below can only come from the notify wake.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let job = worker
+            .submit(shelf, user, "my-book", "My Book", BOOK)
+            .await
+            .unwrap();
+        worker.notify().notify_one();
+
+        // The wake runs the job to Done (unreachable LLM → heuristic
+        // fallback completes it).
+        let mut terminal = None;
+        for _ in 0..100 {
+            let status = worker.job_status(job.job_id).await.unwrap().unwrap();
+            if !matches!(status.status, IngestStatus::Pending | IngestStatus::Running) {
+                terminal = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let status = terminal.expect("job did not reach a terminal status within 2s");
+        assert_eq!(
+            status.status,
+            IngestStatus::Done,
+            "the notify pass must run the job to completion: {}",
+            status.detail
+        );
+
+        // Shutdown: the loop exits cleanly and the JoinHandle resolves.
+        shutdown.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("spawn loop must stop on shutdown");
+        joined.expect("spawn loop task panicked");
     }
 
     async fn seed_user(store: &Arc<Store>, user_id: Uuid) {
