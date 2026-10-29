@@ -4345,6 +4345,430 @@ async fn metrics_reports_backend_health_lines() {
     shutdown.cancel();
 }
 
+// ---------------------------------------------------------------------
+// Task 10: the admin System page renders the backend indicator, the
+// waiting summary, and the per-item waiting table. The indicator test
+// asserts backend_* content, so — per the section rule above — it holds
+// HEALTH_TEST_LOCK with HealthDefaults declared after the guard. The
+// summary/meta test asserts no backend content, so it may read the page
+// unlocked even though admin_system_view snapshots the global
+// server-side.
+// ---------------------------------------------------------------------
+
+/// Direct-SQL user row (no UserStore validation) — needed for the
+/// `<script>` username probe, which `create_local` would reject.
+async fn seed_user_named(pool: &sqlx::SqlitePool, name: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, role, auth_provider, password_hash,
+                            sealed_master_key, must_change_password, totp_secret, created_at, updated_at)
+         VALUES (?, ?, ?, 'user', 'local', NULL, 'placeholder-sealed-master-key', 0, NULL, ?, ?)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(format!("{name}@t.local"))
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// A `waiting_backend` turn for `user_id`, aged `age_secs`, with an
+/// optional `last_error`; seeds a transcript row whose sealed payload
+/// carries `TRANSCRIPT-SECRET` so the test can pin that transcript
+/// content NEVER reaches the admin page. Returns the session id.
+async fn seed_turn_for(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    age_secs: i64,
+    last_error: Option<&str>,
+) -> String {
+    let now = chrono::Utc::now();
+    let aged = (now - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_sessions (id, user_id, title_sealed, created_at, updated_at)
+         VALUES (?, ?, 'sealed-by-nothing', ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(user_id)
+    .bind(&aged)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_turns (id, session_id, user_seq, status, attempts,
+                                 created_at, updated_at, park_state, last_error)
+         VALUES (?, ?, 1, 'waiting_backend', 0, ?, ?, 'waiting_backend', ?)",
+    )
+    .bind(&turn_id)
+    .bind(&session_id)
+    .bind(&aged)
+    .bind(&aged)
+    .bind(last_error)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat_messages (session_id, seq, role, content_sealed, created_at)
+         VALUES (?, 1, 'user', 'TRANSCRIPT-SECRET', ?)",
+    )
+    .bind(&session_id)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+    session_id
+}
+
+/// A pending mutation-queue row (metadata only — no payload) for
+/// `user_id`, aged `age_secs`.
+async fn seed_pending_queue_row(pool: &sqlx::SqlitePool, user_id: &str, age_secs: i64) {
+    let aged = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail,
+                                     created_at, updated_at, next_retry_at, final_paths)
+         VALUES (?, ?, 'add', 'pending', 0, '', ?, ?, NULL, NULL)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(&aged)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A pending ingest job on a fresh shelf + book (FK chain like the
+/// /status test's seed).
+async fn seed_pending_ingest(pool: &sqlx::SqlitePool, user_id: &str, slug: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let shelf_id = uuid::Uuid::new_v4().to_string();
+    let book_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO bookshelves (id, name, created_at) VALUES (?, ?, ?)")
+        .bind(&shelf_id)
+        .bind(format!("shelf-{slug}"))
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO books (id, bookshelf_id, slug, title, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&book_id)
+    .bind(&shelf_id)
+    .bind(slug)
+    .bind(format!("Book {slug}"))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingest_jobs (id, bookshelf_id, book_id, requested_by_user_id, status, detail, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'pending', '', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&shelf_id)
+    .bind(&book_id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Extract the waiting-summary sentence (the muted paragraph ending
+/// in the resume promise) from a rendered /admin/system page.
+fn summary_sentence(html: &str) -> &str {
+    let tail = " waiting — they will resume automatically when the backend returns.";
+    let idx = html.find(tail).expect("summary sentence present");
+    let open = r#"<p class="muted">"#;
+    let start = html[..idx].rfind(open).expect("summary paragraph opens") + open.len();
+    &html[start..idx]
+}
+
+/// The /admin/system page under a forced Red with waiting work: the
+/// indicator carries the state's dot class, an `aria-label`, and a
+/// visible state word (not color alone); the summary line reads
+/// exactly as pinned when both kinds are non-zero; the waiting table
+/// shows metadata (username, kind, waited time, last_error) for the
+/// seeded turn, queue row, and pending ingest job — HTML-escaped, with
+/// NO transcript content; and the page self-refreshes every 30 s,
+/// which `/admin/llm` must not do. Also pins Disabled (dot class +
+/// no outage age) on the same forced clock.
+#[tokio::test]
+async fn admin_system_backend_indicator_and_waiting_table() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Hostile owner for one chat turn, the queue rows, and the ingest
+    // job; the admin owns the other two turns.
+    let hostile = seed_user_named(&pool, "<script>alert(1)</script>").await;
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    seed_turn_for(&pool, &admin_id, 7200, Some("LLM refused the connection")).await;
+    seed_turn_for(&pool, &admin_id, 60, None).await;
+    seed_turn_for(&pool, &hostile, 60, None).await;
+    seed_pending_queue_row(&pool, &hostile, 60).await;
+    seed_pending_queue_row(&pool, &hostile, 30).await;
+    seed_pending_ingest(&pool, &hostile, "waiting-book").await;
+
+    force_red(3600);
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // 1. Indicator: dot class per state + aria-label + visible word.
+    assert!(
+        html.contains(r#"health-dot health-dot--red"#),
+        "red health dot missing: {html}"
+    );
+    assert!(
+        html.contains(r#"aria-label="Backend health: red""#),
+        "indicator aria-label missing: {html}"
+    );
+    assert!(
+        html.contains("Backend red"),
+        "visible state word missing: {html}"
+    );
+    // Outage age ~3600 s: "1h 0m", or "1h 1m" if a second boundary
+    // slipped between forcing and the request (the same ~5 s slack
+    // the /health pins tolerate).
+    assert!(
+        html.contains("down for 1h 0m") || html.contains("down for 1h 1m"),
+        "outage age (~3600 s) missing: {html}"
+    );
+    assert!(
+        html.contains("last checked"),
+        "last-check age missing: {html}"
+    );
+
+    // 2. Summary line — exact, both kinds non-zero (3 turns + 2 writes).
+    assert!(
+        html.contains(
+            "3 chat turns and 2 queued writes waiting — they will resume automatically when the backend returns."
+        ),
+        "exact mixed summary missing: {html}"
+    );
+
+    // 3. Waiting table — metadata cells only, escaped, no transcript.
+    assert!(
+        html.contains(r#"<td data-label="User">&lt;script&gt;alert(1)&lt;/script&gt;</td>"#),
+        "hostile username must render escaped: {html}"
+    );
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "raw script probe leaked: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">chat turn</td>"#),
+        "chat-turn kind cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">queued write</td>"#),
+        "queued-write kind cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">ingest job</td>"#),
+        "ingest-job kind cell missing: {html}"
+    );
+    assert!(
+        html.contains("waiting-book"),
+        "ingest slug cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="State">waiting_backend</td>"#),
+        "turn state cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Waited">2h 0m</td>"#),
+        "7200 s turn should read 2h 0m: {html}"
+    );
+    assert!(
+        html.contains("LLM refused the connection"),
+        "last_error text missing: {html}"
+    );
+    assert!(
+        !html.contains("TRANSCRIPT-SECRET"),
+        "transcript content must never reach the admin page: {html}"
+    );
+
+    // 4. 30 s meta refresh on /admin/system ONLY.
+    assert!(
+        html.contains(r#"<meta http-equiv="refresh" content="30">"#),
+        "30 s refresh meta missing on /admin/system: {html}"
+    );
+    let llm_html = client
+        .get(format!("{base}/admin/llm"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        llm_html.contains("LLM backend"),
+        "sanity: /admin/llm renders"
+    );
+    assert!(
+        !llm_html.contains(r#"<meta http-equiv="refresh""#),
+        "refresh meta must NOT appear on /admin/llm: {llm_html}"
+    );
+
+    // 5. Disabled: the dot + word follow the state, and a frozen
+    //    down_since reads as NOT an outage (no "down for" clause).
+    LLM_HEALTH.set_disabled();
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains(r#"health-dot health-dot--disabled"#),
+        "disabled dot missing: {html}"
+    );
+    assert!(
+        html.contains("Backend disabled"),
+        "disabled state word missing: {html}"
+    );
+    assert!(
+        !html.contains("down for"),
+        "Disabled is not an outage: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The summary line drops a part when its kind's count is zero:
+/// chat-only, then mixed (exact when both), then queue-only, then
+/// nothing at all (no sentence). Asserts no backend content, so it
+/// runs unlocked (the page's server-side snapshot read is harmless —
+/// the summary and table are health-independent).
+#[tokio::test]
+async fn admin_system_summary_drops_zero_parts() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let get_system = || {
+        let client = client.clone();
+        let base = base.clone();
+        let cookie = cookie.clone();
+        async move {
+            client
+                .get(format!("{base}/admin/system"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Chat-only: the queued-writes part is dropped. (The LLM card's
+    // helper text mentions "chat turns" too, so the part-drop checks
+    // scope to the summary sentence itself, never the whole page.)
+    seed_turn_for(&pool, &admin_id, 60, None).await;
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "1 chat turn",
+        "chat-only summary wrong: {html}"
+    );
+
+    // Mixed: exact two-part sentence (singular chat part).
+    seed_pending_queue_row(&pool, &admin_id, 60).await;
+    seed_pending_queue_row(&pool, &admin_id, 30).await;
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "1 chat turn and 2 queued writes",
+        "mixed summary wrong: {html}"
+    );
+
+    // Queue-only: the chat part drops once the turn is terminal.
+    sqlx::query("UPDATE chat_turns SET status = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "2 queued writes",
+        "queue-only summary wrong: {html}"
+    );
+
+    // Nothing waiting: no sentence at all.
+    sqlx::query("UPDATE mutation_queue SET status = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let html = get_system().await;
+    assert!(
+        !html.contains("they will resume automatically when the backend returns"),
+        "no waiting items means no summary sentence: {html}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Regression: a browser that still holds a live session cookie (bookmark,
 /// back button, restart) must be able to submit /login again. The login
 /// page has no session token to render, so app.js injects an empty

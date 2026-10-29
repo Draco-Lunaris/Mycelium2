@@ -2274,6 +2274,24 @@ pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
         .into_response()
 }
 
+/// One row of the System page's per-item waiting table (outage-
+/// recovery spec §3.5): METADATA ONLY — username, kind, what, state,
+/// waited time, bounded error text. Never transcript or concept
+/// content; the page HTML-escapes every cell.
+#[derive(Debug)]
+pub struct WaitingItemRow {
+    /// The item class rendered in the Kind column: "chat turn",
+    /// "queued write", or "ingest job".
+    pub kind: &'static str,
+    pub user: String,
+    /// A short human handle: session id (chat), tool (queue), slug
+    /// (ingest) — never payload.
+    pub what: String,
+    pub state: String,
+    pub waited_seconds: i64,
+    pub last_error: Option<String>,
+}
+
 /// The /health fields the System page surfaces as StatTiles — the
 /// page's rendering DTO, mapped from health::system_stats (the ONE
 /// shared computation). Renamed SystemPageStats in PR 4 (the Task-1
@@ -2286,6 +2304,10 @@ pub async fn admin_view(_admin: mycelium_auth::rbac::RequireAdmin) -> Response {
 /// ONE `LLM_GATE.stats()` read — neither this DTO nor the page reads
 /// the gate again, so the card cannot disagree with the tiles beside
 /// it.
+///
+/// The `backend_*` fields (outage-recovery spec §3.5) ride through
+/// from `SystemStats` the same way — ONE `LLM_HEALTH.snapshot()` read,
+/// so the indicator cannot disagree with /health.
 #[derive(Debug)]
 pub struct SystemPageStats {
     pub users: i64,
@@ -2297,6 +2319,14 @@ pub struct SystemPageStats {
     pub llm_queued: i64,
     pub llm_capacity: i64,
     pub llm_timeouts_total: i64,
+    pub backend_state: &'static str,
+    pub backend_down_seconds: Option<i64>,
+    pub backend_checked_seconds_ago: Option<i64>,
+    pub chat_waiting_count: i64,
+    /// The per-item waiting table's rows (chat turns + queued writes +
+    /// pending ingest jobs, oldest first). The summary line's per-kind
+    /// counts derive from these — no separate counters.
+    pub waiting_items: Vec<WaitingItemRow>,
 }
 
 /// GET /admin/users — the users table + create-user side card
@@ -2447,6 +2477,56 @@ pub async fn admin_system_view(
     // route and /status (the PR-4 SystemStats extraction); mapped into
     // the page's StatTile DTO, which stays a rendering concern.
     let s = crate::health::system_stats(&state).await;
+    // The waiting table's rows (outage-recovery spec §3.5): chat turns
+    // owed an answer, queued writes not yet integrated, and pending
+    // ingest jobs — metadata only, each source zeroed on read failure
+    // like the queue fields beside it (db_ok already reports an
+    // unreachable store). Waited seconds parse from each row's RFC
+    // 3339 created_at; a parse failure degrades to 0 (the same
+    // convention as queue_health_counts's age).
+    let now = chrono::Utc::now();
+    let waited = |ts: &str| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+            .unwrap_or(0)
+    };
+    let mut waiting_items: Vec<WaitingItemRow> = Vec::new();
+    if let Ok(turns) = state.chat_sessions.admin_waiting_turns().await {
+        for t in turns {
+            waiting_items.push(WaitingItemRow {
+                kind: "chat turn",
+                user: t.username,
+                what: t.session_id.to_string(),
+                state: t.status.as_str().to_string(),
+                waited_seconds: waited(&t.created_at),
+                last_error: t.last_error,
+            });
+        }
+    }
+    if let Ok(rows) = state.store.queue_waiting_rows().await {
+        for r in rows {
+            waiting_items.push(WaitingItemRow {
+                kind: "queued write",
+                user: r.username,
+                what: r.tool.as_str().to_string(),
+                state: r.status.as_str().to_string(),
+                waited_seconds: waited(&r.created_at),
+                last_error: r.detail,
+            });
+        }
+    }
+    if let Ok(jobs) = state.store.pending_ingest_job_rows().await {
+        for j in jobs {
+            waiting_items.push(WaitingItemRow {
+                kind: "ingest job",
+                user: j.username,
+                what: j.slug,
+                state: "pending".to_string(),
+                waited_seconds: waited(&j.created_at),
+                last_error: None,
+            });
+        }
+    }
     let stats = SystemPageStats {
         users: s.user_count,
         queue_depth: s.queue_depth as usize,
@@ -2457,6 +2537,11 @@ pub async fn admin_system_view(
         llm_queued: s.llm_queued,
         llm_capacity: s.llm_capacity,
         llm_timeouts_total: s.llm_timeouts_total,
+        backend_state: s.backend_state,
+        backend_down_seconds: s.backend_down_seconds,
+        backend_checked_seconds_ago: s.backend_checked_seconds_ago,
+        chat_waiting_count: s.chat_waiting_count,
+        waiting_items,
     };
     let admin = request_admin_user(&state, &session).await;
     // The TLS card's inputs: the ACTIVE cert's parsed details and the

@@ -13,7 +13,7 @@ pub mod search_index;
 pub mod skill_bundle;
 pub mod skill_group;
 
-pub use books::{BookRow, BooksError};
+pub use books::{BookRow, BooksError, PendingJobRow};
 pub use chat::{
     ChatError, ChatMessageRow, ChatRole, ChatSessionMeta, ChatSessionSummary, ChatStore,
     ChatTurnRow, ChatTurnStatus, MAX_SESSIONS_PER_USER,
@@ -28,8 +28,8 @@ pub use models::{
     Session, User,
 };
 pub use mutation_queue::{
-    MutationPayload, QueueError, QueueHealth, QueueTotals, payload_path, read_payload,
-    write_payload,
+    MutationPayload, QueueError, QueueHealth, QueueTotals, QueueWaitingRow, payload_path,
+    read_payload, write_payload,
 };
 pub use search_index::{EncryptedIndex, IndexError};
 pub use skill_bundle::{SkillBundleError, SkillBundleFile, bundle_skill_files};

@@ -107,6 +107,57 @@ async fn done_dead_terminal_and_health() {
     assert_eq!(health.depth, 0); // done + dead are terminal
 }
 
+// Task 10 (outage recovery): `queue_waiting_rows` — the admin System
+// page's per-item waiting table source. staging+pending only, username
+// joined from users, ORDER BY created_at, empty detail mapped to None.
+#[tokio::test]
+async fn queue_waiting_rows_join_and_order() {
+    let (store, _dir) = store().await;
+    // One user per state, so every claim is unambiguous. staging +
+    // pending WAIT; running is being worked; done/dead are terminal —
+    // only the WAITING two may appear.
+    let alice = seed_user(&store, "alice").await;
+    let bob = seed_user(&store, "bob").await;
+    let carol = seed_user(&store, "carol").await;
+    let dan = seed_user(&store, "dan").await;
+    let staged = store.enqueue(alice, QueueTool::Add).await.unwrap();
+    let pend = store.enqueue(bob, QueueTool::Update).await.unwrap();
+    store.activate(pend).await.unwrap();
+    let run = store.enqueue(carol, QueueTool::Maintain).await.unwrap();
+    store.activate(run).await.unwrap();
+    store.claim_due_for_user(carol).await.unwrap().unwrap(); // run → running
+    let fin = store.enqueue(dan, QueueTool::Add).await.unwrap();
+    store.activate(fin).await.unwrap();
+    store.claim_due_for_user(dan).await.unwrap().unwrap(); // fin → running
+    store.mark_done(fin, &[], "ok").await.unwrap(); // → done
+    let dead = store.enqueue(alice, QueueTool::Add).await.unwrap();
+    store.activate(dead).await.unwrap();
+    store.mark_dead(dead, "gave up").await.unwrap();
+
+    let rows = store.queue_waiting_rows().await.unwrap();
+    assert_eq!(rows.len(), 2, "staging + pending only: {rows:?}");
+    // Created_at order: staging (alice) was enqueued first.
+    assert_eq!(rows[0].id, staged);
+    assert_eq!(rows[0].username, "alice");
+    assert_eq!(rows[0].tool, QueueTool::Add);
+    assert_eq!(rows[0].status, QueueStatus::Staging);
+    assert_eq!(rows[0].detail, None, "empty detail reads as None");
+    assert_eq!(rows[1].id, pend);
+    assert_eq!(rows[1].username, "bob");
+    assert_eq!(rows[1].status, QueueStatus::Pending);
+
+    // A retry back to pending lands the bounded detail + attempts (the
+    // claim already incremented them).
+    store
+        .mark_failed(run, "2000-01-01T00:00:00+00:00".into(), "LLM down")
+        .await
+        .unwrap();
+    let rows = store.queue_waiting_rows().await.unwrap();
+    let run_row = rows.iter().find(|r| r.id == run).unwrap();
+    assert_eq!(run_row.detail.as_deref(), Some("LLM down"));
+    assert_eq!(run_row.attempts, 1);
+}
+
 #[tokio::test]
 async fn queue_health_counts_pending_by_tool() {
     let (store, _dir) = store().await;

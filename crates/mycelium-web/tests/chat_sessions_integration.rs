@@ -1864,11 +1864,11 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
         .unwrap();
     let page_html = page.text().await.unwrap();
     assert!(
-        page_html.contains("/assets/chat.js?v=31"),
+        page_html.contains("/assets/chat.js?v=32"),
         "the /chat page must reference the bumped chat.js version: {page_html}"
     );
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=31"))
+        .get(format!("{base}/assets/chat.js?v=32"))
         .send()
         .await
         .unwrap();

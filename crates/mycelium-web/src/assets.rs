@@ -364,6 +364,20 @@ leptos-island { display: contents; }
    row carries when its concept links outside the bundle. */
 .flag--warning { color: var(--color-warning); background: var(--color-warning-surface); border-radius: var(--radius-pill); padding: 2px var(--gap-2); font-size: var(--text-caption); }
 
+/* Backend health indicator (/admin/system, outage recovery §3.5): the
+   state dot beside the visible state word. Color is never the only
+   signal — the element carries aria-label and the page renders the
+   state name. */
+.health-dot {
+  display: inline-block; width: 10px; height: 10px;
+  border-radius: 50%; margin-right: var(--gap-2);
+  vertical-align: baseline;
+}
+.health-dot--green { background: var(--color-accent); }
+.health-dot--yellow { background: var(--color-warning); }
+.health-dot--red { background: var(--color-danger); }
+.health-dot--disabled { background: var(--color-chip-surface-alt); border: 1px solid var(--color-border); }
+
 /* Banners: leading icon = the first child (inline svg), space reserved by
    the flex gap; success reuses accent tints (spec §5 — no success token). */
 .banner {
@@ -1800,7 +1814,7 @@ pub static HYDRATE_WASM: &[u8] = include_bytes!("../assets/mycelium_ui_bg.wasm")
 /// refresh, so upgrades deliver new defaults while admins can still
 /// customize (delete the marker to opt out of refreshes, or restore it
 /// to re-opt-in on the next boot).
-pub const ASSETS_VERSION: &str = "31";
+pub const ASSETS_VERSION: &str = "32";
 
 /// Write the default assets to `assets_dir`. First boot writes
 /// everything; later boots refresh the defaults when the version
