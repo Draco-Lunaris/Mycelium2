@@ -266,8 +266,10 @@ for container orchestration and scrape endpoints.
 
 The `/health` **degraded posture is deliberately unaffected by backend
 state**: the LLM backend being red is weather the queue and chat
-surfaces absorb (parked turns, deferred drains), not illness of this
-service — 503 `degraded` still means MY database/queue is ill.
+surfaces absorb (parked chat turns waiting for the backend; queued
+writes retry with backoff and integrate through the deterministic
+fallback), not illness of this service — 503 `degraded` still means MY
+database/queue is ill.
 `llm_last_success_seconds` / `mycelium2_llm_last_success_timestamp`
 keep their model-call-only meaning: the health probe never feeds them,
 so a reachable-but-completion-less backend never looks "recently

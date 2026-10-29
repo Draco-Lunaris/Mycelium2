@@ -19,11 +19,11 @@
 //!
 //! Sources: the passive hooks in `llm.rs` (every `LlmClient` completion
 //! notes ok at the `LLM_LAST_SUCCESS` choke point or failure when the
-//! §3.2 classifier says the request never reached a working model) and,
-//! from a later task, a background probe task calling [`probe_once`].
-//! [`probe_once`] itself is pure: it reports to its caller and never
-//! calls `note_*`, so probe results are fed exactly once by whoever runs
-//! them.
+//! §3.2 classifier says the request never reached a working model) and
+//! the background probe task (`mycelium_web::server::spawn_backend_probe`,
+//! feeding [`probe_once`] every [`PROBE_INTERVAL_SECS`]). [`probe_once`]
+//! itself is pure: it reports to its caller and never calls `note_*`, so
+//! probe results are fed exactly once by whoever runs them.
 //!
 //! All state lives behind one mutex; nothing here does I/O. The public
 //! methods stamp `Utc::now()` internally; the `#[doc(hidden)]` `_at`

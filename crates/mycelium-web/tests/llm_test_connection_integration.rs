@@ -529,9 +529,10 @@ async fn probe_task_reaches_green_then_red_then_disabled() {
 
     // Stop the task and WAIT for it: `select!` may pick a due tick over
     // the cancellation, so a late `note_*` could otherwise land after
-    // this test releases TEST_LOCK and perturb a sibling's window.
+    // this test releases TEST_LOCK and perturb a sibling's window. The
+    // unwrap keeps a panicking probe visible as a test failure.
     shutdown.cancel();
-    let _ = probe.await;
+    probe.await.unwrap();
 }
 
 /// The probe re-reads the CURRENT config row every tick, so an admin's
@@ -573,7 +574,8 @@ async fn probe_task_honours_a_config_row_swap_within_a_tick() {
     )
     .await;
 
-    // Join the probe before releasing the lock (see the other test).
+    // Join the probe before releasing the lock (see the other test);
+    // unwrap keeps a probe panic a test failure.
     shutdown.cancel();
-    let _ = probe.await;
+    probe.await.unwrap();
 }

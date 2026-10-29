@@ -164,9 +164,17 @@ While the backend is red:
   resume tick) and complete automatically when the backend returns —
   no restart, no manual nudge, and no permanent failed verdict from
   the downtime itself.
-- The mutation-queue drain skips integration passes (queued writes
-  keep their position); write submissions still enqueue immediately
-  and integrate on the first healthy pass.
+- The mutation-queue drain keeps draining through the outage — it has
+  no health gate. Agent integration attempts fail fast against the
+  dead backend, the per-item retry backoff (30/60/120 s) runs, and the
+  item then integrates through the deterministic fallback: queued
+  writes make progress without the LLM, exactly as the write-queue
+  design intended. This is safe to run during an outage: the drain
+  admits with `try_enter` only, so it never takes gate capacity from
+  interactive work or queues ahead of it — and while the backend is
+  down, interactive work isn't waiting on it either (chat turns are
+  parked, not queued). Only the *staging* rows wait (below), and only
+  for a key, never for the backend.
 - Staged write payloads whose **user key** is temporarily unavailable
   wait **in place**: the row stays `staging` (no dead verdict, no
   retry timer) and activates when the key becomes recoverable again.

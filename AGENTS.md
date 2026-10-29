@@ -39,7 +39,7 @@ Cargo workspace, 10 crates under `crates/`:
 - rmcp 3.2 API facts: `STANDARD_HEADERS == V_2026_07_28`; stateless mode injects `http::request::Parts` (with axum extensions) into JSON-RPC request extensions → tool handlers read per-request state via `Extension<http::request::Parts>`; `#[tool_handler]` auto-generates `list_tools` with SEP-2549 cache hints (ttlMs=0, cacheScope=public) for ≥2026-07-28; `Parameters<T>` is a tuple struct (`args.0.field`); `ServerInfo = InitializeResult` (use `ServerInfo::new(caps).with_server_info(Implementation::new(...))`); rmcp does NOT re-export the `http` crate (add `http = "1.5"`); schemars 1.x (`schemars::JsonSchema` derive on tool arg structs).
 - **serde_yaml is deprecated** — use `serde_yaml_ng` (drop-in).
 - **sqlx stays 0.8.x** (0.9 needs Rust 1.94).
-- **Adding a NEW migration .sql does not trigger a rebuild** of the `sqlx::migrate!` output locally (rust-cache doesn't watch `crates/mycelium-store/src/migrations/`); `touch crates/mycelium-store/src/migrations.rs` to force the rebuild when a fresh migration looks like it isn't running.
+- **Adding a NEW migration .sql does not trigger a rebuild** of the `sqlx::migrate!` output locally (rust-cache doesn't watch `crates/mycelium-store/migrations/`); `touch crates/mycelium-store/src/migrations.rs` to force the rebuild when a fresh migration looks like it isn't running.
 - rand 0.10: `rand::rng()`, `Rng` trait (not `thread_rng`/`RngCore`).
 - reqwest 0.13: TLS feature is `rustls` (not `rustls-tls`).
 
