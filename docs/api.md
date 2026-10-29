@@ -237,6 +237,44 @@ observability only and never make it degraded) and `GET /metrics`
 (Prometheus text) live outside `/api/v1` and are public by design —
 for container orchestration and scrape endpoints.
 
+**Backend-health fields** (outage recovery spec §3.6, on `/health`):
+
+- `backend_state` — the reported LLM-backend state: `"green"` (last
+  observation ok), `"yellow"` (1–2 consecutive probe failures, or
+  reachable-but-stale while runs are attempting), `"red"` (≥3
+  consecutive failures), or `"disabled"` (no stored `llm` config row —
+  nothing to probe).
+- `backend_down_seconds` — seconds since the outage opened (the first
+  failure); absent while green or disabled (a disabled machine's
+  frozen clock is "nothing to probe", not an outage).
+- `backend_checked_seconds_ago` — seconds since the last health
+  observation (probe or model-call note); absent if never observed.
+  Unlike `backend_down_seconds` this is NOT gated on disabled: when
+  health was last actually checked is a fact, not an outage claim.
+- `chat_waiting_count` — chat turns owed an answer: parked
+  `waiting_backend` during an outage plus crash-interrupted turns not
+  yet claimed (all users).
+
+**Backend-health metric lines** (`/metrics`):
+
+- `mycelium2_backend_up` (gauge) — four-state: `0` = disabled,
+  `1` = red, `2` = yellow, `3` = green.
+- `mycelium2_backend_down_seconds` (gauge) — seconds the current
+  outage has been open; `0` when not down (green or disabled).
+- `mycelium2_chat_waiting_turns` (gauge) — the same turns as
+  `chat_waiting_count`.
+
+The `/health` **degraded posture is deliberately unaffected by backend
+state**: the LLM backend being red is weather the queue and chat
+surfaces absorb (parked chat turns waiting for the backend; queued
+writes retry with backoff and integrate through the deterministic
+fallback), not illness of this service — 503 `degraded` still means MY
+database/queue is ill.
+`llm_last_success_seconds` / `mycelium2_llm_last_success_timestamp`
+keep their model-call-only meaning: the health probe never feeds them,
+so a reachable-but-completion-less backend never looks "recently
+successful" there.
+
 ## Error shape
 
 Errors are `{"error": "..."}` with an appropriate status code.

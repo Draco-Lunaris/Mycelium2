@@ -769,6 +769,9 @@ Deep content.
 
     #[tokio::test]
     async fn llm_failure_falls_back() {
+        // Feeds the global health registry (one backend-down failure
+        // from the refused endpoint) — serialize against health tests.
+        let _health = crate::llm_health::health_test_guard().await;
         let outline = parse_outline(BOOK);
         let client = LlmClient::new(&crate::llm::LlmConfig {
             url: "http://127.0.0.1:1/v1".into(),

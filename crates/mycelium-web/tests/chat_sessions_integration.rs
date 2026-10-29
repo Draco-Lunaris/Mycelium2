@@ -24,6 +24,7 @@ use mycelium_auth::login::LoginService;
 use mycelium_librarian::llm_gate::{
     DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
 };
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
 use mycelium_store::Store;
 use mycelium_web::AppState;
 use mycelium_web::chat_api::CHAT_QUEUE_FULL_MSG;
@@ -50,6 +51,19 @@ impl Drop for GateDefaults {
         LLM_GATE.set_capacity(DEFAULT_CAPACITY);
         LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
         LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
+    }
+}
+
+/// Restores the process-global health registry to a fresh Green on drop
+/// (LLM outage spec §3.1): the runner parks a Red-backend turn at
+/// admission, so a leaked Red would park a sibling test's turn instead
+/// of running it. Declared after the TEST_LOCK guard so the restore
+/// happens while the lock is still held.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        LLM_HEALTH.reset_for_test();
     }
 }
 
@@ -1561,9 +1575,15 @@ async fn chat_page_running_and_interrupted_notes() {
 #[tokio::test]
 async fn chat_page_failed_error_bubble() {
     let _g = TEST_LOCK.lock().await;
-    // An empty script exhausts on the first LLM request → the detached
-    // runner persists the error row + finalizes `failed`.
-    let llm_url = mock_llm(vec![]).await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // The mock answers 200 with an EMPTY choices array: a reachable
+    // model that produced nothing is a real run outcome (EmptyResponse
+    // is NOT the backend-down class), so the detached runner persists
+    // the error row + finalizes `failed`. (A 500/exhausted script would
+    // now be weather and park the turn instead — see
+    // `fresh_submit_parks_on_red_backend` for that path.)
+    let llm_url = mock_llm(vec![serde_json::json!({"choices": []})]).await;
     let (base, shutdown, _dir) = boot(llm_url).await;
     let client = client();
     let (cookie, csrf) = login_admin(&client, &base).await;
@@ -1603,6 +1623,219 @@ async fn chat_page_failed_error_bubble() {
     shutdown.cancel();
 }
 
+/// The outage waiting bubble (outage spec §3.3 copy, pinned verbatim;
+/// page contract like the running/interrupted notes): a turn parked as
+/// `waiting_backend` SSRs the waiting note reusing the `chat-status-note`
+/// class (Task 6 ruling — no new CSS), the page carries
+/// `data-turn-status="waiting_backend"`, and the GET `{id}` meta reports
+/// `waiting_backend` + `turn_resumable: true` — the server-side twin of
+/// chat.js's poll branch, which stops polling ONLY for
+/// `interrupted` + non-resumable (assets.rs), so waiting turns keep the
+/// 5 s meta live with NO client change. The note is a constant with no
+/// user content: the session is created with a hostile first message, so
+/// the render proves the pinned string survives alongside the escaped
+/// title (§6.15 escaping stays the pages-level contract).
+#[tokio::test]
+async fn chat_page_waiting_backend_note_and_poll_contract() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    // Green here on purpose: the runner parks on Red at ADMISSION, and
+    // this test drives the mid-run park instead — the store's
+    // `park_waiting` against a held-running turn, exactly what the
+    // runner does when the backend goes Red mid-flight.
+    LLM_HEALTH.reset_for_test();
+    // The mock's gate is never released: the turn stays held running for
+    // the whole test; the response's unread body is dropped at the end.
+    let (llm_url, _gate) = gated_mock_llm(vec![text_response("held reply.")]).await;
+    let (base, shutdown, dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Hostile first message → the derived session title carries markup.
+    let resp = submit_draft(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "<img src=x onerror=alert(2)> parked ask",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let session_id = first_session_id(&client, &base, &cookie).await;
+    poll_meta_until(&client, &base, &cookie, &session_id, "running").await;
+
+    // Park the running turn through the store (the mid-run outage park).
+    let store = Store::open(dir.path()).await.unwrap();
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let (turn_id, user_id): (String, String) = sqlx::query_as(
+        "SELECT t.id, s.user_id FROM chat_turns t \
+         JOIN chat_sessions s ON s.id = t.session_id WHERE s.id = ?",
+    )
+    .bind(&session_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    chat.park_waiting(
+        uuid::Uuid::parse_str(&user_id).unwrap(),
+        uuid::Uuid::parse_str(&turn_id).unwrap(),
+        Some("backend unhealthy at admission"),
+    )
+    .await
+    .unwrap();
+
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    // The pinned copy, verbatim (spec §3.3).
+    assert!(
+        html.contains(
+            r#"<div class="chat-msg chat-status-note">Waiting for the librarian backend — it will resume automatically.</div>"#,
+        ),
+        "waiting note missing: {html}"
+    );
+    assert!(
+        html.contains(r#"data-turn-status="waiting_backend""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-max-seq="1""#), "{html}");
+    assert!(
+        !html.contains("The librarian is thinking…"),
+        "a waiting turn is not running: {html}"
+    );
+    assert!(
+        !html.contains("Interrupted by a server restart"),
+        "a waiting turn is not an interrupted turn: {html}"
+    );
+    // The note itself carries no user content (the exact-div assertion
+    // above pins the constant); the hostile title renders escaped and
+    // the raw markup never appears anywhere in the page.
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(2)&gt;"),
+        "hostile title must render escaped: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x onerror=alert(2)>"),
+        "raw hostile markup leaked: {html}"
+    );
+
+    // The meta endpoint — the poll's 5 s input: waiting AND resumable
+    // (chat.js keeps polling on this shape; only interrupted+spent
+    // stops it), with the transcript cursor at the trigger row.
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(meta["id"], session_id);
+    assert_eq!(meta["turn_status"], "waiting_backend");
+    assert_eq!(
+        meta["turn_resumable"], true,
+        "waiting turns are resumable: {meta}"
+    );
+    assert_eq!(meta["max_seq"], 1, "only the trigger row: {meta}");
+
+    shutdown.cancel();
+}
+
+/// Fresh submit during a known outage (outage spec §3.3 admission edge
+/// (a), decision §6: the submit is ACCEPTED): with the health machine
+/// Red, the runner parks the turn as `waiting_backend` at admission —
+/// never queueing it through an outage. The SSE stream closes on the
+/// park (the registry entry is dropped; the stream carries the session
+/// event and nothing else — no error event, no run events), the meta
+/// endpoint reports `waiting_backend` + resumable, the turn records
+/// `last_error`, NO transcript row beyond the trigger message exists,
+/// and the gate was never entered (`admissions_total` unchanged — the
+/// admission check sits ahead of it).
+#[tokio::test]
+async fn fresh_submit_parks_on_red_backend() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    // Force Red through the machine's own transition rule (3
+    // consecutive failures), per the brief.
+    let fresh = LLM_HEALTH.reset_for_test();
+    assert_eq!(fresh.state, BackendState::Green);
+    LLM_HEALTH.note_failure();
+    LLM_HEALTH.note_failure();
+    LLM_HEALTH.note_failure();
+    assert_eq!(LLM_HEALTH.snapshot().state, BackendState::Red);
+    // A REACHABLE mock with an empty script: a request would 500, so
+    // "no request recorded" proves the run never started.
+    let (llm_url, requests) = capturing_mock_llm(vec![]).await;
+    let (base, shutdown, dir) = boot_with(mycelium_web::LlmConfig {
+        url: llm_url,
+        model: "mock".into(),
+        api_key: None,
+        ..Default::default()
+    })
+    .await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    // A second pool over the same file: the row + last_error
+    // observables.
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let admissions_before = LLM_GATE.stats().admissions_total;
+    let resp = submit_draft(&client, &base, &cookie, &csrf, "asked during an outage").await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "a fresh submit is accepted during an outage"
+    );
+    let body = resp.text().await.unwrap();
+    let events = sse_events(&body);
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["session"],
+        "the stream carries the session event only — the park emits no event: {events:?}"
+    );
+    let session_id = events[0]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // The turn parked: the meta endpoint (the client's poll) shows it
+    // waiting + resumable, and the stream closed (poll semantics).
+    let meta = poll_meta_until(&client, &base, &cookie, &session_id, "waiting_backend").await;
+    assert_eq!(
+        meta["turn_resumable"], true,
+        "waiting turns are resumable: {meta}"
+    );
+    assert_eq!(meta["max_seq"], 1, "only the trigger message row: {meta}");
+
+    let error_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE role = ?")
+        .bind("error")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(error_rows, 0, "a park writes no error row");
+    let (last_error, attempts): (Option<String>, i32) = sqlx::query_as(
+        "SELECT t.last_error, t.attempts FROM chat_turns t \
+         JOIN chat_sessions s ON s.id = t.session_id WHERE s.id = ?",
+    )
+    .bind(&session_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert!(last_error.is_some(), "the park records last_error");
+    assert_eq!(attempts, 0, "parking never touches attempts");
+    assert_eq!(
+        LLM_GATE.stats().admissions_total,
+        admissions_before,
+        "the admission check parked BEFORE the gate — it was never entered"
+    );
+    assert!(
+        requests.lock().await.is_empty(),
+        "a turn parked at admission never calls the LLM"
+    );
+
+    shutdown.cancel();
+}
+
 /// Task 7: the chat page's JS rides the session endpoints — the version
 /// bump invalidates the served-asset caches, the body carries the
 /// create/submit session URLs and the composer island's entry point,
@@ -1631,11 +1864,11 @@ async fn assets_version_bumped_and_chat_js_references_new_endpoints() {
         .unwrap();
     let page_html = page.text().await.unwrap();
     assert!(
-        page_html.contains("/assets/chat.js?v=31"),
+        page_html.contains("/assets/chat.js?v=32"),
         "the /chat page must reference the bumped chat.js version: {page_html}"
     );
     let resp = client
-        .get(format!("{base}/assets/chat.js?v=31"))
+        .get(format!("{base}/assets/chat.js?v=32"))
         .send()
         .await
         .unwrap();

@@ -162,6 +162,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let worker = state.queue_worker.clone();
     worker.spawn(shutdown.clone());
 
+    // Ingest sweep (outage-recovery spec §3.5): re-runs pending ingest
+    // jobs on a signal and a 60 s tick, so a failed boot pass above is
+    // not terminal for the queue. The boot block stays for immediacy.
+    state.librarian.clone().spawn(shutdown.clone());
+
     // Chat boot sweep + resume worker (chat session history spec §3.4):
     // running → interrupted; the worker auto-resumes each once.
     if let Err(e) = state.chat_sessions.boot_sweep().await {
@@ -171,6 +176,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.clone(),
     )));
     resume.spawn(shutdown.clone());
+
+    // Backend health (outage recovery spec §3.1): seed Disabled until
+    // the probe's first tick resolves it — the static machine starts
+    // "configured, fresh", which would otherwise read Green to a
+    // request landing before the task's first pass. The probe loop's
+    // immediate first tick lifts the pin (config row present) and
+    // probes, or re-pins it (row absent).
+    mycelium_librarian::llm_health::LLM_HEALTH.set_disabled();
+    mycelium_web::server::spawn_backend_probe(
+        state.clone(),
+        shutdown.clone(),
+        std::time::Duration::from_secs(mycelium_librarian::llm_health::PROBE_INTERVAL_SECS),
+    )
+    .await;
 
     mycelium_web::serve(
         state,

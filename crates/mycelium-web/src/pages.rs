@@ -1072,6 +1072,15 @@ pub fn chat_page(
                     r#"<div class="chat-msg librarian pending">The librarian is thinking…</div>"#
                         .to_string();
             }
+            // Parked during an outage (spec §3.3): the resume worker
+            // will retry — the note promises it, and the meta poll's
+            // `turn_resumable: true` keeps the page live until then.
+            // Same note class as the interrupted bubble (Task 6
+            // ruling: no new CSS).
+            Some(mycelium_store::chat::ChatTurnStatus::WaitingBackend) => {
+                status_bubble = r#"<div class="chat-msg chat-status-note">Waiting for the librarian backend — it will resume automatically.</div>"#
+                    .to_string();
+            }
             Some(mycelium_store::chat::ChatTurnStatus::Interrupted) => {
                 status_bubble = if view.turn_resumable {
                     r#"<div class="chat-msg chat-status-note">Interrupted by a server restart — it will resume automatically.</div>"#
@@ -2176,13 +2185,137 @@ pub fn llm_card(stats: &crate::api::SystemPageStats) -> String {
     ))
 }
 
-/// Admin: System — the operational view: /health's fields as
-/// StatTiles (a tile per value), the LLM-gate readout card, the TLS
-/// card, and the backup download
-/// (the existing POST /admin/backup button + the no-store rationale).
-/// The ingest-jobs table moved to /status (spec §8's PR-4 ruling —
-/// /status is the jobs-table home; the PR-3 placement here was a
-/// stopgap pending that page).
+/// Format an age in seconds the way the System page reads durations:
+/// under a minute "45s", under an hour "5m", hours-and-minutes "1h 0m".
+/// Deterministic, integer-only (no clock reads here — callers pass the
+/// already-derived seconds).
+fn fmt_waited(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// The backend-health indicator + waiting-summary line (outage-recovery
+/// spec §3.5), rendered ABOVE the StatTile grid on /admin/system. The
+/// values arrive pre-derived through `SystemPageStats` (the ONE
+/// `LLM_HEALTH.snapshot()` read in `health::system_stats`), so the
+/// indicator cannot disagree with /health.
+///
+/// The dot is never the only signal: it carries `aria-label` AND a
+/// visible state word beside it (WCAG — color alone must not encode
+/// state). Disabled reports no outage clause: a Disabled machine's
+/// frozen down_since is "nothing to probe", not a live outage (the
+/// same rule /health applies to `backend_down_seconds`).
+///
+/// The summary sentence counts derive from `waiting_items` — chat
+/// turns + queued writes only (the kinds the sentence promises to
+/// resume); zero-count parts drop, and with no waiting items the
+/// sentence is absent entirely.
+///
+/// Escaping: the state word is `BackendState::as_str()` (a constant),
+/// the ages are i64s — nothing attacker-controlled reaches the markup.
+fn backend_health_block(stats: &crate::api::SystemPageStats) -> String {
+    let state = stats.backend_state;
+    let mut line = format!(
+        r#"<p><span class="health-dot health-dot--{state}" role="img" aria-label="Backend health: {state}"></span><strong>Backend {state}</strong>"#
+    );
+    if let Some(down) = stats.backend_down_seconds {
+        line.push_str(&format!(" <span>down for {}</span>", fmt_waited(down)));
+    }
+    match stats.backend_checked_seconds_ago {
+        Some(ago) => {
+            line.push_str(&format!(
+                " <span>last checked {} ago</span>",
+                fmt_waited(ago)
+            ));
+        }
+        None => line.push_str(" <span>never checked</span>"),
+    }
+    line.push_str("</p>");
+
+    let chat = stats
+        .waiting_items
+        .iter()
+        .filter(|i| i.kind == "chat turn")
+        .count();
+    let writes = stats
+        .waiting_items
+        .iter()
+        .filter(|i| i.kind == "queued write")
+        .count();
+    if chat + writes > 0 {
+        let mut parts = Vec::new();
+        if chat > 0 {
+            parts.push(format!(
+                "{chat} chat {}",
+                if chat == 1 { "turn" } else { "turns" }
+            ));
+        }
+        if writes > 0 {
+            parts.push(format!(
+                "{writes} queued {}",
+                if writes == 1 { "write" } else { "writes" }
+            ));
+        }
+        line.push_str(&format!(
+            r#"<p class="muted">{} waiting — they will resume automatically when the backend returns.</p>"#,
+            parts.join(" and ")
+        ));
+    }
+    line
+}
+
+/// The per-item waiting table (outage-recovery spec §3.5): every item
+/// waiting on the backend — parked chat turns, un-integrated queued
+/// writes, pending ingest jobs. METADATA ONLY (username, kind, handle,
+/// state, waited, bounded last_error) — never transcript or concept
+/// content. Every cell goes through `html_escape` (the page's shared
+/// helper) before entering its TrustedHtml slot, matching the /status
+/// jobs table's exact composition.
+fn waiting_items_card(stats: &crate::api::SystemPageStats) -> String {
+    let rows: Vec<Vec<TrustedHtml>> = stats
+        .waiting_items
+        .iter()
+        .map(|item| {
+            vec![
+                TrustedHtml::from_markup(html_escape(item.kind)),
+                TrustedHtml::from_markup(html_escape(&item.user)),
+                TrustedHtml::from_markup(html_escape(&item.what)),
+                TrustedHtml::from_markup(html_escape(&item.state)),
+                TrustedHtml::from_markup(html_escape(&fmt_waited(item.waited_seconds))),
+                TrustedHtml::from_markup(html_escape(item.last_error.as_deref().unwrap_or(""))),
+            ]
+        })
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &["Kind", "User", "What", "State", "Waited", "Last error"],
+        &rows,
+    ));
+    mycelium_ui::render::render(mycelium_ui::card(
+        "Waiting items",
+        TrustedHtml::from_markup(table),
+    ))
+}
+
+/// Admin: System — the operational view: the backend-health indicator,
+/// waiting summary and per-item waiting table above the StatTiles
+/// (outage-recovery spec §3.5), then /health's fields as StatTiles (a
+/// tile per value), the LLM-gate readout card, the TLS card, and the
+/// backup download (the existing POST /admin/backup button with its
+/// no-store rationale). The ingest-jobs table moved to /status (spec
+/// §8's PR-4 ruling — /status is the jobs-table home; the PR-3
+/// placement here was a stopgap pending that page).
+///
+/// The page self-refreshes every 30 s via a `<meta http-equiv="refresh">`
+/// — the only page that does (the waiting table is a live picture).
+/// The head belongs to the mycelium-ui shell, so the tag is
+/// post-inserted here rather than threaded through ui: every other
+/// page's document stays byte-identical.
 pub fn admin_system_page(
     user: &SessionUser,
     csrf: &str,
@@ -2224,11 +2357,19 @@ pub fn admin_system_page(
         "System",
         TrustedHtml::from_markup(""),
     ));
+    // The backend indicator + waiting summary + waiting table sit
+    // ABOVE the StatTile grid (spec §3.5: the admin's first read is
+    // "is the backend down, and what is waiting on it").
+    let backend_html = format!(
+        "<section class=\"card\">{}</section>",
+        backend_health_block(stats)
+    );
+    let waiting_html = waiting_items_card(stats);
     // The LLM card sits directly under the queue/health tiles (spec
     // §3.6: "next to the existing queue table"), ahead of the TLS and
     // maintenance cards.
     let body = format!(
-        "{header}{tabs}{flash}{stats_html}{}{}{}",
+        "{header}{tabs}{flash}{backend_html}{waiting_html}{stats_html}{}{}{}",
         llm_card(stats),
         tls_card(cert, pending, csrf),
         mycelium_ui::render::render(mycelium_ui::card(
@@ -2238,7 +2379,16 @@ pub fn admin_system_page(
         tabs = admin_tabs("/admin/system"),
         flash = admin_flash(ok, err),
     );
-    layout("System", Some(user), csrf, "/admin/system", body)
+    let mut page = layout("System", Some(user), csrf, "/admin/system", body).0;
+    // 30 s auto-refresh — /admin/system only (the head belongs to the
+    // mycelium-ui shell; inserting before `</head>` keeps every other
+    // page's document byte-identical).
+    page = page.replacen(
+        "</head>",
+        "<meta http-equiv=\"refresh\" content=\"30\">\n</head>",
+        1,
+    );
+    Html(page)
 }
 
 /// Librarian status (mockup 04; admin-only per spec §6 — the page

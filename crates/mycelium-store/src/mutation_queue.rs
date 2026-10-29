@@ -252,6 +252,51 @@ impl Store {
         self.rows_with_status("staging").await
     }
 
+    /// Admin scan (outage-recovery spec §3.5): every queue item still
+    /// waiting to be integrated — `staging` + `pending` (never
+    /// `running`: a claimed item is being worked, not waiting) — with
+    /// the owner's username joined from `users`, oldest first. Metadata
+    /// only: no payload, no args JSON; `detail` is the bounded
+    /// `short_detail` failure/provenance text the drain persists.
+    pub async fn queue_waiting_rows(&self) -> Result<Vec<QueueWaitingRow>> {
+        let rows: Vec<(String, String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT q.id, u.username, q.tool, q.status, q.attempts, q.detail, q.created_at
+             FROM mutation_queue q
+             JOIN users u ON u.id = q.user_id
+             WHERE q.status IN ('staging', 'pending')
+             ORDER BY q.created_at",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, username, tool, status, attempts, detail, created_at)| {
+                    Ok(QueueWaitingRow {
+                        id: Uuid::parse_str(&id)
+                            .map_err(|_| sqlx::Error::Decode("bad queue row id".into()))?,
+                        username,
+                        tool: QueueTool::from_str(&tool).ok_or_else(|| {
+                            sqlx::Error::Decode(format!("bad tool {tool}").into())
+                        })?,
+                        status: QueueStatus::from_str(&status).ok_or_else(|| {
+                            sqlx::Error::Decode(format!("bad status {status}").into())
+                        })?,
+                        attempts: u32::try_from(attempts).unwrap_or(0),
+                        // The column is NOT NULL DEFAULT '' — an empty
+                        // detail is "no error yet", which the page
+                        // renders as nothing.
+                        detail: if detail.is_empty() {
+                            None
+                        } else {
+                            Some(detail)
+                        },
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
     /// Running rows (boot sweep: a dead process left them mid-flight).
     pub async fn running_rows(&self) -> Result<Vec<MutationQueueItem>> {
         self.rows_with_status("running").await
@@ -431,6 +476,23 @@ pub async fn read_payload(
         Err(FileRepoError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// One row of the admin waiting scan (`queue_waiting_rows` output).
+/// Metadata only — no payload, no args JSON; `detail` is the bounded
+/// drain failure text (`short_detail` convention).
+#[derive(Debug, Clone)]
+pub struct QueueWaitingRow {
+    pub id: Uuid,
+    pub username: String,
+    pub tool: QueueTool,
+    pub status: QueueStatus,
+    pub attempts: u32,
+    /// None when the row has never failed (the column's empty default).
+    pub detail: Option<String>,
+    /// RFC 3339 enqueue timestamp (the waited-seconds base the page
+    /// derives; same raw-string convention as `AdminWaitingTurn`).
+    pub created_at: String,
 }
 
 /// Queue health snapshot (store-side; the web layer formats it).

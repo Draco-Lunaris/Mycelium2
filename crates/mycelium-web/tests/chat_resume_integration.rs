@@ -10,7 +10,11 @@
 //! query-priority test holds its slots outright, so all tests here
 //! serialize on TEST_LOCK and restore the gate's defaults through
 //! [`GateDefaults`] — a held slot leaking into a sibling pass would
-//! make that pass defer and the sibling fail.
+//! make that pass defer and the sibling fail. The backend-parking
+//! tests (outage spec §3.3, the section at the end) additionally read
+//! and drive the process-global `llm_health::LLM_HEALTH`, so every test
+//! that touches it starts from `reset_for_test()` and restores Green
+//! through [`HealthDefaults`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,9 +26,11 @@ use mycelium_auth::login::LoginService;
 use mycelium_librarian::llm_gate::{
     DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
 };
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
 use mycelium_store::Store;
 use mycelium_store::chat::{ChatRole, ChatTurnStatus};
 use mycelium_web::AppState;
+use mycelium_web::chat_runner::{ChatRunContext, ChatRunRegistry, spawn_chat_run};
 
 /// Known admin password for the pre-seeded account (tests log in with it).
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
@@ -45,6 +51,70 @@ impl Drop for GateDefaults {
         LLM_GATE.set_per_user_active(DEFAULT_PER_USER_ACTIVE);
         LLM_GATE.set_chat_queue_depth(DEFAULT_CHAT_QUEUE_DEPTH);
     }
+}
+
+/// Restores the process-global health registry to a fresh Green on
+/// drop (LLM outage spec §3.1): the runner's parking rules read it —
+/// the admission check acts on `Red`, the run-failure check on
+/// `Disabled` — so a leaked non-Green state (a 502 mock's passive
+/// failure note, a forced Red, a pinned Disabled) would make a sibling
+/// test's turn park instead of reaching its own terminal outcome.
+/// Declared after the TEST_LOCK guard so the restore happens while the
+/// lock is still held.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        LLM_HEALTH.reset_for_test();
+    }
+}
+
+/// A mock that refuses every completion with HTTP 502 — the
+/// backend-down class (outage spec §3.2): the agent's first request
+/// fails with `LlmError::Status { status: 502, .. }`.
+async fn status_502_mock() -> String {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|_body: String| async move {
+            (axum::http::StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Build the detached runner's context directly — the store-driven
+/// counterpart of the endpoint's `submit_turn` / the resume worker's
+/// spawn — with the caller's own live-run registry, so the parking
+/// tests can watch `register`/`remove` without an HTTP server.
+fn run_ctx(state: &AppState, runs: Arc<ChatRunRegistry>, llm_url: String) -> ChatRunContext {
+    ChatRunContext {
+        store: (*state.store).clone(),
+        service_key: (*state.service_key).clone(),
+        chat: (*state.chat_sessions).clone(),
+        runs,
+        llm: mycelium_web::LlmConfig {
+            url: llm_url,
+            model: "mock".into(),
+            api_key: None,
+            ..Default::default()
+        },
+        scopes_visible: None,
+    }
+}
+
+/// The error-role rows of a decrypted transcript (D4's invariant:
+/// exactly one on a terminal path, exactly none on a park).
+fn error_rows(
+    rows: &[mycelium_store::chat::ChatMessageRow],
+) -> Vec<&mycelium_store::chat::ChatMessageRow> {
+    rows.iter()
+        .filter(|r| matches!(r.role, ChatRole::Error))
+        .collect()
 }
 
 /// A scripted mock LLM: pops responses LIFO.
@@ -385,11 +455,18 @@ async fn restart_marks_interrupted_and_resumes_once() {
 }
 
 #[tokio::test]
-async fn resume_llm_dead_returns_interrupted_final() {
+async fn resume_llm_dead_parks_as_waiting() {
     let _g = TEST_LOCK.lock().await;
-    // Dead URL (connection refused instantly): the resumed run fails
-    // on the LLM → back to `interrupted` (attempts now 1 = final, no
-    // loop), with the user-facing LLM-down error row.
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // Dead URL (connection refused instantly) on a RESUMED turn: a
+    // backend-down run is weather, not a verdict (outage spec §3.3) —
+    // the turn parks `waiting_backend` instead of the pre-outage
+    // interrupted-final, with `attempts` left at 1 (out of the
+    // crash-resume budget, into the unlimited weather pool) and NO
+    // error row (parking rows write nothing). This assertion replaced
+    // the pre-outage `interrupted + attempts = 1 + LLM-down row` pin
+    // when the parking rule landed.
     let (state, _dir) = boot(DEAD_LLM_URL.to_string()).await;
     let user = admin_id(&state).await;
     let session = submit_message(&state, user, "asked while down").await;
@@ -402,29 +479,38 @@ async fn resume_llm_dead_returns_interrupted_final() {
         .unwrap();
     poll_until(
         || async {
-            let t = latest_turn(&state, user, session).await;
-            t.status == ChatTurnStatus::Interrupted && t.attempts == 1
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
         },
-        "interrupted-final after a dead LLM resume",
+        "waiting_backend after a dead-LLM resume",
     )
     .await;
+    let parked = latest_turn(&state, user, session).await;
+    assert_eq!(parked.attempts, 1, "the spent crash-resume attempt is kept");
     let rows = transcript(&state, user, session).await;
-    let errors: Vec<_> = rows
-        .iter()
-        .filter(|r| matches!(r.role, ChatRole::Error))
-        .collect();
-    assert_eq!(errors.len(), 1, "the LLM-down error row is present");
-    assert!(
-        errors[0].content.contains("unavailable"),
-        "user-facing LLM-down message: {}",
-        errors[0].content
+    assert_eq!(
+        error_rows(&rows).len(),
+        0,
+        "a park writes no error row (spec §3.3 parking rows)"
     );
 
-    // No further claims: a second pass is a no-op (attempts = 1 —
-    // resumable_turns no longer lists it; nothing to claim). The
-    // observable: the store's own listing, checked directly (never a
-    // sleep) — plus the transcript unchanged.
+    // The crash-resume claim path never lists it again (waiting turns
+    // are the resume worker's `claim_waiting` supply — Task 5 — not the
+    // once-guard's), and the second pass changes nothing. Since Task 5
+    // a Yellow pass WOULD re-claim and re-park this turn, so the pass
+    // runs under a forced Red instead: the whole-pass health skip makes
+    // it a true no-op, with no straggler runner whose dead-URL failure
+    // note could land after HealthDefaults restores Green and leak into
+    // a sibling test's health assertions. The store listing + the
+    // transcript are the observables, checked directly (never a sleep).
     let before = transcript(&state, user, session).await.len();
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure();
+    }
+    assert_eq!(
+        LLM_HEALTH.state(),
+        BackendState::Red,
+        "Red before the skipped second pass"
+    );
     mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
         .run_pending()
         .await
@@ -436,14 +522,21 @@ async fn resume_llm_dead_returns_interrupted_final() {
             .await
             .unwrap()
             .is_empty(),
-        "an interrupted-final turn is never resumable again"
+        "a waiting turn is never in the crash-resumable listing"
     );
     assert_eq!(
         transcript(&state, user, session).await.len(),
         before,
         "second pass no-op"
     );
-    assert_eq!(latest_turn(&state, user, session).await.attempts, 1);
+    let parked2 = latest_turn(&state, user, session).await;
+    assert_eq!(
+        parked2.status,
+        ChatTurnStatus::WaitingBackend,
+        "not re-claimed"
+    );
+    assert_eq!(parked2.attempts, 1);
+    assert!(turn_last_error(&state, parked.id).await.is_some());
 }
 
 #[tokio::test]
@@ -786,4 +879,737 @@ async fn resume_key_unavailable_skips_user() {
         0,
         "no agent rows — nothing ran"
     );
+}
+
+// ---------------------------------------------------------------------
+// Backend-down parking (LLM outage spec §3.3): the runner treats the
+// backend being down as weather, not a verdict — both fresh submits
+// and resumed turns park as `waiting_backend` with NO transcript row,
+// NO SSE event, and the live-run entry closed. Every test here drives
+// the process-global health machine, so each takes TEST_LOCK and
+// restores Green through HealthDefaults.
+// ---------------------------------------------------------------------
+
+/// The turn row's `last_error` (unsealed failure metadata, spec §3.6)
+/// read straight from the store.
+async fn turn_last_error(state: &AppState, turn_id: uuid::Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT last_error FROM chat_turns WHERE id = ?")
+        .bind(turn_id.to_string())
+        .fetch_one(state.store.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn resumed_run_backend_down_parks() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // Resumed turn (attempts = 1, the once-claim already spent) hitting
+    // a 502: backend-down class → park, NOT the interrupted-final the
+    // pre-outage code wrote. The park never touches attempts.
+    let llm_url = status_502_mock().await;
+    let (state, _dir) = boot(llm_url.clone()).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "resumed into an outage").await;
+    state.chat_sessions.boot_sweep().await.unwrap();
+    let first = latest_turn(&state, user, session).await;
+    assert!(
+        state
+            .chat_sessions
+            .claim_resumable(user, session, first.id)
+            .await
+            .unwrap(),
+        "the crash-resume claim wins (attempts 0 → 1)"
+    );
+    let turn = latest_turn(&state, user, session).await;
+    assert_eq!(turn.status, ChatTurnStatus::Running);
+    assert_eq!(turn.attempts, 1);
+
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), llm_url);
+    let turn_id = spawn_chat_run(
+        ctx,
+        user,
+        admin_master(),
+        session,
+        turn,
+        /* resumed */ true,
+    )
+    .await;
+
+    poll_until(
+        || async {
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
+        },
+        "the backend-down resume parked",
+    )
+    .await;
+    let parked = latest_turn(&state, user, session).await;
+    assert_eq!(parked.id, turn_id);
+    assert_eq!(parked.attempts, 1, "parking never touches attempts");
+    assert!(
+        turn_last_error(&state, turn_id).await.is_some(),
+        "the park records last_error"
+    );
+    // Weather leaves no trace in the transcript: the trigger user row
+    // is the ONLY row (spec §3.3 parking rows).
+    let rows = transcript(&state, user, session).await;
+    assert_eq!(error_rows(&rows).len(), 0, "no error row on a park");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| !matches!(r.role, ChatRole::User))
+            .count(),
+        0,
+        "no transcript rows at all beyond the trigger"
+    );
+    poll_until(
+        || async { !runs.contains(turn_id) },
+        "the registry entry closed on the park",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fresh_run_backend_down_parks() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // A FRESH run whose agent error is the backend-down class parks too
+    // — no `failed`, no error row. The turn is health Green (not
+    // Disabled), so the admission check does not fire and the run
+    // reaches the gate + the mock before the 502.
+    let llm_url = status_502_mock().await;
+    let (state, _dir) = boot(llm_url.clone()).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "fresh into an outage").await;
+    let turn = latest_turn(&state, user, session).await;
+
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), llm_url);
+    let turn_id = spawn_chat_run(
+        ctx,
+        user,
+        admin_master(),
+        session,
+        turn,
+        /* resumed */ false,
+    )
+    .await;
+
+    poll_until(
+        || async {
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
+        },
+        "the backend-down fresh run parked",
+    )
+    .await;
+    let parked = latest_turn(&state, user, session).await;
+    assert_eq!(parked.id, turn_id);
+    assert_eq!(
+        parked.attempts, 0,
+        "a parked fresh turn keeps its resume budget"
+    );
+    assert!(turn_last_error(&state, turn_id).await.is_some());
+    let rows = transcript(&state, user, session).await;
+    assert_eq!(
+        error_rows(&rows).len(),
+        0,
+        "no failed row — it is not a verdict"
+    );
+    poll_until(
+        || async { !runs.contains(turn_id) },
+        "the registry entry closed on the park",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fresh_run_hard_error_still_fails() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // Invariant pin (D4 + §3.2): a run that genuinely ran and hit the
+    // step cap is a real outcome, NOT weather — `failed` with exactly
+    // one error row, unchanged by the parking rules.
+    let llm_url = endless_tool_mock().await;
+    let (state, _dir) = boot(llm_url.clone()).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "run into the cap fresh").await;
+    let turn = latest_turn(&state, user, session).await;
+
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), llm_url);
+    let turn_id = spawn_chat_run(
+        ctx,
+        user,
+        admin_master(),
+        session,
+        turn,
+        /* resumed */ false,
+    )
+    .await;
+
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Failed },
+        "the step-capped fresh run failed",
+    )
+    .await;
+    let rows = transcript(&state, user, session).await;
+    let errors = error_rows(&rows);
+    assert_eq!(errors.len(), 1, "exactly one error row on a hard failure");
+    assert!(
+        errors[0].content.contains("step cap"),
+        "the step-cap error surfaced: {}",
+        errors[0].content
+    );
+    assert!(!runs.contains(turn_id));
+}
+
+#[tokio::test]
+async fn parking_writes_no_transcript_row() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure();
+    }
+    assert_eq!(
+        LLM_HEALTH.snapshot().state,
+        BackendState::Red,
+        "Red at both parks"
+    );
+    // The multi-retry guard (spec §3.3 parking rows): park → claim →
+    // park again — a multi-hour outage re-parks on every retry tick,
+    // so parking must append NOTHING. Through two full park cycles the
+    // transcript holds only the trigger message.
+    let (state, _dir) = boot(DEAD_LLM_URL.to_string()).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "asked during a long outage").await;
+    let turn = latest_turn(&state, user, session).await;
+
+    // Park #1 (admission check: Red → park before the gate).
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), DEAD_LLM_URL.to_string());
+    let turn_id = spawn_chat_run(ctx, user, admin_master(), session, turn, false).await;
+    poll_until(
+        || async {
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
+        },
+        "the first park",
+    )
+    .await;
+    let after_first = transcript(&state, user, session).await;
+    assert_eq!(error_rows(&after_first).len(), 0, "park #1 wrote no row");
+    assert_eq!(after_first.len(), 1, "only the trigger message");
+
+    // The weather claim (Task 3's `claim_waiting` — does not touch
+    // attempts), then a second runner pass in the still-Red machine.
+    assert!(
+        state
+            .chat_sessions
+            .claim_waiting(user, session, turn_id)
+            .await
+            .unwrap(),
+        "a waiting turn is claimable again"
+    );
+    let r2 = latest_turn(&state, user, session).await;
+    assert_eq!(r2.status, ChatTurnStatus::Running);
+    let ctx2 = run_ctx(&state, Arc::clone(&runs), DEAD_LLM_URL.to_string());
+    spawn_chat_run(ctx2, user, admin_master(), session, r2, false).await;
+    poll_until(
+        || async {
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
+        },
+        "the second park",
+    )
+    .await;
+    let after_second = transcript(&state, user, session).await;
+    assert_eq!(
+        error_rows(&after_second).len(),
+        0,
+        "park #2 wrote no row either"
+    );
+    assert_eq!(
+        after_second.len(),
+        1,
+        "still only the trigger message after two parks"
+    );
+    let parked = latest_turn(&state, user, session).await;
+    assert_eq!(
+        parked.attempts, 0,
+        "parking is not a claim — attempts untouched"
+    );
+    assert!(turn_last_error(&state, turn_id).await.is_some());
+}
+
+#[tokio::test]
+async fn disabled_llm_fails_fast() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    LLM_HEALTH.set_disabled();
+    // "Not configured" is not weather: it will not fix itself, and
+    // parking it would promise a resume that never comes. Disabled
+    // keeps today's exact terminal outcomes on the SAME dead-LLM input
+    // the parking tests use — fresh → `failed` + the LLM_UNAVAILABLE
+    // row; resumed → `interrupted` (attempts 1 = final) + row.
+    let (state, _dir) = boot(DEAD_LLM_URL.to_string()).await;
+    let user = admin_id(&state).await;
+
+    // Fresh submit: failed with the configure message.
+    let session = submit_message(&state, user, "asked with no backend").await;
+    let turn = latest_turn(&state, user, session).await;
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), DEAD_LLM_URL.to_string());
+    spawn_chat_run(ctx, user, admin_master(), session, turn, false).await;
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Failed },
+        "the fresh disabled-backend turn failed",
+    )
+    .await;
+    let rows = transcript(&state, user, session).await;
+    let errors = error_rows(&rows);
+    assert_eq!(errors.len(), 1, "the fresh path keeps its one error row");
+    assert!(
+        errors[0].content.contains("unavailable"),
+        "the user-facing configure message: {}",
+        errors[0].content
+    );
+    assert_eq!(
+        latest_turn(&state, user, session).await.status,
+        ChatTurnStatus::Failed,
+        "Disabled never parks"
+    );
+
+    // Resumed turn: back to `interrupted` (the once-budget spent),
+    // with its row — again no parking.
+    let session2 = submit_message(&state, user, "asked before the shutdown").await;
+    state.chat_sessions.boot_sweep().await.unwrap();
+    let first = latest_turn(&state, user, session2).await;
+    assert!(
+        state
+            .chat_sessions
+            .claim_resumable(user, session2, first.id)
+            .await
+            .unwrap()
+    );
+    let turn2 = latest_turn(&state, user, session2).await;
+    let ctx2 = run_ctx(&state, Arc::clone(&runs), DEAD_LLM_URL.to_string());
+    spawn_chat_run(
+        ctx2,
+        user,
+        admin_master(),
+        session2,
+        turn2,
+        /* resumed */ true,
+    )
+    .await;
+    poll_until(
+        || async {
+            let t = latest_turn(&state, user, session2).await;
+            t.status == ChatTurnStatus::Interrupted && t.attempts == 1
+        },
+        "the resumed disabled-backend turn is interrupted-final",
+    )
+    .await;
+    let rows2 = transcript(&state, user, session2).await;
+    assert_eq!(
+        error_rows(&rows2).len(),
+        1,
+        "the resumed path keeps its row too"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Resume worker: health gate + dual supply (LLM outage spec §3.3). One
+// pass merges BOTH supplies — `resumable_turns` (crash) and
+// `waiting_turns` (weather) — oldest-first by `created_at`, and the
+// whole pass is skipped while the backend is Red or Disabled: the
+// weather turns idle until there is a backend to resume into. Every
+// test here reads the process-global health machine, so each takes
+// TEST_LOCK and starts from `reset_for_test()` behind a HealthDefaults
+// guard.
+// ---------------------------------------------------------------------
+
+/// Force a turn row into the weather supply through the store handle
+/// (`park_waiting`: running → waiting_backend — the raw seed the Task 3
+/// store tests use). The runner's own park path is the parking section
+/// above's ground; the worker only needs a waiting row to find.
+async fn park_raw(state: &AppState, user: uuid::Uuid, turn_id: uuid::Uuid) {
+    with_busy_retry("raw park_waiting", || async {
+        state
+            .chat_sessions
+            .park_waiting(user, turn_id, Some("parked by the test harness"))
+            .await
+    })
+    .await;
+}
+
+/// The turn row's `park_state` provenance column (the weather claim
+/// stamps `waiting_backend`; the crash claim `interrupted`).
+async fn turn_park_state(state: &AppState, turn_id: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT park_state FROM chat_turns WHERE id = ?")
+        .bind(turn_id.to_string())
+        .fetch_one(state.store.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn red_backend_skips_whole_pass() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // Backend Red: the WHOLE pass is skipped even with claimable work
+    // present (the resume worker's background twin of the runner's
+    // admission gate). Both supplies stay untouched: no claim, no run,
+    // no gate slot spent. The crash-turn twin makes the skip assertive
+    // — pre-gate the pass would claim and run it into a pointless
+    // re-park; the weather turn is the brief's pin (Review Focus 1).
+    let llm_url = mock_llm(vec![]).await;
+    let (state, _dir) = boot(llm_url).await;
+    let user = admin_id(&state).await;
+    let crashed_session = submit_message(&state, user, "crashed into the outage").await;
+    let waiting_session = submit_message(&state, user, "parked before the pass").await;
+    // Park the weather turn WHILE it is still running (park_waiting is
+    // conditional on 'running'), then sweep: the sweep only flips
+    // running rows, so the parked one stays waiting_backend.
+    let waiting = latest_turn(&state, user, waiting_session).await;
+    park_raw(&state, user, waiting.id).await;
+    state.chat_sessions.boot_sweep().await.unwrap();
+    let crashed = latest_turn(&state, user, crashed_session).await;
+    assert_eq!(crashed.status, ChatTurnStatus::Interrupted);
+    assert_eq!(
+        latest_turn(&state, user, waiting_session).await.status,
+        ChatTurnStatus::WaitingBackend,
+        "the raw park landed before the sweep"
+    );
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure();
+    }
+    assert_eq!(LLM_HEALTH.state(), BackendState::Red, "Red before the pass");
+
+    // Gate idle before the pass (no sibling-runner stragglers), so the
+    // untouched check below is about THIS pass only.
+    poll_until(
+        || async {
+            let s = LLM_GATE.stats();
+            s.active == 0 && s.queued == 0
+        },
+        "the gate idle before the skipped pass",
+    )
+    .await;
+    let before = LLM_GATE.stats();
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+    let after = LLM_GATE.stats();
+    assert_eq!(
+        after.active, before.active,
+        "the skipped pass took no gate slot"
+    );
+    assert_eq!(
+        after.queued, before.queued,
+        "the skipped pass queued nothing"
+    );
+
+    let w = latest_turn(&state, user, waiting_session).await;
+    assert_eq!(
+        w.status,
+        ChatTurnStatus::WaitingBackend,
+        "the waiting turn is untouched while Red"
+    );
+    assert_eq!(w.attempts, 0, "claim_waiting never ran");
+    assert!(
+        state
+            .chat_sessions
+            .waiting_turns()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, t)| t.id == waiting.id),
+        "the turn is still in the weather supply"
+    );
+    let c = latest_turn(&state, user, crashed_session).await;
+    assert_eq!(
+        c.status,
+        ChatTurnStatus::Interrupted,
+        "the crash turn is untouched while Red"
+    );
+    assert_eq!(c.attempts, 0, "claim_resumable never ran");
+    assert!(
+        state
+            .chat_sessions
+            .resumable_turns()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, t)| t.id == crashed.id),
+        "the crash turn is still in the crash supply"
+    );
+}
+
+#[tokio::test]
+async fn disabled_backend_skips_whole_pass() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    LLM_HEALTH.set_disabled();
+    // Disabled (no configured backend) skips the whole pass too — the
+    // pre-ruled strand guard: a claimed weather turn would fail-fast
+    // terminal under Disabled (waiting provenance lost, error row
+    // written), and Disabled will not fix itself, so the turns idle
+    // until an `llm` row exists. Same dual-supply shape as the Red
+    // test: neither supply may be claimed.
+    let llm_url = mock_llm(vec![]).await;
+    let (state, _dir) = boot(llm_url).await;
+    let user = admin_id(&state).await;
+    let crashed_session = submit_message(&state, user, "crashed while unconfigured").await;
+    let waiting_session = submit_message(&state, user, "parked while unconfigured").await;
+    let waiting = latest_turn(&state, user, waiting_session).await;
+    park_raw(&state, user, waiting.id).await;
+    state.chat_sessions.boot_sweep().await.unwrap();
+    let crashed = latest_turn(&state, user, crashed_session).await;
+    assert_eq!(crashed.status, ChatTurnStatus::Interrupted);
+    assert_eq!(LLM_HEALTH.state(), BackendState::Disabled);
+
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+
+    let w = latest_turn(&state, user, waiting_session).await;
+    assert_eq!(
+        w.status,
+        ChatTurnStatus::WaitingBackend,
+        "the waiting turn is untouched while Disabled"
+    );
+    assert_eq!(w.attempts, 0, "claim_waiting never ran");
+    let c = latest_turn(&state, user, crashed_session).await;
+    assert_eq!(
+        c.status,
+        ChatTurnStatus::Interrupted,
+        "the crash turn is untouched while Disabled"
+    );
+    assert_eq!(c.attempts, 0, "claim_resumable never ran");
+    assert_eq!(
+        transcript(&state, user, crashed_session)
+            .await
+            .iter()
+            .filter(|r| !matches!(r.role, ChatRole::User))
+            .count(),
+        0,
+        "nothing ran — no fail-fast row was written"
+    );
+}
+
+#[tokio::test]
+async fn waiting_turn_resumes_when_healthy() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // A waiting turn + healthy backend: the pass claims it through
+    // `claim_waiting` (park_state flips to the weather provenance,
+    // attempts STAY 0 — weather retries never spend the crash budget),
+    // runs it through the same resumed runner, and it lands Done with
+    // its reply row and no error row.
+    let llm_url = mock_llm(vec![text_response("recovered reply")]).await;
+    let (state, _dir) = boot(llm_url).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "asked during the outage").await;
+    let turn = latest_turn(&state, user, session).await;
+    park_raw(&state, user, turn.id).await;
+    assert_eq!(
+        turn_park_state(&state, turn.id).await,
+        "interrupted",
+        "parking is not a claim — provenance untouched until the claim"
+    );
+    assert_eq!(
+        latest_turn(&state, user, session).await.status,
+        ChatTurnStatus::WaitingBackend,
+        "the raw park landed"
+    );
+
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Done },
+        "the waiting turn resumed to Done",
+    )
+    .await;
+    let done = latest_turn(&state, user, session).await;
+    assert_eq!(done.attempts, 0, "the weather claim never touches attempts");
+    assert_eq!(
+        turn_park_state(&state, turn.id).await,
+        "waiting_backend",
+        "claim_waiting stamps the weather provenance"
+    );
+    assert!(
+        state
+            .chat_sessions
+            .waiting_turns()
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, t)| t.id != turn.id),
+        "a resumed turn leaves the weather supply"
+    );
+    let rows = transcript(&state, user, session).await;
+    let assistant: Vec<_> = rows
+        .iter()
+        .filter(|r| matches!(r.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(assistant.len(), 1, "the reply landed");
+    assert_eq!(assistant[0].content, "recovered reply");
+    assert_eq!(
+        error_rows(&rows).len(),
+        0,
+        "the outage left no error row on the resumed turn"
+    );
+}
+
+#[tokio::test]
+async fn outage_then_recovery_completes_without_restart() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // The flagship (the spec's "periodically retry, not just on first
+    // boot"): a fresh run parks to waiting_backend while the backend is
+    // Red (the runner's admission park, Task 4's real path), the
+    // backend recovers (`note_ok`), and the NEXT pass of the SAME
+    // worker in the SAME process picks the turn up and completes it —
+    // no restart anywhere in between.
+    let llm_url = mock_llm(vec![text_response("answered after the outage")]).await;
+    let (state, _dir) = boot(llm_url.clone()).await;
+    let user = admin_id(&state).await;
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure();
+    }
+    assert_eq!(LLM_HEALTH.state(), BackendState::Red, "outage is on");
+    let session = submit_message(&state, user, "asked into the outage").await;
+    let turn = latest_turn(&state, user, session).await;
+    let runs = Arc::new(ChatRunRegistry::default());
+    let ctx = run_ctx(&state, Arc::clone(&runs), llm_url.clone());
+    spawn_chat_run(
+        ctx,
+        user,
+        admin_master(),
+        session,
+        turn,
+        /* resumed */ false,
+    )
+    .await;
+    poll_until(
+        || async {
+            latest_turn(&state, user, session).await.status == ChatTurnStatus::WaitingBackend
+        },
+        "the Red admission park",
+    )
+    .await;
+    assert_eq!(
+        transcript(&state, user, session).await.len(),
+        1,
+        "the park wrote nothing"
+    );
+
+    // The backend recovers. The process never restarted: same AppState,
+    // same worker, next pass.
+    LLM_HEALTH.note_ok();
+    poll_until(
+        || async { LLM_HEALTH.state() == BackendState::Green },
+        "the health machine back to Green after note_ok",
+    )
+    .await;
+
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Done },
+        "the post-recovery pass completed the parked turn",
+    )
+    .await;
+    let done = latest_turn(&state, user, session).await;
+    assert_eq!(
+        done.attempts, 0,
+        "weather retries never spend the crash budget"
+    );
+    let rows = transcript(&state, user, session).await;
+    let assistant: Vec<_> = rows
+        .iter()
+        .filter(|r| matches!(r.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(assistant.len(), 1, "exactly one reply, after the recovery");
+    assert_eq!(assistant[0].content, "answered after the outage");
+    assert_eq!(
+        error_rows(&rows).len(),
+        0,
+        "the outage + park + recovery wrote no error row"
+    );
+    assert!(
+        state
+            .chat_sessions
+            .waiting_turns()
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing weather-waiting remains after the recovery"
+    );
+    // The recovery run healed the machine (the success hook notes ok).
+    assert_eq!(
+        LLM_HEALTH.state(),
+        BackendState::Green,
+        "the completed run keeps the backend Green"
+    );
+}
+
+#[tokio::test]
+async fn yellow_backend_attempts() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+    // Yellow is NOT Red (binding ruling): 2 consecutive failures are a
+    // flap, not an outage — the pass proceeds and the waiting turn
+    // runs. A run under a flapping backend either succeeds (healing
+    // the machine through the success hook) or parks itself back via
+    // the runner's parking rules; here the mock is healthy, so: Done.
+    LLM_HEALTH.note_failure();
+    LLM_HEALTH.note_failure();
+    assert_eq!(
+        LLM_HEALTH.state(),
+        BackendState::Yellow,
+        "2 failures are Yellow, not Red"
+    );
+    let llm_url = mock_llm(vec![text_response("answered on a flapping backend")]).await;
+    let (state, _dir) = boot(llm_url).await;
+    let user = admin_id(&state).await;
+    let session = submit_message(&state, user, "asked on a flapping backend").await;
+    let turn = latest_turn(&state, user, session).await;
+    park_raw(&state, user, turn.id).await;
+
+    mycelium_web::chat_resume::ChatResumeWorker::new(Arc::new(state.clone()))
+        .run_pending()
+        .await
+        .unwrap();
+    poll_until(
+        || async { latest_turn(&state, user, session).await.status == ChatTurnStatus::Done },
+        "the Yellow-pass resume completed",
+    )
+    .await;
+    assert_eq!(latest_turn(&state, user, session).await.attempts, 0);
+    let rows = transcript(&state, user, session).await;
+    assert_eq!(error_rows(&rows).len(), 0);
+    assert!(
+        rows.iter().any(|r| matches!(r.role, ChatRole::Assistant)
+            && r.content == "answered on a flapping backend"),
+        "the Yellow pass ran the waiting turn to its reply"
+    );
+    // The successful run noted ok — the machine healed by the time the
+    // turn is Done.
+    assert_eq!(LLM_HEALTH.state(), BackendState::Green);
 }

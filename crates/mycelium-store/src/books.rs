@@ -236,6 +236,45 @@ impl Store {
             .map(|(id,)| Uuid::parse_str(&id).unwrap_or_default())
             .collect())
     }
+
+    /// Admin scan (outage-recovery spec §3.5): every pending ingest job
+    /// with the book slug joined from `books` and the requester's
+    /// username joined from `users`, oldest first — the admin System
+    /// page's per-item waiting-table source. Metadata only, and
+    /// explicit ORDER BY like every query here.
+    pub async fn pending_ingest_job_rows(&self) -> Result<Vec<PendingJobRow>, BooksError> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT j.id, b.slug, u.username, j.created_at
+             FROM ingest_jobs j
+             JOIN books b ON b.id = j.book_id
+             JOIN users u ON u.id = j.requested_by_user_id
+             WHERE j.status = 'pending'
+             ORDER BY j.created_at",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, slug, username, created_at)| PendingJobRow {
+                id: Uuid::parse_str(&id).unwrap_or_default(),
+                slug,
+                username,
+                created_at,
+            })
+            .collect())
+    }
+}
+
+/// One row of the admin pending-ingest scan (`pending_ingest_job_rows`
+/// output). Metadata only.
+#[derive(Debug, Clone)]
+pub struct PendingJobRow {
+    pub id: Uuid,
+    pub slug: String,
+    pub username: String,
+    /// RFC 3339 submission timestamp (the waited-seconds base the page
+    /// derives).
+    pub created_at: String,
 }
 
 /// A books catalog row.

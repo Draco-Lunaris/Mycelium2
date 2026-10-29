@@ -1488,19 +1488,28 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), 202);
-    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    // The inline ingest drives the LlmClient (no `llm` row at boot → the
+    // default endpoint), whose passive hooks (llm.rs record_outcome) note
+    // the process-global LLM_HEALTH machine at the real clock — hold
+    // HEALTH_TEST_LOCK across the upload so those notes cannot land
+    // inside a health-pin test's force→assert window (llm_health.rs's
+    // guard rule; see the section comment by HEALTH_TEST_LOCK below).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
     assert_eq!(
         upload_json["status"], "done",
         "ingest ran inline: {upload_json}"
@@ -1577,17 +1586,21 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book2.md", BOOK2)),
     );
-    let second_upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            "multipart/form-data; boundary=secondboundary2",
-        )
-        .body(second_body)
-        .send()
-        .await
-        .unwrap();
+    // (Guard: inline-ingest passive health note — see the first upload.)
+    let second_upload = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=secondboundary2",
+            )
+            .body(second_body)
+            .send()
+            .await
+            .unwrap()
+    };
     assert_eq!(second_upload.status(), 202);
     // (a) Un-narrowed: BOTH books' chapters appear — the interleaved
     //     behavior, pinned so a change to the narrowing can't silently
@@ -1715,17 +1728,21 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let secret_upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            "multipart/form-data; boundary=secretboundary7",
-        )
-        .body(secret_body)
-        .send()
-        .await
-        .unwrap();
+    // (Guard: inline-ingest passive health note — see the first upload.)
+    let secret_upload = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=secretboundary7",
+            )
+            .body(secret_body)
+            .send()
+            .await
+            .unwrap()
+    };
     assert_eq!(secret_upload.status(), 202);
     let create_user = client
         .post(format!("{base}/admin/users"))
@@ -2784,19 +2801,28 @@ async fn admin_library_escapes_and_pairs_shelf_names() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
-    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    // The inline ingest drives the LlmClient (no `llm` row at boot → the
+    // default endpoint), whose passive hooks (llm.rs record_outcome) note
+    // the process-global LLM_HEALTH machine at the real clock — hold
+    // HEALTH_TEST_LOCK across the upload so those notes cannot land
+    // inside a health-pin test's force→assert window (llm_health.rs's
+    // guard rule; see the section comment by HEALTH_TEST_LOCK below).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
+        upload.json().await.unwrap()
+    };
     assert_eq!(
         upload_json["status"], "done",
         "ingest ran inline: {upload_json}"
@@ -4010,6 +4036,734 @@ async fn metrics_reports_llm_gate_lines() {
             .unwrap()
             >= 1,
         "the gate always has at least one slot"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------
+// Backend health + chat waiting surfaces (LLM outage recovery spec
+// §3.5). The two pins below FORCE the process-global `LLM_HEALTH`
+// machine, so they serialize on `HEALTH_TEST_LOCK` and restore a fresh
+// Green through `HealthDefaults` — declared after the lock guard so the
+// restore runs while the lock is still held (reverse drop order). This
+// mirrors the `TEST_LOCK` + `HealthDefaults` pattern
+// chat_sessions_integration.rs / chat_resume_integration.rs use for the
+// same global; `llm_health::health_test_guard()` itself is
+// `#[cfg(test)] pub(crate)`, so it exists only inside the librarian's
+// own unit tests and cannot link into an integration binary.
+//
+// FEEDERS on this lock: the inline-ingest uploads in
+// books_count_and_passage_reader and
+// admin_library_escapes_and_pairs_shelf_names post /api/v1/ingest,
+// which runs the catalog through the LlmClient against the default
+// endpoint (no `llm` row at boot) — the llm.rs passive hooks note this
+// global at the REAL clock on every upload (refused = failure note;
+// on an Ollama-running host, success = ok note + LLM_LAST_SUCCESS).
+// Those four uploads each hold the lock across request+response. Any
+// new LLM-driving surface added to this binary must take the lock the
+// same way (llm_health.rs's guard rule).
+//
+// READERS that do NOT take the lock: /health and /metrics on every
+// request snapshot the global server-side via system_stats, and the
+// /status + /admin/system page tests read it the same way — harmless
+// TODAY only because nothing those pages render consumes the backend_*
+// fields yet (the /status chips key off LLM_LAST_SUCCESS and the gate).
+// If Task 10's admin page starts rendering backend health, its tests
+// must join this lock.
+// ---------------------------------------------------------------------
+
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
+
+/// Serializes every test whose leg forces the process-global
+/// backend-health state OR drives a passive health note (the inline
+/// ingest uploads) — mirrors the chat integration binaries' TEST_LOCK
+/// role for this global. See the section comment above.
+static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Restores the process-global health registry to a fresh Green on
+/// drop, so a failed assertion cannot leak a forced Red/Disabled into
+/// a sibling test sharing this process.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        LLM_HEALTH.reset_for_test();
+    }
+}
+
+/// Force the global machine to Red with the outage opened `ago`
+/// seconds back: three failures stamped at `now - ago` (Red threshold
+/// 3; the first failure sets `down_since`, so the outage age pins to
+/// ~`ago`). Callers hold `HEALTH_TEST_LOCK`.
+fn force_red(ago: u64) {
+    LLM_HEALTH.reset_for_test();
+    let since = chrono::Utc::now().timestamp().max(ago as i64) as u64 - ago;
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure_at(since);
+    }
+    assert_eq!(
+        LLM_HEALTH.state(),
+        BackendState::Red,
+        "Red before the request"
+    );
+}
+
+/// Seed ONE `waiting_backend` turn row directly against the test pool
+/// (the same direct-SQL style the /status test uses, satisfying the FK
+/// chain session → seeded admin user). The row is inert here: `boot()`
+/// serves but starts no resume worker (`main.rs` owns that spawn), so
+/// nothing claims the row while the request runs.
+async fn seed_waiting_turn(pool: &sqlx::SqlitePool) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_sessions (id, user_id, title_sealed, created_at, updated_at)
+         VALUES (?, ?, 'sealed-by-nothing', ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat_turns (id, session_id, user_seq, status, attempts,
+                                 created_at, updated_at, park_state, last_error)
+         VALUES (?, ?, 1, 'waiting_backend', 0, ?, ?, 'waiting_backend', NULL)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The PUBLIC /health JSON carries the four outage-recovery fields
+/// (spec §3.5) beside the gate and queue ones: under a forced Red with
+/// a seeded waiting turn, `backend_state` is "red", `backend_down_seconds`
+/// is the outage age, `backend_checked_seconds_ago` is present, and
+/// `chat_waiting_count` counts the parked turn. Disabled reports
+/// `backend_state` "disabled" with a NULL `backend_down_seconds` —
+/// nothing-to-probe is not an outage. The degraded rule is queue/db
+/// only: an EXPLICIT non-regression pin below proves a Red backend
+/// never flips /health to degraded.
+#[tokio::test]
+async fn health_reports_backend_and_waiting_fields() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    seed_waiting_turn(&pool).await;
+    force_red(3600);
+
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(
+        health.status(),
+        200,
+        "non-regression: a Red backend must NOT degrade /health"
+    );
+    let body: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(
+        body["status"], "ok",
+        "non-regression: the degraded rule never consults backend health: {body}"
+    );
+    assert_eq!(body["backend_state"], "red", "{body}");
+    let down = body["backend_down_seconds"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("backend_down_seconds must be a number: {body}"));
+    assert!(
+        (3600..=3605).contains(&down),
+        "backend_down_seconds should be ~3600 (outage forced 3600 s back), got {down}: {body}"
+    );
+    let checked = body["backend_checked_seconds_ago"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("backend_checked_seconds_ago must be a number: {body}"));
+    assert!(
+        (3600..=3605).contains(&checked),
+        "backend_checked_seconds_ago should be ~3600 (notes stamped at now-3600), got {checked}: {body}"
+    );
+    assert_eq!(
+        body["chat_waiting_count"].as_i64(),
+        Some(1),
+        "the seeded waiting turn must be counted: {body}"
+    );
+
+    // Disabled: nothing to probe is NOT an outage — the state name and
+    // a NULL outage age, still "ok".
+    LLM_HEALTH.set_disabled();
+    let body: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "ok", "Disabled never degrades: {body}");
+    assert_eq!(body["backend_state"], "disabled", "{body}");
+    assert!(
+        body["backend_down_seconds"].is_null(),
+        "a stale down_since under Disabled must read as not-down: {body}"
+    );
+    assert_eq!(
+        body["chat_waiting_count"].as_i64(),
+        Some(1),
+        "the waiting count is not health-gated: {body}"
+    );
+
+    shutdown.cancel();
+}
+
+/// /metrics carries the three outage-recovery lines in the same
+/// `# TYPE`-then-sample shape as the rest: `mycelium2_backend_up`
+/// (0=disabled, 1=red, 2=yellow, 3=green), `mycelium2_backend_down_seconds`
+/// (0 when not down), and `mycelium2_chat_waiting_turns`. Values pinned
+/// across green → red → disabled, plus the model-call-only rule: with
+/// no LLM completion in this process (the probe never feeds
+/// `LLM_LAST_SUCCESS`), `mycelium2_llm_last_success_timestamp` stays
+/// absent.
+#[tokio::test]
+async fn metrics_reports_backend_health_lines() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    for (name, kind) in [
+        ("mycelium2_backend_up", "gauge"),
+        ("mycelium2_backend_down_seconds", "gauge"),
+        ("mycelium2_chat_waiting_turns", "gauge"),
+    ] {
+        assert!(
+            client
+                .get(format!("{base}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+                .contains(&format!("# TYPE {name} {kind}\n")),
+            "/metrics lacks the `# TYPE {name} {kind}` line"
+        );
+    }
+
+    // Green (idle process: no runs queued, so the staleness rule
+    // cannot fire) → up 3, outage age 0.
+    LLM_HEALTH.reset_for_test();
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "3",
+        "green maps to 3:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_down_seconds"),
+        "0",
+        "not down reads 0:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_chat_waiting_turns"),
+        "0",
+        "no waiting turns seeded yet:\n{text}"
+    );
+
+    // Red + one seeded waiting turn → up 1, age ~3600, count 1.
+    seed_waiting_turn(&pool).await;
+    force_red(3600);
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "1",
+        "red maps to 1:\n{text}"
+    );
+    let down: u64 = metric_sample(&text, "mycelium2_backend_down_seconds")
+        .parse()
+        .unwrap();
+    assert!(
+        (3600..=3605).contains(&down),
+        "backend_down_seconds should be ~3600, got {down}:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_chat_waiting_turns"),
+        "1",
+        "the seeded waiting turn must be exported:\n{text}"
+    );
+
+    // Disabled → up 0 and 0 again (not down), even with a stale
+    // down_since still stored.
+    LLM_HEALTH.set_disabled();
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "0",
+        "disabled maps to 0:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_down_seconds"),
+        "0",
+        "disabled is not down:\n{text}"
+    );
+
+    // The probe never feeds LLM_LAST_SUCCESS, and no LLM completion
+    // ran in this process → the model-call-only gauge stays absent.
+    assert!(
+        !text.contains("mycelium2_llm_last_success_timestamp"),
+        "llm_last_success_timestamp is model-call-only and no call ran here:\n{text}"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------
+// Task 10: the admin System page renders the backend indicator, the
+// waiting summary, and the per-item waiting table. The indicator test
+// asserts backend_* content, so — per the section rule above — it holds
+// HEALTH_TEST_LOCK with HealthDefaults declared after the guard. The
+// summary/meta test asserts no backend content, so it may read the page
+// unlocked even though admin_system_view snapshots the global
+// server-side.
+// ---------------------------------------------------------------------
+
+/// Direct-SQL user row (no UserStore validation) — needed for the
+/// `<script>` username probe, which `create_local` would reject.
+async fn seed_user_named(pool: &sqlx::SqlitePool, name: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, role, auth_provider, password_hash,
+                            sealed_master_key, must_change_password, totp_secret, created_at, updated_at)
+         VALUES (?, ?, ?, 'user', 'local', NULL, 'placeholder-sealed-master-key', 0, NULL, ?, ?)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(format!("{name}@t.local"))
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// A `waiting_backend` turn for `user_id`, aged `age_secs`, with an
+/// optional `last_error`; seeds a transcript row whose sealed payload
+/// carries `TRANSCRIPT-SECRET` so the test can pin that transcript
+/// content NEVER reaches the admin page. Returns the session id.
+async fn seed_turn_for(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    age_secs: i64,
+    last_error: Option<&str>,
+) -> String {
+    let now = chrono::Utc::now();
+    let aged = (now - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_sessions (id, user_id, title_sealed, created_at, updated_at)
+         VALUES (?, ?, 'sealed-by-nothing', ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(user_id)
+    .bind(&aged)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_turns (id, session_id, user_seq, status, attempts,
+                                 created_at, updated_at, park_state, last_error)
+         VALUES (?, ?, 1, 'waiting_backend', 0, ?, ?, 'waiting_backend', ?)",
+    )
+    .bind(&turn_id)
+    .bind(&session_id)
+    .bind(&aged)
+    .bind(&aged)
+    .bind(last_error)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat_messages (session_id, seq, role, content_sealed, created_at)
+         VALUES (?, 1, 'user', 'TRANSCRIPT-SECRET', ?)",
+    )
+    .bind(&session_id)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+    session_id
+}
+
+/// A pending mutation-queue row (metadata only — no payload) for
+/// `user_id`, aged `age_secs`.
+async fn seed_pending_queue_row(pool: &sqlx::SqlitePool, user_id: &str, age_secs: i64) {
+    let aged = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail,
+                                     created_at, updated_at, next_retry_at, final_paths)
+         VALUES (?, ?, 'add', 'pending', 0, '', ?, ?, NULL, NULL)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(&aged)
+    .bind(&aged)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A pending ingest job on a fresh shelf + book (FK chain like the
+/// /status test's seed).
+async fn seed_pending_ingest(pool: &sqlx::SqlitePool, user_id: &str, slug: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let shelf_id = uuid::Uuid::new_v4().to_string();
+    let book_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO bookshelves (id, name, created_at) VALUES (?, ?, ?)")
+        .bind(&shelf_id)
+        .bind(format!("shelf-{slug}"))
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO books (id, bookshelf_id, slug, title, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&book_id)
+    .bind(&shelf_id)
+    .bind(slug)
+    .bind(format!("Book {slug}"))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ingest_jobs (id, bookshelf_id, book_id, requested_by_user_id, status, detail, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'pending', '', ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&shelf_id)
+    .bind(&book_id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Extract the waiting-summary sentence (the muted paragraph ending
+/// in the resume promise) from a rendered /admin/system page.
+fn summary_sentence(html: &str) -> &str {
+    let tail = " waiting — they will resume automatically when the backend returns.";
+    let idx = html.find(tail).expect("summary sentence present");
+    let open = r#"<p class="muted">"#;
+    let start = html[..idx].rfind(open).expect("summary paragraph opens") + open.len();
+    &html[start..idx]
+}
+
+/// The /admin/system page under a forced Red with waiting work: the
+/// indicator carries the state's dot class, an `aria-label`, and a
+/// visible state word (not color alone); the summary line reads
+/// exactly as pinned when both kinds are non-zero; the waiting table
+/// shows metadata (username, kind, waited time, last_error) for the
+/// seeded turn, queue row, and pending ingest job — HTML-escaped, with
+/// NO transcript content; and the page self-refreshes every 30 s,
+/// which `/admin/llm` must not do. Also pins Disabled (dot class +
+/// no outage age) on the same forced clock.
+#[tokio::test]
+async fn admin_system_backend_indicator_and_waiting_table() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Hostile owner for one chat turn, the queue rows, and the ingest
+    // job; the admin owns the other two turns.
+    let hostile = seed_user_named(&pool, "<script>alert(1)</script>").await;
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    seed_turn_for(&pool, &admin_id, 7200, Some("LLM refused the connection")).await;
+    seed_turn_for(&pool, &admin_id, 60, None).await;
+    seed_turn_for(&pool, &hostile, 60, None).await;
+    seed_pending_queue_row(&pool, &hostile, 60).await;
+    seed_pending_queue_row(&pool, &hostile, 30).await;
+    seed_pending_ingest(&pool, &hostile, "waiting-book").await;
+
+    force_red(3600);
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // 1. Indicator: dot class per state + aria-label + visible word.
+    assert!(
+        html.contains(r#"health-dot health-dot--red"#),
+        "red health dot missing: {html}"
+    );
+    assert!(
+        html.contains(r#"aria-label="Backend health: red""#),
+        "indicator aria-label missing: {html}"
+    );
+    assert!(
+        html.contains("Backend red"),
+        "visible state word missing: {html}"
+    );
+    // Outage age ~3600 s: "1h 0m", or "1h 1m" if a second boundary
+    // slipped between forcing and the request (the same ~5 s slack
+    // the /health pins tolerate).
+    assert!(
+        html.contains("down for 1h 0m") || html.contains("down for 1h 1m"),
+        "outage age (~3600 s) missing: {html}"
+    );
+    assert!(
+        html.contains("last checked"),
+        "last-check age missing: {html}"
+    );
+
+    // 2. Summary line — exact, both kinds non-zero (3 turns + 2 writes).
+    assert!(
+        html.contains(
+            "3 chat turns and 2 queued writes waiting — they will resume automatically when the backend returns."
+        ),
+        "exact mixed summary missing: {html}"
+    );
+
+    // 3. Waiting table — metadata cells only, escaped, no transcript.
+    assert!(
+        html.contains(r#"<td data-label="User">&lt;script&gt;alert(1)&lt;/script&gt;</td>"#),
+        "hostile username must render escaped: {html}"
+    );
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "raw script probe leaked: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">chat turn</td>"#),
+        "chat-turn kind cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">queued write</td>"#),
+        "queued-write kind cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Kind">ingest job</td>"#),
+        "ingest-job kind cell missing: {html}"
+    );
+    assert!(
+        html.contains("waiting-book"),
+        "ingest slug cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="State">waiting_backend</td>"#),
+        "turn state cell missing: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Waited">2h 0m</td>"#),
+        "7200 s turn should read 2h 0m: {html}"
+    );
+    assert!(
+        html.contains("LLM refused the connection"),
+        "last_error text missing: {html}"
+    );
+    assert!(
+        !html.contains("TRANSCRIPT-SECRET"),
+        "transcript content must never reach the admin page: {html}"
+    );
+
+    // 4. 30 s meta refresh on /admin/system ONLY.
+    assert!(
+        html.contains(r#"<meta http-equiv="refresh" content="30">"#),
+        "30 s refresh meta missing on /admin/system: {html}"
+    );
+    let llm_html = client
+        .get(format!("{base}/admin/llm"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        llm_html.contains("LLM backend"),
+        "sanity: /admin/llm renders"
+    );
+    assert!(
+        !llm_html.contains(r#"<meta http-equiv="refresh""#),
+        "refresh meta must NOT appear on /admin/llm: {llm_html}"
+    );
+
+    // 5. Disabled: the dot + word follow the state, and a frozen
+    //    down_since reads as NOT an outage (no "down for" clause).
+    LLM_HEALTH.set_disabled();
+    let html = client
+        .get(format!("{base}/admin/system"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains(r#"health-dot health-dot--disabled"#),
+        "disabled dot missing: {html}"
+    );
+    assert!(
+        html.contains("Backend disabled"),
+        "disabled state word missing: {html}"
+    );
+    assert!(
+        !html.contains("down for"),
+        "Disabled is not an outage: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The summary line drops a part when its kind's count is zero:
+/// chat-only, then mixed (exact when both), then queue-only, then
+/// nothing at all (no sentence). Asserts no backend content, so it
+/// runs unlocked (the page's server-side snapshot read is harmless —
+/// the summary and table are health-independent).
+#[tokio::test]
+async fn admin_system_summary_drops_zero_parts() {
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let get_system = || {
+        let client = client.clone();
+        let base = base.clone();
+        let cookie = cookie.clone();
+        async move {
+            client
+                .get(format!("{base}/admin/system"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Chat-only: the queued-writes part is dropped. (The LLM card's
+    // helper text mentions "chat turns" too, so the part-drop checks
+    // scope to the summary sentence itself, never the whole page.)
+    seed_turn_for(&pool, &admin_id, 60, None).await;
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "1 chat turn",
+        "chat-only summary wrong: {html}"
+    );
+
+    // Mixed: exact two-part sentence (singular chat part).
+    seed_pending_queue_row(&pool, &admin_id, 60).await;
+    seed_pending_queue_row(&pool, &admin_id, 30).await;
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "1 chat turn and 2 queued writes",
+        "mixed summary wrong: {html}"
+    );
+
+    // Queue-only: the chat part drops once the turn is terminal.
+    sqlx::query("UPDATE chat_turns SET status = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let html = get_system().await;
+    assert_eq!(
+        summary_sentence(&html),
+        "2 queued writes",
+        "queue-only summary wrong: {html}"
+    );
+
+    // Nothing waiting: no sentence at all.
+    sqlx::query("UPDATE mutation_queue SET status = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let html = get_system().await;
+    assert!(
+        !html.contains("they will resume automatically when the backend returns"),
+        "no waiting items means no summary sentence: {html}"
     );
 
     shutdown.cancel();

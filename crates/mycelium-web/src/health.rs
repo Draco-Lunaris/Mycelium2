@@ -51,6 +51,12 @@ pub(crate) fn oldest_degraded_at_secs() -> i64 {
 /// as the three gauges beside it; it is DELIBERATELY not reported by
 /// the `/health` JSON, whose gate fields stay the three spec §4.2
 /// gauges.
+///
+/// The backend-health fields (`backend_*`, outage recovery spec §3.5)
+/// come from ONE `LLM_HEALTH.snapshot()` read per request. Like the
+/// gate fields they are observability only: no degraded rule consults
+/// them — an unhealthy backend is weather the queue and chat surfaces
+/// absorb, not illness of THIS service.
 pub struct SystemStats {
     pub user_count: i64,
     pub queue_depth: i64,
@@ -61,6 +67,24 @@ pub struct SystemStats {
     pub llm_queued: i64,
     pub llm_capacity: i64,
     pub llm_timeouts_total: i64,
+    /// The reported backend state name (`BackendState::as_str`:
+    /// disabled/green/yellow/red).
+    pub backend_state: &'static str,
+    /// Seconds since the outage opened (the registry's `down_since`);
+    /// `None` while not down — Green clears it, and a Disabled
+    /// machine's frozen clock is NOT an active outage.
+    pub backend_down_seconds: Option<i64>,
+    /// Seconds since the last health observation (probe or model-call
+    /// note); `None` when none was ever made. NOT gated on Disabled
+    /// like `backend_down_seconds`: a Disabled machine's frozen last
+    /// observation passes through as-is — "when health was last
+    /// actually checked" is a fact, not an outage claim, so a renderer
+    /// must not read it as a live liveness tick.
+    pub backend_checked_seconds_ago: Option<i64>,
+    /// Turns parked `waiting_backend` or crash-interrupted and never
+    /// claimed (`ChatStore::waiting_turn_count`; zeroed on read failure
+    /// like the queue fields).
+    pub chat_waiting_count: i64,
     pub db_ok: bool,
 }
 
@@ -92,6 +116,24 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
     // ONE gate read per request (spec §3.6): a short internal mutex
     // acquisition, no I/O, shared by every field below.
     let gate = mycelium_librarian::llm_gate::LLM_GATE.stats();
+    // Backend health (outage recovery spec §3.5): ONE snapshot read,
+    // mutex-only, no I/O. Both backend ages derive from the single
+    // `now` below (llm_last_success_seconds above reads its own clock;
+    // the instants are µs apart). A Disabled machine's down_since is
+    // FROZEN (notes are ignored while pinned), not an active outage —
+    // disabled is "nothing to probe", so it reads as not-down.
+    let now = chrono::Utc::now().timestamp();
+    let health = mycelium_librarian::llm_health::LLM_HEALTH.snapshot();
+    let backend_down_seconds =
+        if health.state == mycelium_librarian::llm_health::BackendState::Disabled {
+            None
+        } else {
+            health.down_since.map(|ts| now - ts as i64)
+        };
+    let backend_checked_seconds_ago = health.checked_at.map(|ts| now - ts as i64);
+    // Chat waiting turns (same zero-on-failure convention as the queue
+    // fields: db_ok already reports an unreachable store).
+    let chat_waiting_count = state.chat_sessions.waiting_turn_count().await.unwrap_or(0);
     SystemStats {
         user_count,
         queue_depth,
@@ -102,6 +144,10 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
         llm_queued: gate.queued as i64,
         llm_capacity: gate.capacity as i64,
         llm_timeouts_total: gate.timeouts_total as i64,
+        backend_state: health.state.as_str(),
+        backend_down_seconds,
+        backend_checked_seconds_ago,
+        chat_waiting_count,
         db_ok,
     }
 }
@@ -144,6 +190,10 @@ async fn health(State(state): State<AppState>) -> Response {
             "llm_active": stats.llm_active,
             "llm_queued": stats.llm_queued,
             "llm_capacity": stats.llm_capacity,
+            "backend_state": stats.backend_state,
+            "backend_down_seconds": stats.backend_down_seconds,
+            "backend_checked_seconds_ago": stats.backend_checked_seconds_ago,
+            "chat_waiting_count": stats.chat_waiting_count,
         })),
     )
         .into_response()
@@ -294,7 +344,43 @@ async fn metrics(State(state): State<AppState>) -> Response {
         "# TYPE mycelium2_llm_gate_wait_count counter\nmycelium2_llm_gate_wait_count {}",
         gate.wait_count
     );
+    // Backend health (outage recovery spec §3.5). ONE snapshot read
+    // feeds both lines. `backend_up` is a four-state gauge:
+    // 0=disabled, 1=red, 2=yellow, 3=green. `backend_down_seconds` is
+    // 0 when not down — Green clears down_since, and Disabled's frozen
+    // clock is "nothing to probe", not an outage.
+    let health = mycelium_librarian::llm_health::LLM_HEALTH.snapshot();
+    let up = match health.state {
+        mycelium_librarian::llm_health::BackendState::Disabled => 0,
+        mycelium_librarian::llm_health::BackendState::Red => 1,
+        mycelium_librarian::llm_health::BackendState::Yellow => 2,
+        mycelium_librarian::llm_health::BackendState::Green => 3,
+    };
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_backend_up gauge\nmycelium2_backend_up {up}"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let down_seconds = if health.state == mycelium_librarian::llm_health::BackendState::Disabled {
+        0
+    } else {
+        health.down_since.map_or(0, |ts| now - ts as i64)
+    };
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_backend_down_seconds gauge\nmycelium2_backend_down_seconds {down_seconds}"
+    );
+    // Chat turns owed an answer (weather-parked + unclaimed crash),
+    // zeroed on read failure like the queue surfaces beside it.
+    let chat_waiting = state.chat_sessions.waiting_turn_count().await.unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_chat_waiting_turns gauge\nmycelium2_chat_waiting_turns {chat_waiting}"
+    );
     // Absent until the first LLM success (spec §4.3); 0 means none yet.
+    // Model-call-only by design: the health probe never feeds it, so a
+    // reachable-but-completion-less backend never looks "recently
+    // successful" here.
     let llm = mycelium_librarian::llm::LLM_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed);
     if llm > 0 {
         let _ = writeln!(

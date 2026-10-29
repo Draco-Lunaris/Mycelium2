@@ -15,11 +15,13 @@
 //! `pool.begin()`. Every user-facing query filters `chat_sessions.user_id`
 //! — a foreign session id is indistinguishable from an unknown one.
 //!
-//! Turn state machine (spec D3/D6/D8): exactly one `running` turn per
-//! session (unique partial index — a second `create_turn` is a
-//! `Conflict`); a boot sweep marks running turns `interrupted` (the
-//! resume worker claims those once: `interrupted` with `attempts = 0`);
-//! a new submit supersedes a resumable interrupted turn → `abandoned`.
+//! Turn state machine (spec D3/D6/D8 + §3.3): exactly one `running`
+//! turn per session (unique partial index — a second `create_turn` is a
+//! `Conflict`); a boot sweep re-parks running turns to their
+//! `park_state` provenance (crash resumes → `interrupted`, claimed
+//! once with `attempts = 0`; weather claims → `waiting_backend`,
+//! retried unboundedly); a new submit supersedes an unanswered turn
+//! (resumable interrupted or `waiting_backend`) → `abandoned`.
 
 use mycelium_crypto::CryptoError;
 use mycelium_crypto::chat_keys::{ChatKeys, open_chat, seal_chat};
@@ -72,6 +74,9 @@ pub enum ChatTurnStatus {
     Failed,
     Interrupted,
     Abandoned,
+    /// Parked while the LLM backend is down (spec §3.3): retried
+    /// unboundedly by the resume worker, never a permanent verdict.
+    WaitingBackend,
 }
 
 impl ChatTurnStatus {
@@ -82,6 +87,7 @@ impl ChatTurnStatus {
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
             Self::Abandoned => "abandoned",
+            Self::WaitingBackend => "waiting_backend",
         }
     }
 
@@ -93,6 +99,7 @@ impl ChatTurnStatus {
             "failed" => Some(Self::Failed),
             "interrupted" => Some(Self::Interrupted),
             "abandoned" => Some(Self::Abandoned),
+            "waiting_backend" => Some(Self::WaitingBackend),
             _ => None,
         }
     }
@@ -122,6 +129,24 @@ pub struct ChatTurnRow {
     pub user_seq: i64,
     pub status: ChatTurnStatus,
     pub attempts: i32,
+    /// Turn age (RFC 3339): the resume worker sorts the merged
+    /// resumable+waiting supplies by it, and the admin table renders
+    /// waited-seconds from it.
+    pub created_at: String,
+}
+
+/// One row of the admin waiting-turn scan (`admin_waiting_turns`
+/// output). Metadata only — no key material, no transcript content.
+#[derive(Debug, Clone)]
+pub struct AdminWaitingTurn {
+    pub turn_id: Uuid,
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub username: String,
+    pub status: ChatTurnStatus,
+    pub attempts: i32,
+    pub created_at: String,
+    pub last_error: Option<String>,
 }
 
 /// Session metadata for the JS liveness poll (`session_meta` output).
@@ -132,8 +157,8 @@ pub struct ChatSessionMeta {
     /// The session's latest non-abandoned turn's status; None when the
     /// session has no interesting turn.
     pub turn_status: Option<ChatTurnStatus>,
-    /// The latest turn is `interrupted` with `attempts = 0` — the resume
-    /// worker may still claim it.
+    /// The latest turn is `interrupted` with `attempts = 0`, or
+    /// `waiting_backend` — the resume worker may still claim it.
     pub turn_resumable: bool,
     /// `MAX(seq)` over the transcript (the `?after=` cursor base).
     pub max_seq: i64,
@@ -164,9 +189,24 @@ fn now() -> String {
 
 /// Raw `chat_turns` row shape for `query_as` (one field per column, in
 /// SELECT order).
-type TurnRowRaw = (String, String, i64, String, i32);
+type TurnRowRaw = (String, String, i64, String, i32, String);
 
-fn turn_row((id, session_id, user_seq, status, attempts): TurnRowRaw) -> Result<ChatTurnRow> {
+/// Raw admin-scan row shape for `admin_waiting_turns`' `query_as` (one
+/// field per column, in SELECT order).
+type AdminTurnRowRaw = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    String,
+    Option<String>,
+);
+
+fn turn_row(
+    (id, session_id, user_seq, status, attempts, created_at): TurnRowRaw,
+) -> Result<ChatTurnRow> {
     Ok(ChatTurnRow {
         id: Uuid::parse_str(&id).map_err(|_| sqlx::Error::Decode("bad chat turn id".into()))?,
         session_id: Uuid::parse_str(&session_id)
@@ -175,6 +215,7 @@ fn turn_row((id, session_id, user_seq, status, attempts): TurnRowRaw) -> Result<
         status: ChatTurnStatus::from_str(&status)
             .ok_or_else(|| sqlx::Error::Decode(format!("bad turn status {status}").into()))?,
         attempts,
+        created_at,
     })
 }
 
@@ -222,8 +263,9 @@ impl ChatStore {
     ///
     /// When the user is at the session cap, the oldest prunable session
     /// is deleted first: newest-by-`updated_at`, skipping sessions with
-    /// a `running` turn or a resumable (`interrupted`, `attempts = 0`)
-    /// turn — never delete a session whose turn still owes an answer.
+    /// a `running` turn, a resumable (`interrupted`, `attempts = 0`)
+    /// turn, or a `waiting_backend` turn — never delete a session whose
+    /// turn still owes an answer.
     pub async fn create_session(
         &self,
         user_id: Uuid,
@@ -243,9 +285,10 @@ impl ChatStore {
             .await?;
         let cap = i64::try_from(MAX_SESSIONS_PER_USER).unwrap_or(i64::MAX);
         if count >= cap {
-            // Prunable: no running turn, no resumable interrupted turn.
-            // The `updated_at` ASC ordering + NOT EXISTS guard picks
-            // exactly the oldest debt-free sessions.
+            // Prunable: no running turn, no resumable interrupted turn,
+            // no waiting_backend turn. The `updated_at` ASC ordering +
+            // NOT EXISTS guard picks exactly the oldest debt-free
+            // sessions.
             sqlx::query(
                 "DELETE FROM chat_sessions WHERE id IN (
                     SELECT s.id FROM chat_sessions s
@@ -254,7 +297,8 @@ impl ChatStore {
                           SELECT 1 FROM chat_turns t
                           WHERE t.session_id = s.id
                             AND (t.status = 'running'
-                                 OR (t.status = 'interrupted' AND t.attempts = 0))
+                                 OR (t.status = 'interrupted' AND t.attempts = 0)
+                                 OR t.status = 'waiting_backend')
                       )
                     ORDER BY s.updated_at ASC
                     LIMIT ?
@@ -342,7 +386,8 @@ impl ChatStore {
         let turn = self.latest_turn(user_id, session_id).await?;
         let (turn_status, turn_resumable) = match turn {
             Some(t) if t.status != ChatTurnStatus::Abandoned => {
-                let resumable = t.status == ChatTurnStatus::Interrupted && t.attempts == 0;
+                let resumable = (t.status == ChatTurnStatus::Interrupted && t.attempts == 0)
+                    || t.status == ChatTurnStatus::WaitingBackend;
                 (Some(t.status), resumable)
             }
             _ => (None, false),
@@ -431,11 +476,13 @@ impl ChatStore {
             .collect())
     }
 
-    /// Submit a user message: ONE transaction that supersedes resumable
-    /// interrupted turns (D8), inserts the user message (seq =
-    /// `MAX(seq)+1`, bumping the session's `updated_at`), and inserts
-    /// the `running` turn. The unique partial index on running turns is
-    /// the double-submit guard → `Conflict`.
+    /// Submit a user message: ONE transaction that supersedes the
+    /// session's unanswered turns — resumable interrupted and
+    /// `waiting_backend` (D8: the new message replaces the old ask
+    /// either way) — inserts the user message (seq = `MAX(seq)+1`,
+    /// bumping the session's `updated_at`), and inserts the `running`
+    /// turn. The unique partial index on running turns is the
+    /// double-submit guard → `Conflict`.
     pub async fn create_turn(
         &self,
         user_id: Uuid,
@@ -455,12 +502,17 @@ impl ChatStore {
         if owned.is_none() {
             return Err(ChatError::NotFound);
         }
-        // (a) Supersede any resumable interrupted turn of this session.
-        sqlx::query("UPDATE chat_turns SET status = 'abandoned', updated_at = ? WHERE session_id = ? AND status = 'interrupted'")
-            .bind(now())
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+        // (a) Supersede any unanswered turn of this session: resumable
+        // interrupted turns and waiting_backend turns alike (D8 — the
+        // new message replaces the old ask either way).
+        sqlx::query(
+            "UPDATE chat_turns SET status = 'abandoned', updated_at = ?
+             WHERE session_id = ? AND status IN ('interrupted', 'waiting_backend')",
+        )
+        .bind(now())
+        .bind(session_id.to_string())
+        .execute(&mut *tx)
+        .await?;
         // (b) Insert the user message: assign seq inside the tx, seal
         // the content with the assigned seq as AAD, bump updated_at.
         let max_seq: Option<i64> =
@@ -518,6 +570,7 @@ impl ChatStore {
             user_seq: seq,
             status: ChatTurnStatus::Running,
             attempts: 0,
+            created_at: ts,
         })
     }
 
@@ -575,8 +628,10 @@ impl ChatStore {
 
     /// Atomically resume an interrupted turn (resume worker input): the
     /// conditional UPDATE is the once-guard — exactly the first claimer
-    /// wins (`attempts` 0 → 1). `Ok(false)` = already claimed, resumed
-    /// a second time, not interrupted, or not owned.
+    /// wins (`attempts` 0 → 1) and stamps `park_state = 'interrupted'`
+    /// so the boot sweep re-parks a mid-flight crash back to
+    /// `interrupted` (provenance rule, spec §3.3). `Ok(false)` = already
+    /// claimed, resumed a second time, not interrupted, or not owned.
     pub async fn claim_resumable(
         &self,
         user_id: Uuid,
@@ -585,7 +640,7 @@ impl ChatStore {
     ) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE chat_turns
-             SET status = 'running', attempts = attempts + 1, updated_at = ?
+             SET status = 'running', attempts = attempts + 1, park_state = 'interrupted', updated_at = ?
              WHERE id = ? AND session_id = ?
                AND status = 'interrupted' AND attempts = 0
                AND session_id IN (SELECT id FROM chat_sessions WHERE id = ? AND user_id = ?)",
@@ -646,12 +701,97 @@ impl ChatStore {
         Ok(())
     }
 
-    /// Boot sweep: every `running` turn becomes `interrupted` (a dead
-    /// process cannot finalize). Returns the number of turns swept.
-    /// NOT user-scoped — the runner at boot iterates everything it owns.
+    /// Park a running turn as `waiting_backend` (the backend is down —
+    /// weather, not a verdict, spec §3.3): records `last_error`
+    /// (overwritten on each park) and NOTHING else. Never touches
+    /// `attempts` or `park_state` (parking is not a claim), never
+    /// writes a `chat_messages` row (re-parking during a long outage
+    /// must not append duplicate error rows — D4's one-error-row rule
+    /// is a property of terminal paths only).
+    ///
+    /// Conditional on `status = 'running'` and idempotent like
+    /// `finalize_turn`: a re-park of an already-waiting turn no-ops
+    /// (the record stays what the first park wrote); an unknown/foreign
+    /// turn is `NotFound`.
+    pub async fn park_waiting(
+        &self,
+        user_id: Uuid,
+        turn_id: Uuid,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE chat_turns
+             SET status = 'waiting_backend', last_error = ?, updated_at = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND session_id IN (SELECT id FROM chat_sessions WHERE id = chat_turns.session_id AND user_id = ?)",
+        )
+        .bind(last_error)
+        .bind(now())
+        .bind(turn_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            // Idempotent no-op vs. unknown/foreign: distinguish by
+            // whether the turn row exists under this user at all (the
+            // finalize_turn pattern).
+            let exists: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM chat_turns t
+                 JOIN chat_sessions s ON s.id = t.session_id
+                 WHERE t.id = ? AND s.user_id = ?",
+            )
+            .bind(turn_id.to_string())
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+            if exists.is_none() {
+                return Err(ChatError::NotFound);
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically claim a waiting turn (resume worker input during a
+    /// weather pass): like `claim_resumable` but conditional on
+    /// `status = 'waiting_backend'`, stamps `park_state =
+    /// 'waiting_backend'` (provenance rule — a mid-flight crash re-
+    /// parks to waiting, not interrupted), and does NOT touch
+    /// `attempts`: waiting turns retry unboundedly; backend-down costs
+    /// nothing. `Ok(false)` = already claimed, not waiting, or not
+    /// owned.
+    pub async fn claim_waiting(
+        &self,
+        user_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE chat_turns
+             SET status = 'running', park_state = 'waiting_backend', updated_at = ?
+             WHERE id = ? AND session_id = ?
+               AND status = 'waiting_backend'
+               AND session_id IN (SELECT id FROM chat_sessions WHERE id = ? AND user_id = ?)",
+        )
+        .bind(now())
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Boot sweep: every `running` turn re-parks to its `park_state`
+    /// (a dead process cannot finalize; the provenance rule — a
+    /// weather-claim kill lands back in `waiting_backend`, a
+    /// crash-resume kill back in `interrupted`). Returns the number of
+    /// turns swept. NOT user-scoped — the runner at boot iterates
+    /// everything it owns.
     pub async fn boot_sweep(&self) -> Result<u64> {
         let res = sqlx::query(
-            "UPDATE chat_turns SET status = 'interrupted', updated_at = ?
+            "UPDATE chat_turns SET status = park_state, updated_at = ?
              WHERE status = 'running'",
         )
         .bind(now())
@@ -664,8 +804,8 @@ impl ChatStore {
     /// `attempts = 0`), oldest first. NOT user-scoped — the resume
     /// worker iterates users; it recovers keys per user before claiming.
     pub async fn resumable_turns(&self) -> Result<Vec<(Uuid, ChatTurnRow)>> {
-        let rows: Vec<(String, String, i64, String, i32, String)> = sqlx::query_as(
-            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts, s.user_id
+        let rows: Vec<(String, String, i64, String, i32, String, String)> = sqlx::query_as(
+            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts, s.user_id, t.created_at
              FROM chat_turns t
              JOIN chat_sessions s ON s.id = t.session_id
              WHERE t.status = 'interrupted' AND t.attempts = 0
@@ -674,12 +814,40 @@ impl ChatStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, session_id, user_seq, status, attempts, user_id)| {
-                let user_id = Uuid::parse_str(&user_id)
-                    .map_err(|_| sqlx::Error::Decode("bad chat session user_id".into()))?;
-                let row = turn_row((id, session_id, user_seq, status, attempts))?;
-                Ok((user_id, row))
-            })
+            .map(
+                |(id, session_id, user_seq, status, attempts, user_id, created_at)| {
+                    let user_id = Uuid::parse_str(&user_id)
+                        .map_err(|_| sqlx::Error::Decode("bad chat session user_id".into()))?;
+                    let row = turn_row((id, session_id, user_seq, status, attempts, created_at))?;
+                    Ok((user_id, row))
+                },
+            )
+            .collect()
+    }
+
+    /// Every waiting turn across all users (`waiting_backend`), oldest
+    /// first. The weather counterpart of `resumable_turns` — the two
+    /// are separate supplies; the resume worker concatenates and sorts
+    /// by `created_at`. NOT user-scoped for the same reason.
+    pub async fn waiting_turns(&self) -> Result<Vec<(Uuid, ChatTurnRow)>> {
+        let rows: Vec<(String, String, i64, String, i32, String, String)> = sqlx::query_as(
+            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts, s.user_id, t.created_at
+             FROM chat_turns t
+             JOIN chat_sessions s ON s.id = t.session_id
+             WHERE t.status = 'waiting_backend'
+             ORDER BY t.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, session_id, user_seq, status, attempts, user_id, created_at)| {
+                    let user_id = Uuid::parse_str(&user_id)
+                        .map_err(|_| sqlx::Error::Decode("bad chat session user_id".into()))?;
+                    let row = turn_row((id, session_id, user_seq, status, attempts, created_at))?;
+                    Ok((user_id, row))
+                },
+            )
             .collect()
     }
 
@@ -690,8 +858,8 @@ impl ChatStore {
         user_id: Uuid,
         session_id: Uuid,
     ) -> Result<Option<ChatTurnRow>> {
-        let rows: Vec<(String, String, i64, String, i32)> = sqlx::query_as(
-            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts
+        let rows: Vec<TurnRowRaw> = sqlx::query_as(
+            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts, t.created_at
              FROM chat_turns t
              JOIN chat_sessions s ON s.id = t.session_id
              WHERE t.session_id = ? AND s.user_id = ? AND t.status = 'running'",
@@ -711,8 +879,8 @@ impl ChatStore {
         user_id: Uuid,
         session_id: Uuid,
     ) -> Result<Option<ChatTurnRow>> {
-        let rows: Vec<(String, String, i64, String, i32)> = sqlx::query_as(
-            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts
+        let rows: Vec<TurnRowRaw> = sqlx::query_as(
+            "SELECT t.id, t.session_id, t.user_seq, t.status, t.attempts, t.created_at
              FROM chat_turns t
              JOIN chat_sessions s ON s.id = t.session_id
              WHERE t.session_id = ? AND s.user_id = ?
@@ -723,6 +891,62 @@ impl ChatStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().next().map(turn_row).transpose()
+    }
+
+    /// Admin scan: every turn that is still owed an answer for reasons
+    /// the backend owes — `waiting_backend` (weather) or `interrupted`
+    /// with `attempts = 0` (crash-resume budget unspent) — oldest
+    /// first, with the owner's username joined from `users`. Metadata
+    /// only: no key material, no transcript content (`last_error` is
+    /// unsealed failure metadata the runner wrote per the bounded
+    /// `short_detail` convention).
+    pub async fn admin_waiting_turns(&self) -> Result<Vec<AdminWaitingTurn>> {
+        let rows: Vec<AdminTurnRowRaw> = sqlx::query_as(
+            "SELECT t.id, t.session_id, s.user_id, u.username, t.status, t.attempts,
+                    t.created_at, t.last_error
+             FROM chat_turns t
+             JOIN chat_sessions s ON s.id = t.session_id
+             JOIN users u ON u.id = s.user_id
+             WHERE t.status = 'waiting_backend'
+                OR (t.status = 'interrupted' AND t.attempts = 0)
+             ORDER BY t.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, session_id, user_id, username, status, attempts, created_at, last_error)| {
+                    Ok(AdminWaitingTurn {
+                        turn_id: Uuid::parse_str(&id)
+                            .map_err(|_| sqlx::Error::Decode("bad chat turn id".into()))?,
+                        session_id: Uuid::parse_str(&session_id)
+                            .map_err(|_| sqlx::Error::Decode("bad chat turn session_id".into()))?,
+                        user_id: Uuid::parse_str(&user_id)
+                            .map_err(|_| sqlx::Error::Decode("bad chat session user_id".into()))?,
+                        username,
+                        status: ChatTurnStatus::from_str(&status).ok_or_else(|| {
+                            sqlx::Error::Decode(format!("bad turn status {status}").into())
+                        })?,
+                        attempts,
+                        created_at,
+                        last_error,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Count of the turns the admin scan lists (the same WHERE) — the
+    /// health/metrics gauge. NOT user-scoped.
+    pub async fn waiting_turn_count(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_turns
+             WHERE status = 'waiting_backend'
+                OR (status = 'interrupted' AND attempts = 0)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
     }
 }
 
@@ -752,6 +976,7 @@ mod tests {
             ("failed", ChatTurnStatus::Failed),
             ("interrupted", ChatTurnStatus::Interrupted),
             ("abandoned", ChatTurnStatus::Abandoned),
+            ("waiting_backend", ChatTurnStatus::WaitingBackend),
         ] {
             assert_eq!(status.as_str(), v);
             assert_eq!(ChatTurnStatus::from_str(v), Some(status));

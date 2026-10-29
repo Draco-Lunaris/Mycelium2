@@ -1,13 +1,38 @@
-//! The chat resume worker (chat session history spec §3.4): completes
-//! chat turns interrupted by a server restart, each exactly ONCE.
+//! The chat resume worker (chat session history spec §3.4, dual-supply
+//! per LLM outage recovery spec §3.3): completes turns owed an answer —
+//! crash-interrupted ones each exactly ONCE, backend-down-parked ones
+//! as often as the backend takes to come back.
 //!
-//! Resumable turns only ever appear at boot — the boot sweep (called
-//! once by main.rs BEFORE this worker spawns) flips every `running`
-//! turn to `interrupted` with `attempts = 0` — so the wake loop is a
-//! plain 60 s tick with NO enqueue Notify (the resume supply is not
-//! event-driven; the tick absorbs key-recovery latency). Each pass
-//! walks resumable turns oldest-first, grouped by user, through three
-//! gates before a run is ever spawned:
+//! Crash-resumable turns only ever appear at boot — the boot sweep
+//! (called once by main.rs BEFORE this worker spawns) flips every
+//! `running` turn to its `park_state` — so the wake loop is a plain
+//! 60 s tick with NO enqueue Notify (the resume supply is not
+//! event-driven; the tick absorbs key-recovery latency, and it is also
+//! what retries parked weather turns after an outage lifts). Each pass
+//! merges both supplies oldest-first, grouped by user, through the
+//! health gate and then three per-turn gates before a run is ever
+//! spawned:
+//!
+//! Before any of that, one **health gate** (outage recovery spec §3.3):
+//! a `Red` backend (known outage) or `Disabled` (no configured backend —
+//! claim-then-fail-fast would strand the weather provenance and write
+//! the error row the parking rules forbid) skips the WHOLE pass: no
+//! claims, zero LLM cost, and the turns of both supplies idle untouched
+//! until the backend is worth resuming into. Weather turns retry
+//! unboundedly, so the pause costs them nothing. `Yellow` proceeds — a
+//! flap is not an outage.
+//!
+//! The supply is DUAL (spec §3.3): one pass merges `resumable_turns`
+//! (crash: `interrupted` + `attempts = 0`) with `waiting_turns` (the
+//! backend-down parking pool), oldest-first by `created_at`, then
+//! groups by user as before. Per turn the claim dispatches by status —
+//! `Interrupted ⇒ claim_resumable` (the once-guard), `WaitingBackend ⇒
+//! claim_waiting` (no attempts touched — weather never spends the
+//! crash budget). A resumed run that finds the backend down again
+//! parks itself back through the runner's own parking path, so this
+//! worker is the "periodically retry, not just on first boot" engine.
+//!
+//! Per-turn gates:
 //!
 //! 1. **Key gate** — `master_key_for` (cache → service-key seal
 //!    recovery); on error the WHOLE user's turns are skipped this pass
@@ -16,25 +41,29 @@
 //!    None the turn is skipped unclaimed (interactive use wins — the
 //!    Phase-11 query-priority invariant; nothing is ever held while
 //!    waiting: try_enter comes BEFORE the claim).
-//! 3. **Claim gate** — `claim_resumable` (the store's atomic
-//!    attempts-guard, 0 → 1); on `false` the turn was raced or already
-//!    claimed — skipped.
+//! 3. **Claim gate** — the status-dispatched claim (`claim_resumable`
+//!    / `claim_waiting`, both atomic conditional UPDATEs); on `false`
+//!    the turn was raced or already claimed — skipped.
 //!
 //! Claimed turns run through the SAME detached runner
 //! (`spawn_chat_run`, `resumed: true`) registered in the SAME live-run
 //! registry the submit endpoints use — a user opening the session
 //! mid-resume watches it live. The runner's terminal handling is
 //! path-dependent (spec D7): a resumed turn that runs but fails on the
-//! LLM finalizes `interrupted` (attempts already 1 → final, no loop);
-//! a hard error (step cap — the run genuinely ran) finalizes `failed`
-//! + error row.
+//! LLM finalizes `interrupted` (attempts already 1 → final, no loop)
+//! — except backend-down weather (outage-recovery spec §3.3), which
+//! parks the turn as `waiting_backend` (no row, resumable by the
+//! recovery path, not by this worker — `resumable_turns` only ever
+//! lists `interrupted` with `attempts = 0`); a hard error (step cap —
+//! the run genuinely ran) finalizes `failed` + error row.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use mycelium_auth::rbac::SessionUser;
 use mycelium_librarian::llm::LlmConfig;
-use mycelium_store::chat::{ChatError, ChatTurnRow};
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
+use mycelium_store::chat::{ChatError, ChatTurnRow, ChatTurnStatus};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -42,8 +71,9 @@ use crate::api::visible_library_slugs;
 use crate::chat_runner::{ChatRunContext, spawn_chat_run};
 use crate::state::AppState;
 
-/// The periodic resume sweep (spec §4 tunables: 60 s — resumable turns
-/// only appear at boot; the tick absorbs key-recovery latency).
+/// The periodic resume sweep (spec §4 tunables: 60 s — the tick is the
+/// engine for both supplies: crash resumes and mid-outage waiting-turn
+/// re-claims; it also absorbs key-recovery latency).
 const RESUME_TICK_SECS: u64 = 60;
 
 /// The resume worker: a state handle over what one pass needs
@@ -63,9 +93,9 @@ impl ChatResumeWorker {
     }
 
     /// The wake loop (the queue-worker shape): tick → one pass; the
-    /// shutdown token breaks it. No Notify — resumable turns only
-    /// appear at boot (spec §3.4); the main.rs boot sweep has already
-    /// run by the time this spawns.
+    /// shutdown token breaks it. No Notify — both turn supplies arrive
+    /// passively: crashed turns at boot (spec §3.4) and parked waiting
+    /// turns as outages park them; the next tick finds either.
     pub fn spawn(self: Arc<Self>, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(RESUME_TICK_SECS));
@@ -76,9 +106,11 @@ impl ChatResumeWorker {
                     _ = shutdown.cancelled() => {
                         // Bounded shutdown, no new guarantee: claimed
                         // turns still in flight finalize via the
-                        // runner's own paths; unclaimed interrupted
-                        // turns are the boot sweep's business on the
-                        // next start (spec §3.4).
+                        // runner's own paths; unclaimed interrupted and
+                        // waiting turns are likewise left idle — the
+                        // interrupted ones are the boot sweep's business
+                        // on the next start, the waiting ones keep
+                        // their status for the next worker (spec §3.4).
                         tracing::info!("chat resume worker stopped");
                         return;
                     }
@@ -90,17 +122,42 @@ impl ChatResumeWorker {
         })
     }
 
-    /// One pass: resumable turns oldest-first → grouped by user → per
-    /// user recover the key (error: skip the user) → per turn
-    /// try_acquire a permit (None: skip unclaimed) → atomic claim
-    /// (false: raced/skipped) → spawn the resumed run. Returns when
-    /// every eligible turn this pass decided on is dispatched or
-    /// deliberately skipped.
+    /// One pass: health gate (Red/Disabled: skip everything, Ok) →
+    /// merged supplies (crash + weather) oldest-first → grouped by
+    /// user → per user recover the key (error: skip the user) → per
+    /// turn try_acquire a permit (None: skip unclaimed) → atomic
+    /// status-dispatched claim (false: raced/skipped) → spawn the
+    /// resumed run. Returns when every eligible turn this pass decided
+    /// on is dispatched or deliberately skipped.
     pub async fn run_pending(&self) -> Result<(), ChatError> {
-        let turns = self.state.chat_sessions.resumable_turns().await?;
+        // Health gate (outage spec §3.3): Red is a known outage — the
+        // runner would park every claimed turn at admission (weather
+        // turns) or fail it (crash turns), burning claims and gate
+        // slots for nothing; Disabled would claim weather turns into
+        // the runner's fail-fast terminal path, losing the weather
+        // provenance and writing the error row the parking rules
+        // forbid. Either way the whole pass stands down unclaimed —
+        // weather retries are unbounded, so pausing costs nothing.
+        // Yellow PROCEEDS: a flap is not an outage.
+        let health = LLM_HEALTH.state();
+        if matches!(health, BackendState::Red | BackendState::Disabled) {
+            tracing::info!(
+                state = health.as_str(),
+                "chat resume pass skipped — LLM backend not available"
+            );
+            return Ok(());
+        }
+        // Both supplies (spec §3.3): crash-resumable + weather-parked,
+        // each already oldest-first from the store; the merge re-sorts
+        // by created_at so a user's crash and weather turns run in
+        // true age order together (stable sort keeps each supply's
+        // internal order on ties).
+        let mut turns = self.state.chat_sessions.resumable_turns().await?;
+        turns.extend(self.state.chat_sessions.waiting_turns().await?);
         if turns.is_empty() {
             return Ok(());
         }
+        turns.sort_by(|a, b| a.1.created_at.cmp(&b.1.created_at));
         // Group by user (the pass's user-scoped work — key recovery,
         // visibility — happens once), preserving each user's turns in
         // the query's oldest-first order. A BTreeMap keeps the user
@@ -162,14 +219,27 @@ impl ChatResumeWorker {
                 let Some(permit) = mycelium_librarian::llm_gate::LLM_GATE.try_enter() else {
                     continue;
                 };
-                // The once-guard: exactly the first claimer wins
-                // (attempts 0 → 1). `false` = raced (a fresh submit
-                // abandoned it) or already resumed — skip.
-                let claimed = self
-                    .state
-                    .chat_sessions
-                    .claim_resumable(user_id, session_id, turn.id)
-                    .await?;
+                // The claim dispatches by supply (spec §3.3): the
+                // crash path's once-guard (attempts 0 → 1) for
+                // interrupted turns; the weather claim — same atomic
+                // conditional UPDATE, but it never touches `attempts`
+                // (unbounded retries) — for waiting ones. `false` =
+                // raced (a fresh submit superseded it) or already
+                // claimed — skip.
+                let claimed = match turn.status {
+                    ChatTurnStatus::WaitingBackend => {
+                        self.state
+                            .chat_sessions
+                            .claim_waiting(user_id, session_id, turn.id)
+                            .await?
+                    }
+                    _ => {
+                        self.state
+                            .chat_sessions
+                            .claim_resumable(user_id, session_id, turn.id)
+                            .await?
+                    }
+                };
                 if !claimed {
                     drop(permit);
                     continue;

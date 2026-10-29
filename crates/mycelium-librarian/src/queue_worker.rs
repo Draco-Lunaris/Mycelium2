@@ -20,6 +20,7 @@ use crate::agent::{self, AgentError, AgentScopes, MutationResult, TraceSink};
 use crate::fallback;
 use crate::llm::{LlmClient, LlmConfig};
 use crate::llm_gate;
+use crate::llm_health::short_detail;
 
 /// Recovery of a user's master key via the service-key seal.
 /// Implemented with MasterKeyCache::for_user at the binary seam
@@ -70,28 +71,8 @@ impl Default for QueueLimits {
     }
 }
 
-// ---- error-detail bounding (I1) ----
-
-/// Cap on error text persisted into `mutation_queue.detail` (and
-/// re-served through receipts): LLM status errors embed upstream HTTP
-/// bodies, so the drain bounds what it persists.
-const DETAIL_CAP: usize = 512;
-
-/// Bound an error's Display text for the `detail` column: byte-safe
-/// truncation at the cap, cut on a char boundary, with the marker
-/// appended only when something was actually cut. Short errors pass
-/// through unchanged.
-fn short_detail(e: impl std::fmt::Display) -> String {
-    let s = e.to_string();
-    if s.len() <= DETAIL_CAP {
-        return s;
-    }
-    let mut end = DETAIL_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [truncated]", &s[..end])
-}
+// `short_detail` (the byte-safe error-detail bound) moved to
+// `crate::llm_health` so one copy serves every bounded-detail site.
 
 // ---- worker ----
 
@@ -191,6 +172,11 @@ impl QueueWorker {
     /// reconciles that user's orphaned staging notes here). Returns
     /// the count of processed items.
     pub async fn run_pending(&self) -> Result<usize, QueueWorkerError> {
+        // Reconcile staging rows first (outage-recovery spec §3.4): the
+        // staging scan is global, not due-scan-driven, so rows deferred
+        // by an earlier key loss get re-checked on every pass even when
+        // no user has a due pending item. Idempotent.
+        self.recover_staging().await?;
         let mut processed = 0usize;
         loop {
             let users = self.store.queue_users_with_due().await?;
@@ -215,8 +201,8 @@ impl QueueWorker {
     }
 
     /// Boot sweep: running rows (a dead process left them mid-flight)
-    /// go back to pending; staging rows (the enqueue phase died) are
-    /// completed or failed by payload existence.
+    /// go back to pending; staging rows get the same reconciliation
+    /// the periodic drain applies (spec §3.4).
     pub async fn recover_on_boot(&self) -> Result<(), QueueWorkerError> {
         // Running → pending. Direct SQL: queue-specific state repair
         // the store module didn't need to expose.
@@ -233,25 +219,44 @@ impl QueueWorker {
             .execute(self.store.pool())
             .await?;
         }
-        // Staging rows: payload durable → activate; missing → dead
-        // (operator-visible). The existence check is filename-level
-        // (HMAC of the canonical payload path), which needs the row's
-        // user's master key via the recovery callback; a user whose
-        // key can't be recovered fails fast instead of blocking boot.
+        self.recover_staging().await
+    }
+
+    /// Staging-row reconciliation — the pass `recover_on_boot` runs
+    /// once and `run_pending` re-runs on every wake (outage-recovery
+    /// spec §3.4: boot must never issue a permanent verdict for a
+    /// recoverable condition). The existence check is filename-level
+    /// (HMAC of the canonical payload path), which needs the row's
+    /// user's master key via the recovery callback:
+    ///
+    /// - key unrecoverable → **skip the row this pass** (stays
+    ///   `staging`, untouched — no dead verdict, no retry timer). The
+    ///   key comes back on its own via the service seal, and the next
+    ///   pass re-checks; log-and-continue so one bad row can't stall
+    ///   the pass.
+    /// - payload blob present → activate (the interrupted flip
+    ///   completes).
+    /// - payload genuinely absent → dead with the re-submit detail
+    ///   (permanent condition keeps its verdict).
+    ///
+    /// Idempotent: safe to call every tick and after every boot.
+    pub async fn recover_staging(&self) -> Result<(), QueueWorkerError> {
         for item in self.store.staging_rows().await? {
             let master = match ((self.recovery)(item.user_id)).await {
                 Ok(m) => m,
-                Err(_) => {
-                    // No key → the blob's stored name cannot be derived,
-                    // so terminal cleanup can only skip it (it stays
-                    // sealed, same as the row's content).
-                    self.store
-                        .mark_dead(
-                            item.id,
-                            "payload check unavailable: master-key recovery failed",
-                        )
-                        .await
-                        .map_err(QueueWorkerError::Queue)?;
+                Err(e) => {
+                    // No key → the blob's stored name cannot be
+                    // derived, so the row can be neither completed nor
+                    // fairly failed. Defer: it stays `staging` and the
+                    // next pass re-checks (a restart during a key
+                    // outage must not deaden what a later tick would
+                    // recover).
+                    tracing::warn!(
+                        error = %e,
+                        receipt = %item.id,
+                        user = %item.user_id,
+                        "staging row deferred: master-key recovery failed"
+                    );
                     continue;
                 }
             };
@@ -724,26 +729,5 @@ impl QueueWorker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::short_detail;
-
-    #[test]
-    fn short_detail_caps_byte_safe() {
-        // Under the cap: unchanged, no marker.
-        assert_eq!(short_detail("boom"), "boom");
-        assert_eq!(short_detail("x".repeat(512)), "x".repeat(512));
-        // Over the cap (ASCII): cut at the cap + marker.
-        let out = short_detail("x".repeat(600));
-        assert_eq!(out.len(), 512 + "… [truncated]".len());
-        assert!(out.ends_with("[truncated]"));
-        // Over the cap (multibyte): the cut backs off to a char
-        // boundary — no panic, never past the cap + marker. "€" is
-        // 3 bytes, so byte 512 lands mid-char and the back-off loop
-        // must move the cut to 510.
-        let out = short_detail("€".repeat(200)); // 600 bytes
-        assert!(out.ends_with("[truncated]"));
-        assert_eq!(out.len(), 510 + "… [truncated]".len());
-        assert!(out.starts_with(&"€".repeat(100)));
-    }
-}
+// The `short_detail` tests moved with the function to
+// `crate::llm_health::tests`.
