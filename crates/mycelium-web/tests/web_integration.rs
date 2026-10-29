@@ -1488,19 +1488,28 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), 202);
-    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    // The inline ingest drives the LlmClient (no `llm` row at boot → the
+    // default endpoint), whose passive hooks (llm.rs record_outcome) note
+    // the process-global LLM_HEALTH machine at the real clock — hold
+    // HEALTH_TEST_LOCK across the upload so those notes cannot land
+    // inside a health-pin test's force→assert window (llm_health.rs's
+    // guard rule; see the section comment by HEALTH_TEST_LOCK below).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
     assert_eq!(
         upload_json["status"], "done",
         "ingest ran inline: {upload_json}"
@@ -1577,17 +1586,21 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book2.md", BOOK2)),
     );
-    let second_upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            "multipart/form-data; boundary=secondboundary2",
-        )
-        .body(second_body)
-        .send()
-        .await
-        .unwrap();
+    // (Guard: inline-ingest passive health note — see the first upload.)
+    let second_upload = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=secondboundary2",
+            )
+            .body(second_body)
+            .send()
+            .await
+            .unwrap()
+    };
     assert_eq!(second_upload.status(), 202);
     // (a) Un-narrowed: BOTH books' chapters appear — the interleaved
     //     behavior, pinned so a change to the narrowing can't silently
@@ -1715,17 +1728,21 @@ async fn books_count_and_passage_reader() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let secret_upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            "multipart/form-data; boundary=secretboundary7",
-        )
-        .body(secret_body)
-        .send()
-        .await
-        .unwrap();
+    // (Guard: inline-ingest passive health note — see the first upload.)
+    let secret_upload = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=secretboundary7",
+            )
+            .body(secret_body)
+            .send()
+            .await
+            .unwrap()
+    };
     assert_eq!(secret_upload.status(), 202);
     let create_user = client
         .post(format!("{base}/admin/users"))
@@ -2784,19 +2801,28 @@ async fn admin_library_escapes_and_pairs_shelf_names() {
         ],
         Some(("file", "book.md", BOOK)),
     );
-    let upload = client
-        .post(format!("{base}/api/v1/ingest"))
-        .header("cookie", &cookie)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
-    let upload_json: serde_json::Value = upload.json().await.unwrap();
+    // The inline ingest drives the LlmClient (no `llm` row at boot → the
+    // default endpoint), whose passive hooks (llm.rs record_outcome) note
+    // the process-global LLM_HEALTH machine at the real clock — hold
+    // HEALTH_TEST_LOCK across the upload so those notes cannot land
+    // inside a health-pin test's force→assert window (llm_health.rs's
+    // guard rule; see the section comment by HEALTH_TEST_LOCK below).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202, "the posted shelf name must resolve");
+        upload.json().await.unwrap()
+    };
     assert_eq!(
         upload_json["status"], "done",
         "ingest ran inline: {upload_json}"
@@ -4025,17 +4051,34 @@ async fn metrics_reports_llm_gate_lines() {
 // chat_sessions_integration.rs / chat_resume_integration.rs use for the
 // same global; `llm_health::health_test_guard()` itself is
 // `#[cfg(test)] pub(crate)`, so it exists only inside the librarian's
-// own unit tests and cannot link into an integration binary. No other
-// test in this binary reads the health global (the /status chips key
-// off `LLM_LAST_SUCCESS` and the gate, not health), so only the
-// forcing tests need the lock.
+// own unit tests and cannot link into an integration binary.
+//
+// FEEDERS on this lock: the inline-ingest uploads in
+// books_count_and_passage_reader and
+// admin_library_escapes_and_pairs_shelf_names post /api/v1/ingest,
+// which runs the catalog through the LlmClient against the default
+// endpoint (no `llm` row at boot) — the llm.rs passive hooks note this
+// global at the REAL clock on every upload (refused = failure note;
+// on an Ollama-running host, success = ok note + LLM_LAST_SUCCESS).
+// Those four uploads each hold the lock across request+response. Any
+// new LLM-driving surface added to this binary must take the lock the
+// same way (llm_health.rs's guard rule).
+//
+// READERS that do NOT take the lock: /health and /metrics on every
+// request snapshot the global server-side via system_stats, and the
+// /status + /admin/system page tests read it the same way — harmless
+// TODAY only because nothing those pages render consumes the backend_*
+// fields yet (the /status chips key off LLM_LAST_SUCCESS and the gate).
+// If Task 10's admin page starts rendering backend health, its tests
+// must join this lock.
 // ---------------------------------------------------------------------
 
 use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
 
-/// Serializes the tests that force the process-global backend-health
-/// state (mirrors the chat integration binaries' TEST_LOCK role for
-/// this global).
+/// Serializes every test whose leg forces the process-global
+/// backend-health state OR drives a passive health note (the inline
+/// ingest uploads) — mirrors the chat integration binaries' TEST_LOCK
+/// role for this global. See the section comment above.
 static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Restores the process-global health registry to a fresh Green on

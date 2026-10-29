@@ -75,7 +75,11 @@ pub struct SystemStats {
     /// machine's frozen clock is NOT an active outage.
     pub backend_down_seconds: Option<i64>,
     /// Seconds since the last health observation (probe or model-call
-    /// note); `None` when none was ever made.
+    /// note); `None` when none was ever made. NOT gated on Disabled
+    /// like `backend_down_seconds`: a Disabled machine's frozen last
+    /// observation passes through as-is — "when health was last
+    /// actually checked" is a fact, not an outage claim, so a renderer
+    /// must not read it as a live liveness tick.
     pub backend_checked_seconds_ago: Option<i64>,
     /// Turns parked `waiting_backend` or crash-interrupted and never
     /// claimed (`ChatStore::waiting_turn_count`; zeroed on read failure
@@ -113,10 +117,11 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
     // acquisition, no I/O, shared by every field below.
     let gate = mycelium_librarian::llm_gate::LLM_GATE.stats();
     // Backend health (outage recovery spec §3.5): ONE snapshot read,
-    // mutex-only, no I/O. Ages are derived against the same `now` as
-    // llm_last_success_seconds above. A Disabled machine's down_since
-    // is FROZEN (notes are ignored while pinned), not an active
-    // outage — disabled is "nothing to probe", so it reads as not-down.
+    // mutex-only, no I/O. Both backend ages derive from the single
+    // `now` below (llm_last_success_seconds above reads its own clock;
+    // the instants are µs apart). A Disabled machine's down_since is
+    // FROZEN (notes are ignored while pinned), not an active outage —
+    // disabled is "nothing to probe", so it reads as not-down.
     let now = chrono::Utc::now().timestamp();
     let health = mycelium_librarian::llm_health::LLM_HEALTH.snapshot();
     let backend_down_seconds =
