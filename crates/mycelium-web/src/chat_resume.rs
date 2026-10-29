@@ -25,9 +25,12 @@
 //! registry the submit endpoints use — a user opening the session
 //! mid-resume watches it live. The runner's terminal handling is
 //! path-dependent (spec D7): a resumed turn that runs but fails on the
-//! LLM finalizes `interrupted` (attempts already 1 → final, no loop);
-//! a hard error (step cap — the run genuinely ran) finalizes `failed`
-//! + error row.
+//! LLM finalizes `interrupted` (attempts already 1 → final, no loop)
+//! — except backend-down weather (outage-recovery spec §3.3), which
+//! parks the turn as `waiting_backend` (no row, resumable by the
+//! recovery path, not by this worker — `resumable_turns` only ever
+//! lists `interrupted` with `attempts = 0`); a hard error (step cap —
+//! the run genuinely ran) finalizes `failed` + error row.
 
 use std::sync::Arc;
 use std::time::Duration;

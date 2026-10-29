@@ -30,6 +30,16 @@
 //! one deliberate exception to persist-before-broadcast: queue state is
 //! presentation, not lifecycle (spec §3.3), so these two events have no
 //! transcript row, carry no `seq`, and never appear in a replay.
+//!
+//! Backend-down turns park (LLM outage recovery spec §3.3): at
+//! admission, a `Red` health state parks the turn as `waiting_backend`
+//! instead of queueing it through a known outage, and a run whose agent
+//! error is the backend-down class parks too — both with NO transcript
+//! row and NO SSE event (re-parking every retry tick during a
+//! multi-hour outage would otherwise flood the transcript). `Disabled`
+//! (no configured backend) is NOT weather: it keeps the terminal
+//! outcomes, because parking it would promise a resume that never
+//! comes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,6 +52,7 @@ use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_librarian::agent::{AgentError, AgentEvent, run_chat_streaming};
 use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig};
 use mycelium_librarian::llm_gate::{GateError, GatePermit, LLM_GATE};
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH, short_detail};
 use mycelium_store::ConceptStore;
 use mycelium_store::Store;
 use mycelium_store::chat::{ChatError, ChatRole, ChatStore, ChatTurnRow, ChatTurnStatus};
@@ -323,6 +334,27 @@ async fn run_chat_turn(
             }
         };
 
+    // Admission parking (LLM outage spec §3.3 edge (a)): a `Red` health
+    // state is a KNOWN outage, so the turn parks as `waiting_backend`
+    // right away — never queue at the gate during one. The park records
+    // the turn's status + `last_error` ONLY: no transcript row, no SSE
+    // event, no finalize (re-parking every retry tick during a
+    // multi-hour outage would otherwise flood the transcript — D4's
+    // one-error-row rule is a property of terminal paths). Every other
+    // state falls through unchanged: Green/Yellow proceed, and
+    // `Disabled` (no configured backend) keeps today's terminal
+    // outcomes below — "not configured" will not fix itself, and
+    // parking it would promise a resume that never comes.
+    if LLM_HEALTH.state() == BackendState::Red {
+        tracing::warn!(
+            turn_id = %turn_id, user_id = %user_id, resumed,
+            "chat turn parked at admission — backend unhealthy"
+        );
+        let why = short_detail("backend unhealthy at admission");
+        park_turn(&ctx, user_id, turn_id, &why).await;
+        return;
+    }
+
     // Gate admission (LLM concurrency spec §3.3/§3.5). This is the
     // chat surface's SINGLE admission point: fresh submits and resumed
     // turns both arrive here, so neither can start an agent run without
@@ -513,6 +545,19 @@ async fn run_chat_turn(
             .await;
         }
         Err(AgentError::Llm(e)) => {
+            // Backend-down is weather (outage spec §3.2/§3.3 edge (b)):
+            // the request never reached a working model, so the run
+            // earned no verdict — park instead of finalizing, UNLESS
+            // the machine is Disabled (not configured — not weather;
+            // the terminal split below is today's exact behavior and
+            // the only honest outcome).
+            if e.is_backend_down() && LLM_HEALTH.state() != BackendState::Disabled {
+                tracing::warn!(error = %e, turn_id = %turn_id, resumed,
+                    "chat run parked — backend down");
+                let why = short_detail(&e);
+                park_turn(&ctx, user_id, turn_id, &why).await;
+                return;
+            }
             // LLM failures emit no agent event — the error row and its
             // broadcast are created here. Warn, not error: an
             // unreachable backend is an operator condition, not a
@@ -647,6 +692,25 @@ async fn emit_event(
             None
         }
     }
+}
+
+/// Park a running turn as `waiting_backend` (backend-down = weather,
+/// outage spec §3.3): the record is the turn's status + `last_error`
+/// (overwritten each park) ONLY — no `finish_turn`, no transcript row,
+/// no SSE event, and `attempts`/`park_state` untouched (parking is not
+/// a claim). Removing the registry entry drops the broadcast sender,
+/// which closes attached streams (the terminal signal every row-less
+/// exit gives) and defuses the `RunGuard` so it cannot re-finalize the
+/// turn as `failed`/`interrupted`. A park failure is logged, never
+/// propagated: the store is unreachable, and the registry entry must
+/// go regardless so a parked run never leaks a live entry. (The
+/// store-side park is conditional on `running` + idempotent: a re-park
+/// of an already-waiting turn no-ops.)
+async fn park_turn(ctx: &ChatRunContext, user_id: Uuid, turn_id: Uuid, why: &str) {
+    if let Err(e) = ctx.chat.park_waiting(user_id, turn_id, Some(why)).await {
+        tracing::error!(error = %e, turn_id = %turn_id, "chat turn park failed");
+    }
+    ctx.runs.remove(turn_id);
 }
 
 /// Terminal bookkeeping shared by every exit path: optionally persist
