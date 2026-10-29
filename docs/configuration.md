@@ -32,7 +32,11 @@ variables for runtime settings:
   stored key. Default `http://localhost:11434/v1` (Ollama). Used by
   the librarian for chapter/section extraction and the /chat agent;
   unreachable backends fall back to a heuristic catalog (ingest never
-  fails on LLM errors).
+  fails on LLM errors). A background probe checks the backend every
+  30 s (`GET {url}/models`, 5 s timeout) to keep the health indicator,
+  `/health`, and `/metrics` current — no new config fields for it; a
+  deleted config row means `Disabled` (nothing to probe, grey dot), not
+  an outage.
 - **Upload limits** — maximum book upload size (MiB, 1–255; default
   32, the original Mycelium's default). Takes effect immediately.
 - **Security settings** — tunable within guardrails (out-of-range

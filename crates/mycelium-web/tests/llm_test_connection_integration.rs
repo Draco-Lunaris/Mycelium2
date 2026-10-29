@@ -4,15 +4,59 @@
 //! flash. Success → `?ok=connected…`; backend errors → `?error=…`
 //! carrying the backend's status and body so a mis-pasted key or wrong
 //! URL is visible in seconds.
+//!
+//! The file also hosts the background backend-probe loop tests (outage
+//! recovery spec §3.1: `spawn_backend_probe` keeps the process-global
+//! `LLM_HEALTH` registry fresh). `LLM_HEALTH` is process-global, so
+//! every test in this binary serializes on [`TEST_LOCK`], and every
+//! test restores the registry through [`HealthDefaults`] (chat_sessions
+//! _integration.rs's pattern — integration binaries cannot link the
+//! crate's `#[cfg(test)]` guard).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::response::IntoResponse;
 
 use mycelium_auth::login::LoginService;
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
 use mycelium_store::Store;
 use mycelium_web::AppState;
+
+/// Serializes all tests in this binary around the shared health
+/// registry (the test-connection tests drive the passive `LlmClient`
+/// hooks, which note into `LLM_HEALTH` from `chat_system`).
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Restores the process-global health registry to a fresh Green on drop,
+/// so a probe loop still running (or a leaked Red from a failed
+/// assertion) cannot perturb a sibling test. Declared AFTER the
+/// `TEST_LOCK` guard so the restore happens while the lock is held.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        LLM_HEALTH.reset_for_test();
+    }
+}
+
+/// Poll a health-state condition with a deadline (never a bare sleep —
+/// the poll target is observable registry state).
+async fn poll_health_until(state: BackendState, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if LLM_HEALTH.state() == state {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw {what}: {:?}",
+            LLM_HEALTH.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// Known admin password for the pre-seeded account.
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
@@ -224,6 +268,8 @@ fn percent_decode(s: &str) -> String {
 
 #[tokio::test]
 async fn test_connection_success_reports_connected() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
     let (llm_url, captured) = status_mock(
         200,
         r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
@@ -248,6 +294,8 @@ async fn test_connection_success_reports_connected() {
 
 #[tokio::test]
 async fn test_connection_failure_carries_backend_status_and_body() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
     let (llm_url, _captured) =
         status_mock(401, r#"{"error":{"message":"API key is missing."}}"#).await;
     let (base, _shutdown, _dir) = boot().await;
@@ -272,6 +320,8 @@ async fn test_connection_failure_carries_backend_status_and_body() {
 
 #[tokio::test]
 async fn test_connection_blank_key_probes_the_stored_config() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
     // Seed a stored config with a key, then test with a blank key: the
     // probe must reach the backend with the STORED key, not nothing.
     let (llm_url, captured) = status_mock(
@@ -313,6 +363,8 @@ async fn test_connection_blank_key_probes_the_stored_config() {
 
 #[tokio::test]
 async fn test_connection_unreachable_url_reports_connect_failure() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
     // Port 1 on loopback: connection refused territory.
     let (base, _shutdown, _dir) = boot().await;
     let cl = client();
@@ -328,6 +380,8 @@ async fn test_connection_unreachable_url_reports_connect_failure() {
 
 #[tokio::test]
 async fn test_connection_requires_admin() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
     let (base, _shutdown, _dir) = boot().await;
     let cl = client();
 
@@ -346,4 +400,180 @@ async fn test_connection_requires_admin() {
         303,
         "unauthenticated POST must redirect to login"
     );
+}
+
+// ---- background backend probe task (outage recovery spec §3.1) ----
+//
+// `LLM_HEALTH` is process-global and the probe loop feeds it from a
+// spawned task, so every test here holds `TEST_LOCK` for its whole body
+// and stops its probe (token cancel) before releasing the lock. The
+// probe feeds no other process-global, so nothing else needs guarding.
+
+/// A raw `/models` mock (the probe's own endpoint — NOT the chat-
+/// completions mock the passive hooks ride, so a probe tick never notes
+/// through `LlmClient`). The health verdict is hot-swappable through the
+/// shared cell so one listener can change from reachable to 503 without
+/// a port change.
+async fn models_mock_live(status: Arc<std::sync::atomic::AtomicU16>) -> String {
+    let app = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get(move || {
+            let status = Arc::clone(&status);
+            async move {
+                (
+                    axum::http::StatusCode::from_u16(
+                        status.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                    .unwrap(),
+                    "probe body",
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}/v1", addr.port())
+}
+
+/// A bare `AppState` over a fresh store (no HTTP listener): the probe
+/// task needs the config store + service key, nothing else.
+async fn state_only() -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            ADMIN_PASSWORD,
+            mycelium_auth::Role::Admin,
+        )
+        .await
+        .unwrap();
+    let login = LoginService::new(store.pool().clone());
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        dir.path().join("assets"),
+        dir.path().to_path_buf(),
+        None,
+    );
+    (state, dir)
+}
+
+/// Sealed-`llm`-row writer (the admin page's own storage shape).
+async fn write_llm_row(state: &AppState, url: String) {
+    let sealed = mycelium_web::state::seal_config(
+        &state.service_key,
+        "llm",
+        &mycelium_web::LlmConfig {
+            url,
+            model: "probe".into(),
+            ..Default::default()
+        },
+    );
+    state.config.set("llm", &sealed).await.unwrap();
+}
+
+/// The probe's first tick fires immediately: a reachable mock → Green
+/// within one short interval; flipping the mock to 503 → three interval
+/// ticks (1/failure) take it through Yellow to Red; deleting the config
+/// row → Disabled within two ticks.
+#[tokio::test]
+async fn probe_task_reaches_green_then_red_then_disabled() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    // Pin Disabled first (the production boot seed): the reset state is
+    // trivially Green, so without the pin the first Green assertion
+    // could not tell a fed machine from an un-started task. Reaching
+    // Green from here requires note_configured (lift) AND note_ok (the
+    // probe's ok feed) — exactly what the task's first tick must do.
+    LLM_HEALTH.reset_for_test();
+    LLM_HEALTH.set_disabled();
+
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let url = models_mock_live(Arc::clone(&status)).await;
+    let (state, _dir) = state_only().await;
+    write_llm_row(&state, url).await;
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probe = mycelium_web::server::spawn_backend_probe(
+        state.clone(),
+        shutdown.clone(),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    // Reachable → Green (first tick fires at once).
+    poll_health_until(BackendState::Green, "Green against a reachable mock").await;
+
+    // Backend returns 503: unhealthy → Yellow after 1 failure, Red at
+    // the 3-failure threshold. A 503 answers instantly, so the poll's
+    // 10 s bound is generous headroom over 3×100 ms intervals.
+    status.store(503, std::sync::atomic::Ordering::SeqCst);
+    poll_health_until(BackendState::Red, "Red after 3 failed probes").await;
+
+    // Backend recovers → the very next ok note clears everything.
+    status.store(200, std::sync::atomic::Ordering::SeqCst);
+    poll_health_until(BackendState::Green, "Green after the backend recovers").await;
+
+    // Config row deleted → Disabled within two ticks.
+    state.config.delete("llm").await.unwrap();
+    poll_health_until(BackendState::Disabled, "Disabled after the row is deleted").await;
+
+    // Stop the task and WAIT for it: `select!` may pick a due tick over
+    // the cancellation, so a late `note_*` could otherwise land after
+    // this test releases TEST_LOCK and perturb a sibling's window.
+    shutdown.cancel();
+    let _ = probe.await;
+}
+
+/// The probe re-reads the CURRENT config row every tick, so an admin's
+/// config swap applies within one interval: Red against a dropped
+/// listener, then the row repointed at a live mock heals it to Green
+/// without touching the running task.
+#[tokio::test]
+async fn probe_task_honours_a_config_row_swap_within_a_tick() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+
+    // A port that refuses connections (bound, then dropped).
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let (state, _dir) = state_only().await;
+    write_llm_row(&state, format!("http://{dead_addr}/v1")).await;
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probe = mycelium_web::server::spawn_backend_probe(
+        state.clone(),
+        shutdown.clone(),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    poll_health_until(BackendState::Red, "Red against a refused port").await;
+
+    // Repoint the row at a live mock (the config swap). The probe reads
+    // the row each tick, so it must heal within the next interval — no
+    // task restart, no reboot.
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let live = models_mock_live(status).await;
+    write_llm_row(&state, live).await;
+    poll_health_until(
+        BackendState::Green,
+        "Green after the row points at a live mock",
+    )
+    .await;
+
+    // Join the probe before releasing the lock (see the other test).
+    shutdown.cancel();
+    let _ = probe.await;
 }

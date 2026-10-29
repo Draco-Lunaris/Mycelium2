@@ -323,3 +323,34 @@ call; the existing `llm` row stays the single LLM config surface.)
   `reqwest` path and never self-feeds.
 - The crash-stranded waiting-claim the builder check found is closed by
   the `park_state` provenance rule (§3.3), not by widening D7.
+
+## 7. Implementation amendments (2026-10-29, at ship)
+
+Recorded while implementing this spec on the `worktree-llm-outage-
+recovery` branch; the implementation is the authority for these three
+details, everything else stands as designed.
+
+- **/health field name**: the outage-age field ships as
+  `backend_down_seconds` (§3.6 said `backend_down_since_seconds`).
+  It is an age in seconds (like `oldest_pending_age_seconds`), not a
+  timestamp, and the `/metrics` gauge already shipped under the
+  matching name `mycelium2_backend_down_seconds`.
+- **§3.4 queue staging — skip-in-place supersedes defer-to-pending**:
+  a staging row whose master key is unrecoverable stays `staging` and
+  is re-checked on every drain pass (and every boot sweep), activating
+  when the key becomes recoverable. The spec asked for a defer back to
+  `pending`; skipping in place keeps the row out of the pending/due
+  scans it would only churn through, with the same operator-visible
+  outcome (the item waits for the key, never dies from key loss).
+- **Park-on-Red only (clarification of §3.3a)**: the admission park
+  fires exclusively on `Red`. `Disabled` keeps the fail-fast terminal
+  path — "not configured" is not weather and would promise a resume
+  that never comes — and `Yellow` proceeds. The spec text ("on `Red`")
+  implies this; the code and chat_runner comments pin it.
+
+Probe wiring as shipped: `mycelium_web::server::spawn_backend_probe`
+(queue-worker-shaped ticker, first tick immediate = the boot health
+seed; `main.rs` seeds `LLM_HEALTH.set_disabled()` before spawning so a
+request never sees the static's trivial Green). An `llm` row that is
+present but undecryptable feeds NO health observation (config problem,
+not backend weather) and logs a warning per tick.

@@ -132,8 +132,56 @@ WantedBy=multi-user.target
     queue wait of admitted wait-class runs
   - `mycelium2_llm_gate_wait_count` (counter) — samples behind that
     total; average wait = `wait_seconds_total / wait_count`
+- Backend-health metric lines (all from one health-registry read per
+  scrape): `mycelium2_backend_up` (gauge; `0`=disabled — no stored LLM
+  config row, `1`=red, `2`=yellow, `3`=green),
+  `mycelium2_backend_down_seconds` (gauge; seconds the outage has been
+  open, `0` when not down), and `mycelium2_chat_waiting_turns` (gauge;
+  chat turns owed an answer). The `/health` JSON carries the same
+  facts as `backend_state`, `backend_down_seconds`,
+  `backend_checked_seconds_ago`, and `chat_waiting_count`. An
+  unhealthy backend never makes `/health` `degraded` — the LLM backend
+  being down is weather these services wait out, not illness of this
+  container; degraded still means MY database or write queue is ill.
 - Container healthcheck: the HTTP redirect listener answers on port
   80 (`curl http://127.0.0.1:80/`).
+
+### Backend outages (what operators see, what recovers on its own)
+
+A background probe asks the configured LLM backend `GET {url}/models`
+every 30 s (5 s timeout). One or two consecutive failures report
+**yellow**; three or more report **red**; no stored LLM config row is
+**disabled** (grey — nothing to probe, not an outage). The admin
+**System page** (`/admin/system`) shows the state as a dot + word (and
+self-refreshes every 30 s), a waiting-summary line, and a table of
+every non-terminal waiting item (parked chat turns, queued writes,
+pending ingest jobs — metadata only, never transcript content).
+
+While the backend is red:
+
+- New chat messages are accepted and parked `waiting_backend`; parked
+  and crash-interrupted turns are **retried periodically** (the 60 s
+  resume tick) and complete automatically when the backend returns —
+  no restart, no manual nudge, and no permanent failed verdict from
+  the downtime itself.
+- The mutation-queue drain skips integration passes (queued writes
+  keep their position); write submissions still enqueue immediately
+  and integrate on the first healthy pass.
+- Staged write payloads whose **user key** is temporarily unavailable
+  wait **in place**: the row stays `staging` (no dead verdict, no
+  retry timer) and activates when the key becomes recoverable again.
+  (The original spec §3.4 wording said such rows are deferred back to
+  `pending`; the implementation skips in place instead — the outcome
+  operators care about is identical: the item waits for the key, it
+  never dies from key loss.)
+- Ingest jobs stay pending and run on a later worker tick.
+
+A reachable-but-flapping backend (yellow) still runs work: a flap is
+not an outage, and failing fast on yellow would throw away recovery
+opportunities. A corrupt or foreign-sealed `llm` config row is a
+config problem, not backend weather: the probe logs a warning each
+tick and reports **no** observation (the last real state stays), so a
+bad row never drives the dot red.
 
 ### Sizing `max_parallel`
 

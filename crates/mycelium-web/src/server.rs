@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -296,6 +297,103 @@ pub async fn sync_llm_gate_from_store(state: &AppState) {
         chat_queue_depth = mycelium_librarian::llm_gate::LLM_GATE.chat_queue_depth_limit(),
         "LLM gate synced from the stored config"
     );
+}
+
+/// One probe tick against the CURRENT stored `"llm"` row, feeding the
+/// process-global [`LLM_HEALTH`](mycelium_librarian::llm_health::LLM_HEALTH)
+/// exactly once (outage recovery spec §3.1 —
+/// [`probe_once`](mycelium_librarian::llm_health::probe_once) is pure
+/// and never self-feeds, so this tick is the feeding site).
+///
+/// The three postures:
+/// - **Absent row** → `set_disabled`: nothing to probe; the machine
+///   pins Disabled and ignores notes until a row comes back.
+/// - **Present row** → `note_configured` lifts any Disabled pin (its
+///   contract is row *presence*, so it happens even when the row then
+///   fails to decrypt), then the probe's verdict feeds `note_ok` /
+///   `note_failure`.
+/// - **Undecryptable row** → NO observation is fed at all (deliberate,
+///   and the subtle one): a corrupt/foreign-sealed row is a config
+///   problem, not backend weather. Feeding `note_failure` would drive
+///   the dot Red and pause the resume worker on a claim about a backend
+///   we never contacted; feeding `set_disabled` would claim "no `llm`
+///   row" when one plainly exists (wrong fail-fast message to users,
+///   grey dot for a configured system). Skipping the note claims
+///   nothing: the machine keeps its last real observation, and its
+///   `checked_at` clock ages honestly ("last checked Ns ago"). The
+///   passive `LlmClient` hooks correct from real traffic within a few
+///   attempts, and the warn fires every tick.
+///
+/// A raw-read failure (DB error) skips the tick entirely — even
+/// presence is unknown, so neither pin nor lift is honest.
+async fn probe_tick(state: &AppState) {
+    let raw = match state.config.raw_get("llm").await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(error = %e, "backend probe: llm config row unreadable — tick skipped");
+            return;
+        }
+    };
+    let Some(_raw) = raw else {
+        mycelium_librarian::llm_health::LLM_HEALTH.set_disabled();
+        return;
+    };
+    mycelium_librarian::llm_health::LLM_HEALTH.note_configured();
+    let Some(cfg) =
+        crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
+            .await
+    else {
+        tracing::warn!(
+            "backend probe: llm config row present but undecryptable — \
+             no health observation this tick (config problem, not backend weather)"
+        );
+        return;
+    };
+    if mycelium_librarian::llm_health::probe_once(&cfg).await {
+        mycelium_librarian::llm_health::LLM_HEALTH.note_ok();
+    } else {
+        mycelium_librarian::llm_health::LLM_HEALTH.note_failure();
+    }
+}
+
+/// Spawn the background backend probe: the periodic `LLM_HEALTH`
+/// feeder (outage recovery spec §3.1; the module doc's "a background
+/// probe task calling [`probe_once`]" is this task).
+///
+/// The wake loop mirrors the established worker shape (queue worker /
+/// chat resume worker): a [`tokio::time::interval`] whose **first tick
+/// fires immediately** — so the task's first pass is also the boot
+/// health seed (absent row → Disabled, present row → probed) — with
+/// `MissedTickBehavior::Delay` so a slow probe (the 5 s timeout) never
+/// bursts catch-up ticks, and a `tokio::select!` shutdown arm that
+/// info-logs and returns (defused by the token, no spin).
+///
+/// Each tick re-reads the CURRENT config row, so an admin's config swap
+/// (URL, key, or deleting the row) applies within one interval — no
+/// restart, no task restart. Production passes
+/// [`mycelium_librarian::llm_health::PROBE_INTERVAL_SECS`] (30 s);
+/// tests pass short intervals to keep the transition paths observable.
+pub async fn spawn_backend_probe(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.cancelled() => {
+                    // Nothing owed: the registry is in-memory only, and
+                    // the next boot's first tick re-derives it.
+                    tracing::info!("backend probe task stopped");
+                    return;
+                }
+            }
+            probe_tick(&state).await;
+        }
+    })
 }
 
 /// Serve HTTPS on `https_addr`, redirecting HTTP on `http_addr` to it.

@@ -177,6 +177,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )));
     resume.spawn(shutdown.clone());
 
+    // Backend health (outage recovery spec §3.1): seed Disabled until
+    // the probe's first tick resolves it — the static machine starts
+    // "configured, fresh", which would otherwise read Green to a
+    // request landing before the task's first pass. The probe loop's
+    // immediate first tick lifts the pin (config row present) and
+    // probes, or re-pins it (row absent).
+    mycelium_librarian::llm_health::LLM_HEALTH.set_disabled();
+    mycelium_web::server::spawn_backend_probe(
+        state.clone(),
+        shutdown.clone(),
+        std::time::Duration::from_secs(mycelium_librarian::llm_health::PROBE_INTERVAL_SECS),
+    )
+    .await;
+
     mycelium_web::serve(
         state,
         &data_dir,
