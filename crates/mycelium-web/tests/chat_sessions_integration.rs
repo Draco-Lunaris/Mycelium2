@@ -1623,6 +1623,121 @@ async fn chat_page_failed_error_bubble() {
     shutdown.cancel();
 }
 
+/// The outage waiting bubble (outage spec §3.3 copy, pinned verbatim;
+/// page contract like the running/interrupted notes): a turn parked as
+/// `waiting_backend` SSRs the waiting note reusing the `chat-status-note`
+/// class (Task 6 ruling — no new CSS), the page carries
+/// `data-turn-status="waiting_backend"`, and the GET `{id}` meta reports
+/// `waiting_backend` + `turn_resumable: true` — the server-side twin of
+/// chat.js's poll branch, which stops polling ONLY for
+/// `interrupted` + non-resumable (assets.rs), so waiting turns keep the
+/// 5 s meta live with NO client change. The note is a constant with no
+/// user content: the session is created with a hostile first message, so
+/// the render proves the pinned string survives alongside the escaped
+/// title (§6.15 escaping stays the pages-level contract).
+#[tokio::test]
+async fn chat_page_waiting_backend_note_and_poll_contract() {
+    let _g = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    // Green here on purpose: the runner parks on Red at ADMISSION, and
+    // this test drives the mid-run park instead — the store's
+    // `park_waiting` against a held-running turn, exactly what the
+    // runner does when the backend goes Red mid-flight.
+    LLM_HEALTH.reset_for_test();
+    // The mock's gate is never released: the turn stays held running for
+    // the whole test; the response's unread body is dropped at the end.
+    let (llm_url, _gate) = gated_mock_llm(vec![text_response("held reply.")]).await;
+    let (base, shutdown, dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Hostile first message → the derived session title carries markup.
+    let resp = submit_draft(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "<img src=x onerror=alert(2)> parked ask",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let session_id = first_session_id(&client, &base, &cookie).await;
+    poll_meta_until(&client, &base, &cookie, &session_id, "running").await;
+
+    // Park the running turn through the store (the mid-run outage park).
+    let store = Store::open(dir.path()).await.unwrap();
+    let chat = mycelium_store::chat::ChatStore::new(store.pool().clone());
+    let (turn_id, user_id): (String, String) = sqlx::query_as(
+        "SELECT t.id, s.user_id FROM chat_turns t \
+         JOIN chat_sessions s ON s.id = t.session_id WHERE s.id = ?",
+    )
+    .bind(&session_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    chat.park_waiting(
+        uuid::Uuid::parse_str(&user_id).unwrap(),
+        uuid::Uuid::parse_str(&turn_id).unwrap(),
+        Some("backend unhealthy at admission"),
+    )
+    .await
+    .unwrap();
+
+    let page = client
+        .get(format!("{base}/chat?s={session_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    // The pinned copy, verbatim (spec §3.3).
+    assert!(
+        html.contains(
+            r#"<div class="chat-msg chat-status-note">Waiting for the librarian backend — it will resume automatically.</div>"#,
+        ),
+        "waiting note missing: {html}"
+    );
+    assert!(
+        html.contains(r#"data-turn-status="waiting_backend""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-max-seq="1""#), "{html}");
+    assert!(
+        !html.contains("The librarian is thinking…"),
+        "a waiting turn is not running: {html}"
+    );
+    assert!(
+        !html.contains("Interrupted by a server restart"),
+        "a waiting turn is not an interrupted turn: {html}"
+    );
+    // The note itself carries no user content (the exact-div assertion
+    // above pins the constant); the hostile title renders escaped and
+    // the raw markup never appears anywhere in the page.
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(2)&gt;"),
+        "hostile title must render escaped: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x onerror=alert(2)>"),
+        "raw hostile markup leaked: {html}"
+    );
+
+    // The meta endpoint — the poll's 5 s input: waiting AND resumable
+    // (chat.js keeps polling on this shape; only interrupted+spent
+    // stops it), with the transcript cursor at the trigger row.
+    let meta = get_meta(&client, &base, &cookie, &session_id).await;
+    assert_eq!(meta["id"], session_id);
+    assert_eq!(meta["turn_status"], "waiting_backend");
+    assert_eq!(
+        meta["turn_resumable"], true,
+        "waiting turns are resumable: {meta}"
+    );
+    assert_eq!(meta["max_seq"], 1, "only the trigger row: {meta}");
+
+    shutdown.cancel();
+}
+
 /// Fresh submit during a known outage (outage spec §3.3 admission edge
 /// (a), decision §6: the submit is ACCEPTED): with the health machine
 /// Red, the runner parks the turn as `waiting_backend` at admission —

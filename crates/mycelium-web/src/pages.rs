@@ -1072,6 +1072,15 @@ pub fn chat_page(
                     r#"<div class="chat-msg librarian pending">The librarian is thinking…</div>"#
                         .to_string();
             }
+            // Parked during an outage (spec §3.3): the resume worker
+            // will retry — the note promises it, and the meta poll's
+            // `turn_resumable: true` keeps the page live until then.
+            // Same note class as the interrupted bubble (Task 6
+            // ruling: no new CSS).
+            Some(mycelium_store::chat::ChatTurnStatus::WaitingBackend) => {
+                status_bubble = r#"<div class="chat-msg chat-status-note">Waiting for the librarian backend — it will resume automatically.</div>"#
+                    .to_string();
+            }
             Some(mycelium_store::chat::ChatTurnStatus::Interrupted) => {
                 status_bubble = if view.turn_resumable {
                     r#"<div class="chat-msg chat-status-note">Interrupted by a server restart — it will resume automatically.</div>"#

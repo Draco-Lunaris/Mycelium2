@@ -71,8 +71,9 @@ use crate::api::visible_library_slugs;
 use crate::chat_runner::{ChatRunContext, spawn_chat_run};
 use crate::state::AppState;
 
-/// The periodic resume sweep (spec §4 tunables: 60 s — resumable turns
-/// only appear at boot; the tick absorbs key-recovery latency).
+/// The periodic resume sweep (spec §4 tunables: 60 s — the tick is the
+/// engine for both supplies: crash resumes and mid-outage waiting-turn
+/// re-claims; it also absorbs key-recovery latency).
 const RESUME_TICK_SECS: u64 = 60;
 
 /// The resume worker: a state handle over what one pass needs
@@ -92,9 +93,9 @@ impl ChatResumeWorker {
     }
 
     /// The wake loop (the queue-worker shape): tick → one pass; the
-    /// shutdown token breaks it. No Notify — resumable turns only
-    /// appear at boot (spec §3.4); the main.rs boot sweep has already
-    /// run by the time this spawns.
+    /// shutdown token breaks it. No Notify — both turn supplies arrive
+    /// passively: crashed turns at boot (spec §3.4) and parked waiting
+    /// turns as outages park them; the next tick finds either.
     pub fn spawn(self: Arc<Self>, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(RESUME_TICK_SECS));
@@ -105,9 +106,11 @@ impl ChatResumeWorker {
                     _ = shutdown.cancelled() => {
                         // Bounded shutdown, no new guarantee: claimed
                         // turns still in flight finalize via the
-                        // runner's own paths; unclaimed interrupted
-                        // turns are the boot sweep's business on the
-                        // next start (spec §3.4).
+                        // runner's own paths; unclaimed interrupted and
+                        // waiting turns are likewise left idle — the
+                        // interrupted ones are the boot sweep's business
+                        // on the next start, the waiting ones keep
+                        // their status for the next worker (spec §3.4).
                         tracing::info!("chat resume worker stopped");
                         return;
                     }
