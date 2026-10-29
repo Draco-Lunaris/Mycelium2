@@ -282,9 +282,13 @@ pub async fn spawn_chat_run(
 ///
 /// Terminal handling is path-dependent (spec §3.4/D7): a fresh submit
 /// finalizes `failed` on any error; a resumed turn finalizes
-/// `interrupted` (attempts already 1 → final, no loop) when the LLM
-/// was unreachable — transient, no side-effect doubt — and `failed`
-/// on a hard error (the run genuinely ran).
+/// `interrupted` (attempts already 1 → final, no loop) on a transient
+/// non-weather LLM failure (e.g. the Disabled fail-fast) — and
+/// `failed` on a hard error (the run genuinely ran). A backend-down
+/// error is weather, not a verdict: it parks the turn as
+/// `waiting_backend` instead of finalizing (outage recovery spec
+/// §3.3) — no transcript row, no error row, `attempts` untouched, and
+/// the resume worker re-supplies it while the backend stays down.
 async fn run_chat_turn(
     ctx: ChatRunContext,
     user_id: Uuid,
