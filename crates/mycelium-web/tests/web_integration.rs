@@ -4015,6 +4015,293 @@ async fn metrics_reports_llm_gate_lines() {
     shutdown.cancel();
 }
 
+// ---------------------------------------------------------------------
+// Backend health + chat waiting surfaces (LLM outage recovery spec
+// §3.5). The two pins below FORCE the process-global `LLM_HEALTH`
+// machine, so they serialize on `HEALTH_TEST_LOCK` and restore a fresh
+// Green through `HealthDefaults` — declared after the lock guard so the
+// restore runs while the lock is still held (reverse drop order). This
+// mirrors the `TEST_LOCK` + `HealthDefaults` pattern
+// chat_sessions_integration.rs / chat_resume_integration.rs use for the
+// same global; `llm_health::health_test_guard()` itself is
+// `#[cfg(test)] pub(crate)`, so it exists only inside the librarian's
+// own unit tests and cannot link into an integration binary. No other
+// test in this binary reads the health global (the /status chips key
+// off `LLM_LAST_SUCCESS` and the gate, not health), so only the
+// forcing tests need the lock.
+// ---------------------------------------------------------------------
+
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
+
+/// Serializes the tests that force the process-global backend-health
+/// state (mirrors the chat integration binaries' TEST_LOCK role for
+/// this global).
+static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Restores the process-global health registry to a fresh Green on
+/// drop, so a failed assertion cannot leak a forced Red/Disabled into
+/// a sibling test sharing this process.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        LLM_HEALTH.reset_for_test();
+    }
+}
+
+/// Force the global machine to Red with the outage opened `ago`
+/// seconds back: three failures stamped at `now - ago` (Red threshold
+/// 3; the first failure sets `down_since`, so the outage age pins to
+/// ~`ago`). Callers hold `HEALTH_TEST_LOCK`.
+fn force_red(ago: u64) {
+    LLM_HEALTH.reset_for_test();
+    let since = chrono::Utc::now().timestamp().max(ago as i64) as u64 - ago;
+    for _ in 0..3 {
+        LLM_HEALTH.note_failure_at(since);
+    }
+    assert_eq!(
+        LLM_HEALTH.state(),
+        BackendState::Red,
+        "Red before the request"
+    );
+}
+
+/// Seed ONE `waiting_backend` turn row directly against the test pool
+/// (the same direct-SQL style the /status test uses, satisfying the FK
+/// chain session → seeded admin user). The row is inert here: `boot()`
+/// serves but starts no resume worker (`main.rs` owns that spawn), so
+/// nothing claims the row while the request runs.
+async fn seed_waiting_turn(pool: &sqlx::SqlitePool) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_sessions (id, user_id, title_sealed, created_at, updated_at)
+         VALUES (?, ?, 'sealed-by-nothing', ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO chat_turns (id, session_id, user_seq, status, attempts,
+                                 created_at, updated_at, park_state, last_error)
+         VALUES (?, ?, 1, 'waiting_backend', 0, ?, ?, 'waiting_backend', NULL)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The PUBLIC /health JSON carries the four outage-recovery fields
+/// (spec §3.5) beside the gate and queue ones: under a forced Red with
+/// a seeded waiting turn, `backend_state` is "red", `backend_down_seconds`
+/// is the outage age, `backend_checked_seconds_ago` is present, and
+/// `chat_waiting_count` counts the parked turn. Disabled reports
+/// `backend_state` "disabled" with a NULL `backend_down_seconds` —
+/// nothing-to-probe is not an outage. The degraded rule is queue/db
+/// only: an EXPLICIT non-regression pin below proves a Red backend
+/// never flips /health to degraded.
+#[tokio::test]
+async fn health_reports_backend_and_waiting_fields() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    seed_waiting_turn(&pool).await;
+    force_red(3600);
+
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(
+        health.status(),
+        200,
+        "non-regression: a Red backend must NOT degrade /health"
+    );
+    let body: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(
+        body["status"], "ok",
+        "non-regression: the degraded rule never consults backend health: {body}"
+    );
+    assert_eq!(body["backend_state"], "red", "{body}");
+    let down = body["backend_down_seconds"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("backend_down_seconds must be a number: {body}"));
+    assert!(
+        (3600..=3605).contains(&down),
+        "backend_down_seconds should be ~3600 (outage forced 3600 s back), got {down}: {body}"
+    );
+    let checked = body["backend_checked_seconds_ago"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("backend_checked_seconds_ago must be a number: {body}"));
+    assert!(
+        (3600..=3605).contains(&checked),
+        "backend_checked_seconds_ago should be ~3600 (notes stamped at now-3600), got {checked}: {body}"
+    );
+    assert_eq!(
+        body["chat_waiting_count"].as_i64(),
+        Some(1),
+        "the seeded waiting turn must be counted: {body}"
+    );
+
+    // Disabled: nothing to probe is NOT an outage — the state name and
+    // a NULL outage age, still "ok".
+    LLM_HEALTH.set_disabled();
+    let body: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "ok", "Disabled never degrades: {body}");
+    assert_eq!(body["backend_state"], "disabled", "{body}");
+    assert!(
+        body["backend_down_seconds"].is_null(),
+        "a stale down_since under Disabled must read as not-down: {body}"
+    );
+    assert_eq!(
+        body["chat_waiting_count"].as_i64(),
+        Some(1),
+        "the waiting count is not health-gated: {body}"
+    );
+
+    shutdown.cancel();
+}
+
+/// /metrics carries the three outage-recovery lines in the same
+/// `# TYPE`-then-sample shape as the rest: `mycelium2_backend_up`
+/// (0=disabled, 1=red, 2=yellow, 3=green), `mycelium2_backend_down_seconds`
+/// (0 when not down), and `mycelium2_chat_waiting_turns`. Values pinned
+/// across green → red → disabled, plus the model-call-only rule: with
+/// no LLM completion in this process (the probe never feeds
+/// `LLM_LAST_SUCCESS`), `mycelium2_llm_last_success_timestamp` stays
+/// absent.
+#[tokio::test]
+async fn metrics_reports_backend_health_lines() {
+    let _g = HEALTH_TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (base, shutdown, _dir, pool) = boot().await;
+    let client = client();
+
+    for (name, kind) in [
+        ("mycelium2_backend_up", "gauge"),
+        ("mycelium2_backend_down_seconds", "gauge"),
+        ("mycelium2_chat_waiting_turns", "gauge"),
+    ] {
+        assert!(
+            client
+                .get(format!("{base}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+                .contains(&format!("# TYPE {name} {kind}\n")),
+            "/metrics lacks the `# TYPE {name} {kind}` line"
+        );
+    }
+
+    // Green (idle process: no runs queued, so the staleness rule
+    // cannot fire) → up 3, outage age 0.
+    LLM_HEALTH.reset_for_test();
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "3",
+        "green maps to 3:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_down_seconds"),
+        "0",
+        "not down reads 0:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_chat_waiting_turns"),
+        "0",
+        "no waiting turns seeded yet:\n{text}"
+    );
+
+    // Red + one seeded waiting turn → up 1, age ~3600, count 1.
+    seed_waiting_turn(&pool).await;
+    force_red(3600);
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "1",
+        "red maps to 1:\n{text}"
+    );
+    let down: u64 = metric_sample(&text, "mycelium2_backend_down_seconds")
+        .parse()
+        .unwrap();
+    assert!(
+        (3600..=3605).contains(&down),
+        "backend_down_seconds should be ~3600, got {down}:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_chat_waiting_turns"),
+        "1",
+        "the seeded waiting turn must be exported:\n{text}"
+    );
+
+    // Disabled → up 0 and 0 again (not down), even with a stale
+    // down_since still stored.
+    LLM_HEALTH.set_disabled();
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_up"),
+        "0",
+        "disabled maps to 0:\n{text}"
+    );
+    assert_eq!(
+        metric_sample(&text, "mycelium2_backend_down_seconds"),
+        "0",
+        "disabled is not down:\n{text}"
+    );
+
+    // The probe never feeds LLM_LAST_SUCCESS, and no LLM completion
+    // ran in this process → the model-call-only gauge stays absent.
+    assert!(
+        !text.contains("mycelium2_llm_last_success_timestamp"),
+        "llm_last_success_timestamp is model-call-only and no call ran here:\n{text}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Regression: a browser that still holds a live session cookie (bookmark,
 /// back button, restart) must be able to submit /login again. The login
 /// page has no session token to render, so app.js injects an empty
