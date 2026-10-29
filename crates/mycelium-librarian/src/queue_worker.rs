@@ -172,6 +172,11 @@ impl QueueWorker {
     /// reconciles that user's orphaned staging notes here). Returns
     /// the count of processed items.
     pub async fn run_pending(&self) -> Result<usize, QueueWorkerError> {
+        // Reconcile staging rows first (outage-recovery spec §3.4): the
+        // staging scan is global, not due-scan-driven, so rows deferred
+        // by an earlier key loss get re-checked on every pass even when
+        // no user has a due pending item. Idempotent.
+        self.recover_staging().await?;
         let mut processed = 0usize;
         loop {
             let users = self.store.queue_users_with_due().await?;
@@ -196,8 +201,8 @@ impl QueueWorker {
     }
 
     /// Boot sweep: running rows (a dead process left them mid-flight)
-    /// go back to pending; staging rows (the enqueue phase died) are
-    /// completed or failed by payload existence.
+    /// go back to pending; staging rows get the same reconciliation
+    /// the periodic drain applies (spec §3.4).
     pub async fn recover_on_boot(&self) -> Result<(), QueueWorkerError> {
         // Running → pending. Direct SQL: queue-specific state repair
         // the store module didn't need to expose.
@@ -214,25 +219,44 @@ impl QueueWorker {
             .execute(self.store.pool())
             .await?;
         }
-        // Staging rows: payload durable → activate; missing → dead
-        // (operator-visible). The existence check is filename-level
-        // (HMAC of the canonical payload path), which needs the row's
-        // user's master key via the recovery callback; a user whose
-        // key can't be recovered fails fast instead of blocking boot.
+        self.recover_staging().await
+    }
+
+    /// Staging-row reconciliation — the pass `recover_on_boot` runs
+    /// once and `run_pending` re-runs on every wake (outage-recovery
+    /// spec §3.4: boot must never issue a permanent verdict for a
+    /// recoverable condition). The existence check is filename-level
+    /// (HMAC of the canonical payload path), which needs the row's
+    /// user's master key via the recovery callback:
+    ///
+    /// - key unrecoverable → **skip the row this pass** (stays
+    ///   `staging`, untouched — no dead verdict, no retry timer). The
+    ///   key comes back on its own via the service seal, and the next
+    ///   pass re-checks; log-and-continue so one bad row can't stall
+    ///   the pass.
+    /// - payload blob present → activate (the interrupted flip
+    ///   completes).
+    /// - payload genuinely absent → dead with the re-submit detail
+    ///   (permanent condition keeps its verdict).
+    ///
+    /// Idempotent: safe to call every tick and after every boot.
+    pub async fn recover_staging(&self) -> Result<(), QueueWorkerError> {
         for item in self.store.staging_rows().await? {
             let master = match ((self.recovery)(item.user_id)).await {
                 Ok(m) => m,
-                Err(_) => {
-                    // No key → the blob's stored name cannot be derived,
-                    // so terminal cleanup can only skip it (it stays
-                    // sealed, same as the row's content).
-                    self.store
-                        .mark_dead(
-                            item.id,
-                            "payload check unavailable: master-key recovery failed",
-                        )
-                        .await
-                        .map_err(QueueWorkerError::Queue)?;
+                Err(e) => {
+                    // No key → the blob's stored name cannot be
+                    // derived, so the row can be neither completed nor
+                    // fairly failed. Defer: it stays `staging` and the
+                    // next pass re-checks (a restart during a key
+                    // outage must not deaden what a later tick would
+                    // recover).
+                    tracing::warn!(
+                        error = %e,
+                        receipt = %item.id,
+                        user = %item.user_id,
+                        "staging row deferred: master-key recovery failed"
+                    );
                     continue;
                 }
             };

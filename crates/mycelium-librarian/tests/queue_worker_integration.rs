@@ -291,6 +291,32 @@ fn recovery(master: MasterKey) -> Arc<MasterKeyRecovery> {
     })
 }
 
+/// Stub recovery that always fails (the service seal unavailable — the
+/// restart-during-outage class of spec §3.4).
+fn failing_recovery() -> Arc<MasterKeyRecovery> {
+    Arc::new(|_uid| Box::pin(async { Err::<MasterKey, sqlx::Error>(sqlx::Error::RowNotFound) }))
+}
+
+/// Stub recovery that fails while `ok` is false and hands back the key
+/// once the flag flips: an outage that ends without a restart.
+fn flaky_recovery(
+    master: MasterKey,
+    ok: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<MasterKeyRecovery> {
+    let m2 = master.clone();
+    Arc::new(move |_uid| {
+        let m = m2.clone();
+        let ok = Arc::clone(&ok);
+        Box::pin(async move {
+            if ok.load(Ordering::Relaxed) {
+                Ok(m)
+            } else {
+                Err(sqlx::Error::RowNotFound)
+            }
+        })
+    })
+}
+
 /// An LLM config pointing at a port nothing listens on.
 fn dead_port_config() -> LlmConfig {
     LlmConfig {
@@ -831,6 +857,128 @@ async fn boot_sweep_reconciliation() {
         row_c.detail.contains("interrupted"),
         "detail: {}",
         row_c.detail
+    );
+}
+
+// ---------- Task 7 (outage-recovery spec §3.4): staging recovery is
+// periodic — boot never issues a permanent verdict for a recoverable
+// condition. A master-key recovery failure SKIPS the row (stays
+// staging, untouched); the periodic drain pass re-checks, and genuine
+// payload absence keeps its dead verdict.
+
+#[tokio::test]
+async fn boot_staging_key_unavailable_defers() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let uid = seed_user(&store, "t7a").await;
+
+    // Interrupted enqueue: a staging row. Whether the payload blob
+    // made it to disk is unknowable while the key is down — boot must
+    // not guess (spec §3.4/D4: a recoverable condition never gets a
+    // permanent verdict from boot).
+    let id = store.enqueue(uid, QueueTool::Add).await.unwrap();
+
+    let (_config, worker) = worker(&store, failing_recovery(), QueueLimits::default());
+    worker.recover_on_boot().await.unwrap();
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Staging,
+        "a key loss at boot must defer, never dead: {row:?}"
+    );
+    // The row is untouched: boot wrote no verdict into it.
+    assert_eq!(row.detail, "", "boot must leave the row untouched: {row:?}");
+    assert_eq!(row.attempts, 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn staging_activates_when_key_returns() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t7b").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // The interrupted flip: row + payload blob, never activated —
+    // exactly the enqueue-crash window the recovery pass completes.
+    let id = store.enqueue_capped(uid, QueueTool::Add, 50).await.unwrap();
+    let payload = MutationPayload {
+        tool: QueueTool::Add,
+        args_json: serde_json::json!({ "content": "key came back" }).to_string(),
+        content: "key came back".into(),
+    };
+    mutation_queue::write_payload(&FileRepo::new(store.user_dir(uid)), &master, id, &payload)
+        .await
+        .unwrap();
+
+    let ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let limits = QueueLimits {
+        age_deadline_secs: 0,
+        ..QueueLimits::default()
+    };
+    let (config, worker) = worker(
+        &store,
+        flaky_recovery(master.clone(), Arc::clone(&ok)),
+        limits,
+    );
+    config.set("llm", &dead_port_config()).await.unwrap();
+
+    // Key down at boot: deferred, not deadened.
+    worker.recover_on_boot().await.unwrap();
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Staging, "boot defers: {row:?}");
+
+    // Key still down at a drain pass: still deferred. The staging scan
+    // is global (not due-scan-driven), so this row is re-checked even
+    // though no user has a due pending item.
+    assert_eq!(worker.run_pending().await.unwrap(), 0);
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Staging,
+        "drain defers too: {row:?}"
+    );
+
+    // Key returns: the next pass activates the row (staging scan) and
+    // drains it (due loop) to done — one run_pending, no restart.
+    ok.store(true, Ordering::Relaxed);
+    assert_eq!(worker.run_pending().await.unwrap(), 1);
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Done, "row {id}");
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    // The fallback integrated it (age deadline 0 → deterministic path).
+    assert!(
+        row.detail
+            .starts_with("integrated via deterministic fallback"),
+        "detail: {}",
+        row.detail
+    );
+    let written = cs.get("/key-came-back.md").await.unwrap();
+    assert_eq!(written.body.trim(), "key came back");
+}
+
+#[tokio::test]
+async fn staging_payload_absent_still_dies() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t7c").await;
+
+    // Staging row with NO payload blob (the enqueue died
+    // pre-durability) and the key recoverable: a permanent condition
+    // keeps its permanent verdict (spec §3.4).
+    let id = store.enqueue(uid, QueueTool::Add).await.unwrap();
+
+    let (_config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    worker.recover_on_boot().await.unwrap();
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Dead);
+    assert_eq!(
+        row.detail, "payload missing — enqueue interrupted before durability; re-submit",
+        "pinned boot verdict for genuine payload absence"
     );
 }
 
