@@ -357,8 +357,8 @@ async fn probe_tick(state: &AppState) {
 }
 
 /// Spawn the background backend probe: the periodic `LLM_HEALTH`
-/// feeder (outage recovery spec §3.1; the module doc's "a background
-/// probe task calling [`probe_once`]" is this task).
+/// feeder (outage recovery spec §3.1; llm_health's Sources note names
+/// this task as the probe-side feeder).
 ///
 /// The wake loop mirrors the established worker shape (queue worker /
 /// chat resume worker): a [`tokio::time::interval`] whose **first tick
