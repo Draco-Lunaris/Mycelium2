@@ -1,7 +1,9 @@
 //! Migration 0010 schema guards: `concept_revisions` (spec §3.2 — the
 //! write-ahead undo log) and `search_vectors` (spec §3.3 — the hybrid
 //! vector rows) exist with exactly the columns and constraints the
-//! design spec prescribes. The later steps of the stream build their
+//! design spec prescribes. Step 2 amended the DDL in place (§3.2a-1:
+//! `path TEXT NOT NULL`) while the branch is still unmerged, so this pin
+//! is the amendment's gate. The later steps of the stream build their
 //! writers and readers on this schema, so any drift here is a schema
 //! contract break caught at the pin, not downstream.
 
@@ -26,18 +28,32 @@ async fn columns(store: &Store, table: &str) -> Vec<(String, String, i32, Option
     .unwrap()
 }
 
-/// The declared UNIQUE (scope_id, path_token, revision_no) as the
-/// `(ordered column names)` of its enforced index — whatever name the
-/// autoindex carries.
+/// The declared UNIQUE (scope_id, path_token, revision_no), hardened
+/// per the step-2 amendments: ALL declared indexes of the table are
+/// fetched (nothing filtered away), the UNIQUE index count must be
+/// exactly 1, that index must be unique, and it must cover
+/// `(scope_id, path_token, revision_no)` in order.
 async fn enforced_unique_columns(store: &Store, table: &str) -> Vec<(String,)> {
-    let (index_name,): (String,) = sqlx::query_as(&format!(
-        "SELECT name FROM pragma_index_list('{table}') WHERE origin = 'u'"
+    let all_indexes: Vec<(String, i32, String)> = sqlx::query_as(&format!(
+        "SELECT name, \"unique\", origin FROM pragma_index_list('{table}') ORDER BY seq"
     ))
-    .fetch_one(store.pool())
+    .fetch_all(store.pool())
     .await
     .unwrap();
+    assert_eq!(
+        all_indexes.len(),
+        1,
+        "{table} declares exactly one index (the table-level UNIQUE) — \
+         got {all_indexes:?}"
+    );
+    assert_eq!(all_indexes[0].1, 1, "the declared index must be unique");
+    assert_eq!(
+        all_indexes[0].2, "u",
+        "origin 'u' — the CREATE TABLE UNIQUE(...) constraint"
+    );
     sqlx::query_as(&format!(
-        "SELECT name FROM pragma_index_info('{index_name}')"
+        "SELECT name FROM pragma_index_info('{}') ORDER BY seqno",
+        all_indexes[0].0
     ))
     .fetch_all(store.pool())
     .await
@@ -55,9 +71,13 @@ async fn primary_key_columns(store: &Store, table: &str) -> Vec<(String,)> {
     .unwrap()
 }
 
-/// Spec §3.2: the column list in declaration order with their SQL
-/// types and NOT NULLs; `summary` has no default (the spec prescribes
-/// the summary text, never "unsettable").
+/// Spec §3.2 + §3.2a-1: the column list in declaration order with their
+/// SQL types and NOT NULLs. `path` (the §3.2a amendment) carries the
+/// plaintext display path: path tokens are one-way HMAC and `delete`
+/// erases the registry row, so the revisions browser page needs the
+/// column to still name deleted paths — the same plaintext-metadata
+/// posture as `scope_files` title/type. `summary` has no default (the
+/// spec prescribes the summary text, never "unsettable").
 #[tokio::test]
 async fn concept_revisions_columns_match_spec() {
     let (_dir, store) = test_store().await;
@@ -79,6 +99,8 @@ async fn concept_revisions_columns_match_spec() {
             ("id".to_string(), "INTEGER".to_string(), 0, None),
             req("scope_id", "TEXT"),
             req("path_token", "TEXT"),
+            // §3.2a-1: after `path_token`, before `revision_no`.
+            req("path", "TEXT"),
             req("revision_no", "INTEGER"),
             req("op", "TEXT"),
             req("source", "TEXT"),
@@ -86,12 +108,15 @@ async fn concept_revisions_columns_match_spec() {
             req("payload", "BLOB"),
             req("created_at", "TEXT"),
         ],
-        "concept_revisions columns must match spec §3.2 exactly (order included)"
+        "concept_revisions columns must match spec §3.2 + §3.2a-1 exactly (order included)"
     );
 }
 
 /// Spec §3.2: the UNIQUE (scope_id, path_token, revision_no), in that
-/// order.
+/// order — and (hardened) it is the table's single unique index.
+/// Revision numbers are assigned MAX+1 per (scope_id, path_token) under
+/// that key: the revision-writer's retry loop and this pin share the
+/// assumption that the triple is THE collision surface.
 #[tokio::test]
 async fn concept_revisions_unique_key_is_scope_path_revision() {
     let (_dir, store) = test_store().await;

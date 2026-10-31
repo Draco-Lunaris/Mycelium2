@@ -17,18 +17,23 @@
 --     '' (unknown provenance, never rewritten).
 --   * concept_revisions / search_vectors: the undo-log (spec §3.2) and the
 --     hybrid vector index (spec §3.3), columns exactly as those sections
---     specify them.
+--     specify them. Step 2 (amendments §3.2a) adds `path TEXT NOT NULL`
+--     after `path_token`: path tokens are one-way HMAC and `delete` erases
+--     the registry row, so §3.2's revisions browser page cannot name a
+--     deleted path otherwise — the same plaintext-metadata posture as
+--     scope_files title/type.
 
 ALTER TABLE search_docs ADD COLUMN lifecycle_status TEXT;
 
 ALTER TABLE mutation_queue ADD COLUMN source TEXT NOT NULL DEFAULT '';
 
--- Spec §3.2: write-ahead undo log for concept mutations. One row per
--- concept-changing op, newest revision_no per (scope, path token).
+-- Spec §3.2 (+ §3.2a-1 `path`): write-ahead undo log for concept mutations.
+-- One row per concept-changing op, newest revision_no per (scope, path token).
 CREATE TABLE concept_revisions (
     id          INTEGER PRIMARY KEY,
     scope_id    TEXT NOT NULL,               -- user:<uuid> | global:skills | global:library
     path_token  TEXT NOT NULL,               -- HMAC path token, same scheme as search_tokens
+    path        TEXT NOT NULL,               -- plaintext concept path (dead paths must stay nameable — §3.2a-1)
     revision_no INTEGER NOT NULL,            -- monotonic per (scope_id, path_token); MAX+1 at insert
     op          TEXT NOT NULL,               -- create|update|delete|restore|merge|consolidate|migration
     source      TEXT NOT NULL,               -- provenance captured at enqueue (spec §3.1)
