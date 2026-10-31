@@ -50,6 +50,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// The canonical text indexed for a concept: title + description + tags +
 /// body. Both the in-memory reference index and the encrypted SQLite index
 /// must use this so their results agree (oracle equivalence).
+///
+/// Body content is cut at the first line whose `trim_end()` is exactly
+/// `# History`: everything from that heading on is lifecycle history and is
+/// never indexed.
 pub fn searchable_text(concept: &Concept) -> String {
     let mut text = String::new();
     text.push_str(
@@ -68,7 +72,16 @@ pub fn searchable_text(concept: &Concept) -> String {
         text.push_str(tag);
     }
     text.push(' ');
-    text.push_str(&concept.body);
+    // Line scan: keep every line before the first exact `# History` heading
+    // (trim_end comparison so trailing whitespace still matches); a body that
+    // starts with the marker contributes no body content.
+    let body_len: usize = concept
+        .body
+        .split_inclusive('\n')
+        .take_while(|line| line.trim_end() != "# History")
+        .map(str::len)
+        .sum();
+    text.push_str(&concept.body[..body_len]);
     text
 }
 
@@ -205,6 +218,33 @@ mod tests {
         idx.add(&concept("/a.md", "One", "body")).ok();
         let results = idx.search(&SearchQuery::new(vec![])).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn history_section_not_indexed() {
+        let c = Concept::parse(
+            "/x.md",
+            "---\ntype: Note\n---\ncurrent body\n\n# History\nobsolete zebracorn facts\n",
+        )
+        .unwrap();
+        let t = searchable_text(&c);
+        assert!(t.contains("current body"));
+        assert!(!t.contains("zebracorn"));
+    }
+
+    #[test]
+    fn history_marker_requires_exact_line() {
+        for heading in ["## History", "#History", "# History extra"] {
+            let c = Concept::parse(
+                "/x.md",
+                &format!("---\ntype: Note\n---\nbody\n\n{heading}\nzebracorn facts\n"),
+            )
+            .unwrap();
+            assert!(
+                searchable_text(&c).contains("zebracorn"),
+                "{heading} must NOT split"
+            );
+        }
     }
 
     #[test]
