@@ -3,8 +3,10 @@
 //! `status: retired` at boot. Idempotent and predicate-driven — the
 //! predicate is "the frontmatter carries a tag lowercasing to
 //! `deprecated`", so a migrated concept simply stops matching: no
-//! marker row, no flag, no revision (a failed scope retries next boot
-//! for free).
+//! marker row, no flag needed (each rewrite records a `migration`-
+//! tagged undo-log revision row; a failed scope retries next boot
+//! for free, and a retry of an already-migrated concept writes
+//! nothing — no put, hence no revision row).
 //!
 //! Scope: every user scope (raw `SELECT id FROM users`) plus the
 //! `global:skills` service scope. `global:library` is NOT swept —
@@ -48,7 +50,9 @@ pub enum LifecycleError {
 ///
 /// Pure — no I/O; the sweep wires the result into `ConceptStore::put`
 /// (built with `.with_provenance("migration")`, which re-stamps
-/// `source` + `confirmed_at` on the way to disk).
+/// `source` + `confirmed_at` on the way to disk, and
+/// `.with_revision_op("migration")`, which tags the revision row the
+/// write-ahead hook records for the rewrite).
 pub fn rewrite_if_deprecated(concept: Concept) -> Option<Concept> {
     if !concept
         .frontmatter
@@ -94,7 +98,8 @@ pub async fn migrate_deprecated_tags(state: &AppState) -> Result<u32, LifecycleE
         &state.store.skills_dir(),
         "skills",
     )
-    .with_provenance(MIGRATION_LABEL);
+    .with_provenance(MIGRATION_LABEL)
+    .with_revision_op(MIGRATION_LABEL);
     migrated += sweep_scope(&skills, "global:skills").await;
 
     // Every user scope, enumerated with raw SQL on the pool (the
@@ -124,8 +129,9 @@ pub async fn migrate_deprecated_tags(state: &AppState) -> Result<u32, LifecycleE
                 continue;
             }
         };
-        let cs =
-            ConceptStore::for_user(&state.store, user_id, master).with_provenance(MIGRATION_LABEL);
+        let cs = ConceptStore::for_user(&state.store, user_id, master)
+            .with_provenance(MIGRATION_LABEL)
+            .with_revision_op(MIGRATION_LABEL);
         migrated += sweep_scope(&cs, &format!("user:{user_id}")).await;
     }
     Ok(migrated)
@@ -185,7 +191,7 @@ mod tests {
     use super::*;
     use mycelium_auth::login::LoginService;
     use mycelium_core::concept::Frontmatter;
-    use mycelium_store::Store;
+    use mycelium_store::{RevisionEntry, RevisionStore, Store};
 
     // ---- the four spec tests (written FIRST — TDD) ----
 
@@ -312,6 +318,36 @@ mod tests {
         assert_eq!(skill.frontmatter.status.as_deref(), Some("retired"));
         assert_eq!(skill.frontmatter.source.as_deref(), Some("migration"));
 
+        // The revision chains (Task 6 wiring): the sweep's rewrite puts
+        // go through stores built `.with_revision_op("migration")`, so
+        // each migrated concept gains a `migration` row ON TOP of its
+        // seed `create` row — never the mechanically derived `update`
+        // (`list` is newest-first).
+        let user_rs = RevisionStore::for_user(state.store.pool(), user, &master);
+        let skills_rs =
+            RevisionStore::for_service(state.store.pool(), &state.service_key, "skills");
+        let legacy_revs = user_rs.list("/notes/legacy.md").await.unwrap();
+        assert_eq!(
+            ops(&legacy_revs),
+            vec!["migration", "create"],
+            "the sweep's rewrite lands a migration row above the seed create"
+        );
+        assert_eq!(
+            legacy_revs[0].summary, "deprecated tag migrated to status: retired",
+            "the migration row carries its op summary"
+        );
+        assert_eq!(
+            ops(&skills_rs.list("/skills/old-skill.md").await.unwrap()),
+            vec!["migration", "create"],
+            "the skills scope's rewrite is tagged too"
+        );
+        // A concept the sweep never writes keeps its seed chain only.
+        assert_eq!(
+            ops(&user_rs.list("/notes/current.md").await.unwrap()),
+            vec!["create"],
+            "an untouched concept gains no revision row"
+        );
+
         // The clean concept's frontmatter fields were never touched.
         let clean = user_cs.get("/notes/current.md").await.unwrap();
         assert_eq!(clean.frontmatter.status, None);
@@ -334,6 +370,18 @@ mod tests {
             markdown(&skills_cs, "/skills/old-skill.md").await,
             skill_after_first,
             "run 2 must leave the migrated skills concept byte-identical"
+        );
+        // ...and run 2 writes NO revision row either — the predicate
+        // miss means no put, and no put means no undo-log entry.
+        assert_eq!(
+            user_rs.list("/notes/legacy.md").await.unwrap().len(),
+            2,
+            "the second sweep adds no revision row"
+        );
+        assert_eq!(
+            skills_rs.list("/skills/old-skill.md").await.unwrap().len(),
+            2,
+            "the second sweep adds no revision row (skills scope)"
         );
 
         // Untouched concepts stay untouched across both passes.
@@ -416,5 +464,10 @@ mod tests {
     /// markdown the byte-identical checks compare.
     async fn markdown(cs: &ConceptStore<'_>, path: &str) -> String {
         cs.get(path).await.unwrap().to_markdown().unwrap()
+    }
+
+    /// The op tags of a revision list, in list order (newest first).
+    fn ops(revs: &[RevisionEntry]) -> Vec<&str> {
+        revs.iter().map(|r| r.op.as_str()).collect()
     }
 }
