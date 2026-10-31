@@ -22,6 +22,7 @@ use mycelium_librarian::llm::{LlmClient, LlmConfig};
 use mycelium_librarian::llm_gate::{
     DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
 };
+use mycelium_librarian::llm_health::BackendState;
 use mycelium_librarian::queue_worker::{MasterKeyRecovery, QueueLimits, QueueWorker};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use mycelium_store::{ConceptStore, ConfigStore, FileRepo, QueueStatus, QueueTool, Store};
@@ -327,22 +328,44 @@ fn dead_port_config() -> LlmConfig {
     }
 }
 
+/// A fixed backend-health source. Every fixture-built worker stamps one
+/// so the drain's health gate never reads the process-global
+/// `LLM_HEALTH` — that global is fed by every mock/dead-port LLM call in
+/// this binary, so reading it would make each test's claim path depend
+/// on which tests ran before it.
+fn fixed_health(state: BackendState) -> Arc<dyn Fn() -> BackendState + Send + Sync> {
+    Arc::new(move || state)
+}
+
 /// Build a worker over the store (fresh ConfigStore the test can seed).
+/// Health source: fixed Green — existing tests must not see the drain's
+/// claims gated by unrelated tests' passive health notes.
 fn worker(
     store: &Arc<Store>,
     recovery: Arc<MasterKeyRecovery>,
     limits: QueueLimits,
 ) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
+    worker_with_health(store, recovery, limits, BackendState::Green)
+}
+
+/// `worker` with an explicit backend-health state (the Red-gate test).
+fn worker_with_health(
+    store: &Arc<Store>,
+    recovery: Arc<MasterKeyRecovery>,
+    limits: QueueLimits,
+    health: BackendState,
+) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
     let config = Arc::new(ConfigStore::new(store.pool().clone()));
     let service_key = Arc::new(test_service_key());
-    let w = Arc::new(QueueWorker::new(
+    let mut w = QueueWorker::new(
         Arc::clone(store),
         Arc::clone(&config),
         recovery,
         service_key,
         limits,
-    ));
-    (config, w)
+    );
+    w.set_health_source(fixed_health(health));
+    (config, Arc::new(w))
 }
 
 /// A deterministic service key for tests that seed sealed config rows
@@ -471,6 +494,88 @@ async fn drain_integrates_queued_add() {
     assert_eq!(written.body.trim(), "drain me please");
     assert_eq!(worker.integrated_count.load(Ordering::Relaxed), 1);
     assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
+}
+
+// ---------- T5.1b: the done row's summary detail is bounded ----------
+
+// The model's final summary is the done row's `detail` — re-served by
+// receipts. Every OTHER detail writer bounds its text through
+// `short_detail` at the queue's 512-byte cap, so the summary must
+// persist bounded too (an over-cap model answer otherwise inflates the
+// /status receipts cell without bound).
+#[tokio::test]
+async fn long_done_summary_is_bounded() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t51b").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // A >512-byte final summary with a distinctive head and tail.
+    let head = "integrated all of it. ";
+    let summary = format!("{head}{}TAILSUMMARY", "S".repeat(600));
+
+    // Script (LIFO): one write_concept call, then that final summary.
+    let (url, _mock) = mock_llm(vec![
+        text_response(&summary),
+        tool_call_response(
+            "c1",
+            "write_concept",
+            serde_json::json!({
+                "path": "/notes/summarybound.md",
+                "frontmatter": { "type": "Note", "title": "Summary Bound" },
+                "body": "summary bound"
+            }),
+        ),
+    ])
+    .await;
+
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "summary bound" }),
+        "summary bound",
+    )
+    .await;
+
+    assert_eq!(worker.run_pending().await.unwrap(), 1);
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Done);
+    let detail = row.detail.as_str();
+    assert!(
+        detail.starts_with(head),
+        "the summary head survives the bound: {detail}"
+    );
+    assert!(
+        detail.contains("… [truncated]"),
+        "an over-cap summary carries the truncation marker: {detail}"
+    );
+    assert!(
+        !detail.contains("TAILSUMMARY"),
+        "the cut tail does not survive: {detail}"
+    );
+    assert!(
+        detail.len() <= 512 + "… [truncated]".len(),
+        "detail: {detail}"
+    );
 }
 
 // ---------- T5.2: dead LLM retries, then the fallback integrates ----------
@@ -2076,4 +2181,377 @@ async fn try_enter_defers_while_queue_nonempty() {
     assert_eq!(worker.run_pending().await.unwrap(), 1);
     let done = store.queue_item(uid, id).await.unwrap().unwrap();
     assert_eq!(done.status, QueueStatus::Done);
+}
+
+// ---------- Task 2: a malformed tool call must not wedge the drain ----------
+
+// A model that answers with a malformed patch_concept call must not wedge
+// the drain: the run converges to a terminal `done` (after Task 1 the
+// model sees a tool-level error and its closing text ends the run
+// normally — no fallback involvement) and the NEXT queued item still
+// drains. This pins the drain-level contract the 2026-10-31 incident
+// broke (a Map-index panic on malformed args killed the single drain
+// task, leaving every later row stuck in `running` forever).
+#[tokio::test]
+async fn malformed_tool_args_do_not_wedge_drain() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task2wedge").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // `replace_section: {}` — the shape that used to panic the agent
+    // (missing heading/content keys). LIFO script: each item's run pops
+    // the bad tool call, sees the tool-level error, then closes with
+    // text — two steps per item, four responses for two items.
+    let bad_patch = || {
+        tool_call_response(
+            "0",
+            "patch_concept",
+            serde_json::json!({"path": "/x.md", "replace_section": {}}),
+        )
+    };
+    let (url, mock) = mock_llm(vec![
+        text_response("closed item two"),
+        bad_patch(),
+        text_response("closed item one"),
+        bad_patch(),
+    ])
+    .await;
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id1 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "belt item one" }),
+        "belt item one",
+    )
+    .await;
+    let id2 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "belt item two" }),
+        "belt item two",
+    )
+    .await;
+
+    // The whole point: this returns instead of the test task dying with
+    // a propagated panic, and it empties the queue.
+    drain_until_empty(&worker).await;
+
+    // Both rows terminal — the first run's bad args never wedged it,
+    // and the second row still drained behind it.
+    for id in [id1, id2] {
+        let row = store.queue_item(uid, id).await.unwrap().unwrap();
+        assert_eq!(row.status, QueueStatus::Done, "row {id}");
+    }
+    // Both closed as agent runs (the model recovered from the tool
+    // error), not via the fallback: no dead, no fallback involvement.
+    assert_eq!(worker.integrated_count.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.integrated, 2);
+    assert_eq!(totals.dead, 0);
+    // Each run took exactly its two scripted steps (the mock never saw
+    // a fifth request, so no retried or extra step ran).
+    assert_eq!(mock.lock().await.requests.len(), 4);
+    // The drain released every gate slot on its way out.
+    gate_wait_until("gate back to idle", || {
+        let s = LLM_GATE.stats();
+        s.active == 0 && s.queued == 0
+    })
+    .await;
+}
+
+// ---------- Task 2 (fix round 1): a panic inside a run is isolated ----------
+
+// End-to-end coverage of the catch_unwind leg: the worker's documented
+// test-visibility flag makes the FIRST item's run panic before any
+// work; the drain must catch it, route that item through the
+// deterministic fallback with the panic named in the provenance, and
+// still process the SECOND row. Without the wrapper this test fails by
+// propagating the panic out of `run_pending` and orphaning row 1 in
+// `running` forever — the exact 2026-10-31 wedge class.
+#[tokio::test]
+async fn panic_in_run_is_isolated_and_next_row_still_drains() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task2panic").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // Dead LLM, one attempt, zero backoff: the second (unpanicked) row
+    // converges through the fallback quickly instead of sitting on a
+    // 30 s backoff.
+    let limits = QueueLimits {
+        max_attempts: 1,
+        backoff_secs: [0, 0, 0],
+        ..QueueLimits::default()
+    };
+    let config = Arc::new(ConfigStore::new(store.pool().clone()));
+    config.set("llm", &dead_port_config()).await.unwrap();
+    let panic_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut base = QueueWorker::new(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        recovery(master.clone()),
+        Arc::new(test_service_key()),
+        limits,
+    );
+    // Same reason as the fixture: this test's own dead-port runs feed the
+    // global registry, and a prior test's failures may have left it Red —
+    // the drain must claim here regardless.
+    base.set_health_source(fixed_health(BackendState::Green));
+    let worker = Arc::new(QueueWorker {
+        test_panic_on_run: Some(Arc::clone(&panic_flag)),
+        ..base
+    });
+
+    let id1 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "panic item one" }),
+        "panic item one",
+    )
+    .await;
+    let id2 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "panic item two" }),
+        "panic item two",
+    )
+    .await;
+
+    // The whole point: this returns instead of the panic propagating.
+    drain_until_empty(&worker).await;
+
+    // Row 1: caught panic → deterministic-error classification →
+    // fallback integration, provenance naming the injected panic.
+    let row1 = store.queue_item(uid, id1).await.unwrap().unwrap();
+    assert_eq!(row1.status, QueueStatus::Done, "row {id1}");
+    assert!(
+        row1.detail
+            .starts_with("integrated via deterministic fallback (")
+            && row1
+                .detail
+                .contains("agent run panicked: test-injected panic"),
+        "row 1 provenance must name the caught panic: {}",
+        row1.detail
+    );
+    // Row 2: still processed after the caught panic — and NOT via the
+    // panic path (the flag fired exactly once): dead LLM, one attempt
+    // → the exhausted-attempts fallback.
+    let row2 = store.queue_item(uid, id2).await.unwrap().unwrap();
+    assert_eq!(row2.status, QueueStatus::Done, "row {id2}");
+    assert!(
+        row2.detail.contains("attempts exhausted") && !row2.detail.contains("panicked"),
+        "row 2 must be the ordinary fallback, not a second panic: {}",
+        row2.detail
+    );
+    // The injection flag is consumed (swap-to-false on the first run).
+    assert!(
+        !panic_flag.load(Ordering::Relaxed),
+        "the flag must fire exactly once"
+    );
+
+    // Both rows landed via the fallback: nothing through the agent,
+    // nothing dead, totals consistent with the rows.
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.integrated_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.fallback, 2);
+    assert_eq!(totals.integrated, 0);
+    assert_eq!(totals.dead, 0);
+    // No row orphaned in `running` (the wedge's witness), and the
+    // staging notes were reconciled at integration.
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "no orphaned running rows"
+    );
+    assert!(
+        !cs.list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.path.starts_with("/mutation-queue/")),
+        "staging notes must be reconciled"
+    );
+}
+
+// ---------- Task 3: drain claims only on a healthy backend ----------
+
+// Outage-recovery spec §1 ("claims only happen when healthy"): while the
+// health source reports Red, the drain must claim NOTHING — the row
+// stays pending with its attempts intact, and the backend never sees a
+// request. Before the gate, the drain claimed and ran (or fell back)
+// against a backend the health machine already knew was down, burning
+// each row's retry budget toward a dead end. The mock is scripted to
+// SUCCEED, so a claim that happened would integrate the row — proving
+// the row stayed pending because of the gate, not because the LLM
+// refused.
+#[tokio::test]
+async fn red_backend_halts_drain_claims() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task3red").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    let (url, mock) = mock_llm_status(vec![(200, text_response("recorded"))]).await;
+    let (config, worker) = worker_with_health(
+        &store,
+        recovery(master.clone()),
+        QueueLimits::default(),
+        BackendState::Red,
+    );
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "must wait out the outage" }),
+        "must wait out the outage",
+    )
+    .await;
+
+    drain_until_empty(&worker).await;
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Pending,
+        "Red backend must halt claims: {row:?}"
+    );
+    assert_eq!(row.attempts, 0, "no claim, so no attempt spent: {row:?}");
+    assert!(row.next_retry_at.is_none(), "untouched row: {row:?}");
+    assert!(
+        mock.lock().await.requests.is_empty(),
+        "no claim may reach the backend while Red"
+    );
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "nothing may sit claimed while Red"
+    );
+}
+
+// A 401 backend (revoked/misconfigured credentials — the incident's
+// `token_not_found_in_db` shape) is backend-down, not a content verdict.
+// The row must retry through the normal backoff — pending, one attempt
+// spent, re-armed — instead of the old one-pass route (claim → 401 →
+// done via the deterministic fallback, which never contacts the LLM, so
+// it succeeded with the librarian step silently skipped).
+// Default limits: the fresh next_retry_at (~30 s out) is intentionally
+// not due again, so nothing claims a second time in this wake.
+#[tokio::test]
+async fn unauthorized_backend_failure_retries_instead_of_dying() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task3unauth").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    let (url, mock) = mock_llm_status(vec![(
+        401,
+        serde_json::json!({"error": "token_not_found_in_db"}),
+    )])
+    .await;
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "queued during an auth outage" }),
+        "queued during an auth outage",
+    )
+    .await;
+
+    drain_until_empty(&worker).await;
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Pending,
+        "a 401 must retry, never dead or fallback-done: {row:?}"
+    );
+    assert_eq!(row.attempts, 1, "one claim spent one attempt: {row:?}");
+    assert!(
+        row.next_retry_at.is_some(),
+        "the backoff must be re-armed: {row:?}"
+    );
+    assert!(
+        row.detail.contains("401"),
+        "the retry detail names the auth failure: {}",
+        row.detail
+    );
+    // Exactly one backend request: the run's first step; the fallback
+    // never ran, so no second request and no dead.
+    assert_eq!(mock.lock().await.requests.len(), 1);
+    assert_eq!(
+        worker.fallback_count.load(Ordering::Relaxed),
+        0,
+        "the fallback must not run for a retryable failure"
+    );
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    assert_eq!(store.queue_totals().await.unwrap().dead, 0);
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "the failed run released its claim"
+    );
 }

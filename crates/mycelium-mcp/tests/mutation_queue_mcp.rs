@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use mycelium_auth::login::LoginService;
+use mycelium_librarian::llm_health::BackendState;
 use mycelium_librarian::queue_worker::{MasterKeyRecovery, QueueLimits, QueueWorker};
 use mycelium_store::{ConfigStore, Store};
 use mycelium_web::AppState;
@@ -432,13 +433,16 @@ async fn test_worker(
         mycelium_crypto::generate_master_key().as_bytes(),
     )
     .expect("32 bytes");
-    Arc::new(QueueWorker::new(
-        store,
-        config,
-        recovery,
-        Arc::new(sk),
-        limits,
-    ))
+    let mut worker = QueueWorker::new(store, config, recovery, Arc::new(sk), limits);
+    // Every test in this binary that hits a dead LLM feeds the
+    // process-global `LLM_HEALTH` through the hot-path lookup, and no
+    // probe ever runs here to seed or clear it — so that global can read
+    // Red by the time this worker claims, which would gate the drain on
+    // which tests ran before it. Pin the health source to Green, matching
+    // the `fixed_health` fixture convention in the librarian
+    // queue_worker_integration tests.
+    worker.set_health_source(Arc::new(|| BackendState::Green));
+    Arc::new(worker)
 }
 
 // T6.1 — memory_add returns a receipt with LLM dead; row + payload +

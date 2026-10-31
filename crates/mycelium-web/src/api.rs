@@ -2565,7 +2565,9 @@ pub async fn admin_system_view(
 /// spec §6 — the operational page shows cross-user jobs): the
 /// mutation queue's /health surfaces as StatTiles with state chips,
 /// the ingest-jobs table (moved here from the PR-3 System page per
-/// spec §8's ruling), and the issue-#1 receipt placeholder.
+/// spec §8's ruling), and the receipts panel over the most recent queue
+/// rows of every state (`queue_recent_rows`; the issue-#1 placeholder
+/// it replaced is retired).
 pub async fn status_view(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -2594,8 +2596,14 @@ pub async fn status_view(
             shelf_name,
         ));
     }
+    // The receipts panel's rows: the 25 most recent queue items of every
+    // state (terminal `done`/`dead` included), newest enqueue first —
+    // metadata only. A read failure zeroes the panel like the queue
+    // StatTiles beside it (health.rs's documented rule; the "degraded"
+    // chip already reports an unreachable store).
+    let receipts = state.store.queue_recent_rows(25).await.unwrap_or_default();
     let admin = request_admin_user(&state, &session).await;
-    pages::librarian_status_page(&admin, &csrf, &stats, &job_rows).into_response()
+    pages::librarian_status_page(&admin, &csrf, &stats, &job_rows, &receipts).into_response()
 }
 
 /// Fetch the SessionUser for an admin session (RequireAdmin already
@@ -3899,9 +3907,17 @@ pub async fn api_chat(
         Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
         Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
             tracing::warn!(error = %e, "librarian chat LLM failure");
+            // Same honesty rule as the runner's failure rows
+            // (`chat_runner::llm_failure_detail`): a reachable backend's
+            // refusal carries its real error text; the configure-me
+            // wording is reserved for a backend that is not configured
+            // at all. The 503 status itself is unchanged (API contract).
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal",
+                &crate::chat_runner::llm_failure_detail(
+                    &e,
+                    mycelium_librarian::llm_health::LLM_HEALTH.state(),
+                ),
             )
         }
         Err(e) => {

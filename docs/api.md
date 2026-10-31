@@ -202,13 +202,33 @@ bound elapses the turn finalizes `failed` and its error row (and
 queued when the server shuts down is finalized `interrupted` with no
 error row instead, and is resumed once on the next boot.
 
+### Failure rows
+
+A terminal chat error row carries the backend's actual error text —
+status and body for an HTTP failure, the transport reason for a
+connection error — bounded to 512 bytes (cut on a character boundary,
+suffixed `… [truncated]`) and escaped by the transcript path
+like every other row. The
+`the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal`
+wording is reserved for a backend that is not configured at all
+(`backend_state: "disabled"`); a backend that is reachable but refused
+the request — a `400 prompt is too long`, say — reports that refusal
+instead of sending the user to the admin portal to fix something that
+is already configured. A backend that is merely down produces no error
+row at all: the turn parks as `waiting_backend` and retries when the
+backend recovers.
+
 ### `POST /api/v1/chat`
 The stateless one-shot: one message in, one reply out, no cross-call
 memory. Returns `{"reply": "..."}`. Waits up to `query_wait_secs` for
 an LLM slot; on timeout
 `429 {"error": "LLM at capacity — try again shortly"}` with
-`Retry-After: 5`. `503` is reserved for an unreachable or
-unconfigured LLM backend — the two are deliberately distinct.
+`Retry-After: 5`. `503` carries the same failure text as the chat
+failure rows above: the backend's actual error text when a backend is
+configured (transport, 5xx, or the refusal itself — a `400 prompt is
+too long`, say), and the
+`the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal`
+wording only when no backend is configured at all.
 
 ## Dream
 
