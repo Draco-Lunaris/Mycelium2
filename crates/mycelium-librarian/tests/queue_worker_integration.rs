@@ -22,6 +22,7 @@ use mycelium_librarian::llm::{LlmClient, LlmConfig};
 use mycelium_librarian::llm_gate::{
     DEFAULT_CAPACITY, DEFAULT_CHAT_QUEUE_DEPTH, DEFAULT_PER_USER_ACTIVE, LLM_GATE,
 };
+use mycelium_librarian::llm_health::BackendState;
 use mycelium_librarian::queue_worker::{MasterKeyRecovery, QueueLimits, QueueWorker};
 use mycelium_store::mutation_queue::{self, MutationPayload};
 use mycelium_store::{ConceptStore, ConfigStore, FileRepo, QueueStatus, QueueTool, Store};
@@ -327,22 +328,44 @@ fn dead_port_config() -> LlmConfig {
     }
 }
 
+/// A fixed backend-health source. Every fixture-built worker stamps one
+/// so the drain's health gate never reads the process-global
+/// `LLM_HEALTH` — that global is fed by every mock/dead-port LLM call in
+/// this binary, so reading it would make each test's claim path depend
+/// on which tests ran before it.
+fn fixed_health(state: BackendState) -> Arc<dyn Fn() -> BackendState + Send + Sync> {
+    Arc::new(move || state)
+}
+
 /// Build a worker over the store (fresh ConfigStore the test can seed).
+/// Health source: fixed Green — existing tests must not see the drain's
+/// claims gated by unrelated tests' passive health notes.
 fn worker(
     store: &Arc<Store>,
     recovery: Arc<MasterKeyRecovery>,
     limits: QueueLimits,
 ) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
+    worker_with_health(store, recovery, limits, BackendState::Green)
+}
+
+/// `worker` with an explicit backend-health state (the Red-gate test).
+fn worker_with_health(
+    store: &Arc<Store>,
+    recovery: Arc<MasterKeyRecovery>,
+    limits: QueueLimits,
+    health: BackendState,
+) -> (Arc<ConfigStore>, Arc<QueueWorker>) {
     let config = Arc::new(ConfigStore::new(store.pool().clone()));
     let service_key = Arc::new(test_service_key());
-    let w = Arc::new(QueueWorker::new(
+    let mut w = QueueWorker::new(
         Arc::clone(store),
         Arc::clone(&config),
         recovery,
         service_key,
         limits,
-    ));
-    (config, w)
+    );
+    w.set_health_source(fixed_health(health));
+    (config, Arc::new(w))
 }
 
 /// A deterministic service key for tests that seed sealed config rows
@@ -2205,15 +2228,20 @@ async fn panic_in_run_is_isolated_and_next_row_still_drains() {
     let config = Arc::new(ConfigStore::new(store.pool().clone()));
     config.set("llm", &dead_port_config()).await.unwrap();
     let panic_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut base = QueueWorker::new(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        recovery(master.clone()),
+        Arc::new(test_service_key()),
+        limits,
+    );
+    // Same reason as the fixture: this test's own dead-port runs feed the
+    // global registry, and a prior test's failures may have left it Red —
+    // the drain must claim here regardless.
+    base.set_health_source(fixed_health(BackendState::Green));
     let worker = Arc::new(QueueWorker {
         test_panic_on_run: Some(Arc::clone(&panic_flag)),
-        ..QueueWorker::new(
-            Arc::clone(&store),
-            Arc::clone(&config),
-            recovery(master.clone()),
-            Arc::new(test_service_key()),
-            limits,
-        )
+        ..base
     });
 
     let id1 = enqueue_item(
@@ -2291,5 +2319,156 @@ async fn panic_in_run_is_isolated_and_next_row_still_drains() {
             .iter()
             .any(|e| e.path.starts_with("/mutation-queue/")),
         "staging notes must be reconciled"
+    );
+}
+
+// ---------- Task 3: drain claims only on a healthy backend ----------
+
+// Outage-recovery spec §1 ("claims only happen when healthy"): while the
+// health source reports Red, the drain must claim NOTHING — the row
+// stays pending with its attempts intact, and the backend never sees a
+// request. Before the gate, the drain claimed and ran (or fell back)
+// against a backend the health machine already knew was down, burning
+// each row's retry budget toward a dead end. The mock is scripted to
+// SUCCEED, so a claim that happened would integrate the row — proving
+// the row stayed pending because of the gate, not because the LLM
+// refused.
+#[tokio::test]
+async fn red_backend_halts_drain_claims() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task3red").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    let (url, mock) = mock_llm_status(vec![(200, text_response("recorded"))]).await;
+    let (config, worker) = worker_with_health(
+        &store,
+        recovery(master.clone()),
+        QueueLimits::default(),
+        BackendState::Red,
+    );
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "must wait out the outage" }),
+        "must wait out the outage",
+    )
+    .await;
+
+    drain_until_empty(&worker).await;
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Pending,
+        "Red backend must halt claims: {row:?}"
+    );
+    assert_eq!(row.attempts, 0, "no claim, so no attempt spent: {row:?}");
+    assert!(row.next_retry_at.is_none(), "untouched row: {row:?}");
+    assert!(
+        mock.lock().await.requests.is_empty(),
+        "no claim may reach the backend while Red"
+    );
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "nothing may sit claimed while Red"
+    );
+}
+
+// A 401 backend (revoked/misconfigured credentials — the incident's
+// `token_not_found_in_db` shape) is backend-down, not a content verdict.
+// The row must retry through the normal backoff — pending, one attempt
+// spent, re-armed — instead of the old one-pass route (claim → 401 →
+// "deterministic" → immediate fallback → fallback's own 401 path → dead).
+// Default limits: the fresh next_retry_at (~30 s out) is intentionally
+// not due again, so nothing claims a second time in this wake.
+#[tokio::test]
+async fn unauthorized_backend_failure_retries_instead_of_dying() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task3unauth").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    let (url, mock) = mock_llm_status(vec![(
+        401,
+        serde_json::json!({"error": "token_not_found_in_db"}),
+    )])
+    .await;
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "queued during an auth outage" }),
+        "queued during an auth outage",
+    )
+    .await;
+
+    drain_until_empty(&worker).await;
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        QueueStatus::Pending,
+        "a 401 must retry, never dead or fallback-done: {row:?}"
+    );
+    assert_eq!(row.attempts, 1, "one claim spent one attempt: {row:?}");
+    assert!(
+        row.next_retry_at.is_some(),
+        "the backoff must be re-armed: {row:?}"
+    );
+    assert!(
+        row.detail.contains("401"),
+        "the retry detail names the auth failure: {}",
+        row.detail
+    );
+    // Exactly one backend request: the run's first step; the fallback
+    // never ran, so no second request and no dead.
+    assert_eq!(mock.lock().await.requests.len(), 1);
+    assert_eq!(
+        worker.fallback_count.load(Ordering::Relaxed),
+        0,
+        "the fallback must not run for a retryable failure"
+    );
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    assert_eq!(store.queue_totals().await.unwrap().dead, 0);
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "the failed run released its claim"
     );
 }

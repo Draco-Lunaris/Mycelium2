@@ -21,7 +21,7 @@ use crate::agent::{self, AgentError, AgentScopes, MutationResult, TraceSink};
 use crate::fallback;
 use crate::llm::{LlmClient, LlmConfig};
 use crate::llm_gate;
-use crate::llm_health::short_detail;
+use crate::llm_health::{BackendState, LLM_HEALTH, short_detail};
 
 /// Recovery of a user's master key via the service-key seal.
 /// Implemented with MasterKeyCache::for_user at the binary seam
@@ -111,6 +111,13 @@ pub struct QueueWorker {
     /// the drain's catch_unwind leg is exercisable end-to-end from the
     /// integration tests. Production wiring leaves it `None`.
     pub test_panic_on_run: Option<Arc<AtomicBool>>,
+    /// Backend-health source consulted before claiming (outage-recovery
+    /// spec §1: "claims only happen when healthy"). Defaults to the
+    /// process-global [`LLM_HEALTH`]; injectable so integration tests
+    /// pin a fixed state — the global is process-wide, this binary runs
+    /// tests in parallel, and every mock/dead-port LLM call passively
+    /// feeds it (see the fixture note in `tests/queue_worker_integration.rs`).
+    pub health_source: Arc<dyn Fn() -> BackendState + Send + Sync>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,7 +161,14 @@ impl QueueWorker {
             dead_count: AtomicU64::new(0),
             integrated_count: AtomicU64::new(0),
             test_panic_on_run: None,
+            health_source: Arc::new(|| LLM_HEALTH.state()),
         }
+    }
+
+    /// Replace the backend-health source (test seam — stamp before
+    /// wrapping the worker in an `Arc`).
+    pub fn set_health_source(&mut self, f: Arc<dyn Fn() -> BackendState + Send + Sync>) {
+        self.health_source = f;
     }
 
     /// The enqueue-signal handle (the MCP enqueue path notifies this).
@@ -309,12 +323,23 @@ impl QueueWorker {
         Ok(())
     }
 
-    /// One user's next due item: capacity first (the gate's try class —
-    /// query priority, never block), then claim, recover the key, read
-    /// the payload, and run — or take the fallback. Per-item LLM/agent
+    /// One user's next due item: backend health first (Red → claim
+    /// nothing, spec §1), then capacity (the gate's try class — query
+    /// priority, never block), then claim, recover the key, read the
+    /// payload, and run — or take the fallback. Per-item LLM/agent
     /// errors are classified here (retry/fallback/dead), never
     /// surfaced above the item.
     async fn process_next_for_user(&self, uid: Uuid) -> Result<bool, QueueWorkerError> {
+        // Outage-recovery spec §1 anti-goal ("claims only happen when
+        // healthy"): while Red, the probe/passive hooks observed a
+        // failing backend — running would burn each row's attempts
+        // toward a fallback that hits the same backend and deads it.
+        // Yellow proceeds (spec §7: gate on Red only); the source is
+        // injectable so tests stay deterministic (the global is
+        // process-wide and this binary runs tests in parallel).
+        if (self.health_source)() == BackendState::Red {
+            return Ok(false);
+        }
         // Capacity first: don't claim anything we can't run now
         // (claiming then reverting would burn the retry's attempts
         // accounting). try_enter only — the query-priority invariant:
@@ -804,18 +829,23 @@ impl QueueWorker {
         ConceptStore::for_user(self.store.as_ref(), uid, master.clone())
     }
 
-    /// Is the error worth a retry (spec D6)? Transport failures and
-    /// the step cap are transient; store errors and bad tool args are
-    /// deterministic.
+    /// Is the error worth a retry (spec D6)? Backend-down errors —
+    /// transport, 5xx, and 401/403 auth failures (the
+    /// [`crate::llm::LlmError::is_backend_down`] classifier: the
+    /// request never reached a working model) — plus the step cap and
+    /// empty completions are transient; store errors, bad tool args and
+    /// content 4xx verdicts are deterministic. A 401-class outage that
+    /// classified deterministic one-pass-deads every row it touches
+    /// (claim → 401 → immediate fallback → 401 → dead, no retry).
     fn is_transient(e: &AgentError) -> bool {
         match e {
             AgentError::StepCapExceeded => true,
-            AgentError::Llm(crate::llm::LlmError::Request(_)) => true,
+            // Transient today, but a *model outcome* (a reachable model
+            // answered nothing), not backend-down — hence its own arm
+            // rather than the classifier below.
             AgentError::Llm(crate::llm::LlmError::EmptyResponse) => true,
-            AgentError::Llm(crate::llm::LlmError::Status { status, .. }) => {
-                (500..600).contains(status)
-            }
-            // BadToolArgs and Store errors are deterministic.
+            AgentError::Llm(e) if e.is_backend_down() => true,
+            // BadToolArgs, Store errors and content 4xx are deterministic.
             _ => false,
         }
     }
@@ -826,8 +856,29 @@ impl QueueWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::panic_message;
+    use super::{QueueWorker, panic_message};
+    use crate::agent::AgentError;
+    use crate::llm::LlmError;
     use std::any::Any;
+
+    // Task 3: auth-class backend failures (revoked/misconfigured
+    // credentials) are backend-down, not content verdicts — they must
+    // retry through the backoff instead of one-pass-deading the row.
+    #[test]
+    fn transient_retries_backend_auth_failures() {
+        let auth = |s| {
+            AgentError::Llm(LlmError::Status {
+                status: s,
+                body: "x".into(),
+            })
+        };
+        assert!(QueueWorker::is_transient(&auth(401)));
+        assert!(QueueWorker::is_transient(&auth(403)));
+        assert!(
+            !QueueWorker::is_transient(&auth(400)),
+            "a content 400 is a real verdict"
+        );
+    }
 
     fn caught(f: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn Any + Send> {
         std::panic::catch_unwind(f).expect_err("closure must panic")
