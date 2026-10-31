@@ -4,6 +4,28 @@ use std::collections::HashMap;
 
 use crate::concept::Concept;
 
+/// Which lifecycle statuses a search includes. Constructing a
+/// [`SearchQuery`] without saying otherwise means active-only: concepts
+/// marked `superseded` or `retired` disappear from default retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    #[default]
+    ActiveOnly,
+    All,
+}
+
+/// Status values that hide a concept from default retrieval.
+pub const NON_ACTIVE_STATUSES: [&str; 2] = ["superseded", "retired"];
+
+/// True iff a concept with this frontmatter `status` value participates
+/// in ActiveOnly retrieval. None, unknown values and "active" are active.
+pub fn is_active_status(status: Option<&str>) -> bool {
+    match status {
+        None => true,
+        Some(s) => !NON_ACTIVE_STATUSES.contains(&s),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub terms: Vec<String>,
@@ -12,6 +34,9 @@ pub struct SearchQuery {
     /// SQLite index) ignore this — cross-scope search is performed by the
     /// caller querying both the user index and the global index and merging.
     pub include_global: bool,
+    /// Lifecycle filter: [`StatusFilter::ActiveOnly`] (the default) skips
+    /// docs whose status is in [`NON_ACTIVE_STATUSES`].
+    pub status_filter: StatusFilter,
 }
 
 impl SearchQuery {
@@ -19,6 +44,7 @@ impl SearchQuery {
         Self {
             terms,
             include_global: false,
+            status_filter: StatusFilter::default(),
         }
     }
 }
@@ -92,7 +118,7 @@ pub fn searchable_text(concept: &Concept) -> String {
 pub struct InMemoryIndex {
     /// term -> (concept_path -> tf)
     postings: HashMap<String, HashMap<String, u32>>,
-    docs: HashMap<String, (String, String)>, // path -> (title, body)
+    docs: HashMap<String, (String, String, Option<String>)>, // path -> (title, body, status)
 }
 
 impl InMemoryIndex {
@@ -120,8 +146,14 @@ impl SearchIndex for InMemoryIndex {
                 .and_modify(|tf| *tf += 1)
                 .or_insert(1);
         }
-        self.docs
-            .insert(concept.source_path.clone(), (title, concept.body.clone()));
+        self.docs.insert(
+            concept.source_path.clone(),
+            (
+                title,
+                concept.body.clone(),
+                concept.frontmatter.status.clone(),
+            ),
+        );
         Ok(())
     }
 
@@ -131,6 +163,14 @@ impl SearchIndex for InMemoryIndex {
             let token = term.to_lowercase();
             if let Some(docs) = self.postings.get(&token) {
                 for (path, tf) in docs {
+                    // Lifecycle filter is a skip BEFORE scoring: scoring,
+                    // ordering and snippets are untouched by it.
+                    if query.status_filter == StatusFilter::ActiveOnly {
+                        let (_, _, status) = &self.docs[path];
+                        if !is_active_status(status.as_deref()) {
+                            continue;
+                        }
+                    }
                     *scores.entry(path.as_str()).or_insert(0.0) += *tf as f32;
                 }
             }
@@ -138,7 +178,7 @@ impl SearchIndex for InMemoryIndex {
         let mut results: Vec<SearchResult> = scores
             .into_iter()
             .map(|(path, score)| {
-                let (title, body) = &self.docs[path];
+                let (title, body, _) = &self.docs[path];
                 let snippet = body
                     .chars()
                     .take(200)
@@ -178,6 +218,16 @@ mod tests {
             body.into(),
             path.into(),
         )
+    }
+
+    fn concept_with_status(path: &str, status: Option<&str>) -> Concept {
+        let mut c = concept(path, "Rust Fact", "rust details");
+        c.frontmatter.status = status.map(str::to_string);
+        c
+    }
+
+    fn paths(results: &[SearchResult]) -> Vec<String> {
+        results.iter().map(|r| r.concept_path.clone()).collect()
     }
 
     #[test]
@@ -233,8 +283,14 @@ mod tests {
     }
 
     #[test]
+    fn searchable_text_body_starting_with_history_is_empty() {
+        let c = Concept::parse("/x.md", "---\ntype: Note\n---\n# History\nzebracorn\n").unwrap();
+        assert!(!searchable_text(&c).contains("zebracorn"));
+    }
+
+    #[test]
     fn history_marker_requires_exact_line() {
-        for heading in ["## History", "#History", "# History extra"] {
+        for heading in ["## History", "#History", "# History extra", "# history"] {
             let c = Concept::parse(
                 "/x.md",
                 &format!("---\ntype: Note\n---\nbody\n\n{heading}\nzebracorn facts\n"),
@@ -265,5 +321,49 @@ mod tests {
         let results = idx.search(&SearchQuery::new(vec!["rust".into()])).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].concept_path, "/skills/deploy-rust-service.md");
+    }
+
+    #[test]
+    fn retired_concept_hidden_by_default() {
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept_with_status("/retired.md", Some("retired")))
+            .unwrap();
+        idx.add(&concept_with_status("/active.md", Some("active")))
+            .unwrap();
+        let hits = idx.search(&SearchQuery::new(vec!["rust".into()])).unwrap();
+        assert_eq!(paths(&hits), ["/active.md"]);
+    }
+
+    #[test]
+    fn all_filter_includes_retired() {
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept_with_status("/retired.md", Some("retired")))
+            .unwrap();
+        idx.add(&concept_with_status("/active.md", Some("active")))
+            .unwrap();
+        let mut query = SearchQuery::new(vec!["rust".into()]);
+        query.status_filter = StatusFilter::All;
+        let hits = idx.search(&query).unwrap();
+        assert_eq!(paths(&hits), ["/active.md", "/retired.md"]);
+    }
+
+    #[test]
+    fn unknown_status_value_kept_active() {
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept_with_status("/archive.md", Some("archive")))
+            .unwrap();
+        idx.add(&concept_with_status("/retired.md", Some("retired")))
+            .unwrap();
+        let hits = idx.search(&SearchQuery::new(vec!["rust".into()])).unwrap();
+        assert_eq!(paths(&hits), ["/archive.md"]);
+    }
+
+    #[test]
+    fn is_active_status_matches_leniency() {
+        assert!(is_active_status(None));
+        assert!(is_active_status(Some("active")));
+        assert!(is_active_status(Some("archive"))); // unknown ⇒ active
+        assert!(!is_active_status(Some("superseded")));
+        assert!(!is_active_status(Some("retired")));
     }
 }
