@@ -505,8 +505,10 @@ async fn agent_loop_tracked(
 
 /// `include_inactive` from a model-supplied tool-call argument: absent,
 /// null or non-boolean all mean `false` — history queries stay opt-in, so
-/// every existing caller keeps the default active-only filtering.
-fn include_inactive_arg(args: &serde_json::Value) -> bool {
+/// every existing caller keeps the default active-only filtering. Takes
+/// the args map (the `as_object` guard rebinds `args` to a map before the
+/// arms run); the whole-payload null case only exists pre-guard.
+fn include_inactive_arg(args: &serde_json::Map<String, serde_json::Value>) -> bool {
     args.get("include_inactive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
@@ -528,9 +530,23 @@ async fn execute_tool_tracked(
             name: name.to_string(),
             reason: e.to_string(),
         })?;
+    // Tool args must be a JSON object: every arm below reads named keys on
+    // it. A non-object payload (a bare string, array, or number) is a
+    // recoverable bad-args error — never an index panic (a `Map` index on a
+    // missing key panics, which is what wedged the drain worker on
+    // 2026-10-31).
+    let Some(args) = args.as_object() else {
+        return Err(AgentError::BadToolArgs {
+            name: name.to_string(),
+            reason: "arguments must be a JSON object".into(),
+        });
+    };
     let outcome = match name {
         "search_knowledge" => {
-            let query = args["query"].as_str().unwrap_or_default();
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             // Term cap mirrors the MCP layer's MAX_SEARCH_TERMS: the
             // encrypted index issues one lookup per term, so an
             // unbounded (LLM-controlled) term count is a
@@ -545,7 +561,7 @@ async fn execute_tool_tracked(
             // History queries are opt-in: without the flag the search
             // keeps the default active-only filter, so retired and
             // superseded concepts stay out of ordinary retrieval.
-            if include_inactive_arg(&args) {
+            if include_inactive_arg(args) {
                 q.status_filter = mycelium_core::search::StatusFilter::All;
             }
 
@@ -618,7 +634,10 @@ async fn execute_tool_tracked(
             }
         }
         "read_concept" => {
-            let path = args["path"].as_str().unwrap_or_default();
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             // Scope-aware: the path may live in the user's bundle, the
             // global skills shelf, or the global library catalog (search
             // results are scope-tagged). Try the user's bundle first,
@@ -805,20 +824,36 @@ async fn execute_tool_tracked(
                     reason: "write tool in read-only mode".into(),
                 });
             }
-            let path = args["path"].as_str().unwrap_or_default().to_string();
-            let body = args["body"].as_str().unwrap_or_default();
-            let concept_type = args["frontmatter"]["type"]
-                .as_str()
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let body = args
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            // A non-object frontmatter takes the same None/skip path an
+            // absent one does.
+            let frontmatter = args.get("frontmatter").and_then(|v| v.as_object());
+            let concept_type = frontmatter
+                .and_then(|fm| fm.get("type"))
+                .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .unwrap_or("Note")
                 .to_string();
-            let title = args["frontmatter"]["title"].as_str().map(String::from);
-            let description = args["frontmatter"]["description"]
-                .as_str()
+            let title = frontmatter
+                .and_then(|fm| fm.get("title"))
+                .and_then(|v| v.as_str())
                 .map(String::from);
-            let tags: Vec<String> = args["frontmatter"]["tags"]
-                .as_array()
+            let description = frontmatter
+                .and_then(|fm| fm.get("description"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let tags: Vec<String> = frontmatter
+                .and_then(|fm| fm.get("tags"))
+                .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
                         .filter_map(|t| t.as_str().map(String::from))
@@ -849,10 +884,13 @@ async fn execute_tool_tracked(
                     reason: "write tool in read-only mode".into(),
                 });
             }
-            let path = args["path"].as_str().unwrap_or_default();
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             let mut concept = store.get(path).await?;
             // Frontmatter merge: null deletes a key (v1 semantics).
-            if let Some(fm) = args["frontmatter"].as_object() {
+            if let Some(fm) = args.get("frontmatter").and_then(|v| v.as_object()) {
                 for (key, value) in fm {
                     match key.as_str() {
                         "title" => {
@@ -892,11 +930,20 @@ async fn execute_tool_tracked(
                 }
             }
             // Section replace or full body replace.
-            if let Some(section) = args["replace_section"].as_object() {
-                let heading = section["heading"].as_str().unwrap_or_default();
-                let content = section["content"].as_str().unwrap_or_default();
+            if let Some(section) = args.get("replace_section").and_then(|v| v.as_object()) {
+                // Missing keys resolve to empty strings (the Value-miss
+                // semantics these `unwrap_or_default()`s were written for)
+                // — a lenient no-op-ish patch, never a Map-index panic.
+                let heading = section
+                    .get("heading")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let content = section
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 concept.body = replace_section(&concept.body, heading, content);
-            } else if let Some(body) = args["replace_body"].as_str() {
+            } else if let Some(body) = args.get("replace_body").and_then(|v| v.as_str()) {
                 concept.body = body.to_string();
             }
             store.put(&concept).await?;
@@ -912,7 +959,10 @@ async fn execute_tool_tracked(
                     reason: "write tool in read-only mode".into(),
                 });
             }
-            let path = args["path"].as_str().unwrap_or_default();
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             store.delete(path).await?;
             Ok((
                 serde_json::json!({ "deleted": path }).to_string(),
@@ -1381,11 +1431,18 @@ mod tests {
             serde_json::json!({"include_inactive": 1}),
             serde_json::json!({"include_inactive": false}),
         ] {
-            assert!(!include_inactive_arg(&args), "expected false for {args}");
+            // Post-guard the payload is always an object; `.as_object()`
+            // is the same conversion the execute path applies.
+            assert!(
+                !include_inactive_arg(args.as_object().unwrap()),
+                "expected false for {args}"
+            );
         }
-        assert!(include_inactive_arg(&serde_json::json!(
-            {"include_inactive": true}
-        )));
+        assert!(include_inactive_arg(
+            serde_json::json!({ "include_inactive": true })
+                .as_object()
+                .unwrap()
+        ));
     }
 
     // ---- patch_concept lifecycle merge (F1) ----
@@ -1563,5 +1620,92 @@ mod tests {
             .map(|spec| serde_json::to_value(spec).unwrap())
             .find(|spec| spec["function"]["name"] == name)
             .unwrap_or_else(|| panic!("no tool spec named {name}"))
+    }
+    // ---------- execute_tool_tracked args handling (drain-wedge panic) ----------
+
+    /// Fresh temp-dir store, mirroring `tests/queue_worker_integration.rs`.
+    async fn test_store() -> (tempfile::TempDir, mycelium_store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mycelium_store::Store::open(dir.path()).await.unwrap();
+        (dir, store)
+    }
+
+    /// AgentScopes with no extra stores (bare user-scope run).
+    fn bare_scopes<'a>() -> AgentScopes<'a> {
+        AgentScopes {
+            skills: None,
+            library: None,
+            read_stack_text: None,
+            visible_slugs: None,
+            trace: None,
+        }
+    }
+
+    /// A model-shaped tool call (the wire `type` field is private on
+    /// `ToolCall`, so build it through serde like the llm layer does).
+    fn tool_call(name: &str, args: &str) -> ToolCall {
+        serde_json::from_value(serde_json::json!({
+            "id": "0",
+            "type": "function",
+            "function": { "name": name, "arguments": args },
+        }))
+        .unwrap()
+    }
+
+    // A bare-string args payload must yield a recoverable tool error, not a panic.
+    #[tokio::test]
+    async fn non_object_tool_args_become_bad_tool_args_error() {
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, uuid::Uuid::new_v4(), master);
+        let scopes = bare_scopes();
+        let call = tool_call("search_knowledge", "\"just a string\"");
+        let mut rec = crate::trace::TraceRecorder::new();
+        let res = execute_tool_tracked(&cs, &scopes, &call, true, &mut rec).await;
+        assert!(matches!(
+            res,
+            Err(AgentError::BadToolArgs { ref name, .. }) if name == "search_knowledge"
+        ));
+    }
+
+    // patch_concept with replace_section lacking "heading"/"content" must be a
+    // lenient success — the Value-on-object-miss semantics the code intends
+    // (missing keys resolve to the same empty strings an explicit
+    // `{"heading":"","content":""}` produces) — NOT the Map-index panic that
+    // wedged the drain worker. (replace_section with an empty heading matches
+    // no section and appends its stub — pre-existing semantics, pinned here.)
+    #[tokio::test]
+    async fn patch_replace_section_missing_keys_is_lenient() {
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, uuid::Uuid::new_v4(), master);
+        let scopes = bare_scopes();
+        let body = "# A\n\nalpha\n\n# B\n\nbeta\n";
+        cs.put(&Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("Probe".into()),
+                ..Default::default()
+            },
+            body.to_string(),
+            "/probe.md".into(),
+        ))
+        .await
+        .unwrap();
+        let call = tool_call(
+            "patch_concept",
+            r#"{"path":"/probe.md","replace_section":{}}"#,
+        );
+        let mut rec = crate::trace::TraceRecorder::new();
+        let (out, written) = execute_tool_tracked(&cs, &scopes, &call, true, &mut rec)
+            .await
+            .expect("missing replace_section keys must be a lenient success, not an error");
+        assert_eq!(
+            out,
+            serde_json::json!({ "patched": "/probe.md" }).to_string()
+        );
+        assert_eq!(written.as_deref(), Some("/probe.md"));
+        let patched = cs.get("/probe.md").await.unwrap();
+        assert_eq!(patched.body, replace_section(body, "", ""));
     }
 }

@@ -2052,6 +2052,64 @@ async fn api_chat_is_stateless_single_turn() {
 }
 
 #[tokio::test]
+async fn stateless_chat_503_carries_the_backend_real_error() {
+    // The one-shot 503's message routes through the same
+    // `llm_failure_detail` helper as the runner's failure rows: a
+    // reachable backend's refusal is the backend's own text — the
+    // configure-me wording is reserved for a backend that is not
+    // configured at all. (A 400 is not backend-down, so health stays
+    // Green here and feeds nothing.) The 503 status itself is unchanged.
+    let _g = TEST_LOCK.lock().await;
+    let _h = HealthDefaults;
+    LLM_HEALTH.reset_for_test();
+
+    // A reachable mock backend that refuses every completion with 400.
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": { "message": "prompt too long" }
+                })),
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (base, shutdown, _dir) = boot(format!("http://{addr}/v1")).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    let resp = client
+        .post(format!("{base}/api/v1/chat"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("message", "too long for the mock")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "the status contract is unchanged");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("prompt too long"),
+        "the refusal text reaches the caller: {body}"
+    );
+    assert!(
+        !err.contains("configure one"),
+        "a reachable backend must never claim the system is unconfigured: {body}"
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn chat_capacity_timeout_fails_turn() {
     // LLM concurrency spec §3.3: a turn that never gets a slot within
     // `chat_wait_secs` finalizes `failed` with the capacity message —

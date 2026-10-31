@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_librarian::agent::{AgentError, AgentEvent, run_chat_streaming};
-use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig};
+use mycelium_librarian::llm::{ConversationTurn, LlmClient, LlmConfig, LlmError};
 use mycelium_librarian::llm_gate::{GateError, GatePermit, LLM_GATE};
 use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH, short_detail};
 use mycelium_store::ConceptStore;
@@ -67,10 +67,33 @@ const CHAT_CHANNEL_CAPACITY: usize = 256;
 /// user/assistant pairs. Tool and error rows never reach the model.
 const MAX_HISTORY_PAIRS: usize = 20;
 
-/// The user-facing LLM-down message (the `api_chat` 503 wording —
-/// one message everywhere).
+/// The user-facing **unconfigured** message (the `api_chat` 503 wording
+/// — one message everywhere). Used only when no backend is configured at
+/// all; a reachable backend that fails gets its own error text instead
+/// ([`llm_failure_detail`]).
 const LLM_UNAVAILABLE: &str =
     "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal";
+
+/// The error-row text for a terminal LLM failure: what the backend
+/// actually said, unless nothing is configured at all.
+///
+/// A healthy-but-strict backend answers with a real 4xx ("prompt is too
+/// long", a malformed tool call) — the user needs that text to act, and
+/// the configure-me wording would send them to the admin portal to fix
+/// something that is already configured. Only [`BackendState::Disabled`]
+/// (no `llm` row to decrypt) makes "configure one" the honest answer.
+/// Byte-safety and the 512-char bound come from [`short_detail`]; the
+/// transcript path renders the row escaped like every other row.
+///
+/// The backend-down class on a *configured* backend never reaches here —
+/// the park branch above it intercepts it as weather (`waiting_backend`).
+pub(crate) fn llm_failure_detail(e: &LlmError, backend: BackendState) -> String {
+    if backend == BackendState::Disabled {
+        LLM_UNAVAILABLE.to_string()
+    } else {
+        short_detail(e)
+    }
+}
 
 /// The user-facing message for a turn that never got an LLM slot within
 /// `chat_wait_secs` (LLM concurrency spec §3.3: the runner finalizes the
@@ -577,6 +600,9 @@ async fn run_chat_turn(
             } else {
                 ChatTurnStatus::Failed
             };
+            // The row carries the backend's own words; only an
+            // unconfigured machine gets the configure-me wording.
+            let detail = llm_failure_detail(&e, LLM_HEALTH.state());
             finish_turn(
                 &ctx,
                 &master,
@@ -584,7 +610,7 @@ async fn run_chat_turn(
                 session_id,
                 turn_id,
                 status,
-                Some(LLM_UNAVAILABLE),
+                Some(detail.as_str()),
             )
             .await;
         }
@@ -1117,5 +1143,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(admitted, serde_json::json!({ "type": "admitted" }));
+    }
+
+    #[test]
+    fn llm_failure_detail_reachable_backend_carries_real_error() {
+        // A healthy-but-strict backend (400 "prompt too long") is a real
+        // run outcome, not an unconfigured system: the row must say what
+        // the backend actually said, never the configure-me wording.
+        let e = LlmError::Status {
+            status: 400,
+            body: "prompt too long".into(),
+        };
+        let detail = llm_failure_detail(&e, BackendState::Green);
+        assert!(
+            detail.contains("prompt too long") || detail.contains("400"),
+            "the row carries the backend's real error: {detail}"
+        );
+        assert!(
+            !detail.contains("configure one"),
+            "a reachable backend must never claim the system is unconfigured: {detail}"
+        );
+    }
+
+    #[test]
+    fn llm_failure_detail_disabled_keeps_configure_message() {
+        // Any error will do — the health state alone decides: with no
+        // backend configured at all, configure-me IS the honest answer.
+        let e = LlmError::Status {
+            status: 500,
+            body: "{}".into(),
+        };
+        assert_eq!(
+            llm_failure_detail(&e, BackendState::Disabled),
+            LLM_UNAVAILABLE
+        );
     }
 }

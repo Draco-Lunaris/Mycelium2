@@ -167,6 +167,76 @@ async fn queue_waiting_rows_join_and_order() {
     assert_eq!(run_row.attempts, 1);
 }
 
+// Task 6 (/status receipts panel): `queue_recent_rows` — the same join,
+// mapping and decode guards as `queue_waiting_rows`, minus the status
+// filter: every row including the terminal `done`/`dead`, newest
+// enqueue first (`created_at DESC`, the column the row struct carries),
+// and a caller-supplied limit.
+#[tokio::test]
+async fn queue_recent_rows_includes_terminal_newest_first() {
+    let (store, _dir) = store().await;
+    let alice = seed_user(&store, "alice").await;
+    let bob = seed_user(&store, "bob").await;
+
+    // Three rows with deliberately spaced created_at (enqueue stamps it,
+    // so age them directly): the newest-first order must come from
+    // created_at, not insertion order.
+    let oldest = store.enqueue(alice, QueueTool::Add, "test").await.unwrap();
+    let middle = store.enqueue(bob, QueueTool::Update, "test").await.unwrap();
+    let newest = store
+        .enqueue(alice, QueueTool::Maintain, "test")
+        .await
+        .unwrap();
+    for (age_secs, id) in [(300, oldest), (200, middle), (100, newest)] {
+        let aged = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+        sqlx::query("UPDATE mutation_queue SET created_at = ? WHERE id = ?")
+            .bind(&aged)
+            .bind(id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    // Two of the three reach a terminal state — exactly the rows the
+    // waiting scan hides and this one must show.
+    for id in [middle, newest] {
+        store.activate(id).await.unwrap();
+    }
+    store
+        .mark_done(middle, &["/rust/async.md".to_string()], "integrated")
+        .await
+        .unwrap();
+    store.mark_dead(newest, "gave up").await.unwrap();
+
+    let rows = store.queue_recent_rows(25).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![newest, middle, oldest],
+        "every status, newest created_at first: {rows:?}"
+    );
+    // Terminal rows decode through the same guards as the waiting scan.
+    assert_eq!(rows[0].status, QueueStatus::Dead);
+    assert_eq!(rows[0].tool, QueueTool::Maintain);
+    assert_eq!(rows[0].username, "alice");
+    assert_eq!(rows[0].detail.as_deref(), Some("gave up"));
+    assert_eq!(rows[1].status, QueueStatus::Done);
+    assert_eq!(rows[1].tool, QueueTool::Update);
+    assert_eq!(rows[1].username, "bob");
+    assert_eq!(rows[1].detail.as_deref(), Some("integrated"));
+    // Still-waiting rows read unchanged, and the empty detail stays None.
+    assert_eq!(rows[2].status, QueueStatus::Staging);
+    assert_eq!(rows[2].detail, None, "empty detail reads as None");
+
+    // The limit is honored, still newest-first.
+    let top = store.queue_recent_rows(2).await.unwrap();
+    assert_eq!(
+        top.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![newest, middle],
+        "limit trims the oldest off the end"
+    );
+    // Zero is a bound like any other — no rows, never a full scan.
+    assert!(store.queue_recent_rows(0).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn queue_health_counts_pending_by_tool() {
     let (store, _dir) = store().await;

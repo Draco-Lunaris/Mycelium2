@@ -2,8 +2,9 @@
 //! background with bounded LLM capacity, retry/backoff, and the
 //! deterministic fallback as the integration guarantee.
 
+use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
@@ -20,7 +21,7 @@ use crate::agent::{self, AgentError, AgentScopes, MutationResult, TraceSink};
 use crate::fallback;
 use crate::llm::{LlmClient, LlmConfig};
 use crate::llm_gate;
-use crate::llm_health::short_detail;
+use crate::llm_health::{BackendState, LLM_HEALTH, short_detail};
 
 /// Recovery of a user's master key via the service-key seal.
 /// Implemented with MasterKeyCache::for_user at the binary seam
@@ -74,6 +75,19 @@ impl Default for QueueLimits {
 // `short_detail` (the byte-safe error-detail bound) moved to
 // `crate::llm_health` so one copy serves every bounded-detail site.
 
+/// A printable message from a caught panic payload: the two common
+/// shapes (`&'static str` from `panic!("literal")`, `String` from a
+/// formatted panic) plus a non-string fallback. Never itself panics —
+/// the drain's panic isolation must not wedge on its own reporting
+/// path (`unwrap_or_else`, never `unwrap`).
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
 // ---- worker ----
 
 pub struct QueueWorker {
@@ -91,6 +105,19 @@ pub struct QueueWorker {
     pub fallback_count: AtomicU64,
     pub dead_count: AtomicU64,
     pub integrated_count: AtomicU64,
+    /// In-process test-visibility aid only (same class as
+    /// `fallback_count`): when `Some` and the flag reads true,
+    /// `run_item` panics once (the flag self-clears on the swap) so
+    /// the drain's catch_unwind leg is exercisable end-to-end from the
+    /// integration tests. Production wiring leaves it `None`.
+    pub test_panic_on_run: Option<Arc<AtomicBool>>,
+    /// Backend-health source consulted before claiming (outage-recovery
+    /// spec §1: "claims only happen when healthy"). Defaults to the
+    /// process-global [`LLM_HEALTH`]; injectable so integration tests
+    /// pin a fixed state — the global is process-wide, this binary runs
+    /// tests in parallel, and every mock/dead-port LLM call passively
+    /// feeds it (see the fixture note in `tests/queue_worker_integration.rs`).
+    pub health_source: Arc<dyn Fn() -> BackendState + Send + Sync>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -133,7 +160,15 @@ impl QueueWorker {
             fallback_count: AtomicU64::new(0),
             dead_count: AtomicU64::new(0),
             integrated_count: AtomicU64::new(0),
+            test_panic_on_run: None,
+            health_source: Arc::new(|| LLM_HEALTH.state()),
         }
+    }
+
+    /// Replace the backend-health source (test seam — stamp before
+    /// wrapping the worker in an `Arc`).
+    pub fn set_health_source(&mut self, f: Arc<dyn Fn() -> BackendState + Send + Sync>) {
+        self.health_source = f;
     }
 
     /// The enqueue-signal handle (the MCP enqueue path notifies this).
@@ -265,11 +300,18 @@ impl QueueWorker {
             if self.store.user_dir(item.user_id).join(name).exists() {
                 self.store.activate(item.id).await?;
             } else {
+                // Dead flips are never log-silent: the row's persisted
+                // detail is an operator's only other clue, and reading
+                // it once took raw SQL.
+                let detail = "payload missing — enqueue interrupted before durability; re-submit";
+                tracing::warn!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: staging payload never became durable"
+                );
                 self.store
-                    .mark_dead(
-                        item.id,
-                        "payload missing — enqueue interrupted before durability; re-submit",
-                    )
+                    .mark_dead(item.id, detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the blob (no-op here — the
@@ -281,12 +323,23 @@ impl QueueWorker {
         Ok(())
     }
 
-    /// One user's next due item: capacity first (the gate's try class —
-    /// query priority, never block), then claim, recover the key, read
-    /// the payload, and run — or take the fallback. Per-item LLM/agent
+    /// One user's next due item: backend health first (Red → claim
+    /// nothing, spec §1), then capacity (the gate's try class — query
+    /// priority, never block), then claim, recover the key, read the
+    /// payload, and run — or take the fallback. Per-item LLM/agent
     /// errors are classified here (retry/fallback/dead), never
     /// surfaced above the item.
     async fn process_next_for_user(&self, uid: Uuid) -> Result<bool, QueueWorkerError> {
+        // Outage-recovery spec §1 anti-goal ("claims only happen when
+        // healthy"): while Red, the probe/passive hooks observed a
+        // failing backend — running would burn each row's attempts
+        // toward a fallback that hits the same backend and deads it.
+        // Yellow proceeds (spec §7: gate on Red only); the source is
+        // injectable so tests stay deterministic (the global is
+        // process-wide and this binary runs tests in parallel).
+        if (self.health_source)() == BackendState::Red {
+            return Ok(false);
+        }
         // Capacity first: don't claim anything we can't run now
         // (claiming then reverting would burn the retry's attempts
         // accounting). try_enter only — the query-priority invariant:
@@ -326,13 +379,17 @@ impl QueueWorker {
             Ok(Some(p)) => p,
             Ok(None) => {
                 drop(permit);
+                let detail = "payload missing — enqueue interrupted before durability; re-submit the mutation";
+                tracing::warn!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: payload missing at claim"
+                );
                 self.store
-                        .mark_dead(
-                            item.id,
-                            "payload missing — enqueue interrupted before durability; re-submit the mutation",
-                        )
-                        .await
-                        .map_err(QueueWorkerError::Queue)?;
+                    .mark_dead(item.id, detail)
+                    .await
+                    .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the blob (a no-op when absent; a
                 // present-but-unparseable one gets cleaned up too).
                 self.delete_payload(uid, &master, item.id).await;
@@ -343,11 +400,15 @@ impl QueueWorker {
                 drop(permit);
                 // Unseal/corrupt errors: dead (content unreadable;
                 // a retry can't fix a key/path mismatch).
+                let detail = format!("payload unreadable: {}", short_detail(&e));
+                tracing::error!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: payload unreadable/corrupt"
+                );
                 self.store
-                    .mark_dead(
-                        item.id,
-                        &format!("payload unreadable: {}", short_detail(&e)),
-                    )
+                    .mark_dead(item.id, &detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: the blob is unreadable garbage — drop it.
@@ -366,7 +427,32 @@ impl QueueWorker {
                 .map(|()| true);
         }
 
-        let result = self.run_item(&item, &master, &payload).await;
+        // Belt-and-braces against the 2026-10-31 wedge class: if any
+        // panic ever escapes a run's future again, the single drain
+        // task survives, this item takes the deterministic-error path
+        // (fallback), and later items still drain. `AssertUnwindSafe`
+        // is justified: nothing shared is poisoned by an unwind in
+        // these futures (no locks held across the await; sqlx state is
+        // unaffected).
+        let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.run_item(&item, &master, &payload),
+        ))
+        .await
+        .unwrap_or_else(|payload| {
+            let msg = panic_message(payload);
+            tracing::error!(
+                receipt = %item.id,
+                user = %item.user_id,
+                panic = %msg,
+                "drain agent run panicked — routing to the deterministic fallback"
+            );
+            // A panic never reached a real model verdict: deterministic-error shape
+            // (non-transient) → fallback, per the classification the drain already owns.
+            Err(AgentError::BadToolArgs {
+                name: "(panic)".into(),
+                reason: format!("agent run panicked: {msg}"),
+            })
+        });
 
         // Attempt accounting (`attempts` was already incremented in
         // the claim, so `item.attempts` is 1-based: first failure has
@@ -432,6 +518,15 @@ impl QueueWorker {
         master: &MasterKey,
         payload: &MutationPayload,
     ) -> Result<MutationResult, AgentError> {
+        // Test-injection point for the catch_unwind leg (see the
+        // `test_panic_on_run` field doc): fires once, before any work,
+        // so an integration test exercises the wrapper's full route —
+        // catch, log, deterministic fallback — on the first item only.
+        if let Some(flag) = &self.test_panic_on_run
+            && flag.swap(false, Ordering::Relaxed)
+        {
+            panic!("test-injected panic");
+        }
         let uid = item.user_id;
         let client = LlmClient::new(&llm_config(&self.config, &self.service_key).await);
         let cs = self.user_cs(uid, master).with_provenance(&item.source);
@@ -499,8 +594,16 @@ impl QueueWorker {
             // No key → the payload blob's stored name cannot be derived,
             // so terminal cleanup can only skip it (it stays sealed and
             // unrecoverable, same as the row's content).
+            let detail = "fallback unavailable: master-key recovery failed";
+            tracing::warn!(
+                receipt = %item.id,
+                user = %item.user_id,
+                detail = %detail,
+                provenance = %provenance,
+                "queue row marked dead: fallback unavailable without the master key"
+            );
             self.store
-                .mark_dead(item.id, "fallback unavailable: master-key recovery failed")
+                .mark_dead(item.id, detail)
                 .await
                 .map_err(QueueWorkerError::Queue)?;
             self.dead_count.fetch_add(1, Ordering::Relaxed);
@@ -513,11 +616,17 @@ impl QueueWorker {
         // The payload may be missing (enqueue died pre-durability, or
         // corrupted) — dead, never a panic.
         let Some(payload) = mutation_queue::read_payload(&repo, master, item.id).await? else {
+            let detail =
+                "payload missing — enqueue interrupted before durability; re-submit the mutation";
+            tracing::warn!(
+                receipt = %item.id,
+                user = %item.user_id,
+                detail = %detail,
+                provenance = %provenance,
+                "queue row marked dead: payload missing at fallback"
+            );
             self.store
-                .mark_dead(
-                    item.id,
-                    "payload missing — enqueue interrupted before durability; re-submit the mutation",
-                )
+                .mark_dead(item.id, detail)
                 .await
                 .map_err(QueueWorkerError::Queue)?;
             // Terminal dead: drop the blob (no-op when absent; cleans a
@@ -575,8 +684,16 @@ impl QueueWorker {
                 Ok(())
             }
             Err(e) => {
+                let detail = format!("fallback failed: {}", short_detail(&e));
+                tracing::error!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    provenance = %provenance,
+                    "queue row marked dead: deterministic fallback failed"
+                );
                 self.store
-                    .mark_dead(item.id, &format!("fallback failed: {}", short_detail(&e)))
+                    .mark_dead(item.id, &detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the payload blob, then the note
@@ -599,7 +716,7 @@ impl QueueWorker {
         res: MutationResult,
     ) -> Result<(), QueueWorkerError> {
         self.store
-            .mark_done(item.id, &res.files_changed, &res.summary)
+            .mark_done(item.id, &res.files_changed, &short_detail(&res.summary))
             .await
             .map_err(QueueWorkerError::Queue)?;
         // Terminal done: drop the payload blob (the integrated concept
@@ -714,18 +831,24 @@ impl QueueWorker {
         ConceptStore::for_user(self.store.as_ref(), uid, master.clone())
     }
 
-    /// Is the error worth a retry (spec D6)? Transport failures and
-    /// the step cap are transient; store errors and bad tool args are
-    /// deterministic.
+    /// Is the error worth a retry (spec D6)? Backend-down errors —
+    /// transport, 5xx, and 401/403 auth failures (the
+    /// [`crate::llm::LlmError::is_backend_down`] classifier: the
+    /// request never reached a working model) — plus the step cap and
+    /// empty completions are transient; store errors, bad tool args and
+    /// content 4xx verdicts are deterministic. 401/403 must retry
+    /// rather than fall back: the deterministic fallback never contacts
+    /// the LLM, so a one-pass fallback would succeed with the librarian
+    /// step silently skipped.
     fn is_transient(e: &AgentError) -> bool {
         match e {
             AgentError::StepCapExceeded => true,
-            AgentError::Llm(crate::llm::LlmError::Request(_)) => true,
+            // Transient today, but a *model outcome* (a reachable model
+            // answered nothing), not backend-down — hence its own arm
+            // rather than the classifier below.
             AgentError::Llm(crate::llm::LlmError::EmptyResponse) => true,
-            AgentError::Llm(crate::llm::LlmError::Status { status, .. }) => {
-                (500..600).contains(status)
-            }
-            // BadToolArgs and Store errors are deterministic.
+            AgentError::Llm(e) if e.is_backend_down() => true,
+            // BadToolArgs, Store errors and content 4xx are deterministic.
             _ => false,
         }
     }
@@ -733,3 +856,56 @@ impl QueueWorker {
 
 // The `short_detail` tests moved with the function to
 // `crate::llm_health::tests`.
+
+#[cfg(test)]
+mod tests {
+    use super::{QueueWorker, panic_message};
+    use crate::agent::AgentError;
+    use crate::llm::LlmError;
+    use std::any::Any;
+
+    // Task 3: auth-class backend failures (revoked/misconfigured
+    // credentials) are backend-down, not content verdicts — they must
+    // retry through the backoff instead of one-passing to done via the
+    // deterministic fallback (the librarian step silently skipped).
+    #[test]
+    fn transient_retries_backend_auth_failures() {
+        let auth = |s| {
+            AgentError::Llm(LlmError::Status {
+                status: s,
+                body: "x".into(),
+            })
+        };
+        assert!(QueueWorker::is_transient(&auth(401)));
+        assert!(QueueWorker::is_transient(&auth(403)));
+        assert!(
+            !QueueWorker::is_transient(&auth(400)),
+            "a content 400 is a real verdict"
+        );
+    }
+
+    fn caught(f: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn Any + Send> {
+        std::panic::catch_unwind(f).expect_err("closure must panic")
+    }
+
+    #[test]
+    fn panic_message_reads_static_str_payload() {
+        let payload = caught(|| panic!("static str panic"));
+        assert_eq!(panic_message(payload), "static str panic");
+    }
+
+    #[test]
+    fn panic_message_reads_string_payload() {
+        let detail = String::from("formatted");
+        let payload = caught(move || panic!("a {detail} panic"));
+        assert_eq!(panic_message(payload), "a formatted panic");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_non_string_payload() {
+        // A payload that is neither &str nor String must never be
+        // unwrap'd — the reporting path may not itself panic.
+        let payload = caught(|| std::panic::panic_any(42u8));
+        assert_eq!(panic_message(payload), "non-string panic payload");
+    }
+}
