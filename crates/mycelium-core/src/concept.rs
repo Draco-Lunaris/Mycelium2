@@ -79,6 +79,37 @@ impl SkillManifest {
     }
 }
 
+/// Lifecycle status of a concept (frontmatter `status`). Parsing is
+/// exact-lowercase — the lenient frontmatter parser keeps any raw
+/// string, [`Frontmatter::validated`] rejects unknown values at write
+/// time (mirrors how `type` stays a plain String).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleStatus {
+    Active,
+    Superseded,
+    Retired,
+}
+
+impl LifecycleStatus {
+    /// Exact lowercase match only (`"ACTIVE"` is not a status).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "superseded" => Some(Self::Superseded),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Retired => "retired",
+        }
+    }
+}
+
 /// Frontmatter of an OKF concept. `type` is the only required field;
 /// all others are optional and unknown fields are ignored (lenient parsing).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -105,6 +136,46 @@ pub struct Frontmatter {
     /// Skill-bundle manifest carried by a `/<slug>/skill.md` hub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<SkillManifest>,
+    /// Lifecycle status: `active` | `superseded` | `retired`
+    /// ([`LifecycleStatus`]; checked by [`Frontmatter::validated`] on write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Absolute `.md` path of the concept that supersedes this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// RFC 3339 expiry timestamp: the fact stops being valid after this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Origin of the fact, e.g. `mcp:<key-id>` or `chat:<session>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// RFC 3339 timestamp of the last confirmation that the fact is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
+}
+
+impl Frontmatter {
+    /// Shape-validation of the lifecycle fields, run at write time.
+    /// Existence is never checked here (no bundle access): a
+    /// `superseded_by` target may point anywhere well-formed.
+    pub fn validated(&self) -> Result<(), ConceptError> {
+        if let Some(v) = &self.status
+            && LifecycleStatus::parse(v).is_none()
+        {
+            return Err(ConceptError::InvalidLifecycleStatus { value: v.clone() });
+        }
+        if let Some(v) = &self.superseded_by
+            && !(v.starts_with('/') && v.ends_with(".md"))
+        {
+            return Err(ConceptError::InvalidSupersededBy { value: v.clone() });
+        }
+        if let Some(v) = &self.valid_to
+            && chrono::DateTime::parse_from_rfc3339(v).is_err()
+        {
+            return Err(ConceptError::InvalidValidTo { value: v.clone() });
+        }
+        Ok(())
+    }
 }
 
 /// A parsed OKF concept: frontmatter + markdown body + canonical path.
@@ -126,6 +197,12 @@ pub enum ConceptError {
     Yaml(#[from] serde_yaml_ng::Error),
     #[error("skill manifest path escapes the skill directory: {path}")]
     InvalidSkillPath { path: String },
+    #[error("invalid lifecycle status: {value}")]
+    InvalidLifecycleStatus { value: String },
+    #[error("invalid superseded_by target (need absolute .md path): {value}")]
+    InvalidSupersededBy { value: String },
+    #[error("invalid valid_to timestamp (need RFC 3339): {value}")]
+    InvalidValidTo { value: String },
 }
 
 impl Concept {
@@ -394,5 +471,68 @@ mod tests {
             ],
         };
         assert!(good.validated().is_ok());
+    }
+
+    #[test]
+    fn lifecycle_fields_round_trip() {
+        let md = "---\ntype: Note\nstatus: superseded\nsuperseded_by: /new/fact.md\nvalid_to: 2027-01-01T00:00:00Z\nsource: mcp:test-key\nconfirmed_at: 2026-10-31T14:00:00Z\n---\n\nb";
+        let c = Concept::parse("/x.md", md).unwrap();
+        assert_eq!(c.frontmatter.status.as_deref(), Some("superseded"));
+        assert_eq!(c.frontmatter.superseded_by.as_deref(), Some("/new/fact.md"));
+        assert!(c.frontmatter.valid_to.is_some());
+        assert_eq!(c.frontmatter.source.as_deref(), Some("mcp:test-key"));
+        assert!(c.frontmatter.confirmed_at.is_some());
+        assert_eq!(
+            c,
+            Concept::parse("/x.md", &c.to_markdown().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_status_parses_lenient_but_validated_rejects() {
+        let c = Concept::parse("/x.md", "---\ntype: Note\nstatus: archive\n---\n\nb").unwrap();
+        assert_eq!(c.frontmatter.status.as_deref(), Some("archive")); // lenient parse keeps the string
+        assert!(c.frontmatter.validated().is_err());
+    }
+
+    #[test]
+    fn validated_ok_even_if_target_missing() {
+        let c = Concept::parse(
+            "/x.md",
+            "---\ntype: Note\nstatus: superseded\nsuperseded_by: /nowhere/nothing.md\n---\n\nb",
+        )
+        .unwrap();
+        assert!(c.frontmatter.validated().is_ok()); // shape-validated, not existence-validated
+    }
+
+    #[test]
+    fn validated_rejects_relative_and_wrong_ext_superseded_by() {
+        for md in ["relative/x.md", "/no-ext", "/x.txt"] {
+            let c = Concept::parse(
+                "/x.md",
+                &format!("---\ntype: Note\nsuperseded_by: {md}\n---\n\nb"),
+            )
+            .unwrap();
+            assert!(c.frontmatter.validated().is_err(), "must reject {md}");
+        }
+    }
+
+    #[test]
+    fn validated_rejects_bad_valid_to() {
+        let c = Concept::parse("/x.md", "---\ntype: Note\nvalid_to: not-a-date\n---\n\nb").unwrap();
+        assert!(c.frontmatter.validated().is_err());
+    }
+
+    #[test]
+    fn lifecycle_status_enum_parses_exact_strings() {
+        for (s, want) in [
+            ("active", LifecycleStatus::Active),
+            ("superseded", LifecycleStatus::Superseded),
+            ("retired", LifecycleStatus::Retired),
+        ] {
+            assert_eq!(LifecycleStatus::parse(s), Some(want));
+        }
+        assert_eq!(LifecycleStatus::parse("ACTIVE"), None); // exact lowercase only
+        assert_eq!(LifecycleStatus::parse("archive"), None);
     }
 }
