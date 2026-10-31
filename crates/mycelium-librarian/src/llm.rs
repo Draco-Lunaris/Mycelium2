@@ -542,8 +542,9 @@ pub enum ConversationTurn {
 /// conversation keeps the full text (the cap is per-model-call).
 pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 
-/// Token budget for one `chat/completions` call (estimator: chars / 4),
-/// comfortably under the 131,072-token context cap observed via
+/// Token budget for one `chat/completions` call (estimator: bytes / 4 —
+/// conservative for multibyte, since bytes ≥ chars it over-estimates
+/// tokens, never under), comfortably under the 131,072-token context cap observed via
 /// litellm on 2026-10-31 (a 143,083-token prompt was rejected with a
 /// 400). `trim_conversation` drops whole leading units until the
 /// remainder fits; when nothing more is droppable the over-budget
@@ -572,8 +573,10 @@ pub(crate) fn bound_tool_result(text: &str) -> String {
     out
 }
 
-/// Rough prompt cost of one turn's text on the wire, in chars.
-fn turn_chars(turn: &ConversationTurn) -> usize {
+/// Rough prompt cost of one turn's text on the wire, in BYTES
+/// (`.len()` — a multibyte turn overstates its char count, which is the
+/// safe direction for the bytes/4 estimator).
+fn turn_bytes(turn: &ConversationTurn) -> usize {
     match turn {
         ConversationTurn::User(text) | ConversationTurn::Assistant(text) => text.len(),
         ConversationTurn::AssistantToolCalls(calls) => calls
@@ -584,11 +587,13 @@ fn turn_chars(turn: &ConversationTurn) -> usize {
     }
 }
 
-/// The brief's estimator: ~4 chars per token (conservative — the
-/// observed 131,072-token cap allows far more text with structured JSON
-/// overhead included, so an estimate under the budget leaves headroom).
-fn est_tokens(chars: usize) -> usize {
-    chars / 4
+/// The brief's estimator: ~4 bytes per token (bytes / 4 — conservative
+/// for multibyte: bytes ≥ chars, so this over-estimates tokens, never
+/// under; the observed 131,072-token cap allows far more text with
+/// structured JSON overhead included, so an estimate under the budget
+/// leaves headroom).
+fn est_tokens(text_bytes: usize) -> usize {
+    text_bytes / 4
 }
 
 /// The exclusive end of the conversational unit starting at `start`.
@@ -639,9 +644,9 @@ pub(crate) fn trim_conversation(turns: &[ConversationTurn]) -> Vec<ConversationT
         start = end;
     }
 
-    let unit_chars: Vec<usize> = units
+    let unit_bytes: Vec<usize> = units
         .iter()
-        .map(|&(s, e)| turns[s..e].iter().map(turn_chars).sum())
+        .map(|&(s, e)| turns[s..e].iter().map(turn_bytes).sum())
         .collect();
 
     // The unit carrying the final User turn; units strictly before it
@@ -658,9 +663,9 @@ pub(crate) fn trim_conversation(turns: &[ConversationTurn]) -> Vec<ConversationT
         .min(units.len().saturating_sub(1));
 
     let mut drop = 0usize;
-    let mut remaining_chars: usize = unit_chars.iter().sum();
-    while drop < droppable_max && est_tokens(remaining_chars) > CONTEXT_TOKENS_BUDGET {
-        remaining_chars -= unit_chars[drop];
+    let mut remaining_bytes: usize = unit_bytes.iter().sum();
+    while drop < droppable_max && est_tokens(remaining_bytes) > CONTEXT_TOKENS_BUDGET {
+        remaining_bytes -= unit_bytes[drop];
         drop += 1;
     }
 
@@ -1244,8 +1249,8 @@ mod tests {
 
         // The kept tail fits the budget, and nothing of the dropped
         // leading pairs remains.
-        let chars: usize = kept.iter().map(turn_chars).sum();
-        assert!(est_tokens(chars) <= CONTEXT_TOKENS_BUDGET, "{chars} chars");
+        let bytes: usize = kept.iter().map(turn_bytes).sum();
+        assert!(est_tokens(bytes) <= CONTEXT_TOKENS_BUDGET, "{bytes} bytes");
         assert!(
             !kept
                 .iter()
@@ -1329,8 +1334,8 @@ mod tests {
 
         // Still over budget: the walk exhausted the droppable prefix and
         // stopped (a larger estimate is the honest-400 failure mode).
-        let chars: usize = kept.iter().map(turn_chars).sum();
-        assert!(est_tokens(chars) > CONTEXT_TOKENS_BUDGET);
+        let bytes: usize = kept.iter().map(turn_bytes).sum();
+        assert!(est_tokens(bytes) > CONTEXT_TOKENS_BUDGET);
     }
 
     /// One unit larger than the whole budget: nothing may be dropped
@@ -1357,7 +1362,7 @@ mod tests {
         assert!(
             matches!(&kept[1], ConversationTurn::ToolResult { result, .. } if result.len() == big.len())
         );
-        let chars: usize = kept.iter().map(turn_chars).sum();
-        assert!(est_tokens(chars) > CONTEXT_TOKENS_BUDGET);
+        let bytes: usize = kept.iter().map(turn_bytes).sum();
+        assert!(est_tokens(bytes) > CONTEXT_TOKENS_BUDGET);
     }
 }

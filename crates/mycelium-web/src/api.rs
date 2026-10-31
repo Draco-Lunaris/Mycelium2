@@ -3907,9 +3907,17 @@ pub async fn api_chat(
         Ok(reply) => Json(serde_json::json!({ "reply": reply })).into_response(),
         Err(mycelium_librarian::agent::AgentError::Llm(e)) => {
             tracing::warn!(error = %e, "librarian chat LLM failure");
+            // Same honesty rule as the runner's failure rows
+            // (`chat_runner::llm_failure_detail`): a reachable backend's
+            // refusal carries its real error text; the configure-me
+            // wording is reserved for a backend that is not configured
+            // at all. The 503 status itself is unchanged (API contract).
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal",
+                &crate::chat_runner::llm_failure_detail(
+                    &e,
+                    mycelium_librarian::llm_health::LLM_HEALTH.state(),
+                ),
             )
         }
         Err(e) => {

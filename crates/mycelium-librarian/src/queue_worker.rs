@@ -714,7 +714,7 @@ impl QueueWorker {
         res: MutationResult,
     ) -> Result<(), QueueWorkerError> {
         self.store
-            .mark_done(item.id, &res.files_changed, &res.summary)
+            .mark_done(item.id, &res.files_changed, &short_detail(&res.summary))
             .await
             .map_err(QueueWorkerError::Queue)?;
         // Terminal done: drop the payload blob (the integrated concept
@@ -834,9 +834,10 @@ impl QueueWorker {
     /// [`crate::llm::LlmError::is_backend_down`] classifier: the
     /// request never reached a working model) — plus the step cap and
     /// empty completions are transient; store errors, bad tool args and
-    /// content 4xx verdicts are deterministic. A 401-class outage that
-    /// classified deterministic one-pass-deads every row it touches
-    /// (claim → 401 → immediate fallback → 401 → dead, no retry).
+    /// content 4xx verdicts are deterministic. 401/403 must retry
+    /// rather than fall back: the deterministic fallback never contacts
+    /// the LLM, so a one-pass fallback would succeed with the librarian
+    /// step silently skipped.
     fn is_transient(e: &AgentError) -> bool {
         match e {
             AgentError::StepCapExceeded => true,
@@ -863,7 +864,8 @@ mod tests {
 
     // Task 3: auth-class backend failures (revoked/misconfigured
     // credentials) are backend-down, not content verdicts — they must
-    // retry through the backoff instead of one-pass-deading the row.
+    // retry through the backoff instead of one-passing to done via the
+    // deterministic fallback (the librarian step silently skipped).
     #[test]
     fn transient_retries_backend_auth_failures() {
         let auth = |s| {

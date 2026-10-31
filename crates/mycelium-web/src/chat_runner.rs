@@ -87,7 +87,7 @@ const LLM_UNAVAILABLE: &str =
 ///
 /// The backend-down class on a *configured* backend never reaches here —
 /// the park branch above it intercepts it as weather (`waiting_backend`).
-fn llm_failure_detail(e: &LlmError, backend: BackendState) -> String {
+pub(crate) fn llm_failure_detail(e: &LlmError, backend: BackendState) -> String {
     if backend == BackendState::Disabled {
         LLM_UNAVAILABLE.to_string()
     } else {

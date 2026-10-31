@@ -206,8 +206,8 @@ error row instead, and is resumed once on the next boot.
 
 A terminal chat error row carries the backend's actual error text —
 status and body for an HTTP failure, the transport reason for a
-connection error — bounded to 512 characters (cut on a character
-boundary, suffixed `… [truncated]`) and escaped by the transcript path
+connection error — bounded to 512 bytes (cut on a character boundary,
+suffixed `… [truncated]`) and escaped by the transcript path
 like every other row. The
 `the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal`
 wording is reserved for a backend that is not configured at all
@@ -223,8 +223,12 @@ The stateless one-shot: one message in, one reply out, no cross-call
 memory. Returns `{"reply": "..."}`. Waits up to `query_wait_secs` for
 an LLM slot; on timeout
 `429 {"error": "LLM at capacity — try again shortly"}` with
-`Retry-After: 5`. `503` is reserved for an unreachable or
-unconfigured LLM backend — the two are deliberately distinct.
+`Retry-After: 5`. `503` carries the same failure text as the chat
+failure rows above: the backend's actual error text when a backend is
+configured (transport, 5xx, or the refusal itself — a `400 prompt is
+too long`, say), and the
+`the librarian is unavailable (no LLM backend reachable) — configure one in the admin portal`
+wording only when no backend is configured at all.
 
 ## Dream
 

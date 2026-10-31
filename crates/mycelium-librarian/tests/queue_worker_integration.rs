@@ -496,6 +496,88 @@ async fn drain_integrates_queued_add() {
     assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
 }
 
+// ---------- T5.1b: the done row's summary detail is bounded ----------
+
+// The model's final summary is the done row's `detail` — re-served by
+// receipts. Every OTHER detail writer bounds its text through
+// `short_detail` at the queue's 512-byte cap, so the summary must
+// persist bounded too (an over-cap model answer otherwise inflates the
+// /status receipts cell without bound).
+#[tokio::test]
+async fn long_done_summary_is_bounded() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "t51b").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // A >512-byte final summary with a distinctive head and tail.
+    let head = "integrated all of it. ";
+    let summary = format!("{head}{}TAILSUMMARY", "S".repeat(600));
+
+    // Script (LIFO): one write_concept call, then that final summary.
+    let (url, _mock) = mock_llm(vec![
+        text_response(&summary),
+        tool_call_response(
+            "c1",
+            "write_concept",
+            serde_json::json!({
+                "path": "/notes/summarybound.md",
+                "frontmatter": { "type": "Note", "title": "Summary Bound" },
+                "body": "summary bound"
+            }),
+        ),
+    ])
+    .await;
+
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "summary bound" }),
+        "summary bound",
+    )
+    .await;
+
+    assert_eq!(worker.run_pending().await.unwrap(), 1);
+
+    let row = store.queue_item(uid, id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Done);
+    let detail = row.detail.as_str();
+    assert!(
+        detail.starts_with(head),
+        "the summary head survives the bound: {detail}"
+    );
+    assert!(
+        detail.contains("… [truncated]"),
+        "an over-cap summary carries the truncation marker: {detail}"
+    );
+    assert!(
+        !detail.contains("TAILSUMMARY"),
+        "the cut tail does not survive: {detail}"
+    );
+    assert!(
+        detail.len() <= 512 + "… [truncated]".len(),
+        "detail: {detail}"
+    );
+}
+
 // ---------- T5.2: dead LLM retries, then the fallback integrates ----------
 
 #[tokio::test]
@@ -2398,7 +2480,8 @@ async fn red_backend_halts_drain_claims() {
 // `token_not_found_in_db` shape) is backend-down, not a content verdict.
 // The row must retry through the normal backoff — pending, one attempt
 // spent, re-armed — instead of the old one-pass route (claim → 401 →
-// "deterministic" → immediate fallback → fallback's own 401 path → dead).
+// done via the deterministic fallback, which never contacts the LLM, so
+// it succeeded with the librarian step silently skipped).
 // Default limits: the fresh next_retry_at (~30 s out) is intentionally
 // not due again, so nothing claims a second time in this wake.
 #[tokio::test]

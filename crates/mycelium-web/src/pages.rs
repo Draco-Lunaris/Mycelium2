@@ -2429,7 +2429,7 @@ fn receipts_card(rows: &[mycelium_store::QueueWaitingRow]) -> String {
                 TrustedHtml::from_markup(html_escape(row.tool.as_str())),
                 TrustedHtml::from_markup(html_escape(row.status.as_str())),
                 TrustedHtml::from_markup(html_escape(&row.username)),
-                TrustedHtml::from_markup(row.attempts.to_string()),
+                TrustedHtml::from_markup(html_escape(&row.attempts.to_string())),
                 TrustedHtml::from_markup(html_escape(&age(&row.created_at))),
                 TrustedHtml::from_markup(html_escape(row.detail.as_deref().unwrap_or(""))),
             ]
