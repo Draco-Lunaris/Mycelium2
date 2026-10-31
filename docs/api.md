@@ -13,7 +13,9 @@ relative with a leading slash, e.g. `/api/v1/concepts/notes/todo.md`.
 
 ### `PUT /api/v1/concepts/{*path}`
 Create/replace a concept. Body: `{"markdown": "---\ntype: Note\n..."}`.
-The frontmatter must parse and `type` is required. `201` on success.
+The frontmatter must parse and `type` is required; frontmatter whose
+`status` / `superseded_by` / `valid_to` fails write-time validation is
+rejected with `400` carrying the concept parse error text. `201` on success.
 
 ### `DELETE /api/v1/concepts/{*path}`
 Delete a concept. `204` on success.

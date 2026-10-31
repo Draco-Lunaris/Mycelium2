@@ -80,6 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let assets_dir = data_dir.join("assets");
     mycelium_web::assets::scaffold_defaults(&assets_dir)?;
 
+    // Revision retention before ANY concept-writing step (memory-lifecycle
+    // spec §3.2a-4): the packaged-skill seed and every boot sweep below
+    // write concept revisions, so the stored `lifecycle` row must be live
+    // before them. Same boot-order discipline as the LLM gate sync below:
+    // the gate precedes the sweeps, retention precedes the seed.
+    mycelium_store::revisions::sync_lifecycle_from_store(
+        &mycelium_store::ConfigStore::new(store.pool().clone()),
+        &service_key,
+    )
+    .await?;
+
     // Seed the packaged skills (pdf- and ebook-to-markdown)
     // into the global skills shelf — first boot writes them; later boots
     // refresh on a version bump (mirrors the assets scaffold).
@@ -129,6 +140,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if let Err(e) = state.queue_worker.run_pending().await {
         tracing::error!(error = %e, "initial queue drain failed");
+    }
+
+    // Lifecycle boot sweep (memory-lifecycle spec §3.0): legacy
+    // `deprecated` tags → `status: retired`, across every user scope +
+    // the global skills shelf (library is never swept). Idempotent,
+    // predicate-driven — a scope whose key fails this boot simply
+    // retriggers next boot.
+    match mycelium_web::lifecycle::migrate_deprecated_tags(&state).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                count = n,
+                "migrated deprecated-tagged concepts to status: retired"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "lifecycle boot sweep failed"),
     }
 
     let https_addr: SocketAddr = args.https_addr.parse()?;

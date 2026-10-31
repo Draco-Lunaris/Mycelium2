@@ -77,6 +77,10 @@ pub struct ConceptStore<'a> {
     scope: ConceptScope,
     repo: FileRepo,
     index: EncryptedIndex,
+    /// Provenance label stamped into `frontmatter.source` on every put
+    /// (e.g. `mcp:<key-label>`, `web:<username>`, `ingest`, `seed`).
+    /// `None` preserves the author's own frontmatter (plain reads/tests).
+    provenance: Option<String>,
 }
 
 impl<'a> ConceptStore<'a> {
@@ -84,6 +88,16 @@ impl<'a> ConceptStore<'a> {
     /// cache fingerprints and trace sinks.
     pub fn scope_id(&self) -> String {
         self.scope.scope_id()
+    }
+
+    /// Label this store's writes with a provenance source (system
+    /// provenance — the write-time stamp overwrites whatever the
+    /// caller's frontmatter carries in `source`). Consuming builder;
+    /// chain after `for_user`/`for_service`. An empty label is treated
+    /// as unlabeled (legacy queue rows predate the source column).
+    pub fn with_provenance(mut self, source: impl Into<String>) -> Self {
+        self.provenance = Some(source.into());
+        self
     }
 
     /// Open the concept store for a user's private bundle.
@@ -99,6 +113,7 @@ impl<'a> ConceptStore<'a> {
             },
             repo,
             index,
+            provenance: None,
         }
     }
 
@@ -122,6 +137,7 @@ impl<'a> ConceptStore<'a> {
             },
             repo,
             index,
+            provenance: None,
         }
     }
 
@@ -167,11 +183,34 @@ impl<'a> ConceptStore<'a> {
         if concepts.is_empty() {
             return Ok(());
         }
+        // Provenance stamping + lifecycle validation happen BEFORE any
+        // write, on clones (the incoming slice is never mutated):
+        //   * the reserved-basename check stays pre-write;
+        //   * `confirmed_at` is ALWAYS stamped (now) — a system field,
+        //     the author's value never survives;
+        //   * `source` is stamped only when the store is labeled (an
+        //     unstamped store preserves the author's frontmatter; an
+        //     EMPTY label is treated as unlabeled — legacy queue rows
+        //     predate the source column and carry the '' default).
+        //   * `validated()` is the write-time lifecycle guard — one bad
+        //     value fails the whole batch before the first file lands.
+        let mut stamped = Vec::with_capacity(concepts.len());
         for concept in concepts {
             let basename = concept.source_path.rsplit('/').next().unwrap_or_default();
             if matches!(basename, "index.md" | "log.md" | "info.md") {
                 return Err(ConceptStoreError::Reserved(concept.source_path.clone()));
             }
+            let mut c = concept.clone();
+            c.frontmatter.confirmed_at = Some(Utc::now().to_rfc3339());
+            if let Some(src) = &self.provenance
+                && !src.is_empty()
+            {
+                c.frontmatter.source = Some(src.clone());
+            }
+            c.frontmatter.validated()?;
+            stamped.push(c);
+        }
+        for concept in &stamped {
             let markdown = concept.to_markdown()?;
             self.repo
                 .write(
@@ -595,5 +634,110 @@ mod tests {
         // LIKE wildcards in the prefix are literal, not wildcards.
         let pct = library.list_prefix("/my-%/").await.unwrap();
         assert!(pct.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provenance_stamp_on_put_overwrites_spoofed_source_and_sets_confirmed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master).with_provenance("mcp:test");
+        let mut c = concept("/lifecycle/labeled.md", "Labeled", "labeled body");
+        c.frontmatter.source = Some("llm-spoofed".into());
+        c.frontmatter.confirmed_at = Some("2020-01-01T00:00:00Z".into());
+        cs.put(&c).await.unwrap();
+        let got = cs.get("/lifecycle/labeled.md").await.unwrap();
+        assert_eq!(got.frontmatter.source.as_deref(), Some("mcp:test"));
+        let confirmed = got
+            .frontmatter
+            .confirmed_at
+            .as_deref()
+            .expect("confirmed_at stamped");
+        let t = chrono::DateTime::parse_from_rfc3339(confirmed).unwrap();
+        assert!(
+            t.timestamp() >= chrono::Utc::now().timestamp() - 300,
+            "confirmed_at is now-ish, got {confirmed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_label_put_preserves_author_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master);
+        let mut c = concept("/lifecycle/unlabeled.md", "Unlabeled", "unlabeled body");
+        c.frontmatter.source = Some("web:form".into());
+        cs.put(&c).await.unwrap();
+        let got = cs.get("/lifecycle/unlabeled.md").await.unwrap();
+        assert_eq!(got.frontmatter.source.as_deref(), Some("web:form"));
+        let confirmed = got
+            .frontmatter
+            .confirmed_at
+            .as_deref()
+            .expect("confirmed_at is still stamped");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(confirmed).is_ok(),
+            "confirmed_at is RFC 3339, got {confirmed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_rejects_invalid_lifecycle_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master);
+
+        let mut bad = concept("/lifecycle/bad.md", "Bad", "bad body");
+        bad.frontmatter.status = Some("archive".into());
+        let err = cs.put(&bad).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConceptStoreError::Parse(
+                    mycelium_core::ConceptError::InvalidLifecycleStatus { .. }
+                )
+            ),
+            "expected the lifecycle guard, got {err}"
+        );
+        // Rejected before any write: nothing landed in the registry.
+        assert!(cs.list().await.unwrap().is_empty());
+
+        let mut good = concept("/lifecycle/good.md", "Good", "good body");
+        good.frontmatter.status = Some("retired".into());
+        cs.put(&good).await.unwrap();
+        let got = cs.get("/lifecycle/good.md").await.unwrap();
+        assert_eq!(got.frontmatter.status.as_deref(), Some("retired"));
+    }
+
+    #[tokio::test]
+    async fn empty_label_put_is_unlabeled() {
+        // Legacy queue rows predate the source column and carry '' — an
+        // empty label is treated as unlabeled: the author's source stays,
+        // `confirmed_at` is still stamped (mirror of no_label_put_…;
+        // the real call site passes `&item.source` unconditionally).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master).with_provenance("");
+        let mut c = concept("/lifecycle/empty.md", "Empty Label", "empty body");
+        c.frontmatter.source = Some("web:form".into());
+        cs.put(&c).await.unwrap();
+        let got = cs.get("/lifecycle/empty.md").await.unwrap();
+        assert_eq!(got.frontmatter.source.as_deref(), Some("web:form"));
+        let confirmed = got
+            .frontmatter
+            .confirmed_at
+            .as_deref()
+            .expect("confirmed_at is still stamped");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(confirmed).is_ok(),
+            "confirmed_at is RFC 3339, got {confirmed}"
+        );
     }
 }

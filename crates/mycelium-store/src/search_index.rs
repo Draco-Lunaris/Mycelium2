@@ -5,7 +5,10 @@
 //! Results are ranked by term frequency, matching the in-memory reference
 //! index in mycelium-core (oracle equivalence via `searchable_text`).
 
-use mycelium_core::search::{SearchIndex, SearchQuery, SearchResult, searchable_text, tokenize};
+use mycelium_core::search::{
+    NON_ACTIVE_STATUSES, SearchIndex, SearchQuery, SearchResult, StatusFilter, searchable_text,
+    tokenize,
+};
 use mycelium_crypto::aead::{aead_open, aead_seal};
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
 use mycelium_crypto::store_keys::IndexKeys;
@@ -83,6 +86,11 @@ impl EncryptedIndex {
     /// A doc row missing for a scored path (e.g. a concurrent `remove`
     /// between the token scan and the doc load) is skipped, not an error —
     /// search stays correct under concurrent mutation.
+    ///
+    /// [`StatusFilter::ActiveOnly`] (the default) cuts the non-active
+    /// statuses (`NON_ACTIVE_STATUSES`) in SQL, before scoring, on the
+    /// plaintext `lifecycle_status` column — no payload decrypt is needed
+    /// to apply it.
     pub async fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, IndexError> {
         if query.terms.is_empty() {
             return Ok(vec![]);
@@ -96,17 +104,40 @@ impl EncryptedIndex {
         distinct.sort();
         distinct.dedup();
         let tokens: Vec<String> = distinct.iter().map(|t| self.keys.token(t)).collect();
+        // Lifecycle filter as a SQL predicate on the doc row. The join is
+        // 1:1 (`search_docs` PK is (scope, concept_path)), so `SUM(tf)` is
+        // unaffected; a token row whose doc row vanished drops out here
+        // instead of at the doc load — same result either way.
+        let active_only = query.status_filter == StatusFilter::ActiveOnly;
         let mut scores: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for chunk in tokens.chunks(16) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT concept_path, SUM(tf) FROM search_tokens \
-                 WHERE scope = ? AND token IN ({placeholders}) \
-                 GROUP BY concept_path"
-            );
+            let sql = if active_only {
+                let status_holders = vec!["?"; NON_ACTIVE_STATUSES.len()].join(",");
+                format!(
+                    "SELECT t.concept_path, SUM(t.tf) FROM search_tokens t \
+                     JOIN search_docs d \
+                       ON d.scope = t.scope AND d.concept_path = t.concept_path \
+                     WHERE t.scope = ? AND t.token IN ({placeholders}) \
+                       AND (d.lifecycle_status IS NULL \
+                            OR d.lifecycle_status NOT IN ({status_holders})) \
+                     GROUP BY t.concept_path"
+                )
+            } else {
+                format!(
+                    "SELECT t.concept_path, SUM(t.tf) FROM search_tokens t \
+                     WHERE t.scope = ? AND t.token IN ({placeholders}) \
+                     GROUP BY t.concept_path"
+                )
+            };
             let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(&self.scope_id);
             for token in chunk {
                 q = q.bind(token);
+            }
+            if active_only {
+                for status in NON_ACTIVE_STATUSES {
+                    q = q.bind(status);
+                }
             }
             for (path, tf) in q.fetch_all(&self.pool).await? {
                 *scores.entry(path).or_insert(0) += tf;
@@ -230,12 +261,20 @@ impl EncryptedIndex {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("INSERT INTO search_docs (scope, concept_path, payload) VALUES (?, ?, ?)")
-            .bind(&self.scope_id)
-            .bind(&concept.source_path)
-            .bind(&sealed)
-            .execute(&mut *tx)
-            .await?;
+        // The doc row is rebuilt wholesale above, so the lifecycle status
+        // rides along on every re-add — stored AS-WRITTEN (absent status is
+        // SQL NULL, unknown values kept verbatim); leniency belongs to
+        // `is_active_status` at query time, not to normalization here.
+        sqlx::query(
+            "INSERT INTO search_docs (scope, concept_path, payload, lifecycle_status) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&self.scope_id)
+        .bind(&concept.source_path)
+        .bind(&sealed)
+        .bind(concept.frontmatter.status.as_deref())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -246,6 +285,7 @@ mod tests {
     use super::*;
     use crate::Store;
     use mycelium_core::concept::{Concept, Frontmatter};
+    use mycelium_core::search::is_active_status;
 
     fn concept(path: &str, title: &str, body: &str) -> Concept {
         Concept::new(
@@ -257,6 +297,32 @@ mod tests {
             body.into(),
             path.into(),
         )
+    }
+
+    fn concept_with_status(path: &str, title: &str, body: &str, status: Option<&str>) -> Concept {
+        Concept::new(
+            Frontmatter {
+                concept_type: "Note".into(),
+                title: Some(title.into()),
+                status: status.map(str::to_string),
+                ..Default::default()
+            },
+            body.into(),
+            path.into(),
+        )
+    }
+
+    /// The same query with the lifecycle filter lifted.
+    fn query_all(terms: Vec<String>) -> SearchQuery {
+        SearchQuery {
+            terms,
+            include_global: false,
+            status_filter: StatusFilter::All,
+        }
+    }
+
+    fn paths(results: &[SearchResult]) -> Vec<String> {
+        results.iter().map(|r| r.concept_path.clone()).collect()
     }
 
     async fn test_store() -> (tempfile::TempDir, Store) {
@@ -331,21 +397,288 @@ mod tests {
             concept("/a.md", "Rust Deploy", "rust rust rust deploy"),
             concept("/b.md", "Rust Test", "rust once test"),
             concept("/c.md", "Other", "unrelated words here"),
+            concept_with_status(
+                "/d.md",
+                "Rust Retired",
+                "rust deploy retired",
+                Some("superseded"),
+            ),
         ];
         for c in &concepts {
             index.add_async(c).await.unwrap();
             oracle.add(c).ok();
         }
-        for term in ["rust", "deploy", "test", "zebra"] {
-            let encrypted = index
-                .search(&SearchQuery::new(vec![term.into()]))
+        // Both filters, both indexes: the lifecycle cut happens before
+        // scoring on both sides, so paths and ordering must still agree —
+        // hidden docs are absent from the results, not from the index.
+        for filter in [StatusFilter::ActiveOnly, StatusFilter::All] {
+            for term in ["rust", "deploy", "test", "zebra"] {
+                let query = SearchQuery {
+                    terms: vec![term.into()],
+                    include_global: false,
+                    status_filter: filter,
+                };
+                let encrypted = index.search(&query).await.unwrap();
+                let memory = oracle.search(&query).unwrap();
+                assert_eq!(
+                    paths(&encrypted),
+                    paths(&memory),
+                    "term {term} filter {filter:?}: ordering mismatch"
+                );
+            }
+        }
+        // The superseded doc is reachable only with the filter lifted.
+        assert!(
+            index
+                .search(&SearchQuery::new(vec!["retired".into()]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            paths(
+                &index
+                    .search(&query_all(vec!["retired".into()]))
+                    .await
+                    .unwrap()
+            ),
+            vec!["/d.md".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_filter_hides_retired_in_store_index() {
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept_with_status(
+                "/active.md",
+                "Active Note",
+                "zebra fact",
+                Some("active"),
+            ))
+            .await
+            .unwrap();
+        index
+            .add_async(&concept_with_status(
+                "/retired.md",
+                "Retired Note",
+                "zebra fact",
+                Some("retired"),
+            ))
+            .await
+            .unwrap();
+        index
+            .add_async(&concept_with_status(
+                "/superseded.md",
+                "Superseded Note",
+                "zebra fact",
+                Some("superseded"),
+            ))
+            .await
+            .unwrap();
+        // Default filter: the two non-active statuses are cut.
+        let hits = index
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(paths(&hits), vec!["/active.md".to_string()]);
+        // StatusFilter::All reaches them again (equal scores → path asc).
+        let hits = index
+            .search(&query_all(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(&hits),
+            vec![
+                "/active.md".to_string(),
+                "/retired.md".to_string(),
+                "/superseded.md".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_active_status_stays_in_results() {
+        // `status: active` is written as a non-NULL value; it must not be
+        // filtered (absent ⇒ active does not mean non-null ⇒ hidden).
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept_with_status(
+                "/explicit.md",
+                "Explicit",
+                "zebra fact",
+                Some("active"),
+            ))
+            .await
+            .unwrap();
+        let hits = index
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(paths(&hits), vec!["/explicit.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn unknown_status_value_kept_active() {
+        // Leniency mirrors core's `is_active_status`: only the known
+        // non-active statuses hide a concept — unknown values and
+        // differently-cased near-misses stay in default results.
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept_with_status(
+                "/archive.md",
+                "Archive",
+                "zebra fact",
+                Some("archive"),
+            ))
+            .await
+            .unwrap();
+        index
+            .add_async(&concept_with_status(
+                "/cased.md",
+                "Cased",
+                "zebra fact",
+                Some("SUPERSEDED"),
+            ))
+            .await
+            .unwrap();
+        let hits = index
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(&hits),
+            vec!["/archive.md".to_string(), "/cased.md".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_predicate_matches_core_is_active_status() {
+        // Drift guard: the store's SQL predicate must agree with core's
+        // `is_active_status` on every status shape (the expected set is
+        // derived from that function, never hand-listed), so the SQL mirror
+        // cannot silently diverge from the in-memory semantics.
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        let statuses: [Option<&str>; 6] = [
+            None,
+            Some("active"),
+            Some("superseded"),
+            Some("retired"),
+            Some("archive"),
+            Some("SUPERSEDED"),
+        ];
+        for (i, status) in statuses.iter().enumerate() {
+            let path = format!("/s{i}.md");
+            index
+                .add_async(&concept_with_status(&path, "Note", "zebra fact", *status))
                 .await
                 .unwrap();
-            let memory = oracle.search(&SearchQuery::new(vec![term.into()])).unwrap();
-            let paths_e: Vec<&String> = encrypted.iter().map(|r| &r.concept_path).collect();
-            let paths_m: Vec<&String> = memory.iter().map(|r| &r.concept_path).collect();
-            assert_eq!(paths_e, paths_m, "term {term}: ordering mismatch");
         }
+        let hits = paths(
+            &index
+                .search(&SearchQuery::new(vec!["zebra".into()]))
+                .await
+                .unwrap(),
+        );
+        let expected: Vec<String> = statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| is_active_status(**s))
+            .map(|(i, _)| format!("/s{i}.md"))
+            .collect();
+        assert_eq!(hits, expected);
+        // Lifted filter: every doc is reachable again.
+        let all = paths(
+            &index
+                .search(&query_all(vec!["zebra".into()]))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(all.len(), statuses.len());
+    }
+
+    #[tokio::test]
+    async fn readd_updates_status() {
+        // The doc row is rebuilt on re-add, so a status set later hides the
+        // concept from default retrieval (and clearing it brings it back).
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept_with_status("/a.md", "V1", "zebra fact", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(
+                &index
+                    .search(&SearchQuery::new(vec!["zebra".into()]))
+                    .await
+                    .unwrap()
+            ),
+            vec!["/a.md".to_string()]
+        );
+        // Absent status is stored as-written (NULL), not normalized.
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT lifecycle_status FROM search_docs WHERE concept_path = ?")
+                .bind("/a.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+        index
+            .add_async(&concept_with_status(
+                "/a.md",
+                "V2",
+                "zebra fact",
+                Some("superseded"),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            index
+                .search(&SearchQuery::new(vec!["zebra".into()]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            paths(
+                &index
+                    .search(&query_all(vec!["zebra".into()]))
+                    .await
+                    .unwrap()
+            ),
+            vec!["/a.md".to_string()]
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT lifecycle_status FROM search_docs WHERE concept_path = ?")
+                .bind("/a.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("superseded"));
+        // Clearing the status again brings the doc back to default retrieval.
+        index
+            .add_async(&concept_with_status("/a.md", "V3", "zebra fact", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(
+                &index
+                    .search(&SearchQuery::new(vec!["zebra".into()]))
+                    .await
+                    .unwrap()
+            ),
+            vec!["/a.md".to_string()]
+        );
     }
 
     #[tokio::test]

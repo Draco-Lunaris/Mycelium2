@@ -98,7 +98,8 @@ pub async fn write_catalog(
     if outline.chapters.is_empty() {
         return Err(IngestError::NoChapters);
     }
-    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir(), "library");
+    let cs = ConceptStore::for_service(store, service_key.clone(), &store.library_dir(), "library")
+        .with_provenance("ingest");
     let mut written = Vec::new();
     let mut concepts = Vec::new();
     let hub = build_hub_concept(catalog, outline);

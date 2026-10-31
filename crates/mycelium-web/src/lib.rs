@@ -7,6 +7,7 @@ pub mod chat_api;
 pub mod chat_resume;
 pub mod chat_runner;
 pub mod health;
+pub mod lifecycle;
 pub mod middleware;
 pub mod packaged_skills;
 pub mod pages;

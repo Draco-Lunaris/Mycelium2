@@ -182,4 +182,8 @@ pub struct MutationQueueItem {
     pub updated_at: String,
     pub next_retry_at: Option<String>,
     pub final_paths: Option<String>,
+    /// Provenance label captured at enqueue (`mcp:<key-label>`,
+    /// `web:<username>`, …); `''` for rows predating the column —
+    /// stamped into concept frontmatter at integrate time (spec §3.1).
+    pub source: String,
 }

@@ -354,7 +354,7 @@ async fn enqueue_mutation(
     // 1. Row first, capped: a full queue rejects before any write.
     let id = state
         .store
-        .enqueue_capped(user.user_id, tool, state.enqueue_depth_cap)
+        .enqueue_capped(user.user_id, tool, state.enqueue_depth_cap, &user.source)
         .await?;
 
     // 2. Payload blob (user scope, raw FileRepo payload — content

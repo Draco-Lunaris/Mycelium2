@@ -9,6 +9,7 @@ pub mod file_repo;
 pub mod migrations;
 pub mod models;
 pub mod mutation_queue;
+pub mod revisions;
 pub mod search_index;
 pub mod skill_bundle;
 pub mod skill_group;
@@ -30,6 +31,11 @@ pub use models::{
 pub use mutation_queue::{
     MutationPayload, QueueError, QueueHealth, QueueTotals, QueueWaitingRow, payload_path,
     read_payload, write_payload,
+};
+pub use revisions::{
+    DEFAULT_REVISION_RETENTION, LIFECYCLE_CONFIG_KEY, LifecycleConfig, REVISION_OPS,
+    REVISION_RETENTION_RANGE, RevisionEntry, RevisionPathEntry, RevisionStore, RevisionsError,
+    op_summary, revision_retention, set_revision_retention, sync_lifecycle_from_store,
 };
 pub use search_index::{EncryptedIndex, IndexError};
 pub use skill_bundle::{SkillBundleError, SkillBundleFile, bundle_skill_files};

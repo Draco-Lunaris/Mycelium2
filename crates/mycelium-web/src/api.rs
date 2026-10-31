@@ -363,16 +363,29 @@ async fn api_put_concept(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        .with_provenance(format!("web:{}", user.username));
     match cs.put(&concept).await {
         Ok(()) => {
             crate::state::Metrics::inc(&state.metrics.concepts_written);
             (StatusCode::CREATED, "created").into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "concept put failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
+        Err(e) => match &e {
+            // A write-time lifecycle reject (the put path's
+            // `Frontmatter::validated` guard) is the client's bad
+            // input, not a server failure: 400 with the concept error
+            // text — the message the form path's warning banner
+            // carries, so both surfaces stay in parity.
+            mycelium_store::ConceptStoreError::Parse(
+                mycelium_core::ConceptError::InvalidLifecycleStatus { .. }
+                | mycelium_core::ConceptError::InvalidSupersededBy { .. }
+                | mycelium_core::ConceptError::InvalidValidTo { .. },
+            ) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+            _ => {
+                tracing::error!(error = %e, "concept put failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+        },
     }
 }
 
@@ -876,7 +889,8 @@ pub async fn concept_submit(
                 (*state.service_key).clone(),
                 &state.store.skills_dir(),
                 "skills",
-            );
+            )
+            .with_provenance(format!("web:{}", user.username));
             match cs.put(&concept).await {
                 Ok(()) => Redirect::to(&format!(
                     "/concept?path={}&scope=skills",
@@ -911,7 +925,8 @@ pub async fn concept_submit(
                 Ok(m) => m,
                 Err(_) => return pages::not_found().into_response(),
             };
-            let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+                .with_provenance(format!("web:{}", user.username));
             match cs.put(&concept).await {
                 Ok(()) => Redirect::to(&format!(
                     "/concept?path={}",
@@ -3786,7 +3801,11 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        // The dream agent may write concepts: label its store (spec
+        // §3.1 `dream` — system provenance; nothing model-authored
+        // survives the put).
+        .with_provenance("dream");
     // The config load is also the gate's sync point (spec §3.2): the
     // clamped row is the single source of both the gate's limits and
     // this surface's wait bound — no separate plumbing.
@@ -3858,7 +3877,11 @@ pub async fn api_chat(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        // The chat-mode agent may write concepts: label its store (spec
+        // §3.1 — system provenance; nothing model-authored survives the
+        // put).
+        .with_provenance("chat");
     // Config load doubles as the gate sync point (spec §3.2).
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
