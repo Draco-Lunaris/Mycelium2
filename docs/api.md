@@ -97,8 +97,12 @@ literal.
 
 A snapshot that no longer parses (frontmatter a current build rejects)
 answers `400` with the concept parse error text — the same posture as
-the PUT-concept route's lifecycle rejects. The library scope refuses
-restores outright.
+the PUT-concept route's lifecycle rejects. The §3.2a-3 undelete-marker
+row — the EMPTY-payload `restore` revision recorded when a delete is
+undone — also answers this bad-parse `400`: scripts enumerating a chain
+will hit `400` on that newest row of a freshly-undeleted path and should
+target the row before it (the web UI hides restore affordances on
+empty-payload rows). The library scope refuses restores outright.
 
 ## Graph and search
 

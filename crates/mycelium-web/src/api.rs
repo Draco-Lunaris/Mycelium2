@@ -1693,27 +1693,10 @@ pub async fn concept_view(
         }
         // Library catalogs: read-only, shelf-visibility gated.
         Some("library") => {
-            // Visibility: the concept's book slug must be on a
-            // global-read shelf (or the reader is an admin).
-            let slug = canonical
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(".md")
-                .to_string();
-            let visible = match state.store.book_by_slug(&slug).await {
-                Ok(Some(book)) => {
-                    let global_read = state
-                        .store
-                        .bookshelf_is_global_read(book.bookshelf_id)
-                        .await
-                        .unwrap_or(false);
-                    global_read || user.role == Role::Admin
-                }
-                _ => false,
-            };
-            if !visible {
+            // Visibility: the same gate the revisions routes use —
+            // the concept's book slug must be on a global-read shelf
+            // (or the reader is an admin).
+            if !library_path_visible(&state, &user, &canonical).await {
                 return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
             }
             let cs = ConceptStore::for_service(
@@ -1759,6 +1742,13 @@ pub async fn concept_view(
                     )
                     .into_response()
                 }
+                // No dead-path revisions branch here (unlike the
+                // skills/user arms): nothing in the codebase deletes
+                // a library concept — ingest only writes, and
+                // restore/delete answer 403 for the library scope —
+                // so a dead library revision row would mean
+                // out-of-band DB surgery, and a plain 404 is the
+                // honest posture for it.
                 Err(_) => pages::not_found().into_response(),
             }
         }
