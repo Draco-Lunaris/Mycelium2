@@ -82,14 +82,14 @@ confirmed_at: 2026-10-31T14:00:00Z      # stamped by mutation path at integrate 
 
 **Where `source`/`confirmed_at` come from.** Enqueue time is when identity exists:
 
-- MCP write tools (`write_concept`, `patch_concept`, `delete_concept`) already read the per-request identity (`http::request::Parts`) — capture a human-readable label at enqueue: `mcp:<api-key-label>` (ApiKeyManager has labels), falling back `mcp:bearer`. Persisted with the queue row (two new queue columns).
+- The MCP enqueue path (`enqueue_mutation`, mycelium-mcp tools.rs — serving `memory_add`/`memory_update`, whose `QueueTool` is `add`/`update`/`maintain`) already reads the per-request identity (`http::request::Parts`) — capture a human-readable label at enqueue: `mcp:<api-key-label>` (ApiKeyRecord carries `label` for every minted key). Persisted with the queue row (one new `source` queue column; `user_id` already there).
 - Web UI writes carry the session identity (`web:<username>`); dream passes carry `dream`; resume/drain re-integration carries `migration`/`resume` as appropriate.
 - At integrate time the mutation path stamps `confirmed_at = now` and `source = <captured label>` into the concept frontmatter — after whatever the user-supplied body wanted to say on those two fields. `confirmed_at` updates on every successful create/patch/restore touching the concept. `timestamp` keeps its current create-time role (display provenance).
 
 **Shared status filter.** Implemented at the trait level so both indexes — and the vector side in §3.3 — honor it:
 
 - `SearchQuery` (`mycelium-core::search`) gains `status_filter: StatusFilter` (`ActiveOnly` default | `All`). Constructing a `SearchQuery` without saying otherwise means active-only — including the agent's `search_knowledge` tool and every other existing caller, which is the point.
-- Store index: migration `0010` adds plaintext `lifecycle_status TEXT NULL` to the existing concept-metadata table (NULL ⇒ active). `put`/`patch`/`delete` maintain it (it is non-sensitive ranking metadata; paths already carry HMAC tokens). The status filter becomes a SQL predicate — no extra decrypt round-trips.
+- Store index: migration `0010` adds plaintext `lifecycle_status TEXT NULL` to the **`search_docs` index table** (verified: search never joins `scope_files` — the doc-load path reads `search_docs.payload` only — so the index carries its own status column; the registry stays untouched). `put`/`add` maintain it (it is non-sensitive ranking metadata; paths already carry HMAC tokens). The status filter becomes a SQL predicate — no extra decrypt round-trips.
 - In-memory index: filters pre-scoring on the parsed frontmatter.
 - `valid_to` does NOT participate in the filter (advisory only — staleness signal). Retrieval treats a concept with any absent/unknown status as active (lenient, matches "absent ⇒ active").
 - Opt-in for history queries: MCP `memory_query` gains `include_inactive: bool = false` on the hits path, as does the librarian agent's internal `search_knowledge` tool (there is no MCP tool of that name; its schema + the rule-8 prompt rewrite cite it). Direct path reads (`read_concept`, graph, web viewer/writer) see everything always — lifecycle hides concepts from *retrieval*, not from existence.
