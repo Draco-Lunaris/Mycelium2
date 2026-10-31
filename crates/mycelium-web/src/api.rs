@@ -948,21 +948,54 @@ pub async fn revisions_view(
 /// `get` + parse path the snapshot REST route uses (§3.2a-3's payload
 /// convention — create rows carry the created content, every other row
 /// the pre-mutation state, so this is the latest title the undo log
-/// recorded). A live row whose newest payload can't supply one (the
-/// undelete-restore row records NO payload) falls back to the
-/// registry's live title; nothing readable → None (the page's muted
-/// placeholder). Faults log per row and never page-fatal.
+/// recorded). The registry-title fallback is EXCLUSIVE to the
+/// empty-payload row: `get` returning EMPTY bytes (after the AEAD open
+/// this is the same fact [`RevisionEntry::payload_empty`] derives from
+/// the envelope's stored length — an empty plaintext seals to exactly
+/// the envelope's empty overhead — i.e. the §3.2a-3 "recorded no
+/// content" marker, the undelete-restore row by design) on a LIVE row
+/// means the log recorded nothing, so the live registry may supply the
+/// title; a dead row has none. Anything ELSE — a titled or an untitled
+/// frontmatter, non-UTF8 bytes, a parse fault, a decode fault — answers
+/// from the payload only: an undecodable or simply untitled snapshot
+/// shows the muted `(no title)` placeholder, never a live-title
+/// substitution that would pretend the log recorded what it didn't.
+/// Faults log per row and never page-fatal.
 async fn revisions_row_title(
     rev_store: &RevisionStore<'_>,
     cs: &ConceptStore<'_>,
     entry: &RevisionPathEntry,
 ) -> Option<String> {
-    let title_from_payload = match rev_store.get(&entry.path, entry.latest_no).await {
+    match rev_store.get(&entry.path, entry.latest_no).await {
+        // The §3.2a-3 empty-payload row (the undelete-restore marker):
+        // the parse path is never entered (no frontmatter warn for the
+        // designed case), and a live row alone may fall back to the
+        // registry — the only fallback that exists.
+        Ok(bytes) if bytes.is_empty() => {
+            if !entry.live {
+                return None;
+            }
+            match cs.get(&entry.path).await {
+                Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
+                Err(e) => {
+                    tracing::warn!(path = entry.path, error = %e, "browser row registry title");
+                    None
+                }
+            }
+        }
+        // A recorded payload answers for itself — titled (the
+        // snapshot's title, however stale) or untitled (muted). Decode
+        // or parse faults degrade that row to None with a log; the
+        // registry is never substituted for a payload we could read.
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => match Concept::parse(&entry.path, &text) {
                 Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
                 Err(e) => {
-                    tracing::warn!(path = entry.path, error = %e, "browser row snapshot frontmatter");
+                    tracing::warn!(
+                        path = entry.path,
+                        error = %e,
+                        "browser row snapshot frontmatter"
+                    );
                     None
                 }
             },
@@ -978,16 +1011,6 @@ async fn revisions_row_title(
                 error = %e,
                 "browser row snapshot decode"
             );
-            None
-        }
-    };
-    if title_from_payload.is_some() || !entry.live {
-        return title_from_payload;
-    }
-    match cs.get(&entry.path).await {
-        Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
-        Err(e) => {
-            tracing::warn!(path = entry.path, error = %e, "browser row registry title");
             None
         }
     }

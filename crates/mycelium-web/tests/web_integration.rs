@@ -7541,3 +7541,113 @@ async fn revisions_browser_owner_isolation_and_no_js() {
 
     shutdown.cancel();
 }
+
+/// Escape parity with `revisions_page_escapes_rows_and_diff` (Task 4):
+/// hostile content RECORD in the newest snapshot's bytes — a `<script>`
+/// title and an attribute-injecting `<img>` title — reaches the
+/// browser page's raw-markup title slot ONLY escaped (`&lt;…&gt;`),
+/// never as live markup. The hostile body riding the same snapshot is
+/// inert here (a browser row renders titles, not bodies).
+#[tokio::test]
+async fn revisions_browser_page_escapes_hostile_payload_content() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil1.md",
+        "---\ntype: Note\ntitle: <script>alert('t')</script>\n---\n\nbody\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil2.md",
+        "---\ntype: Note\ntitle: <img src=x onerror=alert(1)>\n---\n\n<script>alert('b')</script>\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    // Both recorded titles render ESCAPED — hostile snapshot bytes can
+    // only compose into the trusted-markup slot through html_escape.
+    assert!(
+        html.contains("&lt;script&gt;alert('t')&lt;/script&gt;"),
+        "script title escaped: {html}"
+    );
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "img title escaped: {html}"
+    );
+    assert!(
+        !html.contains("<script>alert"),
+        "no raw script title text: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x onerror"),
+        "no raw injected attribute markup: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The registry-title fallback is EXCLUSIVE to empty-payload rows: a
+/// live concept whose newest recorded payload decodes fine but has NO
+/// title in frontmatter shows the muted `(no title)` placeholder — the
+/// CURRENT live title is never substituted for what the undo log
+/// recorded (that would make the title column lie about the snapshot).
+#[tokio::test]
+async fn revisions_browser_untitled_payload_keeps_placeholder_not_registry() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Create titleless, then an update that ADDS the title: the newest
+    // recorded snapshot (the update's pre-mutation state) is still
+    // titleless while the live concept is titled.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/untitled-now.md",
+        "---\ntype: Note\n---\n\nfirst body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/untitled-now.md",
+        "---\ntype: Note\ntitle: Live Titled\n---\n\nsecond body\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    assert!(
+        html.contains(r#"href="/concept?path=/untitled-now.md&scope=user""#),
+        "the row is present: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="muted">(no title)</span>"#),
+        "the untitled snapshot shows the placeholder: {html}"
+    );
+    assert!(
+        !html.contains("Live Titled"),
+        "the live title is never substituted for the recorded one: {html}"
+    );
+
+    shutdown.cancel();
+}
