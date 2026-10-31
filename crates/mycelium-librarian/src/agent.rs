@@ -1033,7 +1033,11 @@ const OPERATING_RULES: &str = "1. SEARCH FIRST. Before adding anything, search f
 
 /// Render the operating-rules block for the given live-type list.
 fn operating_rules(types_list: &str) -> String {
-    OPERATING_RULES.replace("{types_list}", types_list)
+    // `replacen(…, 1)` encodes the exactly-one-slot invariant: the
+    // const has a single `{types_list}` slot, and a second one should
+    // fail the prompt test (raw slot leaks to the model), not get
+    // silently substituted.
+    OPERATING_RULES.replacen("{types_list}", types_list, 1)
 }
 
 /// The per-mode task section the system prompt appends after the layout.
@@ -1386,6 +1390,10 @@ mod tests {
         assert!(query_prompt.contains("8. DEPRECATE, DON'T DELETE."));
         assert!(query_prompt.contains("status: superseded + superseded_by: <new-concept-path>"));
         assert!(query_prompt.contains("Types currently in the bundle:"));
+        // The placeholder actually got substituted: a drifted replace
+        // target would pass every contains() check while serving the
+        // raw slot to the model.
+        assert!(!query_prompt.contains("{types_list}"));
         assert!(!query_prompt.contains("Prefer tagging `deprecated`"));
 
         let mutate_prompt = build_system_prompt(&cs, AgentMode::Mutate).await.unwrap();

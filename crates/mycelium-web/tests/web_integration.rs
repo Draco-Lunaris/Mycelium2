@@ -4818,3 +4818,78 @@ async fn login_post_with_live_session_cookie_succeeds() {
 
     shutdown.cancel();
 }
+
+/// REST PUT /api/v1/concepts (api.rs `api_put_concept`): a write-time
+/// lifecycle reject (`Frontmatter::validated` surfacing as a
+/// `ConceptStoreError::Parse`) is the client's bad input, not a server
+/// failure — 400 with the concept error text (the same message the
+/// form path's warning banner carries), while a put that fails for a
+/// NON-lifecycle reason keeps the generic all-store-errors 500 posture.
+#[tokio::test]
+async fn rest_put_lifecycle_reject_is_400_and_non_lifecycle_stays_500() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
+
+    // Bad `status` value: 400, and the body carries the rejected value.
+    let bad_status = client
+        .put(format!("{base}/api/v1/concepts/notes/lifecycle-bad.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "markdown": "---\ntype: Note\ntitle: Bad Status\nstatus: archive\n---\n\nrest body"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_status.status(),
+        400,
+        "a lifecycle reject is a client input error, not internal"
+    );
+    let body: serde_json::Value = bad_status.json().await.unwrap();
+    let err_text = body["error"].as_str().expect("JSON error body");
+    assert!(
+        err_text.contains("archive"),
+        "the 400 body must mention the bad status value: {err_text}"
+    );
+
+    // Over-matching guard: a put that fails for a NON-lifecycle reason —
+    // a reserved filename, the only input-dependent non-lifecycle put
+    // reject — keeps the generic 500 posture.
+    let reserved = client
+        .put(format!("{base}/api/v1/concepts/index.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "markdown": "---\ntype: Note\ntitle: Reserved\n---\n\nrest body"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reserved.status(),
+        500,
+        "non-lifecycle store errors stay 500"
+    );
+
+    shutdown.cancel();
+}

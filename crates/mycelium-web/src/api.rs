@@ -370,10 +370,22 @@ async fn api_put_concept(
             crate::state::Metrics::inc(&state.metrics.concepts_written);
             (StatusCode::CREATED, "created").into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "concept put failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
+        Err(e) => match &e {
+            // A write-time lifecycle reject (the put path's
+            // `Frontmatter::validated` guard) is the client's bad
+            // input, not a server failure: 400 with the concept error
+            // text — the message the form path's warning banner
+            // carries, so both surfaces stay in parity.
+            mycelium_store::ConceptStoreError::Parse(
+                mycelium_core::ConceptError::InvalidLifecycleStatus { .. }
+                | mycelium_core::ConceptError::InvalidSupersededBy { .. }
+                | mycelium_core::ConceptError::InvalidValidTo { .. },
+            ) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+            _ => {
+                tracing::error!(error = %e, "concept put failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+        },
     }
 }
 
@@ -3802,9 +3814,6 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
-    // Dream is wait class with the CHAT bound (spec §5): admin-triggered
-    // and rare, so it may wait for a slot — but it never jumps the
-    // queue, and it never hangs unbounded.
     // Dream is wait class with the CHAT bound (spec §5): admin-triggered
     // and rare, so it may wait for a slot — but it never jumps the
     // queue, and it never hangs unbounded.

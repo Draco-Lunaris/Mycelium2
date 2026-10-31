@@ -231,6 +231,13 @@ mod tests {
             rewrite_if_deprecated(concept("/x.md", vec!["deprecation", "deprecated-x"])).is_none(),
             "near-miss tags must not match"
         );
+        // Every occurrence goes: a concept carrying the tag twice (in
+        // both cases) rewires to NO tags and still migrates — the
+        // rewrite removes all of them, not just the first.
+        let both = rewrite_if_deprecated(concept("/x.md", vec!["deprecated", "Deprecated"]))
+            .expect("every occurrence of the tag matches");
+        assert!(both.frontmatter.tags.is_empty());
+        assert_eq!(both.frontmatter.status.as_deref(), Some("retired"));
     }
 
     #[test]
