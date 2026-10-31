@@ -131,6 +131,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::error!(error = %e, "initial queue drain failed");
     }
 
+    // Lifecycle boot sweep (memory-lifecycle spec §3.0): legacy
+    // `deprecated` tags → `status: retired`, across every user scope +
+    // the global skills shelf (library is never swept). Idempotent,
+    // predicate-driven — a scope whose key fails this boot simply
+    // retriggers next boot.
+    match mycelium_web::lifecycle::migrate_deprecated_tags(&state).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                count = n,
+                "migrated deprecated-tagged concepts to status: retired"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "lifecycle boot sweep failed"),
+    }
+
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
