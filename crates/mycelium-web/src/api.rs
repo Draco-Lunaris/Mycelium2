@@ -1488,7 +1488,9 @@ pub async fn concept_submit(
                 }
             }
         }
-        // The library is read-only (ingest is the only writer).
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
         Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
         // Default: the user's private bundle.
         _ => {
@@ -1705,17 +1707,14 @@ pub async fn concept_view(
                 &state.store.library_dir(),
                 "library",
             );
+            let rev_store =
+                RevisionStore::for_service(state.store.pool(), &state.service_key, "library");
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let (preview, _) = pages::build_preview_html(&markdown);
                     // The library is read-only: rows render (a history
                     // is still a read), restore never does.
-                    let rev_store = RevisionStore::for_service(
-                        state.store.pool(),
-                        &state.service_key,
-                        "library",
-                    );
                     let surface = revisions_surface(
                         &rev_store,
                         &canonical,
@@ -1742,13 +1741,47 @@ pub async fn concept_view(
                     )
                     .into_response()
                 }
-                // No dead-path revisions branch here (unlike the
-                // skills/user arms): nothing in the codebase deletes
-                // a library concept — ingest only writes, and
-                // restore/delete answer 403 for the library scope —
-                // so a dead library revision row would mean
-                // out-of-band DB surgery, and a plain 404 is the
-                // honest posture for it.
+                Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+                    // Dead library revision rows are ROUTINE: a replace
+                    // re-ingest deletes the old chapters through
+                    // `delete_book`, and every `ConceptStore::delete`
+                    // records a write-ahead revision row — the
+                    // /revisions browser lists them and links here. So
+                    // the dead path mirrors the skills/user arms: build
+                    // the dead surface (no live markdown — no HEAD side
+                    // to diff or restore against) with the library's
+                    // hard-false restore flag. The page is a history
+                    // read, full stop: restore/confirm never offer
+                    // (restore 403s for the scope), no editor grid,
+                    // undelete not implied. Untracked paths and store
+                    // faults keep the plain 404. The visibility gate ran
+                    // above, so a global-read reader gets the same
+                    // read-only posture the live branch gives it.
+                    match revisions_surface(&rev_store, &canonical, "library", false, None, &query)
+                        .await
+                    {
+                        Some(surface) => {
+                            let extras = pages::ConceptExtras {
+                                revisions: Some(surface),
+                                activation: false,
+                            };
+                            let (preview, _) = pages::build_preview_html("");
+                            pages::concept_editor(
+                                &user,
+                                &csrf,
+                                &canonical,
+                                "",
+                                preview,
+                                None,
+                                Some("library"),
+                                false,
+                                Some(&extras),
+                            )
+                            .into_response()
+                        }
+                        None => pages::not_found().into_response(),
+                    }
+                }
                 Err(_) => pages::not_found().into_response(),
             }
         }
@@ -2084,7 +2117,9 @@ pub async fn concept_delete(
             let _ = cs.delete(&canonical).await;
             Redirect::to("/skills").into_response()
         }
-        // The library is read-only (ingest is the only writer).
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
         Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
         // Default: the user's private bundle.
         _ => {
@@ -2145,7 +2180,9 @@ pub async fn concept_activate(
             .with_provenance(format!("web:{}", user.username));
             activate_and_redirect(cs, &canonical, "skills").await
         }
-        // The library is read-only (ingest is the only writer).
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
         Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
         // Default: the user's private bundle.
         _ => {

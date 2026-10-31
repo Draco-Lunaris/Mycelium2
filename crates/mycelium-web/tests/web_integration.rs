@@ -6050,6 +6050,239 @@ async fn revisions_library_visible_book_reads() {
     shutdown.cancel();
 }
 
+/// The dead library asymmetry (the re-review correction): a replace
+/// re-ingest deletes the old chapters through `delete_book`, and every
+/// `ConceptStore::delete` records a revision row — dead library paths
+/// are ROUTINE, and the viewer serves their history read-only instead
+/// of the plain 404 the old comment wrongly justified ("nothing deletes
+/// a library concept"). Posture matches the live branch's
+/// "a history is still a read": rows render for admins AND global-read
+/// users, restore/confirm never offer (library hard-false), undelete is
+/// not implied, and no editor grid renders on a dead page.
+#[tokio::test]
+async fn dead_library_path_serves_readonly_revision_history() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[("name", "Revision Shelf"), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // Create the book, then REPLACE it with different chapter names:
+    // the replace flow deletes the old catalog (delete_book → one
+    // revision row per concept), so `/my-book/ch-1-chapter-one.md` ends
+    // up dead-but-tracked — the routine state this fix serves.
+    for (boundary, chapters, replace) in [("dead-lib-1", BOOK, false), ("dead-lib-2", BOOK2, true)]
+    {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Revision Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ];
+        if replace {
+            fields.push(("replace", "1"));
+        }
+        let body = multipart_body(boundary, &fields, Some(("file", "book.md", chapters)));
+        let upload_json: serde_json::Value = {
+            let _health_guard = HEALTH_TEST_LOCK.lock().await;
+            let upload = client
+                .post(format!("{base}/api/v1/ingest"))
+                .header("cookie", &admin_cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upload.status(), 202);
+            upload.json().await.unwrap()
+        };
+        assert_eq!(
+            upload_json["status"], "done",
+            "ingest ran inline: {upload_json}"
+        );
+    }
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // The /revisions browser (admin-only page) lists the dead chapter
+    // row with its deleted badge and the link into the per-concept
+    // viewer — the row's target used to be a plain 404.
+    let (status, browser_html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=library").await;
+    assert_eq!(status, 200);
+    assert!(
+        browser_html.contains(r#"href="/concept?path=/my-book/ch-1-chapter-one.md&scope=library""#),
+        "the dead chapter row links into the viewer: {browser_html}"
+    );
+    assert!(
+        browser_html.contains(r#"<span class="chip chip--danger">deleted</span>"#),
+        "the dead row carries the deleted badge: {browser_html}"
+    );
+    assert!(
+        browser_html.contains(r#"<td data-label="Title">Chapter One</td>"#),
+        "the dead row's latest title decodes from the delete row's payload: {browser_html}"
+    );
+
+    for (who, cookie) in [("admin", &admin_cookie), ("mallory", &mallory_cookie)] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            cookie,
+            "path=/my-book/ch-1-chapter-one.md&scope=library",
+        )
+        .await;
+        assert_eq!(status, 200, "{who}: a dead library path serves its history");
+        assert!(
+            html.contains("Revision history (newest first)."),
+            "{who}: the history surface renders: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+            "{who}: the delete row is visible in the list: {html}"
+        );
+        assert!(
+            html.contains(r#"<td data-label="Date">"#),
+            "{who}: each row renders its relative date: {html}"
+        );
+        // The read-only dead posture: no re-create editor, no restore
+        // affordance on any row (payload-empty or not — there is no
+        // restore for the scope at all), no activate offer, and no
+        // "restoring re-creates" implication (undelete is impossible
+        // for the library scope, so the page must not suggest it).
+        assert!(
+            !html.contains("editor-grid") && !html.contains("concept-editor-form"),
+            "{who}: no editor grid on a dead page: {html}"
+        );
+        assert!(
+            !html.contains(">restore<") && !html.contains("Restore revision"),
+            "{who}: no restore affordance for any revision row: {html}"
+        );
+        assert!(
+            !html.contains("Set status: active"),
+            "{who}: no activate form: {html}"
+        );
+        assert!(
+            html.contains("This concept is deleted") && !html.contains("re-creates it"),
+            "{who}: the dead note states the deletion without implying restoration: {html}"
+        );
+        assert!(
+            html.contains("(library — read-only)"),
+            "{who}: the library scope note renders: {html}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// The dead-path flow INHERITS the library visibility gate (it runs
+/// before the get): a non-admin gets 403 for a private-shelf book's
+/// dead chapter — the history never leaks through the gate — while the
+/// admin (the gate's bypass arm) reads that same dead history.
+#[tokio::test]
+async fn dead_library_private_shelf_stays_forbidden() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    // private shelf: no global-read flag.
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[("name", "Secret Dead Shelf"), ("global", "0")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    for (boundary, chapters, replace) in [("deadpriv-1", BOOK, false), ("deadpriv-2", BOOK2, true)]
+    {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Secret Dead Shelf"),
+            ("slug", "secret-book"),
+            ("title", "Secret Book"),
+        ];
+        if replace {
+            fields.push(("replace", "1"));
+        }
+        let body = multipart_body(boundary, &fields, Some(("file", "book.md", chapters)));
+        let upload_json: serde_json::Value = {
+            let _health_guard = HEALTH_TEST_LOCK.lock().await;
+            let upload = client
+                .post(format!("{base}/api/v1/ingest"))
+                .header("cookie", &admin_cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upload.status(), 202);
+            upload.json().await.unwrap()
+        };
+        assert_eq!(
+            upload_json["status"], "done",
+            "ingest ran inline: {upload_json}"
+        );
+    }
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Non-admin, non-visible book: 403, and the surface does not leak.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/secret-book/ch-1-chapter-one.md&scope=library",
+    )
+    .await;
+    assert_eq!(status, 403, "a private-shelf dead path stays gated: {html}");
+    assert!(
+        html.contains("bookshelf is not global-read"),
+        "the gate's message: {html}"
+    );
+    assert!(
+        !html.contains("Revision history") && !html.contains("delete"),
+        "the dead history does not leak through the 403: {html}"
+    );
+
+    // Admin: the gate's bypass arm — the same dead path serves history.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &admin_cookie,
+        "path=/secret-book/ch-1-chapter-one.md&scope=library",
+    )
+    .await;
+    assert_eq!(status, 200, "admin reads the private dead path's history");
+    assert!(
+        html.contains("Revision history (newest first)."),
+        "the admin's dead surface renders: {html}"
+    );
+    assert!(
+        !html.contains(">restore<") && !html.contains("concept-editor-form"),
+        "the admin's dead surface stays restore-free and grid-free: {html}"
+    );
+
+    shutdown.cancel();
+}
+
 /// Rider (from Task 2's review): since the store fails loudly on a
 /// missing concept's delete, the REST DELETE maps the store's NotFound
 /// to 404 — a never-existed path and the re-delete of an already-deleted

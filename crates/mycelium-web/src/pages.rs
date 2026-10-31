@@ -287,7 +287,8 @@ pub struct RevisionsSurface {
     /// library is always false.
     pub restore_ready: bool,
     /// The concept is deleted (its page is the history, the editor is
-    /// off, and restoring "re-creates" the path).
+    /// off; when the scope may also restore, restoring "re-creates"
+    /// the path — a non-restoring dead surface never implies that).
     pub dead: bool,
     /// The chain, newest first (RevisionStore::list's order).
     pub entries: Vec<mycelium_store::RevisionEntry>,
@@ -638,10 +639,22 @@ pub fn concept_editor(
 fn revisions_list_body(surface: &RevisionsSurface) -> TrustedHtml {
     let mut h = String::from(r#"<p class="muted">Revision history (newest first).</p>"#);
     if surface.dead {
-        h.push_str(&format!(
-            r#"<p class="muted">This concept is deleted — restoring a revision re-creates it at {}.</p>"#,
-            html_escape(&surface.path)
-        ));
+        // The restore claim rides the affordance: only a viewer whose
+        // scope may actually restore (restore_ready) is told that
+        // restoring re-creates the path. The library's dead pages are a
+        // history read, full stop — restore hard-false, undelete
+        // impossible — and a non-admin viewer of a skills chain cannot
+        // restore either, so neither surface may imply it.
+        if surface.restore_ready {
+            h.push_str(&format!(
+                r#"<p class="muted">This concept is deleted — restoring a revision re-creates it at {}.</p>"#,
+                html_escape(&surface.path)
+            ));
+        } else {
+            h.push_str(
+                r#"<p class="muted">This concept is deleted — its revision history is preserved below.</p>"#,
+            );
+        }
     }
     h.push_str(&revisions_compare_form(surface));
     let headers = ["Revision", "Operation", "Source", "Date", "Summary", ""];
