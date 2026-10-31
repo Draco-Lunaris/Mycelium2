@@ -230,31 +230,14 @@ async fn list_paths_includes_dead_paths_and_liveness() {
     let alive = "/notes/alive.md";
     let dead = "/notes/dead.md";
 
-    // Through the real ConceptStore boundary, so scope_files carries the
-    // `live` side of the index. (ConceptStore does not record revisions
-    // itself yet — that wiring is Task 2; the test records explicitly.)
+    // Task 2 wired the boundary hook: the ConceptStore's own puts and
+    // deletes write the rows now. `alive` keeps a single-put chain;
+    // `dead` is put and then deleted — dead, but its chain stays listed.
     cs.put(&concept(alive, "Alive", "kept body zebra"))
-        .await
-        .unwrap();
-    rs.record(alive, "create", "concept created", &markdown("v1 alive"))
         .await
         .unwrap();
 
     cs.put(&concept(dead, "Dead", "doomed body")).await.unwrap();
-    rs.record(dead, "create", "concept created", &markdown("v1 dead"))
-        .await
-        .unwrap();
-    rs.record_as(
-        dead,
-        "update",
-        "web:dana",
-        "concept updated",
-        &markdown("v2 dead"),
-    )
-    .await
-    .unwrap();
-    // Then the concept is deleted: the registry row (and file + index
-    // rows) vanish, but the revision chain must stay listed.
     cs.delete(dead).await.unwrap();
 
     let paths = rs.list_paths().await.unwrap();
@@ -270,9 +253,17 @@ async fn list_paths_includes_dead_paths_and_liveness() {
     assert_eq!(alive_row.last_op, "create");
     assert!(!dead_row.live, "a deleted concept is dead but still listed");
     assert_eq!(dead_row.latest_no, 2);
-    assert_eq!(dead_row.last_op, "update");
+    assert_eq!(dead_row.last_op, "delete");
     assert!(!alive_row.last_op_at.is_empty());
     assert!(!dead_row.last_op_at.is_empty());
+
+    // A delete row carries the pre-delete state (hook contract §3.2a-3) —
+    // restoring it re-creates the concept (pinned fully by Task 2's
+    // restore tests; here: the dead path's chain stays nameable).
+    assert_eq!(
+        rs.get(dead, 2).await.unwrap(),
+        rs.get(dead, 1).await.unwrap()
+    );
 }
 
 #[tokio::test]

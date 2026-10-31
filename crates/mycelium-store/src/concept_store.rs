@@ -1,6 +1,8 @@
 //! Concept store: the coordinated facade over FileRepo + EncryptedIndex +
-//! the scope_files registry — one place that keeps files, index, and
-//! listing metadata in sync (the Phase 3 review's "atomic lifecycle" gap).
+//! the scope_files registry + the revision undo log — one place that keeps
+//! files, index, and listing metadata in sync (the Phase 3 review's
+//! "atomic lifecycle" gap), and the write-ahead revision boundary where
+//! every mutation records its undo row first (spec §3.2).
 
 use chrono::Utc;
 use mycelium_core::concept::Concept;
@@ -9,6 +11,7 @@ use uuid::Uuid;
 
 use crate::Store;
 use crate::file_repo::{FileRepo, FileRepoError, Scope};
+use crate::revisions::{RevisionStore, RevisionsError, op_summary};
 use crate::search_index::{EncryptedIndex, IndexError};
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +24,8 @@ pub enum ConceptStoreError {
     Db(#[from] sqlx::Error),
     #[error("concept parse error: {0}")]
     Parse(#[from] mycelium_core::ConceptError),
+    #[error("revision log error: {0}")]
+    Revisions(#[from] RevisionsError),
     #[error("concept not found: {0}")]
     NotFound(String),
     #[error("{0} is a reserved filename (index.md, log.md, info.md) — system-maintained")]
@@ -77,10 +82,17 @@ pub struct ConceptStore<'a> {
     scope: ConceptScope,
     repo: FileRepo,
     index: EncryptedIndex,
+    /// The scope's revision chain (write-ahead undo log keyed off the
+    /// same pool + scope keys — spec §3.2).
+    revisions: RevisionStore<'a>,
     /// Provenance label stamped into `frontmatter.source` on every put
     /// (e.g. `mcp:<key-label>`, `web:<username>`, `ingest`, `seed`).
     /// `None` preserves the author's own frontmatter (plain reads/tests).
     provenance: Option<String>,
+    /// Explicit revision-op tag for every revision a put writes
+    /// (`migration` for the boot sweep; `merge`/`consolidate` reserved
+    /// for step 5's dream sites). `None` derives op mechanically.
+    revision_op: Option<String>,
 }
 
 impl<'a> ConceptStore<'a> {
@@ -100,11 +112,26 @@ impl<'a> ConceptStore<'a> {
         self
     }
 
+    /// Tag every revision a put writes with this op — the explicit tag
+    /// for system-driven rewrites (the deprecated-tag boot sweep tags
+    /// its writes `migration`; step 5's dream sites tag `merge`/
+    /// `consolidate`). Consuming builder; chain after `for_user`/
+    /// `for_service`. Leave the tag off for ordinary writes: the op then
+    /// derives mechanically (scope_files existence ⇒ create/update). The
+    /// vocabulary is [`crate::revisions::REVISION_OPS`] — an unknown tag
+    /// fails the put loudly at record time, before any effect.
+    pub fn with_revision_op(mut self, op: impl Into<String>) -> Self {
+        self.revision_op = Some(op.into());
+        self
+    }
+
     /// Open the concept store for a user's private bundle.
     pub fn for_user(store: &'a Store, user_id: Uuid, master_key: MasterKey) -> Self {
         let repo = FileRepo::new(store.user_dir(user_id));
         let index =
             EncryptedIndex::for_user(store.pool().clone(), &user_id.to_string(), &master_key);
+        // Built before the key moves into the scope enum.
+        let revisions = RevisionStore::for_user(store.pool(), user_id, &master_key);
         Self {
             store,
             scope: ConceptScope::User {
@@ -113,7 +140,9 @@ impl<'a> ConceptStore<'a> {
             },
             repo,
             index,
+            revisions,
             provenance: None,
+            revision_op: None,
         }
     }
 
@@ -129,6 +158,7 @@ impl<'a> ConceptStore<'a> {
     ) -> Self {
         let repo = FileRepo::new(dir);
         let index = EncryptedIndex::for_service(store.pool().clone(), &service_key, namespace);
+        let revisions = RevisionStore::for_service(store.pool(), &service_key, namespace);
         Self {
             store,
             scope: ConceptScope::Service {
@@ -137,16 +167,21 @@ impl<'a> ConceptStore<'a> {
             },
             repo,
             index,
+            revisions,
             provenance: None,
+            revision_op: None,
         }
     }
 
-    /// Store a concept: encrypt the file, register it, index it, then
-    /// regenerate the scope's index.md. Ordering: file → registry →
-    /// index. The registry is the source of truth for listing; the
-    /// index lags it, never leads. A crash between steps leaves an
-    /// orphaned encrypted file or a listed-but-unsearchable concept
-    /// (visible, self-heals on next put) — never a search ghost.
+    /// Store a concept: record its revision (write-ahead undo row — the
+    /// boundary hook, spec §3.2), then encrypt the file, register it,
+    /// and index it, then regenerate the scope's index.md. Ordering:
+    /// revision → file → registry → index; a failing revision insert
+    /// fails the put before anything moves. The registry is the source
+    /// of truth for listing; the index lags it, never leads. A crash
+    /// between steps leaves an orphaned encrypted file or a
+    /// listed-but-unsearchable concept (visible, self-heals on next
+    /// put) — never a search ghost.
     ///
     /// Reserved filenames (`index.md`, `log.md`, `info.md`) are
     /// rejected — they are system-maintained (index.md is regenerated
@@ -161,7 +196,8 @@ impl<'a> ConceptStore<'a> {
     /// Batched put: writes many concepts with ONE index.md regeneration
     /// at the end (put() regenerates per concept — O(n²) on a
     /// 300-chapter catalog ingest). Same ordering guarantees as put():
-    /// file → registry → index per concept, then the single regen.
+    /// revision → file → registry → index per concept (each writes its
+    /// own revision row ahead of its effect), then the single regen.
     ///
     /// Rejects the mutation queue's reserved `/mutation-queue/` prefix —
     /// only the queue's internal bypass may write there.
@@ -180,6 +216,20 @@ impl<'a> ConceptStore<'a> {
     /// (index.md/log.md/info.md) still applies — a queue path never
     /// collides with those, but the bypass must not weaken it.
     pub async fn put_batch_internal(&self, concepts: &[Concept]) -> Result<(), ConceptStoreError> {
+        self.put_batch_with_revision(concepts, self.revision_op.clone(), None)
+            .await
+    }
+
+    /// The single write-body: the batch put with the boundary's revision
+    /// hook (spec §3.2 write-ahead — every record precedes its effect).
+    /// `op_override` carries [`with_revision_op`]'s explicit tag;
+    /// `summary_override` carries `restore`'s deterministic summary.
+    async fn put_batch_with_revision(
+        &self,
+        concepts: &[Concept],
+        op_override: Option<String>,
+        summary_override: Option<String>,
+    ) -> Result<(), ConceptStoreError> {
         if concepts.is_empty() {
             return Ok(());
         }
@@ -191,9 +241,10 @@ impl<'a> ConceptStore<'a> {
         //   * `source` is stamped only when the store is labeled (an
         //     unstamped store preserves the author's frontmatter; an
         //     EMPTY label is treated as unlabeled — legacy queue rows
-        //     predate the source column and carry the '' default).
+        //     predate the source column and carry the '' default);
         //   * `validated()` is the write-time lifecycle guard — one bad
-        //     value fails the whole batch before the first file lands.
+        //     value fails the whole batch before the first file lands,
+        //     and before any revision row (guard-before-revision).
         let mut stamped = Vec::with_capacity(concepts.len());
         for concept in concepts {
             let basename = concept.source_path.rsplit('/').next().unwrap_or_default();
@@ -210,8 +261,94 @@ impl<'a> ConceptStore<'a> {
             c.frontmatter.validated()?;
             stamped.push(c);
         }
+        let scope_id = self.scope.scope_id();
         for concept in &stamped {
             let markdown = concept.to_markdown()?;
+            // Revision hook (write-ahead, §3.2 + §3.2a-5): 1. the
+            // `/mutation-queue/` staging bypass records nothing
+            // (queue-internal scaffolding, not user concepts); 2. op =
+            // the explicit tag if set, else the registry row's existence
+            // decides create/update; 3–4. payload per §3.2a-3 (create =
+            // the created markdown, update/others = the RAW pre-mutation
+            // file bytes), record BEFORE any effect — so a failing record
+            // fails the put with no revision-less change (Review Focus
+            // #5: no half-applied state).
+            if !concept.source_path.starts_with("/mutation-queue/") {
+                let (op, payload) = match &op_override {
+                    Some(tag) if tag == "create" => (tag.clone(), markdown.as_bytes().to_vec()),
+                    Some(tag) => match self
+                        .repo
+                        .read(&concept.source_path, &self.scope.repo_scope())
+                        .await
+                    {
+                        // Explicit-tagged ops act on live concepts: the
+                        // pre-mutation state is the payload. A vanished
+                        // concept reads as empty pre-state for `restore`
+                        // (undelete: no prior state, §3.2a-3) and as
+                        // create-content for any other tag.
+                        Ok(pre) => (tag.clone(), pre),
+                        Err(FileRepoError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                            let payload = if tag == "restore" {
+                                Vec::new()
+                            } else {
+                                markdown.as_bytes().to_vec()
+                            };
+                            (tag.clone(), payload)
+                        }
+                        Err(other) => return Err(other.into()),
+                    },
+                    None => {
+                        let existed: i64 = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM scope_files
+                                 WHERE scope = ? AND path = ?)",
+                        )
+                        .bind(&scope_id)
+                        .bind(&concept.source_path)
+                        .fetch_one(self.store.pool())
+                        .await?;
+                        if existed == 0 {
+                            ("create".to_string(), markdown.as_bytes().to_vec())
+                        } else {
+                            match self
+                                .repo
+                                .read(&concept.source_path, &self.scope.repo_scope())
+                                .await
+                            {
+                                Ok(pre) => ("update".to_string(), pre),
+                                // Registry row but no file (a half-written
+                                // state): nothing prior exists — create
+                                // semantics.
+                                Err(FileRepoError::Io(io))
+                                    if io.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    ("create".to_string(), markdown.as_bytes().to_vec())
+                                }
+                                Err(other) => return Err(other.into()),
+                            }
+                        }
+                    }
+                };
+                let summary = match summary_override {
+                    Some(ref s) => s.clone(),
+                    None => op_summary(&op, None)?,
+                };
+                // Provenance in the row: a labeled store mirrors its label
+                // (the stamped value: it overwrote the frontmatter on
+                // disk); an EMPTY label records the unknown-provenance
+                // convention (`''`, even though the concept's frontmatter
+                // keeps the author value); an unlabeled store mirrors what
+                // the concept carries — the author's declaration is the
+                // disk truth.
+                let rev_source = match &self.provenance {
+                    Some(src) if !src.is_empty() => src.clone(),
+                    Some(_) => String::new(),
+                    None => concept.frontmatter.source.clone().unwrap_or_default(),
+                };
+                self.revisions
+                    .record_as(&concept.source_path, &op, &rev_source, &summary, &payload)
+                    .await?;
+            }
+            // The EXISTING effect steps: file → registry → index.
             self.repo
                 .write(
                     &concept.source_path,
@@ -233,7 +370,7 @@ impl<'a> ConceptStore<'a> {
                    concept_type = excluded.concept_type,
                    updated_at = excluded.updated_at",
             )
-            .bind(self.scope.scope_id())
+            .bind(&scope_id)
             .bind(&concept.source_path)
             .bind(&title)
             .bind(&concept.frontmatter.concept_type)
@@ -244,6 +381,39 @@ impl<'a> ConceptStore<'a> {
         }
         self.regen_index_md().await?;
         Ok(())
+    }
+
+    /// Restore-to-N (spec §3.2, the undo button's store action): decode
+    /// snapshot N, parse it, and put it through the NORMAL stamped write
+    /// path — `confirmed_at` re-stamps unconditionally, `source` per the
+    /// provenance label rules — committing the result as a NEW revision
+    /// (`op: restore`, summary `restored to revision {n}`); the restore
+    /// row's payload is the pre-restore raw markdown, empty when it
+    /// UNDELETES. Restoring a deleted chain's revision re-creates the
+    /// concept at its original path (chains continue across eras, so a
+    /// roll-back is itself reversible). Restored `status` is whatever the
+    /// snapshot said — restore is literal; the separate set-active action
+    /// revives.
+    pub async fn restore(&self, path: &str, revision_no: u64) -> Result<(), ConceptStoreError> {
+        if path.starts_with("/mutation-queue/") {
+            return Err(ConceptStoreError::QueuePath(path.to_string()));
+        }
+        let snapshot = self.revisions.get(path, revision_no).await?;
+        let markdown = String::from_utf8(snapshot).map_err(|_| {
+            ConceptStoreError::Revisions(RevisionsError::Corrupted {
+                detail: format!("revision {revision_no} of {path} is not UTF-8 markdown"),
+            })
+        })?;
+        // A snapshot that no longer parses (a bad frontmatter value) fails
+        // loudly here — the REST surface maps Parse to 400.
+        let concept = Concept::parse(path, &markdown)?;
+        let summary = op_summary("restore", Some(revision_no))?;
+        self.put_batch_with_revision(
+            std::slice::from_ref(&concept),
+            Some("restore".to_string()),
+            Some(summary),
+        )
+        .await
     }
 
     /// Regenerate the scope's `index.md` (v1 parity: the auto-
@@ -357,12 +527,17 @@ impl<'a> ConceptStore<'a> {
         Ok(Concept::parse(path, &markdown)?)
     }
 
-    /// Delete a concept: registry + index first, then the file (a crash
-    /// leaves an orphaned encrypted file — harmless, cleaned by
-    /// maintenance; never a stale listing). Regenerates index.md.
+    /// Delete a concept: record the delete's revision row FIRST (with
+    /// the pre-delete raw bytes — the write-ahead undo row, spec §3.2),
+    /// then registry + index, then the file (a crash leaves an
+    /// orphaned encrypted file — harmless, cleaned by maintenance;
+    /// never a stale listing). Regenerates index.md. A concept that is
+    /// already absent fails `NotFound` with no revision row and no
+    /// side changes (the re-delete contract).
     ///
     /// Rejects the mutation queue's reserved `/mutation-queue/` prefix —
-    /// only the queue's internal bypass may delete there.
+    /// only the queue's internal bypass may delete there (and staging-
+    /// note deletes record no revision, symmetric with the put hook).
     pub async fn delete(&self, path: &str) -> Result<(), ConceptStoreError> {
         if path.starts_with("/mutation-queue/") {
             return Err(ConceptStoreError::QueuePath(path.to_string()));
@@ -371,8 +546,42 @@ impl<'a> ConceptStore<'a> {
     }
 
     /// Internal delete path for the mutation queue: the `delete` body
-    /// minus the reserved-prefix check.
+    /// minus the reserved-prefix check (the queue deletes its staging
+    /// notes through this).
     pub async fn delete_internal(&self, path: &str) -> Result<(), ConceptStoreError> {
+        // Write-ahead pre-state FIRST (§3.2a-5): a missing concept fails
+        // NotFound with NO revision row and NO side changes (the
+        // re-delete contract). The snapshot bytes ARE the delete row's
+        // payload — captured before anything moves.
+        let pre_state = match self.repo.read(path, &self.scope.repo_scope()).await {
+            Ok(bytes) => bytes,
+            Err(FileRepoError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConceptStoreError::NotFound(path.to_string()));
+            }
+            Err(other) => return Err(other.into()),
+        };
+        // The delete row, write-ahead (§3.2): source is the boundary's
+        // provenance label ('' when unlabeled — a delete's row records
+        // the ACTOR, and this path has no system actor when the store
+        // carries none). Staging notes bypass, symmetric with the put
+        // hook (queue-internal scaffolding, not user concepts).
+        if !path.starts_with("/mutation-queue/") {
+            let rev_source = match &self.provenance {
+                Some(src) if !src.is_empty() => src.clone(),
+                _ => String::new(),
+            };
+            self.revisions
+                .record_as(
+                    path,
+                    "delete",
+                    &rev_source,
+                    &op_summary("delete", None)?,
+                    &pre_state,
+                )
+                .await?;
+        }
+        // The EXISTING steps: registry first, then index, then file (a
+        // crash keeps the ordering invariants).
         let scope_id = self.scope.scope_id();
         sqlx::query("DELETE FROM scope_files WHERE scope = ? AND path = ?")
             .bind(&scope_id)
