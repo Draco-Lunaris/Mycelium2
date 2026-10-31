@@ -7599,6 +7599,51 @@ async fn revisions_browser_page_escapes_hostile_payload_content() {
     shutdown.cancel();
 }
 
+/// Hostile-PATH escape pin (Task 5 re-review rider): the REST put
+/// route's canonicalization is leading-slash ONLY (no character
+/// whitelist), so a concept at a path carrying `<script>` markup IS
+/// seedable. The browser page's path cell must render that anchor text
+/// `html_escape`d like every other user-derived fragment — the href
+/// already carries the path percent-encoded, the cell text must arrive
+/// as `&lt;`/`&gt;` entities with no raw `<script>` markup anywhere in
+/// the page (same assertion shape as
+/// `revisions_browser_page_escapes_hostile_payload_content` for record
+/// content).
+#[tokio::test]
+async fn revisions_browser_page_escapes_hostile_path_markup() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Seedable through the real REST route (201 pinned by rest_put).
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a<script>b.md",
+        "---\ntype: Note\ntitle: Path Shape\n---\n\nbody\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "scope=user").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    // The row's path cell renders the path ESCAPED — composing the raw
+    // path into the cell would leave live `<script>` markup in the page.
+    assert!(
+        html.contains("/a&lt;script&gt;b.md"),
+        "path escaped in the row cell: {html}"
+    );
+    assert!(
+        !html.contains("<script>"),
+        "no raw script markup from the path: {html}"
+    );
+
+    shutdown.cancel();
+}
+
 /// The registry-title fallback is EXCLUSIVE to empty-payload rows: a
 /// live concept whose newest recorded payload decodes fine but has NO
 /// title in frontmatter shows the muted `(no title)` placeholder — the
