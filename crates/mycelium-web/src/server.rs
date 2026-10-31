@@ -73,6 +73,9 @@ pub fn build_router_with_shutdown(
         .route("/search", get(api::search_view))
         .route("/graph", get(api::graph_view))
         .route("/skills", get(api::skills_view))
+        // Revisions browser (Task 5, spec §3.2): the scope-level index
+        // of every revision-tracked path beside the skills page.
+        .route("/revisions", get(api::revisions_view))
         .route("/books", get(api::books_view))
         .route("/chat", get(api::chat_view))
         // Librarian status (PR 4, spec §6/§8): the admin-only

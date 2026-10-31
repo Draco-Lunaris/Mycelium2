@@ -7157,3 +7157,387 @@ async fn skills_concept_activate_offer_admin_only() {
 
     shutdown.cancel();
 }
+
+// ---------- Revisions browser page (Task 5: the scope-level index) ----------
+
+/// GET the revisions browser page (returns status + HTML body; empty
+/// query → `/revisions?`, the user's own bundle).
+async fn revisions_browser_page(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    query: &str,
+) -> (reqwest::StatusCode, String) {
+    let r = client
+        .get(format!("{base}/revisions?{query}"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let html = r.text().await.unwrap();
+    (status, html)
+}
+
+/// The user-scope browser (Task 5's row shape): the caller's own paths —
+/// live AND deleted — with live/deleted badges, last-op chips and dates
+/// in path order, and every path linking into Task 4's per-path view
+/// (dead paths included — the deleted row's link opens its history
+/// page, which now exists).
+#[tokio::test]
+async fn revisions_browser_user_scope_lists_paths_badges_links() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Live path: two revisions (create + update); deleted path: create
+    // + delete (the REST delete records its row at the boundary).
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a-live.md",
+        "---\ntype: Note\ntitle: Live One\n---\n\nfirst live body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a-live.md",
+        "---\ntype: Note\ntitle: Live Two\n---\n\nsecond live body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/b-dead.md",
+        "---\ntype: Note\ntitle: Dead One\n---\n\ndead body\n",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/b-dead.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "the delete must land (dead path)");
+
+    // The browser page: no scope param → the user's own bundle.
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page must render: {html}");
+    // Both paths listed; rows run in path order (a-live < b-dead).
+    let pos_a = html.find("/a-live.md").expect("live path listed");
+    let pos_b = html
+        .find("/b-dead.md")
+        .expect("a deleted path is listed unconditionally");
+    assert!(pos_a < pos_b, "rows run in path order: {html}");
+    // Badges: the live row carries the live chip, the deleted row the
+    // deleted one.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#),
+        "live badge: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">deleted</span>"#),
+        "deleted badge: {html}"
+    );
+    // Every row links into the per-path view with its scope spelled.
+    assert!(
+        html.contains(r#"href="/concept?path=/a-live.md&scope=user""#),
+        "live row link: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/concept?path=/b-dead.md&scope=user""#),
+        "deleted row link: {html}"
+    );
+    // Last op renders as the op chip: update on the live row, delete on
+    // the dead one.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">update</span>"#),
+        "update chip: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+        "delete chip: {html}"
+    );
+    // Dates render (relative bands or "just now" on a fast clock).
+    assert!(
+        html.contains(r#"<td data-label="Last op at">"#)
+            && (html.contains("ago") || html.contains("just now")),
+        "last-op dates: {html}"
+    );
+
+    // Functional link: the deleted path's row link opens Task 4's
+    // history-only page for the dead path (its restore lives there).
+    let (status, page) = concept_page(&client, &base, &cookie, "path=/b-dead.md&scope=user").await;
+    assert_eq!(status, 200, "the dead path's per-path page loads");
+    assert!(
+        page.contains("concept deleted"),
+        "the dead path's history renders from the link target: {page}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The title column decodes the NEWEST PAYLOAD (spec §3.2a-3's payload
+/// convention, the page's named source): an updated concept shows the
+/// title as it stood BEFORE its newest recorded op — not the live
+/// frontmatter ("Titled Two", not the live "Titled Three"); after a
+/// delete it shows the pre-delete title; and a live row whose newest
+/// payload is empty (the undelete-restore row records NO payload) falls
+/// back to the registry's live title.
+#[tokio::test]
+async fn revisions_browser_title_column_from_newest_payload() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Three puts: One (create), Two, Three. The newest payload (rev 3)
+    // records the PRE-put state of the third put — the "Two" content.
+    for title in ["One", "Two", "Three"] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/titled.md",
+            &format!("---\ntype: Note\ntitle: Titled {title}\n---\n\n{title} body\n"),
+        )
+        .await;
+    }
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page must render: {html}");
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Two</td>"#),
+        "the newest payload's title (the third put's pre-state) renders: {html}"
+    );
+    assert!(
+        !html.contains("Titled Three"),
+        "the live title is not this page's source: {html}"
+    );
+
+    // Delete: the delete row's payload is the pre-delete content — the
+    // page still names the path's last recorded title.
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/titled.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Three</td>"#),
+        "the delete row's payload (pre-delete state) supplies the title: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+        "the dead row says delete: {html}"
+    );
+
+    // Undeleting restore: the newest row carries NO payload (§3.2a-3's
+    // empty undelete-restore row) while the path is live again — the
+    // title falls back to the registry's live title (the one truth the
+    // undo log's payload column can't give).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/titled.md&n=4"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "the undelete restore lands");
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#),
+        "restored to live: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Three</td>"#),
+        "live registry title on the empty-payload row: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Service-scope browses are admin-only PAGES — a non-admin gets the
+/// 403 in place (never a redirect: a redirect is discoverable signal),
+/// no rows leak on the denial — while the admin renders the scope's
+/// rows (title decoded from the newest payload) and its empty library
+/// state. An unknown scope is a 400 (the REST parse's convention).
+#[tokio::test]
+async fn revisions_browser_service_scopes_admin_only() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // A skills-scope concept with a chain, so the admin's page has a row.
+    let put = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-browser.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk Browser\n---\n\nskill body\n",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 303, "skills seed put");
+
+    // Non-admin: 403 on BOTH service scopes — in place, and nothing of
+    // the scope's content leaks through the denial.
+    for scope in ["skills", "library"] {
+        let r = client
+            .get(format!("{base}/revisions?scope={scope}"))
+            .header("cookie", &mallory_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "non-admin {scope} browser is forbidden");
+        assert!(
+            r.headers().get("location").is_none(),
+            "the 403 must not redirect ({scope})"
+        );
+        let body = r.text().await.unwrap();
+        assert!(
+            !body.contains("sk-browser"),
+            "no scoped rows leak through the 403 ({scope}): {body}"
+        );
+    }
+    // ...while the user scope needs no admin (and a non-admin's page
+    // offers no service-scope chips they could not reach).
+    let (status, own_html) = revisions_browser_page(&client, &base, &mallory_cookie, "").await;
+    assert_eq!(status, 200, "the user scope needs no admin: {own_html}");
+    assert!(
+        !own_html.contains("/revisions?scope=skills")
+            && !own_html.contains("/revisions?scope=library"),
+        "no service-scope chips on a non-admin's page: {own_html}"
+    );
+
+    // Admin: the skills scope renders the row and links into the
+    // per-path page; the library scope renders (empty state here — no
+    // ingest needed to pin the page's shape).
+    let (status, html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=skills").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"href="/concept?path=/sk-browser.md&scope=skills""#),
+        "skills row link carries the scope: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#)
+            && html.contains(r#"<td data-label="Title">Sk Browser</td>"#),
+        "skills row badge + decoded title: {html}"
+    );
+    let (status, page) = concept_page(
+        &client,
+        &base,
+        &admin_cookie,
+        "path=/sk-browser.md&scope=skills",
+    )
+    .await;
+    assert_eq!(status, 200, "the row's link target loads");
+    assert!(
+        page.contains("Sk Browser"),
+        "the row's link target renders the concept: {page}"
+    );
+    let (status, html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=library").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("No revisions yet"),
+        "an empty scope renders the empty state: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/revisions?scope=skills""#)
+            && html.contains(r#"href="/revisions?scope=user""#),
+        "the admin's scope-switch chips: {html}"
+    );
+
+    // Unknown scope → 400 (the REST parse's convention, shared).
+    let r = client
+        .get(format!("{base}/revisions?scope=nope"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "unknown scope is a bad request");
+
+    shutdown.cancel();
+}
+
+/// The browser lists the CALLER's own user store only (the session
+/// user's id scopes `RevisionStore::for_user`): another user's private
+/// bundle never crosses the page — no path, no decoded title. And the
+/// page navigates without script: anchors only (no forms, no inline
+/// scripts anywhere).
+#[tokio::test]
+async fn revisions_browser_owner_isolation_and_no_js() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    rest_put(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "/admin-secret.md",
+        "---\ntype: Note\ntitle: Admin Secret\n---\n\nadmin body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &mallory_cookie,
+        &mallory_csrf,
+        "/mallory.md",
+        "---\ntype: Note\ntitle: Mallory Note\n---\n\nmallory body\n",
+    )
+    .await;
+
+    // Mallory's page: her row only; neither the admin's path nor title.
+    let (status, html) = revisions_browser_page(&client, &base, &mallory_cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    assert!(html.contains("/mallory.md"), "her own row: {html}");
+    assert!(
+        !html.contains("admin-secret"),
+        "another user's path is invisible: {html}"
+    );
+    assert!(
+        !html.contains("Admin Secret"),
+        "another user's title is invisible: {html}"
+    );
+
+    // No script, no forms: navigation is anchors alone (no-JS usable).
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+    assert!(
+        !html.contains("<form"),
+        "nothing on the page needs JS: {html}"
+    );
+
+    shutdown.cancel();
+}

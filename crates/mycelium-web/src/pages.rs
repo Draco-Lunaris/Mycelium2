@@ -804,6 +804,132 @@ fn revisions_diff_body(data: &DiffData, surface: &RevisionsSurface) -> TrustedHt
     ));
     TrustedHtml::from_markup(h)
 }
+
+/// One row of the scope-level revisions browser (Task 5) — gathered BY
+/// the handler (which alone can decode payloads), composed BY the page:
+/// the path, the registry state, the newest recorded payload's title,
+/// and the chain's last op + time (`RevisionStore::list_paths`'s
+/// finding, plus the decode).
+pub struct RevisionPathRow {
+    pub path: String,
+    /// A `scope_files` row exists right now (the store fn's live flag).
+    pub live: bool,
+    /// The newest recorded snapshot's frontmatter title — `None` when
+    /// no payload could supply one (the page renders a muted
+    /// placeholder).
+    pub title: Option<String>,
+    pub last_op: String,
+    pub last_op_at: String,
+}
+
+/// The scope-level revisions browser (Task 5, spec §3.2 "…a scope-level
+/// Revisions browser page (owner for user scopes; admin for service
+/// scopes) listing every path with revisions, live or deleted (latest
+/// title + last op per path)"). Breadcrumb (Browse → Revisions), the
+/// scope-switch chips (admins only — a non-admin can reach only the
+/// user scope, so offering the others would be dead links), and the
+/// data table: Path (the link into Task 4's per-path view + the
+/// live/deleted badge), decoded latest title, last-op chip, last-op
+/// date. No forms, no script — pure anchors for no-JS navigation;
+/// `err` renders as the page's banner (a store fault answers in place,
+/// the books page's posture).
+pub fn revisions_page(
+    user: &SessionUser,
+    csrf: &str,
+    scope_param: &str,
+    rows: &[RevisionPathRow],
+    err: Option<&str>,
+) -> Html<String> {
+    let breadcrumb = mycelium_ui::render::render(mycelium_ui::breadcrumb(&[
+        ("Browse", Some("/")),
+        ("Revisions", None),
+    ]));
+    // Scope chips, the home_page filter-chip convention (accent +
+    // aria-current on the active one; hrefs stay percent-clean — the
+    // three param spellings are fixed words).
+    let actions = if user.role == Role::Admin {
+        let chip_link = |param: &str, label: &str| {
+            let active = param == scope_param;
+            format!(
+                r#"<a class="chip{}" href="/revisions?scope={param}"{}>{}</a>"#,
+                if active { " chip--accent" } else { "" },
+                if active {
+                    r#" aria-current="true""#
+                } else {
+                    ""
+                },
+                html_escape(label)
+            )
+        };
+        format!(
+            "{}{}{}",
+            chip_link("user", "Your bundle"),
+            chip_link("skills", "Global skills"),
+            chip_link("library", "Library"),
+        )
+    } else {
+        String::new()
+    };
+    let content = if rows.is_empty() {
+        mycelium_ui::render::render(mycelium_ui::empty_state(
+            "No revisions yet",
+            "Concepts appear here after they are created, edited, or deleted.",
+        ))
+    } else {
+        let table_rows: Vec<Vec<TrustedHtml>> = rows
+            .iter()
+            .map(|r| revision_path_row_cells(r, scope_param))
+            .collect();
+        mycelium_ui::render::render(mycelium_ui::data_table(
+            &["Path", "Title", "Last op", "Last op at"],
+            &table_rows,
+        ))
+    };
+    let body = format!(
+        "{}{}{}{}",
+        breadcrumb,
+        mycelium_ui::render::render(mycelium_ui::page_header(
+            "Revisions",
+            TrustedHtml::from_markup(actions)
+        )),
+        flash(None, err),
+        content
+    );
+    layout("Revisions", Some(user), csrf, "/revisions", body)
+}
+
+/// One browser row's four cells: the path anchor (into the per-path
+/// page, always scope-tagged) with its live/deleted badge, the escaped
+/// title (or the muted placeholder), the last-op chip (the per-concept
+/// list's palette), and the last-op date. User-derived text (the path,
+/// the title, the op) is `html_escape`d / rendered through the chip at
+/// composition — the page is a trusted-markup slot over escaped
+/// fragments only.
+fn revision_path_row_cells(row: &RevisionPathRow, scope_param: &str) -> Vec<TrustedHtml> {
+    let badge = if row.live {
+        r#"<span class="chip chip--neutral">live</span>"#.to_string()
+    } else {
+        r#"<span class="chip chip--danger">deleted</span>"#.to_string()
+    };
+    let path_cell = format!(
+        r#"<a href="/concept?path={path}&scope={sp}">{}</a> {badge}"#,
+        html_escape(&row.path),
+        path = urlencoding_encode(&row.path),
+        sp = scope_param
+    );
+    vec![
+        TrustedHtml::from_markup(path_cell),
+        TrustedHtml::from_markup(match &row.title {
+            Some(title) => html_escape(title),
+            None => r#"<span class="muted">(no title)</span>"#.to_string(),
+        }),
+        TrustedHtml::from_markup(mycelium_ui::render::render(mycelium_ui::chip(
+            &row.last_op,
+            revision_op_class(&row.last_op),
+        ))),
+        TrustedHtml::from_markup(html_escape(&relative_date(&row.last_op_at))),
+    ]
+}
 /// Build the editor's static preview pane from the concept's markdown.
 /// Returns `(preview_html, frontmatter_error)`: the preview is composed
 /// from html-escaped fragments ONLY (escape-then-compose — the spec's

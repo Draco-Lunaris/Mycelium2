@@ -13,8 +13,8 @@ use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::{Concept, LifecycleStatus};
 use mycelium_core::search::SearchQuery;
 use mycelium_store::{
-    ConceptStore, FileRepo, RevisionStore, RevisionsError, Scope, SkillBundleError, SkillGroup,
-    bundle_skill_files, chat::ChatError, group_skills,
+    ConceptStore, FileRepo, RevisionPathEntry, RevisionStore, RevisionsError, Scope,
+    SkillBundleError, SkillGroup, bundle_skill_files, chat::ChatError, group_skills,
 };
 
 use crate::middleware::SessionId;
@@ -849,6 +849,146 @@ async fn api_revisions_restore(
         Err(e) => {
             tracing::error!(error = %e, "revision restore failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+// ---------- Revisions browser page (Task 5: GET /revisions) ----------
+
+#[derive(Deserialize)]
+pub struct RevisionsPageQuery {
+    /// The scope to browse — absent → the caller's own bundle (the
+    /// ConceptQuery convention).
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// GET /revisions — the scope-level revisions browser page (spec §3.2:
+/// "owner for user scopes; admin for service scopes" listing every path
+/// with revisions, live or deleted). The revisions REST INDEX's exact
+/// perm matrix ([`revisions_index_store`]): user scope = the session
+/// user's own bundle; skills/library = admin only, answered IN PLACE as
+/// 403 — never a redirect, which would signal which scopes exist. Rows
+/// in path order, each linking into Task 4's per-concept page (which
+/// now serves dead paths' history).
+pub async fn revisions_view(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    Query(q): Query<RevisionsPageQuery>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let rev_store = match revisions_index_store(&state, &user, scope).await {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    // The registry-title fallback's concept store (see
+    // [`revisions_row_title`]): the same scope's live concepts.
+    let cs = match scope {
+        RevScope::User => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(error = %e, "revisions browser: master key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                }
+            };
+            ConceptStore::for_user(&state.store, user.user_id, master)
+        }
+        RevScope::Skills => ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.skills_dir(),
+            "skills",
+        ),
+        RevScope::Library => ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        ),
+    };
+    let paths = match rev_store.list_paths().await {
+        Ok(paths) => paths,
+        Err(e) => {
+            // A store fault answers in place: the page shell with the
+            // error banner (the books page's posture) — not a 500, not
+            // a bare error body.
+            tracing::error!(error = %e, "revisions browser listing failed");
+            return pages::revisions_page(
+                &user,
+                &csrf,
+                scope.as_param(),
+                &[],
+                Some("The revision history could not be loaded."),
+            )
+            .into_response();
+        }
+    };
+    let mut rows = Vec::with_capacity(paths.len());
+    for entry in &paths {
+        let title = revisions_row_title(&rev_store, &cs, entry).await;
+        rows.push(pages::RevisionPathRow {
+            path: entry.path.clone(),
+            live: entry.live,
+            title,
+            last_op: entry.last_op.clone(),
+            last_op_at: entry.last_op_at.clone(),
+        });
+    }
+    pages::revisions_page(&user, &csrf, scope.as_param(), &rows, None).into_response()
+}
+
+/// One browser row's title (Task 5's "latest title"): the NEWEST
+/// recorded payload's frontmatter title, decoded through the same
+/// `get` + parse path the snapshot REST route uses (§3.2a-3's payload
+/// convention — create rows carry the created content, every other row
+/// the pre-mutation state, so this is the latest title the undo log
+/// recorded). A live row whose newest payload can't supply one (the
+/// undelete-restore row records NO payload) falls back to the
+/// registry's live title; nothing readable → None (the page's muted
+/// placeholder). Faults log per row and never page-fatal.
+async fn revisions_row_title(
+    rev_store: &RevisionStore<'_>,
+    cs: &ConceptStore<'_>,
+    entry: &RevisionPathEntry,
+) -> Option<String> {
+    let title_from_payload = match rev_store.get(&entry.path, entry.latest_no).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => match Concept::parse(&entry.path, &text) {
+                Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
+                Err(e) => {
+                    tracing::warn!(path = entry.path, error = %e, "browser row snapshot frontmatter");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = entry.path, error = %e, "browser row snapshot bytes");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                path = entry.path,
+                n = entry.latest_no,
+                error = %e,
+                "browser row snapshot decode"
+            );
+            None
+        }
+    };
+    if title_from_payload.is_some() || !entry.live {
+        return title_from_payload;
+    }
+    match cs.get(&entry.path).await {
+        Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
+        Err(e) => {
+            tracing::warn!(path = entry.path, error = %e, "browser row registry title");
+            None
         }
     }
 }
