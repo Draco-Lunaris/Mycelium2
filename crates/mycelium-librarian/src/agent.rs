@@ -503,6 +503,15 @@ async fn agent_loop_tracked(
     Err(AgentError::StepCapExceeded)
 }
 
+/// `include_inactive` from a model-supplied tool-call argument: absent,
+/// null or non-boolean all mean `false` — history queries stay opt-in, so
+/// every existing caller keeps the default active-only filtering.
+fn include_inactive_arg(args: &serde_json::Value) -> bool {
+    args.get("include_inactive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Execute one tool call; returns (JSON result for the model, path
 /// written when the tool mutated a concept). Records the step on the
 /// run's trace recorder.
@@ -532,7 +541,13 @@ async fn execute_tool_tracked(
                 .take(MAX_SEARCH_TERMS)
                 .map(|t| t.to_string())
                 .collect();
-            let q = SearchQuery::new(terms);
+            let mut q = SearchQuery::new(terms);
+            // History queries are opt-in: without the flag the search
+            // keeps the default active-only filter, so retired and
+            // superseded concepts stay out of ordinary retrieval.
+            if include_inactive_arg(&args) {
+                q.status_filter = mycelium_core::search::StatusFilter::All;
+            }
 
             // Collect hits from all available scopes, tagging each with its scope.
             let mut all_hits: Vec<(String, mycelium_core::search::SearchResult)> = Vec::new();
@@ -1001,6 +1016,60 @@ pub async fn format_tree(store: &ConceptStore<'_>) -> Result<String, AgentError>
     Ok(lines.join("\n"))
 }
 
+/// The OKF operating-rules block the system prompt interpolates verbatim
+/// (v1's rules, adapted). It lives here rather than inline in the prompt
+/// builder so the block has one home the content tests can pin — rule 8
+/// carries the knowledge-lifecycle guidance. `{types_list}` is the only
+/// slot the builder fills in.
+const OPERATING_RULES: &str = "1. SEARCH FIRST. Before adding anything, search for existing concepts the new knowledge relates to.
+2. ENRICH OVER CREATE. A fact that is an attribute of an existing concept gets patched INTO that concept — not filed as its own concept.
+3. LINK BOTH WAYS. A new concept must be wired into the graph: link it to related concepts AND patch those to reference it back.
+4. REUSE TYPES. Prefer a type already in use. Types currently in the bundle: {types_list}.
+5. PLACE DELIBERATELY. Choose directories by subject area; reuse existing directories; short kebab-case filenames.
+6. WRITE FOR THE NEXT READER. One-line descriptions; concise, factual, self-contained bodies.
+7. PREFER PATCH OVER REWRITE. Use patch_concept for small changes.
+8. DEPRECATE, DON'T DELETE. When knowledge is outdated: patch the OLD concept — status: superseded + superseded_by: <new-concept-path> — or status: retired. Never leave a live concept contradicting a new one. Use delete_concept only for wrong/harmful content or on explicit request.
+9. CITE WHEN ANSWERING. Ground every claim in concepts you actually read; list their paths. If the knowledge base doesn't contain the answer, say so plainly — never invent knowledge.";
+
+/// Render the operating-rules block for the given live-type list.
+fn operating_rules(types_list: &str) -> String {
+    OPERATING_RULES.replace("{types_list}", types_list)
+}
+
+/// The per-mode task section the system prompt appends after the layout.
+fn mode_section(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Query => {
+            "## Your task mode: QUERY (read-only)
+
+Answer the user's question from the knowledge base. Search, read the relevant concepts, then answer. End your answer with a \"Sources:\" line listing the bundle paths you used.
+
+RETRIEVAL PROTOCOL — search is keyword-based, not semantic, so one empty search proves nothing:
+1. Search with the question's key terms.
+2. On a miss, retry once or twice with synonyms, broader terms, or related entities.
+3. Still nothing? Check the bundle layout (above, or via list_directory) and read_concept EVERY concept whose type, name, or description could plausibly relate.
+4. Only after steps 1-3 may you answer that the knowledge base has no coverage; then suggest what concept could be added."
+        }
+        AgentMode::Mutate => {
+            "## Your task mode: MUTATE
+
+The input is knowledge to persist or a change to apply — NOT a message to reply to. Do not respond conversationally. You MUST act with the write tools.
+
+WRITE PROTOCOL:
+1. Search for concepts the knowledge relates to or belongs to; read the strongest candidates.
+2. CHECK FOR CONTRADICTION. If the new knowledge conflicts with an existing concept, update it — never leave two contradictory claims standing. When replacing a concept entirely, set its status to superseded and its superseded_by to the new concept's path (rule 8).
+3. ENRICH OVER CREATE: a fact that belongs to an existing concept gets patched into it; only a distinct entity gets its own concept.
+4. LINK BOTH WAYS: new concepts must be wired into the graph — link related concepts and patch them to reference back.
+5. Finish with a one-sentence summary of what changed and the paths touched."
+        }
+        AgentMode::Chat => {
+            "## Your task mode: CHAT
+
+You are conversing with the user about their knowledge base. Answer questions (search and read first, cite paths), and when the user asks to record or change knowledge, use the write tools following the MUTATE protocol. Be concise."
+        }
+    }
+}
+
 /// Build the system prompt (v1's OKF operating rules, adapted).
 pub async fn build_system_prompt(
     store: &ConceptStore<'_>,
@@ -1027,36 +1096,8 @@ pub async fn build_system_prompt(
     } else {
         types.join(", ")
     };
-    let mode_section = match mode {
-        AgentMode::Query => {
-            "## Your task mode: QUERY (read-only)
-
-Answer the user's question from the knowledge base. Search, read the relevant concepts, then answer. End your answer with a \"Sources:\" line listing the bundle paths you used.
-
-RETRIEVAL PROTOCOL — search is keyword-based, not semantic, so one empty search proves nothing:
-1. Search with the question's key terms.
-2. On a miss, retry once or twice with synonyms, broader terms, or related entities.
-3. Still nothing? Check the bundle layout (above, or via list_directory) and read_concept EVERY concept whose type, name, or description could plausibly relate.
-4. Only after steps 1-3 may you answer that the knowledge base has no coverage; then suggest what concept could be added."
-        }
-        AgentMode::Mutate => {
-            "## Your task mode: MUTATE
-
-The input is knowledge to persist or a change to apply — NOT a message to reply to. Do not respond conversationally. You MUST act with the write tools.
-
-WRITE PROTOCOL:
-1. Search for concepts the knowledge relates to or belongs to; read the strongest candidates.
-2. CHECK FOR CONTRADICTION. If the new knowledge conflicts with an existing concept, update it — never leave two contradictory claims standing.
-3. ENRICH OVER CREATE: a fact that belongs to an existing concept gets patched into it; only a distinct entity gets its own concept.
-4. LINK BOTH WAYS: new concepts must be wired into the graph — link related concepts and patch them to reference back.
-5. Finish with a one-sentence summary of what changed and the paths touched."
-        }
-        AgentMode::Chat => {
-            "## Your task mode: CHAT
-
-You are conversing with the user about their knowledge base. Answer questions (search and read first, cite paths), and when the user asks to record or change knowledge, use the write tools following the MUTATE protocol. Be concise."
-        }
-    };
+    let rules = operating_rules(&types_list);
+    let mode_text = mode_section(mode);
     Ok(format!(
         "You are the Knowledge Keeper — an agent that manages a knowledge base conforming to the Open Knowledge Format (OKF).
 
@@ -1070,21 +1111,13 @@ You are conversing with the user about their knowledge base. Answer questions (s
 
 ## Operating rules
 
-1. SEARCH FIRST. Before adding anything, search for existing concepts the new knowledge relates to.
-2. ENRICH OVER CREATE. A fact that is an attribute of an existing concept gets patched INTO that concept — not filed as its own concept.
-3. LINK BOTH WAYS. A new concept must be wired into the graph: link it to related concepts AND patch those to reference it back.
-4. REUSE TYPES. Prefer a type already in use. Types currently in the bundle: {types_list}.
-5. PLACE DELIBERATELY. Choose directories by subject area; reuse existing directories; short kebab-case filenames.
-6. WRITE FOR THE NEXT READER. One-line descriptions; concise, factual, self-contained bodies.
-7. PREFER PATCH OVER REWRITE. Use patch_concept for small changes.
-8. DEPRECATE, DON'T DELETE. Prefer tagging `deprecated` over delete_concept; delete only when wrong/harmful or explicitly asked.
-9. CITE WHEN ANSWERING. Ground every claim in concepts you actually read; list their paths. If the knowledge base doesn't contain the answer, say so plainly — never invent knowledge.
+{rules}
 
 ## Current bundle layout
 
 {tree}
 
-{mode_section}"
+{mode_text}"
     ))
 }
 
@@ -1128,7 +1161,8 @@ pub fn read_tool_specs() -> Vec<crate::llm::ToolSpec<'static>> {
                     static_schema(serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Keywords to search for" }
+                            "query": { "type": "string", "description": "Keywords to search for" },
+                            "include_inactive": {"type": "boolean", "description": "Include retired/superseded concepts (history queries). Default false."}
                         },
                         "required": ["query"]
                     })),
@@ -1221,7 +1255,7 @@ pub fn all_tool_specs() -> Vec<crate::llm::ToolSpec<'static>> {
             ));
             tools.push(tool_spec(
                 "delete_concept",
-                "Permanently delete a concept. Prefer deprecation (tag 'deprecated' via patch_concept) unless content is wrong/harmful or deletion was explicitly requested.",
+                "Permanently delete a concept. Prefer lifecycle retirement instead: patch the concept with status: retired (or status: superseded + superseded_by pointing at the replacement). Use delete_concept only when content is wrong/harmful or deletion was explicitly requested.",
                 static_schema(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1256,5 +1290,115 @@ mod tests {
         assert!(out.contains("# Schema"));
         assert!(out.contains("the schema"));
         assert!(out.contains("Intro."));
+    }
+
+    // ---- lifecycle prompt / tool-description content pins (spec §3.1) ----
+    //
+    // These strings are copy-pinned from the lifecycle spec: the rule,
+    // sentence and description below must match it byte-for-byte.
+
+    #[test]
+    fn rule8_pins_lifecycle_instructions() {
+        let rules = operating_rules("Note, Decision");
+        assert!(rules.contains("status: superseded"));
+        assert!(rules.contains("superseded_by"));
+        assert!(
+            rules.contains(
+                "8. DEPRECATE, DON'T DELETE. When knowledge is outdated: patch the OLD concept — status: superseded + superseded_by: <new-concept-path> — or status: retired. Never leave a live concept contradicting a new one. Use delete_concept only for wrong/harmful content or on explicit request."
+            ),
+            "rule 8 drifted from the lifecycle wording:\n{rules}"
+        );
+    }
+
+    #[test]
+    fn delete_concept_description_pins_retirement() {
+        let spec = spec_json("delete_concept");
+        let description = spec["function"]["description"].as_str().unwrap();
+        assert!(description.contains("status: retired"));
+        assert_eq!(
+            description,
+            "Permanently delete a concept. Prefer lifecycle retirement instead: patch the concept with status: retired (or status: superseded + superseded_by pointing at the replacement). Use delete_concept only when content is wrong/harmful or deletion was explicitly requested."
+        );
+    }
+
+    #[test]
+    fn search_knowledge_schema_has_include_inactive() {
+        let spec = spec_json("search_knowledge");
+        let prop = &spec["function"]["parameters"]["properties"]["include_inactive"];
+        assert_eq!(prop["type"], "boolean");
+        assert_eq!(
+            prop["description"],
+            "Include retired/superseded concepts (history queries). Default false."
+        );
+        // History queries stay opt-in: the arg must not be required.
+        let required = &spec["function"]["parameters"]["required"];
+        assert!(
+            required
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r != "include_inactive"),
+            "include_inactive must default false, not be required"
+        );
+    }
+
+    #[test]
+    fn mutate_step2_pins_supersede_hint() {
+        let section = mode_section(AgentMode::Mutate);
+        assert!(section.contains("2. CHECK FOR CONTRADICTION."));
+        assert!(
+            section.contains(
+                "When replacing a concept entirely, set its status to superseded and its superseded_by to the new concept's path (rule 8)."
+            ),
+            "MUTATE step 2 lost its supersede hint:\n{section}"
+        );
+    }
+
+    #[test]
+    fn include_inactive_arg_defaults_false() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"query": "x"}),
+            serde_json::json!({"include_inactive": null}),
+            serde_json::json!({"include_inactive": "true"}),
+            serde_json::json!({"include_inactive": 1}),
+            serde_json::json!({"include_inactive": false}),
+        ] {
+            assert!(!include_inactive_arg(&args), "expected false for {args}");
+        }
+        assert!(include_inactive_arg(&serde_json::json!(
+            {"include_inactive": true}
+        )));
+    }
+
+    /// The assembled prompt (not just its building blocks) carries the
+    /// lifecycle rule and the MUTATE hint: the builder formats FROM the
+    /// rules const and the mode section, so this pins the wiring too.
+    #[tokio::test]
+    async fn system_prompt_formats_lifecycle_rule_and_supersede_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mycelium_store::Store::open(dir.path()).await.unwrap();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = mycelium_store::ConceptStore::for_user(&store, uuid::Uuid::new_v4(), master);
+
+        let query_prompt = build_system_prompt(&cs, AgentMode::Query).await.unwrap();
+        assert!(query_prompt.contains("## Operating rules"));
+        assert!(query_prompt.contains("8. DEPRECATE, DON'T DELETE."));
+        assert!(query_prompt.contains("status: superseded + superseded_by: <new-concept-path>"));
+        assert!(query_prompt.contains("Types currently in the bundle:"));
+        assert!(!query_prompt.contains("Prefer tagging `deprecated`"));
+
+        let mutate_prompt = build_system_prompt(&cs, AgentMode::Mutate).await.unwrap();
+        assert!(mutate_prompt.contains("2. CHECK FOR CONTRADICTION. If the new knowledge conflicts with an existing concept, update it — never leave two contradictory claims standing. When replacing a concept entirely, set its status to superseded and its superseded_by to the new concept's path (rule 8)."));
+    }
+
+    /// The serialized (wire-shape) spec of a tool by name — `ToolSpec`
+    /// fields are private, the JSON the model sees is not.
+    fn spec_json(name: &str) -> serde_json::Value {
+        all_tool_specs()
+            .iter()
+            .map(|spec| serde_json::to_value(spec).unwrap())
+            .find(|spec| spec["function"]["name"] == name)
+            .unwrap_or_else(|| panic!("no tool spec named {name}"))
     }
 }
