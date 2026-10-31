@@ -3411,3 +3411,143 @@ async fn admin_system_shows_llm_readout() {
     waiter.abort();
     shutdown.cancel();
 }
+
+/// Provenance (lifecycle spec §3.1): a chat-mode agent's concept write
+/// is SYSTEM provenance — the session chat surface's store stamps
+/// `source = "chat"` (never the model's or the author's value) and
+/// `confirmed_at` on every put.
+#[tokio::test]
+async fn chat_agent_write_carries_provenance_label() {
+    let _g = TEST_LOCK.lock().await;
+    // Script: (1) the final answer, (2) a write_concept tool call — the
+    // agent writes a concept through the chat surface's labeled store.
+    let llm_url = mock_llm(vec![
+        text_response("Written."),
+        tool_call_response(
+            "call-1",
+            "write_concept",
+            serde_json::json!({
+                "path": "/chat-written.md",
+                "body": "recorded by the chat agent zebra",
+                "frontmatter": { "type": "Note", "title": "Chat Written" }
+            }),
+        ),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, _csrf) = login_admin(&client, &base).await;
+
+    let (_session_id, events) =
+        submit_draft_collect(&client, &base, &cookie, &_csrf, "record this").await;
+    assert_eq!(events[2]["type"], "done", "tool run, then the answer");
+    assert_eq!(
+        events[1]["name"], "write_concept",
+        "the mocked turn exercised the write tool"
+    );
+
+    // Read the concept back through the user-scope REST API.
+    // (The login cookie is for the same admin bundle the runner wrote.)
+    let resp = client
+        .get(format!("{base}/api/v1/concepts/chat-written.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the agent's write landed");
+    let md = resp.text().await.unwrap();
+    let concept = mycelium_core::concept::Concept::parse("/chat-written.md", &md)
+        .expect("stored concept parses");
+    assert_eq!(
+        concept.frontmatter.source.as_deref(),
+        Some("chat"),
+        "the chat surface's label overwrites anything else"
+    );
+    assert!(
+        concept
+            .frontmatter
+            .confirmed_at
+            .as_ref()
+            .map(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
+            .unwrap_or(false),
+        "confirmed_at is stamped at the put boundary"
+    );
+    shutdown.cancel();
+}
+
+/// Provenance (lifecycle spec §3.1): the dream pass carries the
+/// `dream` label on every concept its agent writes.
+#[tokio::test]
+async fn dream_agent_write_carries_provenance_label() {
+    let _g = TEST_LOCK.lock().await;
+    // Script: (1) the summarizing answer, (2) a write_concept call.
+    // LIFO pop: the tool call answers the first request.
+    let llm_url = mock_llm(vec![
+        text_response("Dream pass complete."),
+        tool_call_response(
+            "call-1",
+            "write_concept",
+            serde_json::json!({
+                "path": "/dream-written.md",
+                "body": "written by the dream pass",
+                "frontmatter": { "type": "Note", "title": "Dream Written" }
+            }),
+        ),
+    ])
+    .await;
+    let (base, shutdown, _dir) = boot(llm_url).await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Seed the signal: a lone unlinked concept is a graph orphan, which
+    // makes run_dream run the agent instead of reporting "no signals".
+    let seed = client
+        .put(format!("{base}/api/v1/concepts/orphan.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!(
+            {"markdown": "---\ntype: Note\ntitle: Lonely\n---\n\nnothing links here"}
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seed.status(), 201, "the orphan seeds the dream signal");
+
+    let resp = client
+        .post(format!("{base}/api/v1/dream"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the orphan gives the dream a signal");
+    let report: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(report["ran"], true, "the dream ran the agent");
+
+    // The concept the dream agent wrote carries the dream label.
+    let got = client
+        .get(format!("{base}/api/v1/concepts/dream-written.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200, "the dream's write landed");
+    let concept =
+        mycelium_core::concept::Concept::parse("/dream-written.md", &got.text().await.unwrap())
+            .expect("stored concept parses");
+    assert_eq!(
+        concept.frontmatter.source.as_deref(),
+        Some("dream"),
+        "the surface's label (spec §3.1) overwrites anything else"
+    );
+    assert!(
+        concept
+            .frontmatter
+            .confirmed_at
+            .as_ref()
+            .map(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
+            .unwrap_or(false),
+        "confirmed_at is stamped at the put boundary"
+    );
+    shutdown.cancel();
+}

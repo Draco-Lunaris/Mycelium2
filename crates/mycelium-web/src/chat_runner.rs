@@ -462,7 +462,12 @@ async fn run_chat_turn(
     };
 
     let client = LlmClient::new(&llm);
-    let cs = ConceptStore::for_user(&ctx.store, user_id, master.clone());
+    let cs = ConceptStore::for_user(&ctx.store, user_id, master.clone())
+        // The chat-mode agent may write concepts: label its store (spec
+        // §3.1 — system provenance; nothing model-authored survives the
+        // put). A resume re-integration carries `resume`, a fresh chat
+        // turn `chat`.
+        .with_provenance(if resumed { "resume" } else { "chat" });
     // AgentScopes borrows the store — built here, inside the task that
     // owns it (the detached-task pattern).
     let scopes = build_agent_scopes(

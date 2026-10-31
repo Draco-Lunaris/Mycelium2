@@ -3781,7 +3781,11 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        // The dream agent may write concepts: label its store (spec
+        // §3.1 `dream` — system provenance; nothing model-authored
+        // survives the put).
+        .with_provenance("dream");
     // The config load is also the gate's sync point (spec §3.2): the
     // clamped row is the single source of both the gate's limits and
     // this surface's wait bound — no separate plumbing.
@@ -3798,6 +3802,9 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         visible_library_slugs(&state, &user).await,
         user.user_id,
     );
+    // Dream is wait class with the CHAT bound (spec §5): admin-triggered
+    // and rare, so it may wait for a slot — but it never jumps the
+    // queue, and it never hangs unbounded.
     // Dream is wait class with the CHAT bound (spec §5): admin-triggered
     // and rare, so it may wait for a slot — but it never jumps the
     // queue, and it never hangs unbounded.
@@ -3853,7 +3860,11 @@ pub async fn api_chat(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        // The chat-mode agent may write concepts: label its store (spec
+        // §3.1 — system provenance; nothing model-authored survives the
+        // put).
+        .with_provenance("chat");
     // Config load doubles as the gate sync point (spec §3.2).
     let llm =
         crate::state::decrypt_config::<crate::LlmConfig>(&state.config, &state.service_key, "llm")
