@@ -436,6 +436,24 @@ impl LlmClient {
         temperature: f32,
     ) -> Result<StepOutput, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
+        // Context-budget pass (Task 5): first drop whole conversational
+        // units from the front until the estimated prompt fits the
+        // token budget, then cap each tool result so a full-size
+        // concept read can never come close to the model's context cap
+        // on its own. Both run loops share this single call site, so
+        // both get the pass for free. The estimator is over the RAW
+        // conversation (capping only ever shrinks the wire body).
+        let conversation = trim_conversation(conversation);
+        let conversation: Vec<ConversationTurn> = conversation
+            .into_iter()
+            .map(|turn| match turn {
+                ConversationTurn::ToolResult { call_id, result } => ConversationTurn::ToolResult {
+                    call_id,
+                    result: bound_tool_result(&result),
+                },
+                turn => turn,
+            })
+            .collect();
         let mut messages: Vec<ChatMessage> = Vec::with_capacity(conversation.len() + 1);
         messages.push(ChatMessage {
             role: "system",
@@ -443,7 +461,7 @@ impl LlmClient {
             tool_calls: None,
             tool_call_id: None,
         });
-        for turn in conversation {
+        for turn in &conversation {
             messages.push(match turn {
                 ConversationTurn::User(text) => ChatMessage {
                     role: "user",
@@ -515,6 +533,141 @@ pub enum ConversationTurn {
         call_id: String,
         result: String,
     },
+}
+
+/// Per-tool-result output cap, in chars (24,000 ≈ 6,000 tokens): a run
+/// reading full-size concepts must not let one `read_concept` result
+/// alone crowd the context window. Applied in `chat_with_tools_impl`
+/// when the model's messages are built — the run loop's own
+/// conversation keeps the full text (the cap is per-model-call).
+pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+
+/// Token budget for one `chat/completions` call (estimator: chars / 4),
+/// comfortably under the 131,072-token context cap observed via
+/// litellm on 2026-10-31 (a 143,083-token prompt was rejected with a
+/// 400). `trim_conversation` drops whole leading units until the
+/// remainder fits; when nothing more is droppable the over-budget
+/// request goes out as-is and the model 400 surfaces honestly.
+pub(crate) const CONTEXT_TOKENS_BUDGET: usize = 96_000;
+
+/// Appended after a capped tool result. The literal 24000 must mirror
+/// [`MAX_TOOL_RESULT_CHARS`] — pinned by `bound_tool_result_truncates_with_marker`.
+const TOOL_RESULT_TRUNCATION_MARKER: &str = "\n\n[tool output truncated at 24000 chars]";
+
+/// Cap one tool result to [`MAX_TOOL_RESULT_CHARS`], truncating on a
+/// char boundary (byte walk-back, like `short_detail`) and appending
+/// [`TOOL_RESULT_TRUNCATION_MARKER`]. Under the cap the text passes
+/// through unchanged.
+pub(crate) fn bound_tool_result(text: &str) -> String {
+    if text.len() <= MAX_TOOL_RESULT_CHARS {
+        return text.to_string();
+    }
+    let mut cut = MAX_TOOL_RESULT_CHARS;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + TOOL_RESULT_TRUNCATION_MARKER.len());
+    out.push_str(&text[..cut]);
+    out.push_str(TOOL_RESULT_TRUNCATION_MARKER);
+    out
+}
+
+/// Rough prompt cost of one turn's text on the wire, in chars.
+fn turn_chars(turn: &ConversationTurn) -> usize {
+    match turn {
+        ConversationTurn::User(text) | ConversationTurn::Assistant(text) => text.len(),
+        ConversationTurn::AssistantToolCalls(calls) => calls
+            .iter()
+            .map(|c| c.id.len() + c.function.name.len() + c.function.arguments.len())
+            .sum(),
+        ConversationTurn::ToolResult { call_id, result } => call_id.len() + result.len(),
+    }
+}
+
+/// The brief's estimator: ~4 chars per token (conservative — the
+/// observed 131,072-token cap allows far more text with structured JSON
+/// overhead included, so an estimate under the budget leaves headroom).
+fn est_tokens(chars: usize) -> usize {
+    chars / 4
+}
+
+/// The exclusive end of the conversational unit starting at `start`.
+/// A unit is a complete `[User, Assistant]` text pair, or an
+/// `AssistantToolCalls` turn plus ALL its immediately following
+/// `ToolResult` turns (never split — the OpenAI protocol binds each
+/// role:"tool" message to the assistant tool_calls message before it).
+/// Any other shape (a lone User, a bare Assistant, an orphan
+/// ToolResult — all protocol-off but defensive) is a single-turn unit.
+fn unit_end(turns: &[ConversationTurn], start: usize) -> usize {
+    match turns.get(start) {
+        Some(ConversationTurn::User(_)) => match turns.get(start + 1) {
+            Some(ConversationTurn::Assistant(_)) => start + 2,
+            _ => start + 1,
+        },
+        Some(ConversationTurn::AssistantToolCalls(_)) => {
+            let mut end = start + 1;
+            while matches!(turns.get(end), Some(ConversationTurn::ToolResult { .. })) {
+                end += 1;
+            }
+            end
+        }
+        _ => start + 1,
+    }
+}
+
+/// Trim the conversation from the FRONT (oldest first), whole units
+/// only, until its estimated prompt cost fits
+/// [`CONTEXT_TOKENS_BUDGET`]. Guards, in order of force:
+///
+/// - a tool-call unit is dropped whole — never split from its results;
+/// - the trailing (newest) unit is never dropped — at least one unit
+///   always remains;
+/// - the unit carrying the conversation's final `User` turn is never
+///   dropped (the user's last message survives — plan Review Focus #4);
+///
+/// so when a single unit (or only the final-user unit + the trailing
+/// one) exceeds the budget, the trim is a no-op and the model 400
+/// surfaces honestly through the run's failure detail. The estimator
+/// runs over the raw conversation; the per-result cap in
+/// `chat_with_tools_impl` shrinks the messages further, never larger.
+pub(crate) fn trim_conversation(turns: &[ConversationTurn]) -> Vec<ConversationTurn> {
+    let mut units: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    while start < turns.len() {
+        let end = unit_end(turns, start);
+        units.push((start, end));
+        start = end;
+    }
+
+    let unit_chars: Vec<usize> = units
+        .iter()
+        .map(|&(s, e)| turns[s..e].iter().map(turn_chars).sum())
+        .collect();
+
+    // The unit carrying the final User turn; units strictly before it
+    // are droppable. A tool block carries no User turn, so the guard
+    // bites only on the (lone-User or [User, Assistant]) unit itself.
+    let last_user_unit = units.iter().rposition(|&(s, e)| {
+        turns[s..e]
+            .iter()
+            .any(|t| matches!(t, ConversationTurn::User(_)))
+    });
+    // Never leave the conversation empty: the trailing unit must survive.
+    let droppable_max = last_user_unit
+        .unwrap_or(units.len())
+        .min(units.len().saturating_sub(1));
+
+    let mut drop = 0usize;
+    let mut remaining_chars: usize = unit_chars.iter().sum();
+    while drop < droppable_max && est_tokens(remaining_chars) > CONTEXT_TOKENS_BUDGET {
+        remaining_chars -= unit_chars[drop];
+        drop += 1;
+    }
+
+    match units.get(drop) {
+        Some(&(start, _)) => turns[start..].to_vec(),
+        None => Vec::new(),
+    }
 }
 
 /// The model's output for one step.
@@ -955,5 +1108,256 @@ mod tests {
         assert!(rendered.contains("max_parallel: 7"), "{rendered}");
         assert!(rendered.contains("chat_queue_depth"), "{rendered}");
         assert!(!rendered.contains("super-secret"), "key leaked: {rendered}");
+    }
+
+    // ---------- Context budget: tool-output cap + conversation trim ----------
+
+    fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    /// A sentinel-prefixed text padded to `prefix.len() + pad_len` chars,
+    /// so fixtures carry both a recognizable marker and a known size.
+    fn padded(prefix: &str, pad_len: usize) -> String {
+        format!("{prefix}{}", "x".repeat(pad_len))
+    }
+
+    fn as_turn_text(turn: &ConversationTurn) -> Option<&str> {
+        match turn {
+            ConversationTurn::User(text) | ConversationTurn::Assistant(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bound_tool_result_truncates_with_marker() {
+        let long = "x".repeat(MAX_TOOL_RESULT_CHARS + 100);
+        let out = bound_tool_result(&long);
+        assert!(
+            out.chars().count() <= MAX_TOOL_RESULT_CHARS + 64,
+            "cap + marker slack: got {} chars",
+            out.chars().count()
+        );
+        // The truncation marker rides at the end — the brief's sketch
+        // says `ends_with("truncated")`, but the normative marker text
+        // is "[tool output truncated at 24000 chars]" which ends with
+        // "chars]"; both spellings pinned.
+        assert!(out.ends_with("chars]"), "marker at the end: {out}");
+        assert!(
+            out.contains("truncated at 24000 chars"),
+            "marker text: {out}"
+        );
+        assert_eq!(bound_tool_result("short"), "short");
+
+        // Exactly at the cap stays untouched (the cap test is strict `>`).
+        let at_cap = "y".repeat(MAX_TOOL_RESULT_CHARS);
+        assert_eq!(bound_tool_result(&at_cap), at_cap);
+
+        // Char-boundary safety: the cap offset splits a multibyte char
+        // here (an "a" run then 3-byte chars) — the cut must walk back
+        // to a boundary, never carry a partial character.
+        let split = format!(
+            "{}{}",
+            "a".repeat(MAX_TOOL_RESULT_CHARS - 1),
+            "日".repeat(500)
+        );
+        let out = bound_tool_result(&split);
+        assert_eq!(
+            out,
+            format!(
+                "{}{}",
+                "a".repeat(MAX_TOOL_RESULT_CHARS - 1),
+                TOOL_RESULT_TRUNCATION_MARKER
+            ),
+            "cut walked back to the last boundary before the cap"
+        );
+
+        // The literal 24000 in the marker must mirror the const.
+        assert_eq!(
+            TOOL_RESULT_TRUNCATION_MARKER,
+            format!(
+                "\n\n[tool output truncated at {} chars]",
+                MAX_TOOL_RESULT_CHARS
+            )
+        );
+    }
+
+    #[test]
+    fn trim_conversation_drops_leading_units_keeps_newest() {
+        // 8 turns = 4 units: two leading [User, Assistant] exchanges, a
+        // [AssistantToolCalls, ToolResult] block, and the final
+        // [User, Assistant] exchange. The sizes put the raw estimate at
+        // ~175k tokens: after ONE dropped exchange ~125k remains
+        // (still over the 96k budget), so the two leading text pairs go
+        // FIRST as whole units; a ToolResult is never separated from its
+        // AssistantToolCalls; the final user message and last assistant
+        // exchange survive.
+        let pad = 100_000;
+        let turns = vec![
+            ConversationTurn::User(padded("u0-old", pad)),
+            ConversationTurn::Assistant(padded("a0-old", pad)),
+            ConversationTurn::User(padded("u1-old", pad)),
+            ConversationTurn::Assistant(padded("a1-old", pad)),
+            ConversationTurn::AssistantToolCalls(vec![tool_call(
+                "call-u1",
+                "search_knowledge",
+                "{}",
+            )]),
+            ConversationTurn::ToolResult {
+                call_id: "call-u1".into(),
+                result: padded("result-u1", 300_000),
+            },
+            ConversationTurn::User("final user question".into()),
+            ConversationTurn::Assistant("final assistant answer".into()),
+        ];
+
+        let kept = trim_conversation(&turns);
+
+        assert_eq!(
+            kept.len(),
+            4,
+            "both leading exchanges dropped whole: {kept:?}"
+        );
+        let ConversationTurn::AssistantToolCalls(calls) = &kept[0] else {
+            panic!("first kept turn must be the whole tool-call unit: {kept:?}");
+        };
+        assert_eq!(calls[0].id, "call-u1");
+        let ConversationTurn::ToolResult { call_id, .. } = &kept[1] else {
+            panic!("the tool result must stay with its call: {kept:?}");
+        };
+        assert_eq!(call_id, "call-u1");
+        assert_eq!(
+            as_turn_text(&kept[2]).expect("final user message survives"),
+            "final user question"
+        );
+        assert_eq!(
+            as_turn_text(&kept[3]).expect("last assistant exchange survives"),
+            "final assistant answer"
+        );
+
+        // The kept tail fits the budget, and nothing of the dropped
+        // leading pairs remains.
+        let chars: usize = kept.iter().map(turn_chars).sum();
+        assert!(est_tokens(chars) <= CONTEXT_TOKENS_BUDGET, "{chars} chars");
+        assert!(
+            !kept
+                .iter()
+                .any(|t| matches!(as_turn_text(t), Some(x) if x.contains("-old"))),
+            "the dropped leading pairs must be gone whole: {kept:?}"
+        );
+    }
+
+    /// The oversize unit is a tool block: the walk drops it WHOLE — the
+    /// AssistantToolCalls turn and its results never separate, and the
+    /// final exchange survives.
+    #[test]
+    fn trim_drops_oversize_tool_block_whole() {
+        let pad = 100_000;
+        let turns = vec![
+            ConversationTurn::User(padded("u0-old", pad)),
+            ConversationTurn::Assistant(padded("a0-old", pad)),
+            ConversationTurn::AssistantToolCalls(vec![tool_call("call-b1", "read_concept", "{}")]),
+            ConversationTurn::ToolResult {
+                call_id: "call-b1".into(),
+                result: "x".repeat(500_000),
+            },
+            ConversationTurn::User("final user question".into()),
+            ConversationTurn::Assistant("final assistant answer".into()),
+        ];
+
+        let kept = trim_conversation(&turns);
+
+        assert_eq!(
+            kept.len(),
+            2,
+            "exchange and tool block drop whole: {kept:?}"
+        );
+        assert!(matches!(&kept[0], ConversationTurn::User(t) if t == "final user question"));
+        assert!(
+            matches!(&kept[1], ConversationTurn::Assistant(t) if t == "final assistant answer")
+        );
+        assert!(
+            !kept.iter().any(|t| matches!(
+                t,
+                ConversationTurn::ToolResult { .. } | ConversationTurn::AssistantToolCalls(_)
+            )),
+            "no split tool block may survive: {kept:?}"
+        );
+    }
+
+    /// The final user message is never dropped: with an oversized tool
+    /// block after it, the walk exhausts the droppable prefix (older
+    /// exchanges go whole) and stops at the final user's unit even
+    /// though the estimate is still over budget — the model 400 then
+    /// surfaces honestly (plan Review Focus #4).
+    #[test]
+    fn trim_never_drops_the_final_user_message() {
+        let pad = 100_000;
+        let turns = vec![
+            ConversationTurn::User(padded("u0-old", pad)),
+            ConversationTurn::Assistant(padded("a0-old", pad)),
+            ConversationTurn::User("final user question".into()),
+            ConversationTurn::AssistantToolCalls(vec![tool_call("call-c1", "read_concept", "{}")]),
+            ConversationTurn::ToolResult {
+                call_id: "call-c1".into(),
+                result: "x".repeat(800_000),
+            },
+        ];
+
+        let kept = trim_conversation(&turns);
+
+        assert_eq!(
+            kept.len(),
+            3,
+            "only the older exchange went whole: {kept:?}"
+        );
+        assert!(
+            matches!(&kept[0], ConversationTurn::User(t) if t == "final user question"),
+            "the final user message survives: {kept:?}"
+        );
+        let ConversationTurn::ToolResult { call_id, .. } = &kept[2] else {
+            panic!("the newest tool block survives whole: {kept:?}");
+        };
+        assert_eq!(call_id, "call-c1");
+
+        // Still over budget: the walk exhausted the droppable prefix and
+        // stopped (a larger estimate is the honest-400 failure mode).
+        let chars: usize = kept.iter().map(turn_chars).sum();
+        assert!(est_tokens(chars) > CONTEXT_TOKENS_BUDGET);
+    }
+
+    /// One unit larger than the whole budget: nothing may be dropped
+    /// (the trailing unit must survive), so the conversation comes back
+    /// unchanged without a panic; the 400 then surfaces honestly.
+    #[test]
+    fn degenerate_single_oversize_turn_is_left_untouched() {
+        let big = "x".repeat(CONTEXT_TOKENS_BUDGET * 5);
+        let turns = vec![ConversationTurn::User(big.clone())];
+        let kept = trim_conversation(&turns);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(&kept[0], ConversationTurn::User(t) if t == &big));
+
+        // A lone tool block over budget: likewise untouched whole.
+        let turns = vec![
+            ConversationTurn::AssistantToolCalls(vec![tool_call("call-d1", "read_concept", "{}")]),
+            ConversationTurn::ToolResult {
+                call_id: "call-d1".into(),
+                result: big.clone(),
+            },
+        ];
+        let kept = trim_conversation(&turns);
+        assert_eq!(kept.len(), 2);
+        assert!(
+            matches!(&kept[1], ConversationTurn::ToolResult { result, .. } if result.len() == big.len())
+        );
+        let chars: usize = kept.iter().map(turn_chars).sum();
+        assert!(est_tokens(chars) > CONTEXT_TOKENS_BUDGET);
     }
 }
