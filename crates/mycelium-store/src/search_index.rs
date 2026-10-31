@@ -665,6 +665,20 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored.as_deref(), Some("superseded"));
+        // Clearing the status again brings the doc back to default retrieval.
+        index
+            .add_async(&concept_with_status("/a.md", "V3", "zebra fact", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(
+                &index
+                    .search(&SearchQuery::new(vec!["zebra".into()]))
+                    .await
+                    .unwrap()
+            ),
+            vec!["/a.md".to_string()]
+        );
     }
 
     #[tokio::test]

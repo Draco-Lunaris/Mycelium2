@@ -32,7 +32,7 @@ CREATE TABLE concept_revisions (
     revision_no INTEGER NOT NULL,            -- monotonic per (scope_id, path_token); MAX+1 at insert
     op          TEXT NOT NULL,               -- create|update|delete|restore|merge|consolidate|migration
     source      TEXT NOT NULL,               -- provenance captured at enqueue (spec §3.1)
-    summary     TEXT NOT NULL DEFAULT '',    -- short deterministic op description
+    summary     TEXT NOT NULL,               -- short deterministic op description
     payload     BLOB NOT NULL,               -- AEAD full concept markdown snapshot (incl. frontmatter)
     created_at  TEXT NOT NULL,
     UNIQUE (scope_id, path_token, revision_no)
