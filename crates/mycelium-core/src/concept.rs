@@ -100,14 +100,6 @@ impl LifecycleStatus {
             _ => None,
         }
     }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Superseded => "superseded",
-            Self::Retired => "retired",
-        }
-    }
 }
 
 /// Frontmatter of an OKF concept. `type` is the only required field;

@@ -864,6 +864,19 @@ async fn execute_tool_tracked(
                         "resource" => {
                             concept.frontmatter.resource = value.as_str().map(String::from);
                         }
+                        // Lifecycle fields (rule 8): same string-or-null
+                        // semantics as `title`. No validation here —
+                        // `Frontmatter::validated()` at put rejects bad
+                        // values and the error reaches the model.
+                        "status" => {
+                            concept.frontmatter.status = value.as_str().map(String::from);
+                        }
+                        "superseded_by" => {
+                            concept.frontmatter.superseded_by = value.as_str().map(String::from);
+                        }
+                        "valid_to" => {
+                            concept.frontmatter.valid_to = value.as_str().map(String::from);
+                        }
                         "tags" => {
                             concept.frontmatter.tags = value
                                 .as_array()
@@ -1373,6 +1386,148 @@ mod tests {
         assert!(include_inactive_arg(&serde_json::json!(
             {"include_inactive": true}
         )));
+    }
+
+    // ---- patch_concept lifecycle merge (F1) ----
+    //
+    // Rule 8/MUTATE step 2 have the model supersede/retire by patching
+    // `status` / `superseded_by` / `valid_to` — the merge must accept
+    // them. String-or-null mirrors `title`: a JSON string sets the
+    // field, `null` clears it; validation happens at put (never here).
+
+    /// Patch tool call in wire shape (`ToolCall`'s private serde
+    /// defaults reconstruct it), executed through the real dispatch.
+    async fn run_patch(
+        cs: &ConceptStore<'_>,
+        args: serde_json::Value,
+    ) -> Result<(String, Option<String>), AgentError> {
+        let call: crate::llm::ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "call-patch-test",
+            "function": {
+                "name": "patch_concept",
+                "arguments": serde_json::to_string(&args).unwrap(),
+            }
+        }))
+        .unwrap();
+        let scopes = AgentScopes {
+            skills: None,
+            library: None,
+            read_stack_text: None,
+            visible_slugs: None,
+            trace: None,
+        };
+        let mut recorder = crate::trace::TraceRecorder::new();
+        execute_tool_tracked(cs, &scopes, &call, true, &mut recorder).await
+    }
+
+    /// Same store setup as the prompt test below, plus a `/old.md` note.
+    async fn patch_store_setup() -> ConceptStore<'static> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::leak(Box::new(
+            mycelium_store::Store::open(dir.path()).await.unwrap(),
+        ));
+        let _dir = Box::leak(Box::new(dir));
+        let master = mycelium_crypto::generate_master_key();
+        let cs = mycelium_store::ConceptStore::for_user(&*store, uuid::Uuid::new_v4(), master);
+        let concept = Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                ..Default::default()
+            },
+            "old fact".into(),
+            "/old.md".into(),
+        );
+        cs.put(&concept).await.unwrap();
+        cs
+    }
+
+    #[tokio::test]
+    async fn patch_concept_merges_lifecycle_frontmatter_fields() {
+        let cs = patch_store_setup().await;
+        let (result, written) = run_patch(
+            &cs,
+            serde_json::json!({
+                "path": "/old.md",
+                "frontmatter": { "status": "superseded", "superseded_by": "/new.md" },
+            }),
+        )
+        .await
+        .expect("patch with lifecycle fields must succeed");
+        assert_eq!(
+            result,
+            serde_json::json!({ "patched": "/old.md" }).to_string()
+        );
+        assert_eq!(written.as_deref(), Some("/old.md"));
+        let stored = cs.get("/old.md").await.unwrap();
+        assert_eq!(stored.frontmatter.status.as_deref(), Some("superseded"));
+        assert_eq!(stored.frontmatter.superseded_by.as_deref(), Some("/new.md"));
+        assert_eq!(stored.body, "old fact"); // merge touched frontmatter only
+    }
+
+    #[tokio::test]
+    async fn patch_concept_null_status_clears_the_field() {
+        let cs = patch_store_setup().await;
+        let superseded = Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                status: Some("superseded".into()),
+                superseded_by: Some("/new.md".into()),
+                ..Default::default()
+            },
+            "old fact".into(),
+            "/old.md".into(),
+        );
+        cs.put(&superseded).await.unwrap();
+        run_patch(
+            &cs,
+            serde_json::json!({ "path": "/old.md", "frontmatter": { "status": null } }),
+        )
+        .await
+        .expect("null status merge must succeed");
+        let stored = cs.get("/old.md").await.unwrap();
+        assert_eq!(stored.frontmatter.status, None); // cleared, field dropped
+        // The sibling field is untouched — null clears only its own key.
+        assert_eq!(stored.frontmatter.superseded_by.as_deref(), Some("/new.md"));
+    }
+
+    #[tokio::test]
+    async fn patch_concept_rejects_invalid_status() {
+        let cs = patch_store_setup().await;
+        let err = run_patch(
+            &cs,
+            serde_json::json!({ "path": "/old.md", "frontmatter": { "status": "Bogus" } }),
+        )
+        .await
+        .expect_err("bad status must fail the put, not merge to a success reply");
+        match &err {
+            AgentError::Store(ConceptStoreError::Parse(
+                mycelium_core::ConceptError::InvalidLifecycleStatus { value },
+            )) => assert_eq!(value, "Bogus"),
+            other => panic!("expected Put(Parse(InvalidLifecycleStatus)), got {other:?}"),
+        }
+        // The error result reaching the model names the bad value —
+        // enough for recovery; it must not be a success reply.
+        assert!(err.to_string().contains("invalid lifecycle status: Bogus"));
+    }
+
+    #[tokio::test]
+    async fn patch_concept_rejects_bad_superseded_by_shape() {
+        let cs = patch_store_setup().await;
+        let err = run_patch(
+            &cs,
+            serde_json::json!({
+                "path": "/old.md",
+                "frontmatter": { "superseded_by": "not-a-valid-shape" },
+            }),
+        )
+        .await
+        .expect_err("bad superseded_by shape must fail the put");
+        match &err {
+            AgentError::Store(ConceptStoreError::Parse(
+                mycelium_core::ConceptError::InvalidSupersededBy { value },
+            )) => assert_eq!(value, "not-a-valid-shape"),
+            other => panic!("expected Put(Parse(InvalidSupersededBy)), got {other:?}"),
+        }
     }
 
     /// The assembled prompt (not just its building blocks) carries the
