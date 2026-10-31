@@ -2,8 +2,9 @@
 //! background with bounded LLM capacity, retry/backoff, and the
 //! deterministic fallback as the integration guarantee.
 
+use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
@@ -74,6 +75,19 @@ impl Default for QueueLimits {
 // `short_detail` (the byte-safe error-detail bound) moved to
 // `crate::llm_health` so one copy serves every bounded-detail site.
 
+/// A printable message from a caught panic payload: the two common
+/// shapes (`&'static str` from `panic!("literal")`, `String` from a
+/// formatted panic) plus a non-string fallback. Never itself panics —
+/// the drain's panic isolation must not wedge on its own reporting
+/// path (`unwrap_or_else`, never `unwrap`).
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
 // ---- worker ----
 
 pub struct QueueWorker {
@@ -91,6 +105,12 @@ pub struct QueueWorker {
     pub fallback_count: AtomicU64,
     pub dead_count: AtomicU64,
     pub integrated_count: AtomicU64,
+    /// In-process test-visibility aid only (same class as
+    /// `fallback_count`): when `Some` and the flag reads true,
+    /// `run_item` panics once (the flag self-clears on the swap) so
+    /// the drain's catch_unwind leg is exercisable end-to-end from the
+    /// integration tests. Production wiring leaves it `None`.
+    pub test_panic_on_run: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +153,7 @@ impl QueueWorker {
             fallback_count: AtomicU64::new(0),
             dead_count: AtomicU64::new(0),
             integrated_count: AtomicU64::new(0),
+            test_panic_on_run: None,
         }
     }
 
@@ -393,11 +414,7 @@ impl QueueWorker {
         ))
         .await
         .unwrap_or_else(|payload| {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".into());
+            let msg = panic_message(payload);
             tracing::error!(
                 receipt = %item.id,
                 user = %item.user_id,
@@ -476,6 +493,15 @@ impl QueueWorker {
         master: &MasterKey,
         payload: &MutationPayload,
     ) -> Result<MutationResult, AgentError> {
+        // Test-injection point for the catch_unwind leg (see the
+        // `test_panic_on_run` field doc): fires once, before any work,
+        // so an integration test exercises the wrapper's full route —
+        // catch, log, deterministic fallback — on the first item only.
+        if let Some(flag) = &self.test_panic_on_run
+            && flag.swap(false, Ordering::Relaxed)
+        {
+            panic!("test-injected panic");
+        }
         let uid = item.user_id;
         let client = LlmClient::new(&llm_config(&self.config, &self.service_key).await);
         let cs = self.user_cs(uid, master);
@@ -797,3 +823,34 @@ impl QueueWorker {
 
 // The `short_detail` tests moved with the function to
 // `crate::llm_health::tests`.
+
+#[cfg(test)]
+mod tests {
+    use super::panic_message;
+    use std::any::Any;
+
+    fn caught(f: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn Any + Send> {
+        std::panic::catch_unwind(f).expect_err("closure must panic")
+    }
+
+    #[test]
+    fn panic_message_reads_static_str_payload() {
+        let payload = caught(|| panic!("static str panic"));
+        assert_eq!(panic_message(payload), "static str panic");
+    }
+
+    #[test]
+    fn panic_message_reads_string_payload() {
+        let detail = String::from("formatted");
+        let payload = caught(move || panic!("a {detail} panic"));
+        assert_eq!(panic_message(payload), "a formatted panic");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_non_string_payload() {
+        // A payload that is neither &str nor String must never be
+        // unwrap'd — the reporting path may not itself panic.
+        let payload = caught(|| std::panic::panic_any(42u8));
+        assert_eq!(panic_message(payload), "non-string panic payload");
+    }
+}

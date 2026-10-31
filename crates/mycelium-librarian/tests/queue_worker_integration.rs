@@ -2176,3 +2176,120 @@ async fn malformed_tool_args_do_not_wedge_drain() {
     })
     .await;
 }
+
+// ---------- Task 2 (fix round 1): a panic inside a run is isolated ----------
+
+// End-to-end coverage of the catch_unwind leg: the worker's documented
+// test-visibility flag makes the FIRST item's run panic before any
+// work; the drain must catch it, route that item through the
+// deterministic fallback with the panic named in the provenance, and
+// still process the SECOND row. Without the wrapper this test fails by
+// propagating the panic out of `run_pending` and orphaning row 1 in
+// `running` forever — the exact 2026-10-31 wedge class.
+#[tokio::test]
+async fn panic_in_run_is_isolated_and_next_row_still_drains() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task2panic").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // Dead LLM, one attempt, zero backoff: the second (unpanicked) row
+    // converges through the fallback quickly instead of sitting on a
+    // 30 s backoff.
+    let limits = QueueLimits {
+        max_attempts: 1,
+        backoff_secs: [0, 0, 0],
+        ..QueueLimits::default()
+    };
+    let config = Arc::new(ConfigStore::new(store.pool().clone()));
+    config.set("llm", &dead_port_config()).await.unwrap();
+    let panic_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let worker = Arc::new(QueueWorker {
+        test_panic_on_run: Some(Arc::clone(&panic_flag)),
+        ..QueueWorker::new(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            recovery(master.clone()),
+            Arc::new(test_service_key()),
+            limits,
+        )
+    });
+
+    let id1 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "panic item one" }),
+        "panic item one",
+    )
+    .await;
+    let id2 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "panic item two" }),
+        "panic item two",
+    )
+    .await;
+
+    // The whole point: this returns instead of the panic propagating.
+    drain_until_empty(&worker).await;
+
+    // Row 1: caught panic → deterministic-error classification →
+    // fallback integration, provenance naming the injected panic.
+    let row1 = store.queue_item(uid, id1).await.unwrap().unwrap();
+    assert_eq!(row1.status, QueueStatus::Done, "row {id1}");
+    assert!(
+        row1.detail
+            .starts_with("integrated via deterministic fallback (")
+            && row1
+                .detail
+                .contains("agent run panicked: test-injected panic"),
+        "row 1 provenance must name the caught panic: {}",
+        row1.detail
+    );
+    // Row 2: still processed after the caught panic — and NOT via the
+    // panic path (the flag fired exactly once): dead LLM, one attempt
+    // → the exhausted-attempts fallback.
+    let row2 = store.queue_item(uid, id2).await.unwrap().unwrap();
+    assert_eq!(row2.status, QueueStatus::Done, "row {id2}");
+    assert!(
+        row2.detail.contains("attempts exhausted") && !row2.detail.contains("panicked"),
+        "row 2 must be the ordinary fallback, not a second panic: {}",
+        row2.detail
+    );
+    // The injection flag is consumed (swap-to-false on the first run).
+    assert!(
+        !panic_flag.load(Ordering::Relaxed),
+        "the flag must fire exactly once"
+    );
+
+    // Both rows landed via the fallback: nothing through the agent,
+    // nothing dead, totals consistent with the rows.
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.integrated_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.fallback, 2);
+    assert_eq!(totals.integrated, 0);
+    assert_eq!(totals.dead, 0);
+    // No row orphaned in `running` (the wedge's witness), and the
+    // staging notes were reconciled at integration.
+    assert!(
+        store.running_rows().await.unwrap().is_empty(),
+        "no orphaned running rows"
+    );
+    assert!(
+        !cs.list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.path.starts_with("/mutation-queue/")),
+        "staging notes must be reconciled"
+    );
+}
