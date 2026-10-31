@@ -2077,3 +2077,102 @@ async fn try_enter_defers_while_queue_nonempty() {
     let done = store.queue_item(uid, id).await.unwrap().unwrap();
     assert_eq!(done.status, QueueStatus::Done);
 }
+
+// ---------- Task 2: a malformed tool call must not wedge the drain ----------
+
+// A model that answers with a malformed patch_concept call must not wedge
+// the drain: the run converges to a terminal `done` (after Task 1 the
+// model sees a tool-level error and its closing text ends the run
+// normally — no fallback involvement) and the NEXT queued item still
+// drains. This pins the drain-level contract the 2026-10-31 incident
+// broke (a Map-index panic on malformed args killed the single drain
+// task, leaving every later row stuck in `running` forever).
+#[tokio::test]
+async fn malformed_tool_args_do_not_wedge_drain() {
+    let _g = TEST_LOCK.lock().await;
+    let (_dir, store) = test_store().await;
+    let master = mycelium_crypto::generate_master_key();
+    let uid = seed_user(&store, "task2wedge").await;
+    let cs = ConceptStore::for_user(&store, uid, master.clone());
+
+    // `replace_section: {}` — the shape that used to panic the agent
+    // (missing heading/content keys). LIFO script: each item's run pops
+    // the bad tool call, sees the tool-level error, then closes with
+    // text — two steps per item, four responses for two items.
+    let bad_patch = || {
+        tool_call_response(
+            "0",
+            "patch_concept",
+            serde_json::json!({"path": "/x.md", "replace_section": {}}),
+        )
+    };
+    let (url, mock) = mock_llm(vec![
+        text_response("closed item two"),
+        bad_patch(),
+        text_response("closed item one"),
+        bad_patch(),
+    ])
+    .await;
+    let (config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
+    config
+        .set(
+            "llm",
+            &LlmConfig {
+                url,
+                model: "mock".into(),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let id1 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "belt item one" }),
+        "belt item one",
+    )
+    .await;
+    let id2 = enqueue_item(
+        &store,
+        &cs,
+        &master,
+        uid,
+        QueueTool::Add,
+        serde_json::json!({ "content": "belt item two" }),
+        "belt item two",
+    )
+    .await;
+
+    // The whole point: this returns instead of the test task dying with
+    // a propagated panic, and it empties the queue.
+    drain_until_empty(&worker).await;
+
+    // Both rows terminal — the first run's bad args never wedged it,
+    // and the second row still drained behind it.
+    for id in [id1, id2] {
+        let row = store.queue_item(uid, id).await.unwrap().unwrap();
+        assert_eq!(row.status, QueueStatus::Done, "row {id}");
+    }
+    // Both closed as agent runs (the model recovered from the tool
+    // error), not via the fallback: no dead, no fallback involvement.
+    assert_eq!(worker.integrated_count.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.fallback_count.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.dead_count.load(Ordering::Relaxed), 0);
+    let totals = store.queue_totals().await.unwrap();
+    assert_eq!(totals.integrated, 2);
+    assert_eq!(totals.dead, 0);
+    // Each run took exactly its two scripted steps (the mock never saw
+    // a fifth request, so no retried or extra step ran).
+    assert_eq!(mock.lock().await.requests.len(), 4);
+    // The drain released every gate slot on its way out.
+    gate_wait_until("gate back to idle", || {
+        let s = LLM_GATE.stats();
+        s.active == 0 && s.queued == 0
+    })
+    .await;
+}

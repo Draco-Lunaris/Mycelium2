@@ -265,11 +265,18 @@ impl QueueWorker {
             if self.store.user_dir(item.user_id).join(name).exists() {
                 self.store.activate(item.id).await?;
             } else {
+                // Dead flips are never log-silent: the row's persisted
+                // detail is an operator's only other clue, and reading
+                // it once took raw SQL.
+                let detail = "payload missing — enqueue interrupted before durability; re-submit";
+                tracing::warn!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: staging payload never became durable"
+                );
                 self.store
-                    .mark_dead(
-                        item.id,
-                        "payload missing — enqueue interrupted before durability; re-submit",
-                    )
+                    .mark_dead(item.id, detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the blob (no-op here — the
@@ -326,13 +333,17 @@ impl QueueWorker {
             Ok(Some(p)) => p,
             Ok(None) => {
                 drop(permit);
+                let detail = "payload missing — enqueue interrupted before durability; re-submit the mutation";
+                tracing::warn!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: payload missing at claim"
+                );
                 self.store
-                        .mark_dead(
-                            item.id,
-                            "payload missing — enqueue interrupted before durability; re-submit the mutation",
-                        )
-                        .await
-                        .map_err(QueueWorkerError::Queue)?;
+                    .mark_dead(item.id, detail)
+                    .await
+                    .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the blob (a no-op when absent; a
                 // present-but-unparseable one gets cleaned up too).
                 self.delete_payload(uid, &master, item.id).await;
@@ -343,11 +354,15 @@ impl QueueWorker {
                 drop(permit);
                 // Unseal/corrupt errors: dead (content unreadable;
                 // a retry can't fix a key/path mismatch).
+                let detail = format!("payload unreadable: {}", short_detail(&e));
+                tracing::error!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    "queue row marked dead: payload unreadable/corrupt"
+                );
                 self.store
-                    .mark_dead(
-                        item.id,
-                        &format!("payload unreadable: {}", short_detail(&e)),
-                    )
+                    .mark_dead(item.id, &detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: the blob is unreadable garbage — drop it.
@@ -366,7 +381,36 @@ impl QueueWorker {
                 .map(|()| true);
         }
 
-        let result = self.run_item(&item, &master, &payload).await;
+        // Belt-and-braces against the 2026-10-31 wedge class: if any
+        // panic ever escapes a run's future again, the single drain
+        // task survives, this item takes the deterministic-error path
+        // (fallback), and later items still drain. `AssertUnwindSafe`
+        // is justified: nothing shared is poisoned by an unwind in
+        // these futures (no locks held across the await; sqlx state is
+        // unaffected).
+        let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.run_item(&item, &master, &payload),
+        ))
+        .await
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            tracing::error!(
+                receipt = %item.id,
+                user = %item.user_id,
+                panic = %msg,
+                "drain agent run panicked — routing to the deterministic fallback"
+            );
+            // A panic never reached a real model verdict: deterministic-error shape
+            // (non-transient) → fallback, per the classification the drain already owns.
+            Err(AgentError::BadToolArgs {
+                name: "(panic)".into(),
+                reason: format!("agent run panicked: {msg}"),
+            })
+        });
 
         // Attempt accounting (`attempts` was already incremented in
         // the claim, so `item.attempts` is 1-based: first failure has
@@ -499,8 +543,16 @@ impl QueueWorker {
             // No key → the payload blob's stored name cannot be derived,
             // so terminal cleanup can only skip it (it stays sealed and
             // unrecoverable, same as the row's content).
+            let detail = "fallback unavailable: master-key recovery failed";
+            tracing::warn!(
+                receipt = %item.id,
+                user = %item.user_id,
+                detail = %detail,
+                provenance = %provenance,
+                "queue row marked dead: fallback unavailable without the master key"
+            );
             self.store
-                .mark_dead(item.id, "fallback unavailable: master-key recovery failed")
+                .mark_dead(item.id, detail)
                 .await
                 .map_err(QueueWorkerError::Queue)?;
             self.dead_count.fetch_add(1, Ordering::Relaxed);
@@ -511,11 +563,17 @@ impl QueueWorker {
         // The payload may be missing (enqueue died pre-durability, or
         // corrupted) — dead, never a panic.
         let Some(payload) = mutation_queue::read_payload(&repo, master, item.id).await? else {
+            let detail =
+                "payload missing — enqueue interrupted before durability; re-submit the mutation";
+            tracing::warn!(
+                receipt = %item.id,
+                user = %item.user_id,
+                detail = %detail,
+                provenance = %provenance,
+                "queue row marked dead: payload missing at fallback"
+            );
             self.store
-                .mark_dead(
-                    item.id,
-                    "payload missing — enqueue interrupted before durability; re-submit the mutation",
-                )
+                .mark_dead(item.id, detail)
                 .await
                 .map_err(QueueWorkerError::Queue)?;
             // Terminal dead: drop the blob (no-op when absent; cleans a
@@ -573,8 +631,16 @@ impl QueueWorker {
                 Ok(())
             }
             Err(e) => {
+                let detail = format!("fallback failed: {}", short_detail(&e));
+                tracing::error!(
+                    receipt = %item.id,
+                    user = %item.user_id,
+                    detail = %detail,
+                    provenance = %provenance,
+                    "queue row marked dead: deterministic fallback failed"
+                );
                 self.store
-                    .mark_dead(item.id, &format!("fallback failed: {}", short_detail(&e)))
+                    .mark_dead(item.id, &detail)
                     .await
                     .map_err(QueueWorkerError::Queue)?;
                 // Terminal dead: drop the payload blob, then the note

@@ -2496,6 +2496,7 @@ version = "0.2.0-beta.2"
 dependencies = [
  "axum",
  "chrono",
+ "futures-util",
  "hex",
  "mycelium-core",
  "mycelium-crypto",
