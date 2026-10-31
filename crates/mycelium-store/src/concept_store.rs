@@ -93,7 +93,8 @@ impl<'a> ConceptStore<'a> {
     /// Label this store's writes with a provenance source (system
     /// provenance — the write-time stamp overwrites whatever the
     /// caller's frontmatter carries in `source`). Consuming builder;
-    /// chain after `for_user`/`for_service`.
+    /// chain after `for_user`/`for_service`. An empty label is treated
+    /// as unlabeled (legacy queue rows predate the source column).
     pub fn with_provenance(mut self, source: impl Into<String>) -> Self {
         self.provenance = Some(source.into());
         self
@@ -188,7 +189,9 @@ impl<'a> ConceptStore<'a> {
         //   * `confirmed_at` is ALWAYS stamped (now) — a system field,
         //     the author's value never survives;
         //   * `source` is stamped only when the store is labeled (an
-        //     unstamped store preserves the author's frontmatter).
+        //     unstamped store preserves the author's frontmatter; an
+        //     EMPTY label is treated as unlabeled — legacy queue rows
+        //     predate the source column and carry the '' default).
         //   * `validated()` is the write-time lifecycle guard — one bad
         //     value fails the whole batch before the first file lands.
         let mut stamped = Vec::with_capacity(concepts.len());
@@ -199,7 +202,9 @@ impl<'a> ConceptStore<'a> {
             }
             let mut c = concept.clone();
             c.frontmatter.confirmed_at = Some(Utc::now().to_rfc3339());
-            if let Some(src) = &self.provenance {
+            if let Some(src) = &self.provenance
+                && !src.is_empty()
+            {
                 c.frontmatter.source = Some(src.clone());
             }
             c.frontmatter.validated()?;
@@ -707,5 +712,32 @@ mod tests {
         cs.put(&good).await.unwrap();
         let got = cs.get("/lifecycle/good.md").await.unwrap();
         assert_eq!(got.frontmatter.status.as_deref(), Some("retired"));
+    }
+
+    #[tokio::test]
+    async fn empty_label_put_is_unlabeled() {
+        // Legacy queue rows predate the source column and carry '' — an
+        // empty label is treated as unlabeled: the author's source stays,
+        // `confirmed_at` is still stamped (mirror of no_label_put_…;
+        // the real call site passes `&item.source` unconditionally).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master).with_provenance("");
+        let mut c = concept("/lifecycle/empty.md", "Empty Label", "empty body");
+        c.frontmatter.source = Some("web:form".into());
+        cs.put(&c).await.unwrap();
+        let got = cs.get("/lifecycle/empty.md").await.unwrap();
+        assert_eq!(got.frontmatter.source.as_deref(), Some("web:form"));
+        let confirmed = got
+            .frontmatter
+            .confirmed_at
+            .as_deref()
+            .expect("confirmed_at is still stamped");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(confirmed).is_ok(),
+            "confirmed_at is RFC 3339, got {confirmed}"
+        );
     }
 }
