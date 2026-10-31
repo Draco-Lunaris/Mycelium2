@@ -20,6 +20,16 @@ pub const TAG_LEN: usize = 16;
 
 const HEADER_LEN: usize = ENVELOPE_MAGIC.len() + 1 + NONCE_LEN;
 
+/// The byte length of an envelope whose plaintext is EMPTY — the
+/// format's fixed overhead (magic + version + nonce, ciphertext is the
+/// tag alone). Meta-only listings derive plaintext emptiness from a
+/// stored length without decrypting, exactly: a sealed envelope's
+/// length is `EMPTY_ENVELOPE_LEN` + plaintext length, so a stored
+/// length at or under [`EMPTY_ENVELOPE_LEN`] decodes to nothing
+/// restorable (and covers corrupt short envelopes — those count as
+/// empty too, fail-safe in the no-restore direction).
+pub const EMPTY_ENVELOPE_LEN: usize = HEADER_LEN + TAG_LEN;
+
 /// A parsed envelope: nonce + ciphertext (tag included).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {

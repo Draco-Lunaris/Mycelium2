@@ -591,9 +591,12 @@ pub fn concept_editor(
         r#"<div class="editor-grid">{pane}<div class="editor-preview">{preview_html}</div></div>"#
     );
     // The front region: the restore-confirm/diff interstitials replace
-    // the editor grid; a dead concept shows the history alone. Below
-    // it, the Revisions card rides list/diff modes (never confirm —
-    // the interstitial's Back link covers navigation there).
+    // the editor grid; a dead concept shows the history alone — its
+    // read-only grid is suppressed for ANY mode it would have rendered
+    // (the editor is off; its restoration path is the revisions block
+    // below). Below it, the Revisions card rides list/diff modes
+    // (never confirm — the interstitial's Back link covers navigation
+    // there).
     let center: String = match surface {
         Some(s) => match &s.mode {
             RevisionsMode::Confirm(data) => mycelium_ui::render::render(mycelium_ui::card(
@@ -604,6 +607,7 @@ pub fn concept_editor(
                 &format!("Diff: from {} to {}", data.from_label, data.to_label),
                 revisions_diff_body(data, s),
             )),
+            RevisionsMode::List if s.dead => String::new(),
             RevisionsMode::List => grid.clone(),
         },
         None => grid,
@@ -655,12 +659,15 @@ fn revisions_list_body(surface: &RevisionsSurface) -> TrustedHtml {
 /// One table row's inner cells (the data_table primitive renders the
 /// `<td data-label>` wrappers): #no, the op chip, the provenance (or a
 /// muted "unlabeled"), the relative date, the bounded summary, and the
-/// restore anchor when the scope may restore.
+/// restore anchor when the scope may restore AND the payload is
+/// non-empty — the empty-payload rows (spec §3.2a-3's undelete-restore
+/// convention) have nothing to restore; their POST is the snapshot-
+/// parse 400 the page must not invite.
 fn revision_row_cells(
     entry: &mycelium_store::RevisionEntry,
     surface: &RevisionsSurface,
 ) -> Vec<TrustedHtml> {
-    let action_cell = if surface.restore_ready {
+    let action_cell = if surface.restore_ready && !entry.payload_empty {
         format!(
             r#"<a href="/concept?path={path}&scope={sp}&revs=1&restore_confirm={no}">restore</a>"#,
             path = urlencoding_encode(&surface.path),

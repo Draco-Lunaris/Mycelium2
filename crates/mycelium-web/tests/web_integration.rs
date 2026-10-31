@@ -1149,6 +1149,23 @@ async fn skills_scoped_delete_round_trip() {
         "confirm dialog must carry scope=skills: {dlg_html}"
     );
 
+    // Positive control for the gone-check below (R5 rider): while the
+    // skill is live, the skills page does list its title — the same
+    // fetch the gone-check makes — so the post-delete absence is
+    // proven against an in-test positive, not assumed.
+    let live_skills_page = client
+        .get(format!("{base}/skills"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_skills_page.status(), 200);
+    let live_skills_html = live_skills_page.text().await.unwrap();
+    assert!(
+        live_skills_html.contains("Skills Scope Test"),
+        "skills page lists the title while live: {live_skills_html}"
+    );
+
     // (c) POST the delete exactly as the dialog/fallback form does:
     //     303 → /skills (the handler's unconditional redirect), then
     //     the authoritative checks.
@@ -6421,6 +6438,23 @@ async fn revisions_diff_view_head_and_rev_pairs() {
         "a missing snapshot side falls back to the list: {html}"
     );
 
+    // (R4 rider) A garbage STRING from-side pins page_revision_param's
+    // posture — absent/blank/non-numeric ⇒ None ⇒ the HEAD sentinel —
+    // so `diff_from=abc` resolves exactly as the blank case does: the
+    // same HEAD↔n diff (the page 200s; the non-numeric never 400s).
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=abc&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #3"),
+        "non-numeric from = blank from (the HEAD sentinel): {html}"
+    );
+
     // Extremely long diffs truncate — the two sides must actually
     // differ line-for-line, or the context radius keeps the unified
     // output small no matter how long both texts are.
@@ -6585,6 +6619,13 @@ async fn revisions_undelete_confirm_on_dead_path() {
         !html.contains("concept-editor-form"),
         "a dead concept has nothing to edit: {html}"
     );
+    // (R2 rider) The read-only editor grid is gone too — the dead
+    // path's page is the history/undelete surface, not an editor
+    // (the concept_editor doc comment's contract).
+    assert!(
+        !html.contains("editor-grid"),
+        "a dead path renders no editor grid: {html}"
+    );
 
     // The confirm interstitial: rev #2 is the delete row, whose
     // snapshot is the pre-delete content — restoring it re-creates
@@ -6625,6 +6666,43 @@ async fn revisions_undelete_confirm_on_dead_path() {
     assert!(
         back.contains("doomed body"),
         "the concept is live again: {back}"
+    );
+
+    // (R3 rider) The chain now ends with the undelete-restore row (an
+    // EMPTY payload — spec §3.2a-3). On the live page that row's cell
+    // carries no restore link — restoring it is the snapshot-parse 400
+    // the page must not invite — while non-empty rows keep theirs.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/doomed.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("restored to revision 2"),
+        "the empty restore row renders in the list: {html}"
+    );
+    assert!(
+        !html.contains("restore_confirm=3"),
+        "the empty-payload row offers no restore link: {html}"
+    );
+    assert!(
+        html.contains("restore_confirm=2"),
+        "non-empty rows keep their restore links: {html}"
+    );
+    // And the confirm URL for the empty row falls back to the plain
+    // revisions list (the unknown-revision posture).
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/doomed.md&revs=1&restore_confirm=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Restore revision #3"),
+        "empty-payload confirm URL falls back to the list: {html}"
+    );
+    assert!(
+        html.contains("restored to revision 2"),
+        "the list renders at the fallback: {html}"
     );
 
     // A never-existed path has no chain: no interstitial — the legacy
@@ -7000,6 +7078,81 @@ async fn concept_activate_permission_matrix() {
         admin_rows.len(),
         1,
         "no refused activate wrote anything: {admin_rows:?}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The skills shelf's LIVE branch offers "Set status: active" to the
+/// skills admin for a paused global skill — either pausing status
+/// (retired or superseded; the POST endpoint already accepts them,
+/// proven by concept_activate_permission_matrix) — and a non-admin
+/// (a global-read user) sees no offer: the offer is editable-gated.
+/// Rationale (Task 4 rider R1): the plan's per-concept rule is
+/// unqualified by scope, and step 5's dream retires global:skills
+/// concepts — an admin needs the UI revive path.
+#[tokio::test]
+async fn skills_concept_activate_offer_admin_only() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // Both pausing statuses, seeded on the global skills shelf (the
+    // form-PUT shape concept_activate_permission_matrix proves works;
+    // each row's lifecycle fields copy that test's known-good seed).
+    let retired_md = "---\ntype: Skill\ntitle: Sk Retired\nstatus: retired\nsuperseded_by: /elsewhere.md\nvalid_to: 2030-01-01T00:00:00Z\n---\n\nsk body\n";
+    let superseded_md = "---\ntype: Skill\ntitle: Sk Superseded\nstatus: superseded\nsuperseded_by: /other.md\n---\n\nsk body\n";
+    for (path, markdown) in [
+        ("/sk-retired.md", retired_md),
+        ("/sk-superseded.md", superseded_md),
+    ] {
+        let put = client
+            .post(format!("{base}/concept"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[("path", path), ("scope", "skills"), ("markdown", markdown)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 303, "skills seed put {path}");
+    }
+
+    // (a) The skills admin's page of a paused skill offers the
+    // activate affordance for either status, posting the skills scope.
+    for path in ["/sk-retired.md", "/sk-superseded.md"] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            &cookie,
+            &format!("path={path}&scope=skills"),
+        )
+        .await;
+        assert_eq!(status, 200, "{path} page loads for the admin");
+        assert!(
+            html.contains(r#"<form method="post" action="/concept/activate">"#)
+                && html.contains("Set status: active"),
+            "activate offer on a paused skill ({path}): {html}"
+        );
+        assert!(
+            html.contains(r#"name="scope" value="skills""#),
+            "the offer posts the skills scope ({path}): {html}"
+        );
+    }
+
+    // (b) A non-admin (global read) loads the same page: no offer.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-retired.md&scope=skills",
+    )
+    .await;
+    assert_eq!(status, 200, "the non-admin still views the concept");
+    assert!(
+        !html.contains("/concept/activate") && !html.contains("Set status: active"),
+        "no activate offer for a non-admin: {html}"
     );
 
     shutdown.cancel();

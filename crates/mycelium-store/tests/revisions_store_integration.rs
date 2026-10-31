@@ -106,6 +106,25 @@ async fn record_assigns_monotonic_revision_numbers() {
     let json = serde_json::to_string(&entries[0]).unwrap();
     assert!(json.contains("\"op\":\"update\""));
     assert!(!json.contains("type:"));
+
+    // (R3 rider) The empty-payload convention (§3.2a-3) pins at the raw
+    // layer too: a recorded EMPTY payload lists as empty in the meta,
+    // the markdown-payload rows do not. No decrypt is involved — the
+    // meta derives from the stored envelope length.
+    let n3 = rs
+        .record(path, "restore", "restored to revision 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(n3, 3, "the empty restore row joins the chain normally");
+    let empties = rs.list(path).await.unwrap();
+    assert!(
+        empties[0].payload_empty,
+        "the recorded-empty restore row lists empty: {empties:?}"
+    );
+    assert!(
+        !empties[1].payload_empty && !empties[2].payload_empty,
+        "the markdown-payload rows list non-empty"
+    );
 }
 
 #[tokio::test]

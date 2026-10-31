@@ -263,6 +263,18 @@ async fn restore_undeletes_at_original_path() {
         Vec::<u8>::new(),
         "undeleting restore row carries an EMPTY payload"
     );
+    // (R3 rider) The same convention is visible in the list META
+    // (no decrypt — derived from the stored envelope length): the
+    // undelete-restore row reports an empty payload, the ordinary
+    // delete/create rows do not.
+    assert!(
+        rows[0].payload_empty,
+        "the undelete-restore row lists as empty: {rows:?}"
+    );
+    assert!(
+        !rows[1].payload_empty && !rows[2].payload_empty,
+        "delete/create rows list as non-empty"
+    );
 }
 
 #[tokio::test]

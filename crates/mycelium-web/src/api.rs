@@ -1463,9 +1463,18 @@ pub async fn concept_view(
                         &query,
                     )
                     .await;
+                    // The activate offer computes like the user branch's:
+                    // the plan's per-concept rule ("Set status: active"
+                    // when the status is paused) is unqualified by scope,
+                    // and /concept/activate already accepts skills admins —
+                    // the page merely offers what the endpoint does. (The
+                    // dead branch stays false: a dead path has no
+                    // lifecycle status — its flow is the restore
+                    // interstitial. Library stays false: read-only.)
+                    let activation = concept_is_paused(&canonical, &markdown);
                     let extras = pages::ConceptExtras {
                         revisions: surface,
-                        activation: false,
+                        activation,
                     };
                     pages::concept_editor(
                         &user,
@@ -1758,10 +1767,15 @@ async fn revisions_surface(
     let dead = live_markdown.is_none();
 
     // Mode: confirm first (it is the page's answer to a per-row
-    // restore click), then diff, then the plain list.
+    // restore click), then diff, then the plain list. An empty-payload
+    // revision (the undelete-restore row) is NOT confirmable — its
+    // restore post is the snapshot-parse 400, so a confirm URL for one
+    // falls back to the list, like an unknown revision number.
     if restore_ready
         && let Some(n) = page_revision_param(query.restore_confirm.as_deref())
-        && entries.iter().any(|e| e.revision_no == n)
+        && entries
+            .iter()
+            .any(|e| e.revision_no == n && !e.payload_empty)
     {
         // The row's labels first (the entries move into the surface
         // after the borrow ends).

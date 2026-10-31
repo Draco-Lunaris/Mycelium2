@@ -79,6 +79,19 @@ mod tests {
         assert!(opened.is_empty());
     }
 
+    /// The relation the store's meta-only emptiness derivation relies
+    /// on (revisions list): stored length == EMPTY_ENVELOPE_LEN +
+    /// plaintext length, exactly, so `<= EMPTY_ENVELOPE_LEN` at the SQL
+    /// layer means "nothing restorable".
+    #[test]
+    fn empty_payload_seal_matches_the_empty_envelope_len_constant() {
+        let key = dek();
+        let sealed = aead_seal(b"", b"", &key).unwrap();
+        assert_eq!(sealed.len(), crate::envelope::EMPTY_ENVELOPE_LEN);
+        let one = aead_seal(b"x", b"", &key).unwrap();
+        assert_eq!(one.len(), crate::envelope::EMPTY_ENVELOPE_LEN + 1);
+    }
+
     #[test]
     fn fresh_nonce_per_call() {
         let key = dek();
