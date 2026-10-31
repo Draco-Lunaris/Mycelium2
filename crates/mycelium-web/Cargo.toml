@@ -31,6 +31,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+# The concept page's revisions compare view (unified text diff).
+similar.workspace = true
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"

@@ -68,6 +68,7 @@ pub fn build_router_with_shutdown(
         .route("/", get(api::home))
         .route("/logout", get(api::logout))
         .route("/concept", get(api::concept_view).post(api::concept_submit))
+        .route("/concept/activate", post(api::concept_activate))
         .route("/concept/delete", post(api::concept_delete))
         .route("/search", get(api::search_view))
         .route("/graph", get(api::graph_view))

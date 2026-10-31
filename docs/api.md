@@ -90,7 +90,10 @@ literal.
   {"restored_to": n}` (the CSRF token rides the `x-csrf-token`
   header).
 - A form POST (`application/x-www-form-urlencoded`, the `csrf_token`
-  field) answers `303` redirect to `/concept?path=…&scope=…`.
+  field) answers `303` redirect to `/concept?path=…&scope=…`
+  — only that content type takes the redirect path; a form sent as
+  `multipart/form-data` (also CSRF-checked, field or header) answers
+  the `200` JSON instead.
 
 A snapshot that no longer parses (frontmatter a current build rejects)
 answers `400` with the concept parse error text — the same posture as

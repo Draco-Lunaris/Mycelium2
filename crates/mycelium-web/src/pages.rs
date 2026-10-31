@@ -250,6 +250,145 @@ pub fn home_page(
     layout("Browse", Some(user), csrf, "/", body)
 }
 
+/// How many characters of each text the restore-confirm page
+/// previews (both sides stay bounded; the full text is one click
+/// away in the snapshot diff and the live editor).
+const RESTORE_PREVIEW_CHARS: usize = 480;
+
+/// Summary-cell cap in characters (a long operation summary truncates
+/// with an ellipsis, cut on a character boundary).
+const SUMMARY_CHARS: usize = 120;
+
+/// The concept editor page's revisions extras (Task 4): the optional
+/// revisions surface (what the block renders) and the "Set status:
+/// active" offer (a live concept whose status is paused).
+pub struct ConceptExtras {
+    /// The revisions surface — present only when the concept is
+    /// revision-tracked (its chain is non-empty); `Some` renders the
+    /// block. Handler-built (the handler gathers, the page composes).
+    pub revisions: Option<RevisionsSurface>,
+    /// The live concept is retired/superseded AND editable — render
+    /// the activate form.
+    pub activation: bool,
+}
+
+/// The revisions surface for one concept page: the chain plus which
+/// mode the block renders (plain list, the restore-confirm
+/// interstitial, or the diff view).
+pub struct RevisionsSurface {
+    /// The concept's canonical path (the compare form and links are
+    /// page-composed from it).
+    pub path: String,
+    /// The scope short param for links/forms ("user" | "skills" |
+    /// "library").
+    pub scope_param: &'static str,
+    /// The scope may restore (user own / skills admin) — restore
+    /// links and the confirm interstitial exist only when true; the
+    /// library is always false.
+    pub restore_ready: bool,
+    /// The concept is deleted (its page is the history, the editor is
+    /// off, and restoring "re-creates" the path).
+    pub dead: bool,
+    /// The chain, newest first (RevisionStore::list's order).
+    pub entries: Vec<mycelium_store::RevisionEntry>,
+    pub mode: RevisionsMode,
+}
+
+/// What the revisions block renders.
+pub enum RevisionsMode {
+    /// The newest-first rows + compare form (the editor above it
+    /// stays).
+    List,
+    /// The restore-confirm interstitial (replaces the editor region).
+    Confirm(ConfirmData),
+    /// The unified diff view (replaces the editor region; the list
+    /// stays below).
+    Diff(DiffData),
+}
+
+/// The restore-confirm interstitial's data: what is restored and what
+/// it replaces.
+pub struct ConfirmData {
+    pub n: u64,
+    /// The row's operation (the "recorded" line).
+    pub op: String,
+    pub summary: String,
+    /// The snapshot being restored (raw markdown — the page escapes).
+    pub snapshot_text: String,
+    /// The live concept's markdown when the concept exists (None on a
+    /// dead path — nothing to replace, restore re-creates).
+    pub current_text: Option<String>,
+}
+
+/// The diff view's data: the line list is PRE-ESCAPE data — the page
+/// wraps it escaped in `<pre>`.
+pub struct DiffData {
+    /// The rendered from-side label ("current" or "revision #N").
+    pub from_label: String,
+    pub to_label: String,
+    /// Unified diff lines (the `---`/`+++` headers, `@@` hunks, and
+    /// context/+/- body lines).
+    pub lines: Vec<String>,
+    /// True when the diff passed the page's line cap.
+    pub truncated: bool,
+}
+
+/// A short relative date for revision rows: "just now", then the
+/// seconds/minutes/hours/days bands, then an absolute `YYYY-MM-DD`
+/// past 30 days. An unparsable timestamp renders itself (a clock
+/// quirk degrades to raw text, never a panic).
+fn relative_date(rfc3339: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let age = chrono::Utc::now().signed_duration_since(parsed);
+    let secs = age.num_seconds().max(0);
+    if secs < 5 {
+        return "just now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86400 {
+        return format!("{}h ago", secs / 3600);
+    }
+    if secs < 30 * 86400 {
+        return format!("{}d ago", secs / 86400);
+    }
+    parsed.format("%Y-%m-%d").to_string()
+}
+
+/// Char-boundary-safe summary cell: cap, ellipsis, then escape.
+fn truncate_summary(summary: &str) -> String {
+    if summary.chars().count() <= SUMMARY_CHARS {
+        return html_escape(summary);
+    }
+    let cut: String = summary.chars().take(SUMMARY_CHARS).collect();
+    format!("{}\u{2026}", html_escape(&cut))
+}
+
+/// Preview slice for the confirm page (character-boundary-safe).
+fn preview_slice(text: &str) -> String {
+    if text.chars().count() <= RESTORE_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(RESTORE_PREVIEW_CHARS).collect();
+    format!("{cut}\n\u{2026}")
+}
+
+/// The operation chip's severity: create accents, delete is danger,
+/// everything else neutral.
+fn revision_op_class(op: &str) -> &'static str {
+    match op {
+        "create" => "accent",
+        "delete" => "danger",
+        _ => "neutral",
+    }
+}
+
 /// The concept editor/viewer (Task 2 rebuild — the one page fn the
 /// three legacy editors collapsed into): breadcrumb, page header with
 /// Save + Delete (the keys page's confirm-dialog pattern), the
@@ -269,6 +408,14 @@ pub fn home_page(
 /// saved yet). `scope` keeps the write aimed at the right store (the
 /// hidden form field, and the delete form + dialog carry it too) and
 /// shows a muted scope note in the header actions.
+///
+/// `extras` (Task 4) carries the revisions surface and the activate
+/// offer: `Some(surface)` adds the Revisions card (list mode) or
+/// REPLACES the editor region with the confirm/diff interstitial; a
+/// dead concept's page is the history alone (the editor is off — its
+/// restoration path is the revisions block). The "Set status: active"
+/// button renders in the header actions while `activation` is set —
+/// offer and editor actions live only on modes that show the editor.
 #[allow(clippy::too_many_arguments)]
 pub fn concept_editor(
     user: &SessionUser,
@@ -279,9 +426,20 @@ pub fn concept_editor(
     frontmatter_error: Option<&str>,
     scope: Option<&str>,
     editable: bool,
+    extras: Option<&ConceptExtras>,
 ) -> Html<String> {
     let is_new = path.is_empty();
     let title: &str = if is_new { "New concept" } else { path };
+    // The revisions surface: which mode renders — and whether the
+    // editor grid is the front region at all (confirm/diff replace it;
+    // dead paths hide it, their page is the history).
+    let surface = extras.and_then(|ex| ex.revisions.as_ref());
+    let interstitial = matches!(
+        surface.map(|s| &s.mode),
+        Some(RevisionsMode::Confirm(_) | RevisionsMode::Diff(_))
+    );
+    let dead = surface.is_some_and(|s| s.dead);
+    let show_grid = !interstitial && !dead;
     // Breadcrumb: Browse → this concept (a plain label, no href).
     let breadcrumb = mycelium_ui::render::render(mycelium_ui::breadcrumb(&[
         ("Browse", Some("/")),
@@ -297,7 +455,33 @@ pub fn concept_editor(
         Some("skills") => r#"<span class="muted">(global skills)</span>"#,
         _ => "",
     };
-    let show_delete = editable && !is_new;
+    let show_delete = editable && !is_new && !interstitial;
+    // The activate offer ("Set status: active", lifecycle spec §4): a
+    // form-driven POST, the same hidden-fields pattern as delete — no
+    // JS. Its fields: csrf + path (+ the scope when the page carries
+    // one), so the handler aims the write exactly as concept_delete.
+    let activate_form = if extras.is_some_and(|ex| ex.activation)
+        && editable
+        && !interstitial
+        && !is_new
+    {
+        let mut fields = format!(
+            r#"<input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="path" value="{}">"#,
+            html_escape(csrf),
+            html_escape(path)
+        );
+        if let Some(s) = scope {
+            fields.push_str(&format!(
+                r#"<input type="hidden" name="scope" value="{}">"#,
+                html_escape(s)
+            ));
+        }
+        format!(
+            r#"<form method="post" action="/concept/activate">{fields}<button type="submit" class="btn btn--secondary">Set status: active</button></form>"#
+        )
+    } else {
+        String::new()
+    };
     let (actions, dialog, confirm_script) = if show_delete {
         let mut delete_fields = format!(
             r#"<input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="path" value="{}">"#,
@@ -335,22 +519,22 @@ pub fn concept_editor(
         ));
         (
             format!(
-                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>{delete_form}"#
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>{activate_form}{delete_form}"#
             ),
             dialog,
             true,
         )
-    } else if editable {
+    } else if editable && !interstitial {
         // New concept: Save only — nothing is saved to delete yet.
         (
             format!(
-                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>"#
+                r#"{scope_note}<button type="submit" class="btn btn--primary" form="concept-editor-form">Save</button>{activate_form}"#
             ),
             String::new(),
             false,
         )
     } else {
-        (scope_note.to_string(), String::new(), false)
+        (format!("{scope_note}{activate_form}"), String::new(), false)
     };
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
         title,
@@ -382,7 +566,7 @@ pub fn concept_editor(
             html_escape(path)
         )
     };
-    let pane = if editable {
+    let pane = if show_grid && editable {
         format!(
             r#"<form class="editor-pane" id="concept-editor-form" method="post" action="/concept">
   {path_input}
@@ -403,10 +587,37 @@ pub fn concept_editor(
             textarea_escape(markdown)
         )
     };
-    let body = format!(
-        "{breadcrumb}{header}{warning}\
-<div class=\"editor-grid\">{pane}<div class=\"editor-preview\">{preview_html}</div></div>{dialog}"
+    let grid = format!(
+        r#"<div class="editor-grid">{pane}<div class="editor-preview">{preview_html}</div></div>"#
     );
+    // The front region: the restore-confirm/diff interstitials replace
+    // the editor grid; a dead concept shows the history alone. Below
+    // it, the Revisions card rides list/diff modes (never confirm —
+    // the interstitial's Back link covers navigation there).
+    let center: String = match surface {
+        Some(s) => match &s.mode {
+            RevisionsMode::Confirm(data) => mycelium_ui::render::render(mycelium_ui::card(
+                &format!("Restore revision #{}", data.n),
+                revisions_confirm_body(data, s, csrf),
+            )),
+            RevisionsMode::Diff(data) => mycelium_ui::render::render(mycelium_ui::card(
+                &format!("Diff: from {} to {}", data.from_label, data.to_label),
+                revisions_diff_body(data, s),
+            )),
+            RevisionsMode::List => grid.clone(),
+        },
+        None => grid,
+    };
+    let below: String = match surface {
+        Some(s) => match &s.mode {
+            RevisionsMode::Confirm(_) => String::new(),
+            _ => {
+                mycelium_ui::render::render(mycelium_ui::card("Revisions", revisions_list_body(s)))
+            }
+        },
+        None => String::new(),
+    };
+    let body = format!("{breadcrumb}{header}{warning}{center}{below}{dialog}");
     let page_title = if is_new { "New concept" } else { "Concept" };
     let scripts: &[&str] = if confirm_script {
         &["/assets/confirm.js"]
@@ -416,6 +627,176 @@ pub fn concept_editor(
     layout_with_scripts(page_title, Some(user), csrf, "/concept", body, scripts)
 }
 
+/// The revisions card's body (list mode, below the editor): the
+/// compare form, then the newest-first table — op chip, source,
+/// relative date, bounded summary, and per-row restore links when the
+/// scope may restore.
+fn revisions_list_body(surface: &RevisionsSurface) -> TrustedHtml {
+    let mut h = String::from(r#"<p class="muted">Revision history (newest first).</p>"#);
+    if surface.dead {
+        h.push_str(&format!(
+            r#"<p class="muted">This concept is deleted — restoring a revision re-creates it at {}.</p>"#,
+            html_escape(&surface.path)
+        ));
+    }
+    h.push_str(&revisions_compare_form(surface));
+    let headers = ["Revision", "Operation", "Source", "Date", "Summary", ""];
+    let rows: Vec<Vec<TrustedHtml>> = surface
+        .entries
+        .iter()
+        .map(|e| revision_row_cells(e, surface))
+        .collect();
+    h.push_str(&mycelium_ui::render::render(mycelium_ui::data_table(
+        &headers, &rows,
+    )));
+    TrustedHtml::from_markup(h)
+}
+
+/// One table row's inner cells (the data_table primitive renders the
+/// `<td data-label>` wrappers): #no, the op chip, the provenance (or a
+/// muted "unlabeled"), the relative date, the bounded summary, and the
+/// restore anchor when the scope may restore.
+fn revision_row_cells(
+    entry: &mycelium_store::RevisionEntry,
+    surface: &RevisionsSurface,
+) -> Vec<TrustedHtml> {
+    let action_cell = if surface.restore_ready {
+        format!(
+            r#"<a href="/concept?path={path}&scope={sp}&revs=1&restore_confirm={no}">restore</a>"#,
+            path = urlencoding_encode(&surface.path),
+            sp = surface.scope_param,
+            no = entry.revision_no
+        )
+    } else {
+        String::new()
+    };
+    [
+        format!("#{}", entry.revision_no),
+        mycelium_ui::render::render(mycelium_ui::chip(&entry.op, revision_op_class(&entry.op))),
+        if entry.source.is_empty() {
+            r#"<span class="muted">unlabeled</span>"#.to_string()
+        } else {
+            html_escape(&entry.source)
+        },
+        html_escape(&relative_date(&entry.created_at)),
+        truncate_summary(&entry.summary),
+        action_cell,
+    ]
+    .into_iter()
+    .map(TrustedHtml::from_markup)
+    .collect()
+}
+
+/// The compare form: a from- and a to-select (the `""` HEAD sentinel
+/// option named "current"), the diff button, and the hidden path/scope/
+/// revs fields that aim the GET back at this page's revisions view.
+/// Options run ascending; the to-select defaults to the chain's head
+/// (HEAD vs newest is the natural first compare). All four params are
+/// Option<String> on the query — the sentinels are blanks, which a
+/// typed extractor would 400-reject (see page_revision_param).
+fn revisions_compare_form(surface: &RevisionsSurface) -> String {
+    let mut hidden = format!(
+        r#"<input type="hidden" name="path" value="{}">"#,
+        html_escape(&surface.path)
+    );
+    // The user shelf compares via the absent scope; the service scopes
+    // aim the GET at their branch.
+    if surface.scope_param != "user" {
+        hidden.push_str(&format!(
+            r#"<input type="hidden" name="scope" value="{}">"#,
+            html_escape(surface.scope_param)
+        ));
+    }
+    hidden.push_str(r#"<input type="hidden" name="revs" value="1">"#);
+    let newest = surface.entries.first().map(|e| e.revision_no);
+    // Options ascending; `selected` marks the prechosen option.
+    let mut nos: Vec<u64> = surface.entries.iter().map(|e| e.revision_no).collect();
+    nos.sort_unstable();
+    let select = |field: &str, label: &str, selected: Option<u64>| {
+        let mut options = String::from(r#"<option value="">current</option>"#);
+        for n in nos.iter().copied() {
+            let sel = if Some(n) == selected { " selected" } else { "" };
+            options.push_str(&format!(r#"<option value="{n}"{sel}>rev {n}</option>"#));
+        }
+        format!(r#"<label>{label} <select name="{field}">{options}</select></label>"#)
+    };
+    format!(
+        r#"<form method="get" action="/concept" class="concept-revisions-diff">{hidden}{}<button type="submit" class="btn btn--secondary">diff</button></form>"#,
+        select("diff_from", "from", None) + &select("diff_to", "to", newest)
+    )
+}
+
+/// The restore-confirm interstitial's body: what is restored (and
+/// what it replaces — the current concept, or its deleted position), a
+/// bounded preview of both sides, the actual restore POST to Task 3's
+/// route, and the back link. The snapshot text rides the page as
+/// DATA: both previews are escaped at composition.
+fn revisions_confirm_body(
+    data: &ConfirmData,
+    surface: &RevisionsSurface,
+    csrf: &str,
+) -> TrustedHtml {
+    let mut h = String::new();
+    if surface.dead {
+        h.push_str(&format!(
+            r#"<p class="muted">The concept is deleted — this restore re-creates it at {}.</p>"#,
+            html_escape(&surface.path)
+        ));
+    } else {
+        h.push_str(&format!(
+            r#"<p>Restoring replaces the current concept with revision #{}'s snapshot.</p>"#,
+            data.n
+        ));
+    }
+    h.push_str(&format!(
+        r#"<p class="muted">recorded: {}.</p>"#,
+        html_escape(&data.summary)
+    ));
+    if let Some(current) = &data.current_text {
+        h.push_str(&format!(
+            r#"<h3>Current (will be replaced)</h3><pre>{}</pre>"#,
+            html_escape(&preview_slice(current))
+        ));
+    }
+    h.push_str(&format!(
+        r#"<h3>Snapshot (restored instead)</h3><pre>{}</pre>"#,
+        html_escape(&preview_slice(&data.snapshot_text))
+    ));
+    h.push_str(&format!(
+        r#"<form method="post" action="/api/v1/revisions/restore?scope={sp}&path={path}&n={n}"><input type="hidden" name="csrf_token" value="{csrf}"><button type="submit" class="btn btn--danger">Restore revision #{n}</button></form>
+<p><a href="/concept?path={path}&scope={sp}&revs=1">Back to revisions</a></p>"#,
+        sp = surface.scope_param,
+        path = urlencoding_encode(&surface.path),
+        n = data.n,
+        csrf = html_escape(csrf)
+    ));
+    TrustedHtml::from_markup(h)
+}
+
+/// The diff view's body: the unified diff lines (handler-computed
+/// `similar` output) wrapped ESCAPED in a `<pre>`, a truncation note
+/// on capped diffs, and the back links — the plain editor and the
+/// revisions list.
+fn revisions_diff_body(data: &DiffData, surface: &RevisionsSurface) -> TrustedHtml {
+    let mut h = String::new();
+    if data.truncated {
+        h.push_str(r#"<p class="muted">Diff truncated — long compares stop at the cap (both texts are visible on the list/editor pages).</p>"#);
+    }
+    h.push_str(&format!(
+        r#"<pre>{}</pre>"#,
+        data.lines
+            .iter()
+            .map(|l| html_escape(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    h.push_str(&format!(
+        r#"<p><a href="/concept?path={path}&scope={sp}&revs=1">Back to revisions</a> <a href="/concept?path={path}&scope={sp}">Editor</a></p>"#,
+        sp = surface.scope_param,
+        path = urlencoding_encode(&surface.path)
+    ));
+    TrustedHtml::from_markup(h)
+}
 /// Build the editor's static preview pane from the concept's markdown.
 /// Returns `(preview_html, frontmatter_error)`: the preview is composed
 /// from html-escaped fragments ONLY (escape-then-compose — the spec's
@@ -2661,6 +3042,7 @@ mod tests {
             fm_err.as_deref(),
             None,
             true,
+            None,
         )
         .0;
         assert!(
@@ -2693,7 +3075,18 @@ mod tests {
             fm_err.is_none(),
             "hostile-but-valid frontmatter must parse: {fm_err:?}"
         );
-        let html = concept_editor(&user, "", "/notes/x.md", hostile, preview, None, None, true).0;
+        let html = concept_editor(
+            &user,
+            "",
+            "/notes/x.md",
+            hostile,
+            preview,
+            None,
+            None,
+            true,
+            None,
+        )
+        .0;
         assert!(
             html.contains(r#"<div class="editor-preview">"#),
             "preview pane present: {html}"

@@ -1167,16 +1167,22 @@ async fn skills_scoped_delete_round_trip() {
     assert_eq!(del.status(), 303);
     assert_eq!(del.headers().get("location").unwrap(), "/skills");
 
-    // The skills-scope view 404s: the global skills concept is gone.
-    let gone = client
-        .get(format!(
-            "{base}/concept?path=/skills-scope-test.md&scope=skills"
-        ))
+    // The skills-scope concept is gone from the shelf: the skills page
+    // no longer lists it. (The SSR viewer itself now answers a
+    // dead-but-revision-tracked path with the revisions page instead
+    // of 404 — Task 4's restore links re-create a deleted concept.)
+    let skills_page = client
+        .get(format!("{base}/skills"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(gone.status(), 404, "skills concept must be gone");
+    assert_eq!(skills_page.status(), 200);
+    let skills_html = skills_page.text().await.unwrap();
+    assert!(
+        !skills_html.contains("Skills Scope Test"),
+        "skills concept must be gone: {skills_html}"
+    );
 
     // The private-bundle twin SURVIVES — the scoped delete must not
     // have misrouted into the user bundle.
@@ -5405,6 +5411,49 @@ async fn revisions_rest_round_trip_json_and_form() {
         "a rejected restore left the concept untouched: {back}"
     );
 
+    // (Task 4 rider) The rejection is observable as "nothing was
+    // written", not just a status: the chain still ends at revision 5
+    // (the form restore's own row) — a rejected restore appended
+    // nothing and disturbed nothing.
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/revisions/list?path=/rv.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.len(),
+        5,
+        "the rejected restore appended nothing: {list:?}"
+    );
+    assert_eq!(
+        list[0]["revision_no"], 5,
+        "the head is still the good restore's row: {list:?}"
+    );
+    assert_eq!(list[0]["op"], "restore", "head op unchanged: {list:?}");
+    let idx: serde_json::Value = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = idx
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .unwrap();
+    assert_eq!(
+        entry["latest_no"], 5,
+        "index latest_no unchanged by the rejected POST: {entry}"
+    );
+
     shutdown.cancel();
 }
 
@@ -6036,6 +6085,922 @@ async fn rest_delete_missing_concept_returns_404() {
         .await
         .unwrap();
     assert_eq!(del.status(), 404, "the re-delete answers 404");
+
+    shutdown.cancel();
+}
+
+// ---------- Revisions pages (Task 4: list, diff, restore, set-active) ----------
+
+/// GET the SSR concept page; returns (status, html). No redirects
+/// followed — the pages answer 200 in place (404/403 bodies included).
+async fn concept_page(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    query: &str,
+) -> (reqwest::StatusCode, String) {
+    let r = client
+        .get(format!("{base}/concept?{query}"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let html = r.text().await.unwrap();
+    (status, html)
+}
+
+/// The revisions list page: newest-first rows (op chip, provenance
+/// source, relative date, bounded summary, per-row restore link), the
+/// compare form with the HEAD sentinel named "current", and — without
+/// JS — the editor still front and center.
+#[tokio::test]
+async fn revisions_page_renders_rows_and_compare_form() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv One\n---\n\nfirst body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Two\n---\n\nsecond body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Three\n---\n\nthird body\n",
+    )
+    .await;
+
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/rv.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Revisions"),
+        "revisions block renders: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Revision">#3</td>"#),
+        "row #3 renders: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Revision">#1</td>"#),
+        "row #1 renders: {html}"
+    );
+    let pos3 = html.find(r#"data-label="Revision">#3</td>"#).unwrap();
+    let pos1 = html.find(r#"data-label="Revision">#1</td>"#).unwrap();
+    assert!(pos3 < pos1, "rows run newest-first: {html}");
+    // Op chips: create accented, update neutral.
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--neutral">update</span></td>"#
+        ),
+        "update chip: {html}"
+    );
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--accent">create</span></td>"#
+        ),
+        "create chip: {html}"
+    );
+    // Provenance source and bounded summary.
+    assert!(
+        html.contains(r#"<td data-label="Source">web:admin</td>"#),
+        "source cell: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Summary">concept updated</td>"#)
+            && html.contains(r#"<td data-label="Summary">concept created</td>"#),
+        "summaries: {html}"
+    );
+    // Relative date ("ago" bands or "just now" on a fast clock).
+    assert!(
+        (html.contains("ago") || html.contains("just now"))
+            && html.contains(r#"<td data-label="Date">"#),
+        "relative date: {html}"
+    );
+    // Per-row restore links (revision confirm params on the page).
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1&restore_confirm=3""#)
+            && html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1&restore_confirm=1""#),
+        "per-row restore links: {html}"
+    );
+    // Compare form: GET /concept with the HEAD sentinel named "current".
+    assert!(
+        html.contains(r#"<form method="get" action="/concept""#)
+            && html.contains("concept-revisions-diff"),
+        "compare form: {html}"
+    );
+    assert!(
+        html.contains(r#"name="diff_from""#) && html.contains(r#"name="diff_to""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="">current</option>"#),
+        "HEAD sentinel: {html}"
+    );
+    assert!(
+        html.contains(r#"<option value="3">rev 3</option>"#)
+            && html.contains(r#"<option value="1">rev 1</option>"#),
+        "revision options: {html}"
+    );
+    // The editor is still the front region in list mode.
+    assert!(
+        html.contains("concept-editor-form"),
+        "editor present: {html}"
+    );
+    // No inline scripts anywhere (CSP-safe, form-driven only).
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Without the revs param the plain editor page has no revisions
+    // block at all (no restore links, no compare form).
+    let (status, plain) = concept_page(&client, &base, &cookie, "path=/rv.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !plain.contains("Revisions") && !plain.contains("restore_confirm="),
+        "plain editor carries no revisions block: {plain}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Escaping: the provenance source (hostile username), the diff's
+/// snapshot side, and every other row are rendered escaped — no raw
+/// markup can reach the page from file content or metadata.
+#[tokio::test]
+async fn revisions_page_escapes_rows_and_diff() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) = create_and_login_user(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "eviluser<img src=x onerror=alert(1)>",
+    )
+    .await;
+
+    // One hostile body, then an update — so the HEAD↔#2 diff carries
+    // the hostile v1 text on the snapshot side.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil.md",
+        "---\ntype: Note\ntitle: Evil\n---\n\n<script>alert(1)</script>\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil.md",
+        "---\ntype: Note\ntitle: Evil\n---\n\nharmless body\n",
+    )
+    .await;
+
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/evil.md&revs=1").await;
+    assert_eq!(status, 200);
+    // The provenance stamp is their hostile username — rendered ESCAPED.
+    assert!(
+        html.contains("web:eviluser&lt;img src=x onerror=alert(1)&gt;"),
+        "hostile source cell escaped: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x"),
+        "no raw injected attribute markup: {html}"
+    );
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Diff view: the snapshot's hostile body appears escaped in <pre>.
+    let (status, diff) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/evil.md&revs=1&diff_from=&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(diff.contains("<pre"), "diff renders in a pre: {diff}");
+    assert!(
+        diff.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "snapshot side escaped: {diff}"
+    );
+    assert!(
+        !diff.contains("<script>alert(1)</script>"),
+        "no raw script text: {diff}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The diff view: HEAD↔N and revision↔revision unified diffs carry both
+/// sides (current body words AND recorded snapshot words), label the
+/// two texts, and link back; broken/absent params fall back to the
+/// plain revisions list. Extremely long diffs truncate.
+#[tokio::test]
+async fn revisions_diff_view_head_and_rev_pairs() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    for (title, body) in [
+        ("Rv One", "first body"),
+        ("Rv Two", "second body"),
+        ("Rv Three", "third body"),
+    ] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/rv.md",
+            &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+        )
+        .await;
+    }
+
+    // HEAD (current) vs revision #3: both sides present.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #3"),
+        "diff heading: {html}"
+    );
+    assert!(
+        html.contains("--- current") && html.contains("+++ revision #3"),
+        "unified labels: {html}"
+    );
+    assert!(
+        html.contains("third body") && html.contains("second body"),
+        "both sides render: {html}"
+    );
+    // The editor region is replaced by the diff region.
+    assert!(
+        !html.contains("concept-editor-form"),
+        "diff view has no editor form: {html}"
+    );
+    // Still linked back to the list and the plain editor.
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1""#),
+        "back to revisions: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user""#),
+        "back to plain editor: {html}"
+    );
+    assert!(html.contains("Revisions"), "list stays below: {html}");
+
+    // Revision↔revision: #1 (v1) vs #3 (v2) — first vs second body.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=1&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from revision #1 to revision #3")
+            && html.contains("--- revision #1")
+            && html.contains("+++ revision #3"),
+        "rev-rev heading and labels: {html}"
+    );
+    assert!(
+        html.contains("first body") && html.contains("second body"),
+        "rev-rev sides: {html}"
+    );
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Broken/absent combos fall back to the plain revisions list.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=&diff_to=",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Diff: from"),
+        "HEAD↔HEAD is the list: {html}"
+    );
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=99&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Diff: from"),
+        "a missing snapshot side falls back to the list: {html}"
+    );
+
+    // Extremely long diffs truncate — the two sides must actually
+    // differ line-for-line, or the context radius keeps the unified
+    // output small no matter how long both texts are.
+    let big_a = "---\ntype: Note\ntitle: Big\n---\n\n".to_string() + &"line\n".repeat(4100);
+    let big_b = "---\ntype: Note\ntitle: Big\n---\n\n".to_string() + &"lineX\n".repeat(4100);
+    rest_put(&client, &base, &cookie, &csrf, "/big.md", &big_a).await;
+    rest_put(&client, &base, &cookie, &csrf, "/big.md", &big_b).await;
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/big.md&revs=1&diff_from=1&diff_to=",
+    )
+    .await;
+    assert_eq!(status, 200, "big diff answers");
+    assert!(html.contains("truncated"), "over-cap diffs say so: {html}");
+
+    shutdown.cancel();
+}
+
+/// The restore-confirm interstitial for a LIVE target: it shows what
+/// gets replaced (current vs snapshot previews) and the actual POST
+/// round-trips the snapshot's content through Task 3's restore route.
+#[tokio::test]
+async fn revisions_restore_confirm_live_and_round_trip() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    for (title, body) in [
+        ("Rv One", "first body"),
+        ("Rv Two", "second body"),
+        ("Rv Three", "third body"),
+    ] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/rv.md",
+            &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+        )
+        .await;
+    }
+
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&restore_confirm=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Restore revision #3"),
+        "confirm heading: {html}"
+    );
+    assert!(
+        html.contains("Restoring replaces the current concept"),
+        "confirm copy: {html}"
+    );
+    assert!(
+        html.contains("Current (will be replaced)") && html.contains("third body"),
+        "current preview shows what is replaced: {html}"
+    );
+    assert!(
+        html.contains("Snapshot (restored instead)") && html.contains("second body"),
+        "snapshot preview shows what comes back: {html}"
+    );
+    // The actual POST: Task 3's restore route with the params in the
+    // query and the CSRF token as a form field.
+    assert!(
+        html.contains(
+            r#"<form method="post" action="/api/v1/revisions/restore?scope=user&path=/rv.md&n=3">"#
+        ),
+        "restore form targets the REST route: {html}"
+    );
+    assert!(html.contains(r#"name="csrf_token""#), "csrf field: {html}");
+    assert!(
+        !html.contains("concept-editor-form"),
+        "interstitial replaces the editor: {html}"
+    );
+
+    // The round trip: the form POST restores the snapshot's content.
+    let posted = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303, "the confirm form's POST restores");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv Two") && back.contains("second body") && !back.contains("Rv Three"),
+        "the live concept is the snapshot: {back}"
+    );
+
+    // An unrecorded revision number falls back to the list page.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&restore_confirm=99",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Restoring replaces"),
+        "unknown revision → plain list: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Undelete: a deleted concept's page is the revisions list (no
+/// editor), the confirm interstitial says it will re-create at the
+/// path, and the POST resurrects the content.
+#[tokio::test]
+async fn revisions_undelete_confirm_on_dead_path() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/doomed.md",
+        "---\ntype: Note\ntitle: Doomed\n---\n\ndoomed body\n",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/doomed.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "delete succeeds");
+
+    // The dead path's page: the revisions list, no editor.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/doomed.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Revisions"),
+        "list renders for a dead path: {html}"
+    );
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--danger">delete</span></td>"#
+        ),
+        "delete row: {html}"
+    );
+    assert!(
+        html.contains("re-creates it at /doomed.md"),
+        "dead-path note: {html}"
+    );
+    assert!(
+        !html.contains("concept-editor-form"),
+        "a dead concept has nothing to edit: {html}"
+    );
+
+    // The confirm interstitial: rev #2 is the delete row, whose
+    // snapshot is the pre-delete content — restoring it re-creates
+    // the concept at its path.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/doomed.md&revs=1&restore_confirm=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Restore revision #2") && html.contains("re-creates it at /doomed.md"),
+        "dead confirm: {html}"
+    );
+    assert!(
+        !html.contains("Current (will be replaced)"),
+        "no live content to replace: {html}"
+    );
+    assert!(
+        html.contains("Snapshot (restored instead)") && html.contains("doomed body"),
+        "snapshot preview: {html}"
+    );
+    // The restore POST resurrects the concept at its path.
+    let posted = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/doomed.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303);
+    let back = rest_get_markdown(&client, &base, &cookie, "/doomed.md").await;
+    assert!(
+        back.contains("doomed body"),
+        "the concept is live again: {back}"
+    );
+
+    // A never-existed path has no chain: no interstitial — the legacy
+    // new-concept editor (template) still answers.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/ghost.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("concept-editor-form") && html.contains("Path (e.g. /notes/my-note.md)"),
+        "no chain → legacy new-concept editor: {html}"
+    );
+    assert!(
+        !html.contains("Revisions"),
+        "no revisions block for an untracked path: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Read-only hides restore: library scope rows never show restore
+/// links (admin or not) and there is no interstitial; a global skill
+/// is restorable only for admins — a non-admin sees the rows but no
+/// restore links.
+#[tokio::test]
+async fn revisions_restore_hidden_on_readonly_scopes() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // A two-version global skill (form-PUT into the skills shelf).
+    for (title, body) in [
+        ("Sk One", "skill first body"),
+        ("Sk Two", "skill second body"),
+    ] {
+        let put = client
+            .post(format!("{base}/concept"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[
+                ("path", "/sk-rev.md"),
+                ("scope", "skills"),
+                (
+                    "markdown",
+                    &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 303, "skills put");
+    }
+
+    // Mallory reads the skills concept's list without restore links.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-rev.md&scope=skills&revs=1",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<td data-label="Revision">#2</td>"#),
+        "rows render for a non-admin reader: {html}"
+    );
+    assert!(
+        !html.contains("restore_confirm="),
+        "no restore links for a skills non-admin: {html}"
+    );
+    // …but the admin's own page of the same concept offers restore.
+    let (a_status, admin_html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/sk-rev.md&scope=skills&revs=1",
+    )
+    .await;
+    assert_eq!(a_status, 200);
+    assert!(
+        admin_html.contains("restore_confirm="),
+        "admin sees restore links in skills: {admin_html}"
+    );
+    // Diff is a read — allowed for a non-admin in skills.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-rev.md&scope=skills&revs=1&diff_from=&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #2"),
+        "skills diff readable for a non-admin: {html}"
+    );
+
+    // A global-read library book: rows render for everyone, restore
+    // links for NOBODY, and the interstitial never appears.
+    let shelf = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("name", "Public Shelf"), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shelf.status(), 303);
+    let boundary = "rvpagesboundary1";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
+    assert_eq!(upload_json["status"], "done", "{upload_json}");
+
+    for (who, name) in [(&mallory_cookie, "mallory"), (&cookie, "admin")] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            who,
+            "path=/my-book/book.md&scope=library&revs=1",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Revisions") && !html.contains("restore_confirm="),
+            "library rows never offer restore ({name}): {html}"
+        );
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            who,
+            "path=/my-book/book.md&scope=library&revs=1&restore_confirm=1",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !html.contains("Restoring replaces"),
+            "no library interstitial ({name}): {html}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// "Set status: active": offered for a paused (retired) concept, clears
+/// status/superseded_by while keeping valid_to, writes through the
+/// stamped store (a provenance'd update revision lands), and answers a
+/// 303 back to the viewer.
+#[tokio::test]
+async fn concept_activate_clears_status_and_superseded_by() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/paused.md",
+        "---\ntype: Note\ntitle: Paused\nstatus: retired\nsuperseded_by: /elsewhere.md\nvalid_to: 2030-01-01T00:00:00Z\n---\n\npaused body\n",
+    )
+    .await;
+
+    // The offer: a no-JS form with the path hidden in (no scope for the
+    // user shelf — the absent scope is user).
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/paused.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<form method="post" action="/concept/activate">"#),
+        "activate form renders for a retired concept: {html}"
+    );
+    assert!(html.contains("Set status: active"), "{html}");
+    assert!(
+        html.contains(r#"name="path" value="/paused.md""#) && html.contains(r#"name="csrf_token""#),
+        "activate form fields: {html}"
+    );
+
+    // An active concept does not offer the button.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/live.md",
+        "---\ntype: Note\ntitle: Live\n---\n\nlive body\n",
+    )
+    .await;
+    let (status, plain) = concept_page(&client, &base, &cookie, "path=/live.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !plain.contains("/concept/activate"),
+        "no activate offer for an active concept: {plain}"
+    );
+
+    // POST (form-encoded, csrf as a field): 303 back to the viewer.
+    let posted = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("path=/paused.md&csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303, "activate redirects");
+    assert_eq!(
+        posted.headers().get("location").unwrap(),
+        "/concept?path=/paused.md&scope=user"
+    );
+
+    // The concept is unpause: no status, no superseded_by, valid_to
+    // untouched, content intact.
+    let back = rest_get_markdown(&client, &base, &cookie, "/paused.md").await;
+    assert!(back.contains("paused body"), "body kept: {back}");
+    assert!(
+        !back.contains("status:") && !back.contains("superseded_by:"),
+        "status and superseded_by cleared: {back}"
+    );
+    assert!(back.contains("valid_to: "), "valid_to is untouched: {back}");
+
+    // The offer is gone and the activation wrote a stamped revision.
+    let (status, after) = concept_page(&client, &base, &cookie, "path=/paused.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !after.contains("/concept/activate"),
+        "no activate offer after activation: {after}"
+    );
+    let list = client
+        .get(format!("{base}/api/v1/revisions/list?path=/paused.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> = list.json().await.unwrap();
+    assert_eq!(rows.len(), 2, "the activation wrote one revision: {rows:?}");
+    assert_eq!(rows[0]["op"], "update");
+    assert_eq!(
+        rows[0]["source"], "web:admin",
+        "stamped store put: {rows:?}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Activate's permission matrix: skills non-admin 403 (and nothing is
+/// written), library always 403 (before any store work — a nonexistent
+/// path in a refused scope must not oracle), unknown path 404, and the
+/// CSRFless form variant hits the middleware 403.
+#[tokio::test]
+async fn concept_activate_permission_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // A paused (superseded) skill by the admin — also proves the offer
+    // fires for the superseded status, not just retired.
+    let put = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[(
+            "path",
+            "/sk-paused.md",
+        ), (
+            "scope",
+            "skills",
+        ), (
+            "markdown",
+            "---\ntype: Note\ntitle: Sk Paused\nstatus: superseded\nsuperseded_by: /other.md\n---\n\nsk body\n",
+        )])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 303, "skills seed put");
+
+    // Skills non-admin: 403, and nothing is written (no revision
+    // appended). Also proves the superseded status is recognized.
+    let denied = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "path=/sk-paused.md&scope=skills&csrf_token={mallory_csrf}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "skills activate is admin-only");
+    let rows: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-paused.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the 403 wrote nothing: {rows:?}");
+
+    // Unknown path in the user scope: 404.
+    let missing = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("path=/nowhere.md&csrf_token={mallory_csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404, "unknown concept → 404");
+
+    // The library is always read-only for activate — and the 403
+    // answers before the store (the path need not exist to answer).
+    let library = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "path=/nowhere-at-all.md&scope=library&csrf_token={csrf}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(library.status(), 403, "library activate refuses");
+
+    // The CSRFless form variant hits the middleware's 403.
+    let csrfless = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("path=/sk-paused.md&scope=skills")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csrfless.status(), 403, "activate carries a CSRF check");
+    let admin_rows: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-paused.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_rows.len(),
+        1,
+        "no refused activate wrote anything: {admin_rows:?}"
+    );
 
     shutdown.cancel();
 }
