@@ -389,7 +389,11 @@ async fn retention_clamps_everywhere() {
 #[tokio::test]
 async fn sync_lifecycle_row_reads_clamped_value() {
     let _retention = retention_lock().await;
-    set_revision_retention(DEFAULT_REVISION_RETENTION);
+    // Deliberately NOT the default: an absent row must RESET the global
+    // to the default, not leave whatever was live before the sync (a
+    // sync that no-oped on the absent row would still pass a
+    // default-before/default-after assert).
+    set_revision_retention(500);
     let (_dir, store) = store().await;
     let config = ConfigStore::new(store.pool().clone());
     let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
@@ -402,7 +406,7 @@ async fn sync_lifecycle_row_reads_clamped_value() {
     assert_eq!(
         revision_retention(),
         200,
-        "absent lifecycle row keeps the default"
+        "absent lifecycle row resets the global to the default"
     );
 
     // A persisted value of 9 clamps ON LOAD: the global can never leave

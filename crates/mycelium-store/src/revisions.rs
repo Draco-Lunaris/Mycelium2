@@ -192,6 +192,8 @@ pub enum RevisionsError {
     NotFound { path: String, n: u64 },
     #[error("invalid revision op: {0}")]
     InvalidOp(String),
+    #[error("concept_revisions row integrity: {detail}")]
+    Corrupted { detail: String },
 }
 
 /// The revision store for ONE scope — the same per-scope identity as
@@ -400,18 +402,21 @@ impl<'a> RevisionStore<'a> {
         .bind(&token)
         .fetch_all(self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(revision_no, op, source, summary, created_at)| RevisionEntry {
-                    revision_no: u64::try_from(revision_no).expect("positive revision_no"),
+        rows.into_iter()
+            .map(|(revision_no, op, source, summary, created_at)| {
+                let revision_no =
+                    u64::try_from(revision_no).map_err(|_| RevisionsError::Corrupted {
+                        detail: format!("negative revision_no {revision_no}"),
+                    })?;
+                Ok(RevisionEntry {
+                    revision_no,
                     op,
                     source,
                     summary,
                     created_at,
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 
     /// One revision's decoded raw markdown snapshot (frontmatter +
@@ -468,18 +473,21 @@ impl<'a> RevisionStore<'a> {
         .bind(&self.scope_id)
         .fetch_all(self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(path, latest_no, last_op, last_op_at, live)| RevisionPathEntry {
+        rows.into_iter()
+            .map(|(path, latest_no, last_op, last_op_at, live)| {
+                let latest_no =
+                    u64::try_from(latest_no).map_err(|_| RevisionsError::Corrupted {
+                        detail: format!("negative revision_no {latest_no}"),
+                    })?;
+                Ok(RevisionPathEntry {
                     path,
                     live: live != 0,
-                    latest_no: u64::try_from(latest_no).expect("positive revision_no"),
+                    latest_no,
                     last_op,
                     last_op_at,
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 
     /// Retention prune for one concept (by its path token) — exposed
