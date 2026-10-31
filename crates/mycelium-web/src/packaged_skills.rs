@@ -180,7 +180,8 @@ pub async fn seed_packaged_skills(
             .map(SkillManifest::validated)
             .transpose()?;
     }
-    let cs = ConceptStore::for_service(store, service_key.clone(), skills_dir, "skills");
+    let cs = ConceptStore::for_service(store, service_key.clone(), skills_dir, "skills")
+        .with_provenance("seed");
     for legacy in LEGACY_FLAT_PATHS {
         match cs.delete(legacy).await {
             Ok(()) | Err(ConceptStoreError::NotFound(_)) => {}

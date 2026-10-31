@@ -15,6 +15,16 @@ pub struct McpUser {
     pub user_id: Uuid,
     pub username: String,
     pub role: mycelium_auth::rbac::Role,
+    /// Provenance label for mutations made through this identity
+    /// (`mcp:<api-key-label>`) — captured on queue rows and stamped
+    /// into concept frontmatter at integrate time (spec §3.1).
+    pub source: String,
+}
+
+/// The provenance label for a mutation made with the API key labeled
+/// `label` (`mcp:<api-key-label>`).
+pub fn api_key_source(label: &str) -> String {
+    format!("mcp:{label}")
 }
 
 /// Axum middleware: require a valid bearer API key on every /mcp request.
@@ -63,10 +73,25 @@ async fn resolve_user(parts: &Parts, pool: &sqlx::SqlitePool) -> Option<McpUser>
         user_id: user.id,
         username: user.username,
         role: user.role,
+        source: api_key_source(&record.label),
     })
 }
 
 /// Extract the authenticated user from rmcp's injected `http::request::Parts`.
 pub fn user_from_parts(parts: &Parts) -> Option<McpUser> {
     parts.extensions.get::<McpUser>().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_source_label_format() {
+        assert_eq!(api_key_source("e2e-key"), "mcp:e2e-key");
+        assert_eq!(
+            api_key_source("label-with-dots.v2"),
+            "mcp:label-with-dots.v2"
+        );
+    }
 }

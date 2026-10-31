@@ -36,22 +36,28 @@ type QueueRow = (
     String,
     Option<String>,
     Option<String>,
+    String,
 );
 
 impl Store {
     /// Enqueue: INSERT row in `staging` (the payload file does not
     /// exist yet). The caller must write the payload, then call
-    /// `activate` to flip the row to pending.
-    pub async fn enqueue(&self, user_id: Uuid, tool: QueueTool) -> Result<Uuid> {
+    /// `activate` to flip the row to pending. `source` is the
+    /// provenance label captured with the row (`mcp:<key-label>`,
+    /// `web:<username>`, …) — stamped into concept frontmatter at
+    /// integrate time (spec §3.1); an empty string is unknown
+    /// provenance.
+    pub async fn enqueue(&self, user_id: Uuid, tool: QueueTool, source: &str) -> Result<Uuid> {
         let id = Uuid::new_v4();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail, created_at, updated_at, next_retry_at, final_paths)
-             VALUES (?, ?, ?, 'staging', 0, '', ?, ?, NULL, NULL)",
+            "INSERT INTO mutation_queue (id, user_id, tool, source, status, attempts, detail, created_at, updated_at, next_retry_at, final_paths)
+             VALUES (?, ?, ?, ?, 'staging', 0, '', ?, ?, NULL, NULL)",
         )
         .bind(id.to_string())
         .bind(user_id.to_string())
         .bind(tool.as_str())
+        .bind(source)
         .bind(&now)
         .bind(&now)
         .execute(self.pool())
@@ -64,7 +70,13 @@ impl Store {
     /// the check-then-insert close enough under contention: a 1-row
     /// overshoot at extreme concurrency is accepted — the cap is a
     /// runaway guard, not an accounting invariant.
-    pub async fn enqueue_capped(&self, user_id: Uuid, tool: QueueTool, cap: u32) -> Result<Uuid> {
+    pub async fn enqueue_capped(
+        &self,
+        user_id: Uuid,
+        tool: QueueTool,
+        cap: u32,
+        source: &str,
+    ) -> Result<Uuid> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM mutation_queue WHERE user_id = ? AND status IN ('staging','pending','running')",
         )
@@ -74,7 +86,7 @@ impl Store {
         if count >= i64::from(cap) {
             return Err(QueueError::Capacity);
         }
-        self.enqueue(user_id, tool).await
+        self.enqueue(user_id, tool, source).await
     }
 
     /// Flip staging → pending (idempotent: allowed when the row is
@@ -191,7 +203,7 @@ impl Store {
     /// user, which by construction matches.
     pub async fn queue_item(&self, user_id: Uuid, id: Uuid) -> Result<Option<MutationQueueItem>> {
         let row: Option<QueueRow> = sqlx::query_as(
-            "SELECT id, user_id, tool, status, attempts, detail, created_at, updated_at, next_retry_at, final_paths
+            "SELECT id, user_id, tool, status, attempts, detail, created_at, updated_at, next_retry_at, final_paths, source
              FROM mutation_queue WHERE id = ? AND user_id = ?",
         )
         .bind(id.to_string())
@@ -209,6 +221,7 @@ impl Store {
             updated_at,
             next_retry_at,
             final_paths,
+            source,
         )) = row
         else {
             return Ok(None);
@@ -227,6 +240,7 @@ impl Store {
             updated_at,
             next_retry_at,
             final_paths,
+            source,
         }))
     }
 
@@ -520,4 +534,42 @@ pub struct QueueTotals {
     pub fallback: u64,
     /// Dead rows.
     pub dead: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn enqueue_carries_source_through_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // A user row to satisfy the queue's FK (mirrors the
+        // integration suite's seed_user).
+        let user = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, role, auth_provider, password_hash, sealed_master_key, must_change_password, totp_secret, created_at, updated_at)
+             VALUES (?, ?, ?, 'user', 'local', NULL, ?, 0, NULL, ?, ?)",
+        )
+        .bind(user.to_string())
+        .bind("queue-source-test")
+        .bind("queue-source-test@t")
+        .bind("placeholder-sealed-master-key")
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let id = store
+            .enqueue_capped(user, QueueTool::Add, 10, "mcp:e2e-key")
+            .await
+            .unwrap();
+        let item = store
+            .queue_item(user, id)
+            .await
+            .unwrap()
+            .expect("row round-trips");
+        assert_eq!(item.source, "mcp:e2e-key");
+    }
 }

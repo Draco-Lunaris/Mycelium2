@@ -365,7 +365,7 @@ async fn enqueue_item(
     args: serde_json::Value,
     content: &str,
 ) -> uuid::Uuid {
-    let id = store.enqueue_capped(uid, tool, 50).await.unwrap();
+    let id = store.enqueue_capped(uid, tool, 50, "test").await.unwrap();
     let payload = MutationPayload {
         tool,
         args_json: args.to_string(),
@@ -810,9 +810,9 @@ async fn boot_sweep_reconciliation() {
     let uid = seed_user(&store, "t56").await;
 
     // (a) enqueue only — staging, no payload (enqueue died pre-durability).
-    let a = store.enqueue(uid, QueueTool::Add).await.unwrap();
+    let a = store.enqueue(uid, QueueTool::Add, "test").await.unwrap();
     // (b) enqueue + payload, NOT activated — still staging.
-    let b = store.enqueue(uid, QueueTool::Update).await.unwrap();
+    let b = store.enqueue(uid, QueueTool::Update, "test").await.unwrap();
     let payload = MutationPayload {
         tool: QueueTool::Update,
         args_json: serde_json::json!({ "path": "/t.md" }).to_string(),
@@ -823,7 +823,7 @@ async fn boot_sweep_reconciliation() {
         .unwrap();
     // (c) enqueue + payload + activate + claim — left running, as if the
     // process died mid-item.
-    let c = store.enqueue(uid, QueueTool::Add).await.unwrap();
+    let c = store.enqueue(uid, QueueTool::Add, "test").await.unwrap();
     let payload_c = MutationPayload {
         tool: QueueTool::Add,
         args_json: serde_json::json!({ "content": "c" }).to_string(),
@@ -876,7 +876,7 @@ async fn boot_staging_key_unavailable_defers() {
     // made it to disk is unknowable while the key is down — boot must
     // not guess (spec §3.4/D4: a recoverable condition never gets a
     // permanent verdict from boot).
-    let id = store.enqueue(uid, QueueTool::Add).await.unwrap();
+    let id = store.enqueue(uid, QueueTool::Add, "test").await.unwrap();
 
     let (_config, worker) = worker(&store, failing_recovery(), QueueLimits::default());
     worker.recover_on_boot().await.unwrap();
@@ -903,7 +903,10 @@ async fn staging_activates_when_key_returns() {
 
     // The interrupted flip: row + payload blob, never activated —
     // exactly the enqueue-crash window the recovery pass completes.
-    let id = store.enqueue_capped(uid, QueueTool::Add, 50).await.unwrap();
+    let id = store
+        .enqueue_capped(uid, QueueTool::Add, 50, "test")
+        .await
+        .unwrap();
     let payload = MutationPayload {
         tool: QueueTool::Add,
         args_json: serde_json::json!({ "content": "key came back" }).to_string(),
@@ -969,7 +972,7 @@ async fn staging_payload_absent_still_dies() {
     // Staging row with NO payload blob (the enqueue died
     // pre-durability) and the key recoverable: a permanent condition
     // keeps its permanent verdict (spec §3.4).
-    let id = store.enqueue(uid, QueueTool::Add).await.unwrap();
+    let id = store.enqueue(uid, QueueTool::Add, "test").await.unwrap();
 
     let (_config, worker) = worker(&store, recovery(master.clone()), QueueLimits::default());
     worker.recover_on_boot().await.unwrap();
@@ -1269,7 +1272,10 @@ async fn restarted_relay_requeues_and_integrates() {
     .await;
     // … and (b) the interrupted flip: row + payload, never activated —
     // exactly the enqueue-crash window the boot sweep must complete.
-    let b = store.enqueue_capped(uid, QueueTool::Add, 50).await.unwrap();
+    let b = store
+        .enqueue_capped(uid, QueueTool::Add, 50, "test")
+        .await
+        .unwrap();
     let payload_b = MutationPayload {
         tool: QueueTool::Add,
         args_json: serde_json::json!({ "content": "restart add two" }).to_string(),

@@ -434,7 +434,7 @@ impl QueueWorker {
     ) -> Result<MutationResult, AgentError> {
         let uid = item.user_id;
         let client = LlmClient::new(&llm_config(&self.config, &self.service_key).await);
-        let cs = self.user_cs(uid, master);
+        let cs = self.user_cs(uid, master).with_provenance(&item.source);
         let scopes = AgentScopes {
             skills: None,
             library: None,
@@ -506,7 +506,9 @@ impl QueueWorker {
             self.dead_count.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        let cs = self.user_cs(item.user_id, master);
+        let cs = self
+            .user_cs(item.user_id, master)
+            .with_provenance(&item.source);
         let repo = FileRepo::new(self.store.user_dir(item.user_id));
         // The payload may be missing (enqueue died pre-durability, or
         // corrupted) — dead, never a panic.

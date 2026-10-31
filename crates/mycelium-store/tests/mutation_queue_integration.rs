@@ -34,7 +34,7 @@ async fn enqueue_activate_receipt_roundtrip() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
     // enqueue lands in staging.
-    let id = store.enqueue(user, QueueTool::Add).await.unwrap();
+    let id = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
     let row = store.queue_item(user, id).await.unwrap().unwrap();
     assert_eq!(row.status, QueueStatus::Staging);
     assert_eq!(row.attempts, 0);
@@ -59,7 +59,10 @@ async fn enqueue_activate_receipt_roundtrip() {
 async fn claim_skips_items_not_yet_due() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
-    let id = store.enqueue(user, QueueTool::Update).await.unwrap();
+    let id = store
+        .enqueue(user, QueueTool::Update, "test")
+        .await
+        .unwrap();
     store.activate(id).await.unwrap();
     // Simulate a retry timer in the future.
     let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
@@ -75,7 +78,7 @@ async fn claim_skips_items_not_yet_due() {
 async fn done_dead_terminal_and_health() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
-    let done_id = store.enqueue(user, QueueTool::Add).await.unwrap();
+    let done_id = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
     store.activate(done_id).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store
@@ -89,7 +92,10 @@ async fn done_dead_terminal_and_health() {
         vec!["/rust/async.md"]
     );
     // A dead item also leaves pending/running counts untouched.
-    let dead_id = store.enqueue(user, QueueTool::Maintain).await.unwrap();
+    let dead_id = store
+        .enqueue(user, QueueTool::Maintain, "test")
+        .await
+        .unwrap();
     store.activate(dead_id).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store.mark_dead(dead_id, "fallback failed").await.unwrap();
@@ -120,17 +126,20 @@ async fn queue_waiting_rows_join_and_order() {
     let bob = seed_user(&store, "bob").await;
     let carol = seed_user(&store, "carol").await;
     let dan = seed_user(&store, "dan").await;
-    let staged = store.enqueue(alice, QueueTool::Add).await.unwrap();
-    let pend = store.enqueue(bob, QueueTool::Update).await.unwrap();
+    let staged = store.enqueue(alice, QueueTool::Add, "test").await.unwrap();
+    let pend = store.enqueue(bob, QueueTool::Update, "test").await.unwrap();
     store.activate(pend).await.unwrap();
-    let run = store.enqueue(carol, QueueTool::Maintain).await.unwrap();
+    let run = store
+        .enqueue(carol, QueueTool::Maintain, "test")
+        .await
+        .unwrap();
     store.activate(run).await.unwrap();
     store.claim_due_for_user(carol).await.unwrap().unwrap(); // run → running
-    let fin = store.enqueue(dan, QueueTool::Add).await.unwrap();
+    let fin = store.enqueue(dan, QueueTool::Add, "test").await.unwrap();
     store.activate(fin).await.unwrap();
     store.claim_due_for_user(dan).await.unwrap().unwrap(); // fin → running
     store.mark_done(fin, &[], "ok").await.unwrap(); // → done
-    let dead = store.enqueue(alice, QueueTool::Add).await.unwrap();
+    let dead = store.enqueue(alice, QueueTool::Add, "test").await.unwrap();
     store.activate(dead).await.unwrap();
     store.mark_dead(dead, "gave up").await.unwrap();
 
@@ -162,9 +171,12 @@ async fn queue_waiting_rows_join_and_order() {
 async fn queue_health_counts_pending_by_tool() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
-    let a = store.enqueue(user, QueueTool::Add).await.unwrap();
-    let b = store.enqueue(user, QueueTool::Add).await.unwrap();
-    let c = store.enqueue(user, QueueTool::Update).await.unwrap();
+    let a = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
+    let b = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
+    let c = store
+        .enqueue(user, QueueTool::Update, "test")
+        .await
+        .unwrap();
     for id in [a, b, c] {
         store.activate(id).await.unwrap();
     }
@@ -192,7 +204,7 @@ async fn queue_totals_counts_and_provenance_split() {
     let user = seed_user(&store, "u1").await;
 
     // Agent-integrated done row (detail without the fallback prefix).
-    let agent = store.enqueue(user, QueueTool::Add).await.unwrap();
+    let agent = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
     store.activate(agent).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store
@@ -202,7 +214,10 @@ async fn queue_totals_counts_and_provenance_split() {
 
     // Fallback-integrated done row: queue_worker's run_fallback detail
     // prefix, byte-identical up to the parenthesized provenance.
-    let fb = store.enqueue(user, QueueTool::Update).await.unwrap();
+    let fb = store
+        .enqueue(user, QueueTool::Update, "test")
+        .await
+        .unwrap();
     store.activate(fb).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store
@@ -216,11 +231,14 @@ async fn queue_totals_counts_and_provenance_split() {
 
     // A dead row and a still-pending row both stay in the per-tool
     // totals (terminal rows are never un-counted).
-    let dead = store.enqueue(user, QueueTool::Maintain).await.unwrap();
+    let dead = store
+        .enqueue(user, QueueTool::Maintain, "test")
+        .await
+        .unwrap();
     store.activate(dead).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store.mark_dead(dead, "fallback failed: x").await.unwrap();
-    let pending = store.enqueue(user, QueueTool::Add).await.unwrap();
+    let pending = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
     store.activate(pending).await.unwrap();
 
     let totals = store.queue_totals().await.unwrap();
@@ -237,18 +255,27 @@ async fn queue_totals_counts_and_provenance_split() {
 async fn enqueue_capped_rejects_at_capacity() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
-    let a = store.enqueue_capped(user, QueueTool::Add, 2).await.unwrap();
+    let a = store
+        .enqueue_capped(user, QueueTool::Add, 2, "test")
+        .await
+        .unwrap();
     store.activate(a).await.unwrap();
-    let b = store.enqueue_capped(user, QueueTool::Add, 2).await.unwrap();
+    let b = store
+        .enqueue_capped(user, QueueTool::Add, 2, "test")
+        .await
+        .unwrap();
     store.activate(b).await.unwrap();
     assert!(matches!(
-        store.enqueue_capped(user, QueueTool::Add, 2).await,
+        store.enqueue_capped(user, QueueTool::Add, 2, "test").await,
         Err(QueueError::Capacity)
     ));
     // Terminal rows do not count against the cap.
     store.claim_due_for_user(user).await.unwrap().unwrap();
     store.mark_done(a, &[], "ok").await.unwrap();
-    let c = store.enqueue_capped(user, QueueTool::Add, 2).await.unwrap();
+    let c = store
+        .enqueue_capped(user, QueueTool::Add, 2, "test")
+        .await
+        .unwrap();
     assert_ne!(c, uuid::Uuid::nil());
 }
 
@@ -256,8 +283,11 @@ async fn enqueue_capped_rejects_at_capacity() {
 async fn staging_and_running_rows_for_sweep() {
     let (store, _dir) = store().await;
     let user = seed_user(&store, "u1").await;
-    let staged = store.enqueue(user, QueueTool::Add).await.unwrap();
-    let mid = store.enqueue(user, QueueTool::Update).await.unwrap();
+    let staged = store.enqueue(user, QueueTool::Add, "test").await.unwrap();
+    let mid = store
+        .enqueue(user, QueueTool::Update, "test")
+        .await
+        .unwrap();
     store.activate(mid).await.unwrap();
     store.claim_due_for_user(user).await.unwrap().unwrap();
     assert_eq!(store.staging_rows().await.unwrap().len(), 1);
@@ -270,13 +300,13 @@ async fn due_users_listed_oldest_first() {
     let (store, _dir) = store().await;
     let u1 = seed_user(&store, "u1").await;
     let u2 = seed_user(&store, "u2").await;
-    let a = store.enqueue(u1, QueueTool::Add).await.unwrap();
+    let a = store.enqueue(u1, QueueTool::Add, "test").await.unwrap();
     store.activate(a).await.unwrap();
     // u2's row is enqueued AFTER u1's: wait a tick so created_at differs
     // (RFC 3339 strings compare lexicographically — same second ties are
     // fine for the test because ordering is by created_at and the
     // expectation only needs u1 NOT to be missing).
-    let b = store.enqueue(u2, QueueTool::Add).await.unwrap();
+    let b = store.enqueue(u2, QueueTool::Add, "test").await.unwrap();
     store.activate(b).await.unwrap();
     let due = store.queue_users_with_due().await.unwrap();
     assert_eq!(due, vec![u1, u2]);
@@ -291,7 +321,7 @@ async fn concurrent_activate_all_reach_pending() {
     let user = seed_user(&store, "u1").await;
     let mut items: Vec<uuid::Uuid> = Vec::with_capacity(8);
     for _ in 0..8 {
-        items.push(store.enqueue(user, QueueTool::Add).await.unwrap());
+        items.push(store.enqueue(user, QueueTool::Add, "test").await.unwrap());
     }
     // Racer bodies share the &Store behind awaits in this single test
     // task; tokio::join! interleaves at await points, which is the

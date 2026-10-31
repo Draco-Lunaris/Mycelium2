@@ -363,7 +363,8 @@ async fn api_put_concept(
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        .with_provenance(format!("web:{}", user.username));
     match cs.put(&concept).await {
         Ok(()) => {
             crate::state::Metrics::inc(&state.metrics.concepts_written);
@@ -876,7 +877,8 @@ pub async fn concept_submit(
                 (*state.service_key).clone(),
                 &state.store.skills_dir(),
                 "skills",
-            );
+            )
+            .with_provenance(format!("web:{}", user.username));
             match cs.put(&concept).await {
                 Ok(()) => Redirect::to(&format!(
                     "/concept?path={}&scope=skills",
@@ -911,7 +913,8 @@ pub async fn concept_submit(
                 Ok(m) => m,
                 Err(_) => return pages::not_found().into_response(),
             };
-            let cs = ConceptStore::for_user(&state.store, user.user_id, master);
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+                .with_provenance(format!("web:{}", user.username));
             match cs.put(&concept).await {
                 Ok(()) => Redirect::to(&format!(
                     "/concept?path={}",

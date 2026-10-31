@@ -1344,6 +1344,7 @@ async fn query_harness(llm_url: &str, max_parallel: u32, query_wait_secs: u32) -
         user_id,
         username: "gate-test".into(),
         role: mycelium_auth::rbac::Role::User,
+        source: mycelium_mcp::auth::api_key_source("gate-key"),
     };
     QueryHarness {
         _dir: dir,
