@@ -38,6 +38,33 @@ type QueueRow = (
     Option<String>,
 );
 
+/// Raw row shape for the two admin scans (`queue_waiting_rows`,
+/// `queue_recent_rows`) — the seven joined columns in SELECT order.
+type AdminRow = (String, String, String, String, i64, String, String);
+
+/// The shared decode behind both admin scans: a bad id/tool/status is a
+/// hard Decode error (a same-version server never writes one), and the
+/// column's empty `detail` default reads as `None` — "no error yet",
+/// which every consumer renders as nothing.
+fn decode_admin_row(row: AdminRow) -> Result<QueueWaitingRow> {
+    let (id, username, tool, status, attempts, detail, created_at) = row;
+    Ok(QueueWaitingRow {
+        id: Uuid::parse_str(&id).map_err(|_| sqlx::Error::Decode("bad queue row id".into()))?,
+        username,
+        tool: QueueTool::from_str(&tool)
+            .ok_or_else(|| sqlx::Error::Decode(format!("bad tool {tool}").into()))?,
+        status: QueueStatus::from_str(&status)
+            .ok_or_else(|| sqlx::Error::Decode(format!("bad status {status}").into()))?,
+        attempts: u32::try_from(attempts).unwrap_or(0),
+        detail: if detail.is_empty() {
+            None
+        } else {
+            Some(detail)
+        },
+        created_at,
+    })
+}
+
 impl Store {
     /// Enqueue: INSERT row in `staging` (the payload file does not
     /// exist yet). The caller must write the payload, then call
@@ -259,7 +286,7 @@ impl Store {
     /// only: no payload, no args JSON; `detail` is the bounded
     /// `short_detail` failure/provenance text the drain persists.
     pub async fn queue_waiting_rows(&self) -> Result<Vec<QueueWaitingRow>> {
-        let rows: Vec<(String, String, String, String, i64, String, String)> = sqlx::query_as(
+        let rows: Vec<AdminRow> = sqlx::query_as(
             "SELECT q.id, u.username, q.tool, q.status, q.attempts, q.detail, q.created_at
              FROM mutation_queue q
              JOIN users u ON u.id = q.user_id
@@ -268,33 +295,29 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter()
-            .map(
-                |(id, username, tool, status, attempts, detail, created_at)| {
-                    Ok(QueueWaitingRow {
-                        id: Uuid::parse_str(&id)
-                            .map_err(|_| sqlx::Error::Decode("bad queue row id".into()))?,
-                        username,
-                        tool: QueueTool::from_str(&tool).ok_or_else(|| {
-                            sqlx::Error::Decode(format!("bad tool {tool}").into())
-                        })?,
-                        status: QueueStatus::from_str(&status).ok_or_else(|| {
-                            sqlx::Error::Decode(format!("bad status {status}").into())
-                        })?,
-                        attempts: u32::try_from(attempts).unwrap_or(0),
-                        // The column is NOT NULL DEFAULT '' — an empty
-                        // detail is "no error yet", which the page
-                        // renders as nothing.
-                        detail: if detail.is_empty() {
-                            None
-                        } else {
-                            Some(detail)
-                        },
-                        created_at,
-                    })
-                },
-            )
-            .collect()
+        rows.into_iter().map(decode_admin_row).collect()
+    }
+
+    /// Receipts panel (`/status`): the most recent queue items of EVERY
+    /// status — `staging`/`pending`/`running` plus the terminal
+    /// `done`/`dead` the waiting scan hides — newest enqueue first,
+    /// capped at `limit`. Same join, columns and decode guards as
+    /// `queue_waiting_rows` (which stays the System page's waiting-only
+    /// source); ordered by `created_at` because that is the enqueue time
+    /// the panel shows an age from, and the only timestamp
+    /// `QueueWaitingRow` carries. Metadata only, exactly like the
+    /// waiting scan: no payload, no args JSON.
+    pub async fn queue_recent_rows(&self, limit: u32) -> Result<Vec<QueueWaitingRow>> {
+        let rows: Vec<AdminRow> = sqlx::query_as(
+            "SELECT q.id, u.username, q.tool, q.status, q.attempts, q.detail, q.created_at
+             FROM mutation_queue q
+             JOIN users u ON u.id = q.user_id
+             ORDER BY q.created_at DESC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(decode_admin_row).collect()
     }
 
     /// Running rows (boot sweep: a dead process left them mid-flight).

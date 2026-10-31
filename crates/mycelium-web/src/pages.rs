@@ -2391,25 +2391,81 @@ pub fn admin_system_page(
     Html(page)
 }
 
+/// The receipts card (`/status`): the most recent mutation-queue items
+/// of EVERY state — including the terminal `done`/`dead` the System
+/// page's waiting table deliberately hides — newest enqueue first,
+/// bounded by the caller's fetch (`queue_recent_rows`). It replaces the
+/// mockup's placeholder banner, which promised receipt ids and state
+/// names the queue could not yet name (issue #1); the panel shows real
+/// rows or says the queue is empty — never a fabricated receipt.
+///
+/// METADATA ONLY (receipt id, tool, state, owner, attempts, age, the
+/// drain's bounded `short_detail` text) — never the encrypted payload
+/// or args JSON. Every cell goes through `html_escape` (the page's
+/// shared helper) before entering its TrustedHtml slot, the waiting
+/// table's exact composition; an absent detail renders blank (the same
+/// empty-detail convention). The age derives from `created_at` through
+/// `fmt_waited`; a timestamp that fails to parse reads 0 — the same
+/// degradation as the waiting table's waited seconds.
+fn receipts_card(rows: &[mycelium_store::QueueWaitingRow]) -> String {
+    if rows.is_empty() {
+        return mycelium_ui::render::render(mycelium_ui::card(
+            "Receipts",
+            TrustedHtml::from_markup(r#"<p class="muted">no queue items</p>"#),
+        ));
+    }
+    let now = chrono::Utc::now();
+    let age = |ts: &str| {
+        let secs = chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+            .unwrap_or(0);
+        fmt_waited(secs)
+    };
+    let cells: Vec<Vec<TrustedHtml>> = rows
+        .iter()
+        .map(|row| {
+            vec![
+                TrustedHtml::from_markup(html_escape(&row.id.to_string())),
+                TrustedHtml::from_markup(html_escape(row.tool.as_str())),
+                TrustedHtml::from_markup(html_escape(row.status.as_str())),
+                TrustedHtml::from_markup(html_escape(&row.username)),
+                TrustedHtml::from_markup(row.attempts.to_string()),
+                TrustedHtml::from_markup(html_escape(&age(&row.created_at))),
+                TrustedHtml::from_markup(html_escape(row.detail.as_deref().unwrap_or(""))),
+            ]
+        })
+        .collect();
+    let table = mycelium_ui::render::render(mycelium_ui::data_table(
+        &[
+            "Receipt", "Tool", "Status", "User", "Attempts", "Age", "Detail",
+        ],
+        &cells,
+    ));
+    mycelium_ui::render::render(mycelium_ui::card(
+        "Receipts",
+        TrustedHtml::from_markup(table),
+    ))
+}
+
 /// Librarian status (mockup 04; admin-only per spec §6 — the page
 /// shows cross-user jobs): the mutation queue's /health surfaces as
 /// StatTiles, state chips (the /health degraded rule mirrored over the
 /// same values, plus the LLM chip on the same staleness window), the
 /// ingest-jobs table (moved here from the PR-3 System page — spec §8
-/// names /status the jobs-table home), and the issue-#1 receipt
-/// placeholder card (mockup-vs-handler item 5 — no fabricated
-/// receipts).
+/// names /status the jobs-table home), and the receipts panel over real
+/// queue rows (`receipts_card` — the issue-#1 placeholder it replaced is
+/// retired).
 ///
 /// Escaping: tile labels/values ride leptos TEXT positions inside the
-/// stat_tile primitive; the chips' texts are constants; every jobs
-/// cell is an escaped fragment in a TrustedHtml slot (the System
-/// page's exact job-row composition); the receipt banner's message is
-/// the pinned constant text.
+/// stat_tile primitive; the chips' texts are constants; every jobs and
+/// receipt cell is an escaped fragment in a TrustedHtml slot (the System
+/// page's exact job-row composition).
 pub fn librarian_status_page(
     user: &SessionUser,
     csrf: &str,
     stats: &crate::health::SystemStats,
     jobs: &[(String, String, String, String, String)],
+    receipts: &[mycelium_store::QueueWaitingRow],
 ) -> Html<String> {
     // A StatTile per queue field; absent optionals read "—".
     let absent = "—";
@@ -2480,13 +2536,9 @@ pub fn librarian_status_page(
         &["Book", "Status", "Detail", "Created", "Shelf"],
         &jobs_rows,
     ));
-    // The receipt panel — mockup-vs-handler item 5's pinned
-    // placeholder (the only place issue #1's outcome touches; no
-    // fabricated receipts).
-    let receipts_banner = mycelium_ui::render::render(mycelium_ui::banner(
-        "info",
-        "Receipt IDs and state names are pending the queue-work item (issue #1).",
-    ));
+    // The receipt panel — real queue rows newest-first, or the honest
+    // empty line (receipts_card).
+    let receipts_html = receipts_card(receipts);
     let header = mycelium_ui::render::render(mycelium_ui::page_header(
         "Librarian status",
         TrustedHtml::from_markup(""),
@@ -2497,10 +2549,7 @@ pub fn librarian_status_page(
             "Ingest jobs",
             TrustedHtml::from_markup(jobs_body),
         )),
-        mycelium_ui::render::render(mycelium_ui::card(
-            "Receipts",
-            TrustedHtml::from_markup(receipts_banner),
-        )),
+        receipts_html,
     );
     layout("Librarian status", Some(user), csrf, "/status", body)
 }

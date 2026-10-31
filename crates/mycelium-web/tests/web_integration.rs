@@ -3001,12 +3001,15 @@ async fn duplicate_bookshelf_name_reports_error_not_false_success() {
     shutdown.cancel();
 }
 
-/// Task 2 (PR 4): the Librarian status page — GET /status renders for
-/// the admin with the four queue StatTiles, the state chips, the
-/// ingest-jobs table (moved here from the PR-3 System stopgap, spec
-/// §8's PR-4 ruling), and the issue-#1 receipt placeholder; the
-/// sidebar's Librarian group carries the Status item (admin-only,
-/// spec §6).
+/// Task 2 (PR 4) + Task 6: the Librarian status page — GET /status
+/// renders for the admin with the four queue StatTiles, the state chips,
+/// the ingest-jobs table (moved here from the PR-3 System stopgap, spec
+/// §8's PR-4 ruling), and the receipts panel over real queue rows
+/// (Task 6 retired the issue-#1 placeholder): the honest empty state
+/// before any row exists, then every seeded row — terminal `done`/`dead`
+/// included — newest-first with its tool, status, user, attempts, age and
+/// escaped detail. The sidebar's Librarian group carries the Status item
+/// (admin-only, spec §6).
 #[tokio::test]
 async fn librarian_status_page() {
     let (base, shutdown, _dir, pool) = boot().await;
@@ -3113,11 +3116,15 @@ async fn librarian_status_page() {
         html.contains(r#"<td data-label="Book">status-book</td>"#),
         "seeded job row missing: {html}"
     );
-    // The issue-#1 receipt placeholder — mockup-vs-handler item 5's
-    // exact text, the only place #1's outcome touches.
+    // The receipts panel with an empty queue (Task 6): no placeholder,
+    // no fabricated row — the card says there is nothing to show.
     assert!(
-        html.contains("Receipt IDs and state names are pending the queue-work item (issue #1)."),
-        "receipt placeholder text missing: {html}"
+        !html.contains("queue-work") && !html.contains("Receipt IDs and state names are pending"),
+        "the issue-#1 receipt placeholder must be retired: {html}"
+    );
+    assert!(
+        html.contains(r#"<p class="muted">no queue items</p>"#),
+        "an empty receipts panel must say so: {html}"
     );
 
     // 2. The sidebar's Librarian group carries Status for the admin,
@@ -3127,6 +3134,107 @@ async fn librarian_status_page() {
             r#"<a href="/status" aria-current="page" class="nav-item nav-item--active">"#
         ),
         "Status nav item must be present and active for the admin: {html}"
+    );
+
+    // 3. Task 6: two TERMINAL queue rows for the admin — the states the
+    //    System page's waiting table deliberately hides and the receipts
+    //    panel exists to show. Direct SQL on the test pool (the panel
+    //    renders metadata only, so no payload blob is involved); the
+    //    dead row is the newer enqueue, and its detail is live markup
+    //    that must arrive escaped.
+    let done_id = uuid::Uuid::new_v4().to_string();
+    let dead_id = uuid::Uuid::new_v4().to_string();
+    for (id, tool, status, attempts, detail, age_secs) in [
+        (done_id.as_str(), "add", "done", 1, "integrated", 3720),
+        (
+            dead_id.as_str(),
+            "update",
+            "dead",
+            3,
+            "<script>alert(1)</script>",
+            120,
+        ),
+    ] {
+        let aged = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO mutation_queue (id, user_id, tool, status, attempts, detail,
+                                         created_at, updated_at, next_retry_at, final_paths)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(tool)
+        .bind(status)
+        .bind(attempts)
+        .bind(detail)
+        .bind(&aged)
+        .bind(&aged)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let page = client
+        .get(format!("{base}/status"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    // Headers + both rows, full receipt ids and every column.
+    for header in [
+        "Receipt", "Tool", "Status", "User", "Attempts", "Age", "Detail",
+    ] {
+        assert!(
+            html.contains(&format!("<th>{header}</th>")),
+            "receipts column {header} missing: {html}"
+        );
+    }
+    assert!(
+        html.contains(r#"<td data-label="Tool">add</td>"#)
+            && html.contains(r#"<td data-label="Status">done</td>"#)
+            && html.contains(r#"<td data-label="Attempts">1</td>"#)
+            && html.contains(r#"<td data-label="Age">1h 2m</td>"#)
+            && html.contains("<td data-label=\"Detail\">integrated</td>"),
+        "the done receipt row missing its cells: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Tool">update</td>"#)
+            && html.contains(r#"<td data-label="Status">dead</td>"#)
+            && html.contains(r#"<td data-label="Attempts">3</td>"#)
+            && html.contains(r#"<td data-label="Age">2m</td>"#),
+        "the dead receipt row missing its cells: {html}"
+    );
+    // Both owners read "admin" (the join), and the full ids render — the
+    // receipt is the thing an operator pastes into `memory_status`.
+    assert_eq!(
+        html.matches(r#"<td data-label="User">admin</td>"#).count(),
+        2,
+        "both rows must carry the joined username: {html}"
+    );
+    assert!(
+        html.contains(&done_id) && html.contains(&dead_id),
+        "full receipt ids missing ({done_id} / {dead_id}): {html}"
+    );
+    // Newest enqueue first (the dead row is the later one).
+    assert!(
+        html.find(&dead_id) < html.find(&done_id),
+        "receipts must render newest-enqueued-first: {html}"
+    );
+    // The detail path is escaped — the payload never reaches the page as
+    // live markup.
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "the dead row's detail must render escaped: {html}"
+    );
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "unescaped detail markup leaked into the page: {html}"
+    );
+    // The empty-state line is gone once there is something to show.
+    assert!(
+        !html.contains(r#"<p class="muted">no queue items</p>"#),
+        "the empty line must not stand beside real rows: {html}"
     );
 
     shutdown.cancel();
