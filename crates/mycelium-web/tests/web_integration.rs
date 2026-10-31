@@ -5001,3 +5001,1041 @@ async fn rest_put_lifecycle_reject_is_400_and_non_lifecycle_stays_500() {
 
     shutdown.cancel();
 }
+
+// ---------- Revisions REST (Task 3: index, list, snapshot, restore) ----------
+//
+// The four routes are query-param shaped (spec §3.2a-2). These tests pin
+// the happy paths (JSON + form restore variants), the dead-path behavior,
+// the 403 matrix, the 400/404 matrix, and the DELETE-missing-concept 404
+// rider. Helpers below mirror the inline login/user-creation blocks the
+// file already repeats.
+
+/// Login as the pre-seeded admin; returns (session cookie, csrf token).
+async fn login_admin(client: &reqwest::Client, base: &str) -> (String, String) {
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
+}
+
+/// Create a regular user through the real admin form, log them in;
+/// returns (session cookie, csrf token).
+async fn create_and_login_user(
+    client: &reqwest::Client,
+    base: &str,
+    admin_cookie: &str,
+    admin_csrf: &str,
+    name: &str,
+) -> (String, String) {
+    let create = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", admin_cookie)
+        .header("x-csrf-token", admin_csrf)
+        .form(&[
+            ("username", name),
+            ("email", &format!("{name}@example.com")),
+            ("password", "a long enough password here 22"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 200, "test user creation must succeed");
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", name),
+            ("password", "a long enough password here 22"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
+}
+
+/// PUT a concept into the logged-in user's private bundle via the REST
+/// route; asserts the 201.
+async fn rest_put(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    markdown: &str,
+) {
+    let r = client
+        .put(format!("{base}/api/v1/concepts{}", path))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .json(&serde_json::json!({ "markdown": markdown }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "rest put {path} must succeed");
+}
+
+/// GET the user-scope concept markdown via the REST route (asserts 200,
+/// returns the raw text/markdown body).
+async fn rest_get_markdown(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    path: &str,
+) -> String {
+    let r = client
+        .get(format!("{base}/api/v1/concepts{}", path))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "rest get {path} must succeed");
+    r.text().await.unwrap()
+}
+
+/// Restore happy paths (spec §3.2a-2): both the JSON and the native-form
+/// variants restore the recorded content, the index/list shapes and DESC
+/// order hold, and the form variant is CSRF-gated. The payload
+/// convention (§3.2a-3) is pinned too: `create` rows carry the created
+/// content; every later row carries the PRE-mutation snapshot (rev 2 =
+/// the v1 state, rev 3 = the v2 state), so restoring to revision N puts
+/// the concept back at the content that row recorded.
+#[tokio::test]
+async fn revisions_rest_round_trip_json_and_form() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Three recorded versions of one concept.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv One\n---\n\nfirst body",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Two\n---\n\nsecond body",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Three\n---\n\nthird body",
+    )
+    .await;
+
+    // Index: one path with the latest revision at the head of its chain.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 200, "revisions index must answer");
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entries = idx_json.as_array().expect("index is a JSON array");
+    let entry = entries
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .expect("the concept's path appears in the index");
+    assert_eq!(
+        entry["live"], true,
+        "a live concept's index entry is live: {entry}"
+    );
+    assert_eq!(entry["latest_no"], 3, "three puts: {entry}");
+    assert_eq!(entry["last_op"], "update", "index entry: {entry}");
+    assert!(
+        entry["last_op_at"].as_str().is_some_and(|t| !t.is_empty()),
+        "last_op_at present: {entry}"
+    );
+    // No payload text anywhere in the index (metadata only).
+    let idx_text = serde_json::to_string(&idx_json).unwrap();
+    assert!(
+        !idx_text.contains("first body") && !idx_text.contains("second body"),
+        "the index must not carry payload text: {idx_text}"
+    );
+
+    // List: DESC order, one row per revision, provenance threaded.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/rv.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "revisions list must answer");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().expect("list is a JSON array");
+    assert_eq!(rows.len(), 3, "three revisions listed: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 3, "newest first: {list_json}");
+    assert_eq!(
+        rows[0]["op"], "update",
+        "newest is the third put: {list_json}"
+    );
+    assert_eq!(rows[1]["revision_no"], 2);
+    assert_eq!(rows[1]["op"], "update");
+    assert_eq!(rows[2]["revision_no"], 1);
+    assert_eq!(rows[2]["op"], "create");
+    for row in rows {
+        assert_eq!(
+            row["source"], "web:admin",
+            "the REST put's provenance stamp lands in the row: {row}"
+        );
+        assert!(
+            row["created_at"].as_str().is_some_and(|t| !t.is_empty()),
+            "created_at present: {row}"
+        );
+        assert!(
+            row["summary"].as_str().is_some_and(|t| !t.is_empty()),
+            "summary present: {row}"
+        );
+    }
+    // No payload text in the list either.
+    let list_text = serde_json::to_string(&list_json).unwrap();
+    assert!(
+        !list_text.contains("first body") && !list_text.contains("second body"),
+        "the list must not carry payload text: {list_text}"
+    );
+
+    // Snapshot n=1: the created content (create rows carry it).
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200, "snapshot n=1 must answer");
+    assert!(
+        snap.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/markdown")),
+        "snapshot is raw markdown"
+    );
+    let snap_one = snap.text().await.unwrap();
+    assert!(
+        snap_one.contains("Rv One") && snap_one.contains("first body"),
+        "snapshot n=1 is the created v1: {snap_one}"
+    );
+    assert!(!snap_one.contains("Rv Two"), "n=1 must not show v2");
+
+    // Snapshot n=2: the update row's PRE-mutation snapshot — the
+    // recorded v1 state, byte-for-byte the same bytes the create row
+    // recorded (both are the concept as it stood after put one).
+    let snap2 = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let snap_two = snap2.text().await.unwrap();
+    assert_eq!(
+        snap_one, snap_two,
+        "rev 2 records the pre-update state of put two"
+    );
+
+    // Snapshot n=3: the third put's pre-state — the v2 content, the
+    // distinct second recorded state.
+    let snap3 = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let snap_three = snap3.text().await.unwrap();
+    assert!(
+        snap_three.contains("Rv Two") && snap_three.contains("second body"),
+        "snapshot n=3 is the pre-put state: {snap_three}"
+    );
+    assert!(!snap_three.contains("Rv Three"), "n=3 is the v2 state");
+
+    // JSON restore: application/json POST answers {"restored_to": n}
+    // and the live concept is exactly the row's recorded content (rev
+    // 3's snapshot: the v2 state).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "JSON restore must answer 200");
+    let restored: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restored["restored_to"], 3, "restore body: {restored}");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv Two") && back.contains("second body") && !back.contains("Rv Three"),
+        "the live concept is rev 3's recorded content: {back}"
+    );
+
+    // The restore itself is a recorded revision (reversible undo chain).
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/rv.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 4, "restore appended a revision: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 4);
+    assert_eq!(rows[0]["op"], "restore");
+    assert_eq!(rows[0]["source"], "web:admin");
+    assert!(
+        rows[0]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("restored to revision 3")),
+        "restore summary: {list_json}"
+    );
+    assert_eq!(rows[1]["revision_no"], 3);
+    assert_eq!(rows[1]["op"], "update");
+    assert_eq!(rows[2]["revision_no"], 2);
+    assert_eq!(rows[2]["op"], "update");
+    assert_eq!(rows[3]["revision_no"], 1);
+    assert_eq!(rows[3]["op"], "create");
+
+    // Updated index: the restore at the head, still live.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .unwrap();
+    assert_eq!(entry["latest_no"], 4, "index entry: {entry}");
+    assert_eq!(entry["last_op"], "restore", "index entry: {entry}");
+
+    // Form restore (the browser path): 303 redirect to the concept
+    // viewer; the csrf_token rides as a form field, params in the query.
+    // Restoring to rev 2 puts back ITS recorded content (the v1 state).
+    let restore2 = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore2.status(), 303, "form restore redirects");
+    assert_eq!(
+        restore2.headers().get("location").unwrap(),
+        "/concept?path=/rv.md&scope=user",
+        "form restore redirects to the concept viewer"
+    );
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv One") && back.contains("first body") && !back.contains("Rv Two"),
+        "the live concept is rev 2's recorded state: {back}"
+    );
+
+    // CSRF gate on the form variant: no token in the form body → the
+    // middleware's 403, before the handler runs — and the concept is
+    // left untouched.
+    let csrfless = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("n=2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csrfless.status(), 403, "form restore carries no CSRF token");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv One"),
+        "a rejected restore left the concept untouched: {back}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Dead paths stay in the index with live=false and the delete op; the
+/// restore undeletes; error matrix: unknown/missing n, unknown scope,
+/// missing revision, missing path, missing path param.
+#[tokio::test]
+async fn revisions_index_dead_path_and_error_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/doomed.md",
+        "---\ntype: Note\ntitle: Doomed\n---\n\ndoomed body",
+    )
+    .await;
+
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/doomed.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+
+    // The dead path stays listed (the plaintext path column carries the
+    // display name long after the registry row is gone) with the delete
+    // op at its head.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/doomed.md")
+        .expect("a deleted path stays in the index");
+    assert_eq!(entry["live"], false, "deleted is not live: {entry}");
+    assert_eq!(entry["latest_no"], 2, "create + delete: {entry}");
+    assert_eq!(entry["last_op"], "delete", "index entry: {entry}");
+
+    // The delete row's payload is the pre-delete state: the content
+    // chain survives the era (metadata says delete, the snapshot is the
+    // concept as it stood).
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200, "the deletion-era snapshot answers");
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Doomed") && snap_text.contains("doomed body"),
+        "the delete row records the pre-delete content: {snap_text}"
+    );
+
+    // The chain survives beyond the era: restoring a deleted chain's
+    // revision re-creates the concept at its original path.
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/doomed.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "undeleting restore: {restore:?}");
+    let restored: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restored["restored_to"], 1);
+    let back = rest_get_markdown(&client, &base, &cookie, "/doomed.md").await;
+    assert!(
+        back.contains("Doomed") && back.contains("doomed body"),
+        "the undeleted concept is v1 again: {back}"
+    );
+
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/doomed.md")
+        .unwrap();
+    assert_eq!(entry["live"], true, "restored to live again: {entry}");
+    assert_eq!(entry["latest_no"], 3, "index entry: {entry}");
+    assert_eq!(entry["last_op"], "restore", "index entry: {entry}");
+
+    // Error matrix.
+    // A never-existed path: snapshot 404, list a 200 empty chain, restore 404.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/nothing.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 404, "no snapshots for a path with no chain");
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/nothing.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    assert!(list_json.as_array().unwrap().is_empty());
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/nothing.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 404, "nothing to restore");
+
+    // A known path with an out-of-range revision: 404.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n=99"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 404, "revision 99 does not exist");
+
+    // n=0 → 400 (1-based); non-numeric n → 400; missing n → 400.
+    for bad_n in ["0", "abc", ""] {
+        let snap = client
+            .get(format!(
+                "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n={bad_n}"
+            ))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(snap.status(), 400, "n={bad_n:?} must be 400");
+        let json: serde_json::Value = snap.json().await.unwrap();
+        assert!(
+            json["error"].as_str().is_some(),
+            "400 body is the JSON error shape: {json}"
+        );
+    }
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 400, "snapshot requires n");
+
+    // Unknown scope → 400 on every route that reads it.
+    for url in [
+        "/api/v1/revisions?scope=admin",
+        "/api/v1/revisions/list?scope=admin&path=/doomed.md",
+        "/api/v1/revisions/snapshot?scope=admin&path=/doomed.md&n=1",
+        "/api/v1/revisions/restore?scope=admin&path=/doomed.md&n=1",
+    ] {
+        let req = if url.contains("restore") {
+            client
+                .post(format!("{base}{url}"))
+                .header("cookie", &cookie)
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            client
+                .get(format!("{base}{url}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(req.status(), 400, "unknown scope: {url}");
+    }
+
+    // A list without a path param → 400.
+    let no_path = client
+        .get(format!("{base}/api/v1/revisions/list?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_path.status(), 400, "list requires a path");
+
+    shutdown.cancel();
+}
+
+/// The 403 matrix (spec §3.2a-2): non-admin index + restore forbidden on
+/// the skills scope (any-user read stays allowed), library restore
+/// forbidden ALWAYS — admin or not, existing path or not (the perm check
+/// precedes the store) — and another user's private-bundle path follows
+/// the api_get_concept posture (not found in the caller's own scope).
+#[tokio::test]
+async fn revisions_permission_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // A skills-scope concept with a two-revision chain (form puts —
+    // writes to the skills shelf are admin-only via the form).
+    let put1 = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-rev.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk V1\n---\n\nskill first body",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put1.status(), 303);
+    let put2 = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-rev.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk V2\n---\n\nskill second body",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put2.status(), 303);
+
+    // Skills INDEX: admin only — a non-admin gets 403.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=skills"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 403, "non-admin skills index is forbidden");
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    assert!(
+        idx_json["error"].as_str().is_some(),
+        "403 body is the JSON error shape: {idx_json}"
+    );
+    // ...while the admin (and any user through list/snapshot) may read.
+    let admin_idx = client
+        .get(format!("{base}/api/v1/revisions?scope=skills"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_idx.status(), 200, "admin skills index answers");
+    let admin_idx_json: serde_json::Value = admin_idx.json().await.unwrap();
+    let entry = admin_idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/sk-rev.md")
+        .expect("skills revisions sit in the skills index: {admin_idx_json}");
+    assert_eq!(entry["latest_no"], 2, "two form puts: {entry}");
+    assert_eq!(entry["live"], true);
+    assert_eq!(entry["last_op"], "update");
+
+    // Skills LIST/SNAPSHOT: any user may read.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-rev.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "skills revisions are readable by all");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "both revisions visible: {list_json}");
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=skills&path=/sk-rev.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Sk V1") && snap_text.contains("skill first body"),
+        "mallory reads the recorded v1: {snap_text}"
+    );
+
+    // Skills RESTORE: admin only — before the store, even for a path
+    // that does not exist (no 404 oracle for the permission gate).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=skills&path=/sk-rev.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        403,
+        "non-admin skills restore is forbidden"
+    );
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=skills&path=/never-a-skill.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        403,
+        "the perm gate precedes the 404 store miss"
+    );
+
+    // Library: restore is ALWAYS forbidden — admin or not, path or not.
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=library&path=/anywhere.md&n=1"
+        ))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 403, "library restore: admin 403 too");
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=library&path=/anywhere.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 403, "library restore: non-admin 403");
+
+    // Library LIST/SNAPSHOT: shelf-visibility gated. A path whose book
+    // slug is not on a global-read shelf (here: no book row at all)
+    // follows concept_view's library-invisibility posture → 403.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=library&path=/invisible/book.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 403, "invisible library path: 403");
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/invisible/book.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 403, "invisible library path: 403");
+
+    // Another user's private-bundle path: api_get_concept posture — the
+    // route reads the CALLER's own scope, so a foreign path is "not
+    // found" (404), indistinguishable from a never-existed path.
+    rest_put(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "/a-secret.md",
+        "---\ntype: Note\ntitle: Secret\n---\n\nsecret body",
+    )
+    .await;
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/a-secret.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap.status(),
+        404,
+        "mallory's own bundle has no such path: 404"
+    );
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/a-secret.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    assert!(
+        list_json.as_array().unwrap().is_empty(),
+        "mallory's chain for that path is empty: {list_json}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Library positives: a real book ingested onto a global-read shelf —
+/// a non-admin lists and snapshots its catalog revisions (shelf
+/// visibility), and the library index itself stays admin-only.
+#[tokio::test]
+async fn revisions_library_visible_book_reads() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    for name in ["Public Shelf"] {
+        let create = client
+            .post(format!("{base}/admin/bookshelves"))
+            .header("cookie", &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .form(&[("name", name), ("global", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 303);
+    }
+
+    let boundary = "revisionsboundary1";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    // Guard: inline-ingest passive health notes (see books_count_…).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &admin_cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
+    assert_eq!(
+        upload_json["status"], "done",
+        "ingest ran inline: {upload_json}"
+    );
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Library index: admin only.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=library"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 403, "non-admin library index is forbidden");
+    let admin_idx = client
+        .get(format!("{base}/api/v1/revisions?scope=library"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_idx.status(), 200, "admin library index answers");
+    let admin_idx_json: serde_json::Value = admin_idx.json().await.unwrap();
+    let entries = admin_idx_json.as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e["path"] == "/my-book/book.md")
+        .expect("the catalog hub has revisions: {admin_idx_json}");
+    assert_eq!(entry["live"], true);
+
+    // The hub chain (global-read shelf → visible to a non-admin).
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=library&path=/my-book/book.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "visible book: mallory reads revisions");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the hub was put once: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 1);
+    assert_eq!(rows[0]["op"], "create");
+
+    // The recorded catalog snapshot carries the chapter titles.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/my-book/book.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Chapter One") && snap_text.contains("Chapter Two"),
+        "the hub's snapshot is the recorded catalog: {snap_text}"
+    );
+
+    // A chapter file's snapshot too.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/my-book/ch-1-chapter-one.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Intro text about zebras"),
+        "the chapter's snapshot is the recorded chapter text: {snap_text}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Rider (from Task 2's review): since the store fails loudly on a
+/// missing concept's delete, the REST DELETE maps the store's NotFound
+/// to 404 — a never-existed path and the re-delete of an already-deleted
+/// path both answer 404 instead of the legacy 204-swallow posture.
+#[tokio::test]
+async fn rest_delete_missing_concept_returns_404() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Never-existed path: 404.
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/never-was.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        del.status(),
+        404,
+        "deleting a concept that never existed is 404"
+    );
+    let json: serde_json::Value = del.json().await.unwrap();
+    assert_eq!(json["error"], "not found", "error shape: {json}");
+
+    // The re-delete: 204 once, then 404.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/del-target.md",
+        "---\ntype: Note\ntitle: Del Target\n---\n\nbody",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/del-target.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "first delete succeeds");
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/del-target.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 404, "the re-delete answers 404");
+
+    shutdown.cancel();
+}

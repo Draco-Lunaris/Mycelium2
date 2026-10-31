@@ -12,8 +12,8 @@ use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::Concept;
 use mycelium_core::search::SearchQuery;
 use mycelium_store::{
-    ConceptStore, FileRepo, Scope, SkillBundleError, SkillGroup, bundle_skill_files,
-    chat::ChatError, group_skills,
+    ConceptStore, FileRepo, RevisionStore, RevisionsError, Scope, SkillBundleError, SkillGroup,
+    bundle_skill_files, chat::ChatError, group_skills,
 };
 
 use crate::middleware::SessionId;
@@ -153,6 +153,17 @@ pub fn api_routes() -> Router<AppState> {
         // Skill bundle download: deterministic zip of a nested skill
         // (global shelf for everyone, private skills owner-only).
         .route("/skills/{slug}/bundle", get(skill_bundle))
+        // Concept revisions (spec §3.2a-2): the undo log's mechanical
+        // REST surfaces — the per-path index (live AND dead paths), one
+        // path's chain, one snapshot, and the restore. Query-param
+        // shaped (axum 0.8 wildcards cannot sit mid-path, so `?path=`
+        // + `?scope=` carry the concept identity; the same convention
+        // as the /concept pages). NO era or confirmation logic here —
+        // the UI's confirm interstitial is the pages layer (Task 4).
+        .route("/revisions", get(api_revisions_index))
+        .route("/revisions/list", get(api_revisions_list))
+        .route("/revisions/snapshot", get(api_revisions_snapshot))
+        .route("/revisions/restore", post(api_revisions_restore))
 }
 
 // ---------- JSON API ----------
@@ -427,6 +438,11 @@ async fn api_get_concept(
 }
 
 /// DELETE /api/v1/concepts/{path}.
+///
+/// Since the lifecycle store (Task 2) fails loudly on a missing
+/// concept's delete (the re-delete contract), a NotFound maps to 404 —
+/// the legacy FileRepo swallow (which answered 204 for a path that was
+/// never there) is gone at this layer.
 async fn api_delete_concept(
     State(state): State<AppState>,
     user: SessionUser,
@@ -440,8 +456,397 @@ async fn api_delete_concept(
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.delete(&canonical).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "not found")
+        }
         Err(e) => {
             tracing::error!(error = %e, "concept delete failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+// ---------- Revisions REST (spec §3.2a-2) ----------
+//
+// Query-param shaped: axum 0.8 `{*path}` wildcards cannot sit mid-path,
+// so the concept identity rides as `?scope=` + `?path=` (the /concept
+// pages' convention). Every route is mechanical — the era/confirmation
+// logic is the UI's (Task 4), never the API's. Perms (mirroring
+// concept_view's scope posture):
+//   READ (index/list/snapshot): user scope = the caller's own bundle;
+//   skills list/snapshot = any user; library = shelf visibility
+//   (concept_view's library posture); the INDEX of a service scope is
+//   admin only.
+//   WRITE (restore): user own / skills admin / library never.
+
+/// The revisions routes' refusal, before it becomes a `Response`: a
+/// (status, message) pair. Every refusal on these routes is a static
+/// status + text pair, so the small pair rides the `Result`'s Err
+/// variant and `revisions_reject` materializes it at the return site —
+/// a whole `Response` there would be a large-error return
+/// (clippy::result_large_err; the same shape as chat_api's `Admission`
+/// enum).
+type RevRejection = (StatusCode, &'static str);
+
+/// Materialize a refusal at its return site.
+fn revisions_reject((status, message): RevRejection) -> Response {
+    error_response(status, message)
+}
+
+/// One of the three revisions scopes (query-param values).
+#[derive(Debug, Clone, Copy)]
+enum RevScope {
+    User,
+    Skills,
+    Library,
+}
+
+impl RevScope {
+    /// Parse the `?scope=` value; absent defaults to the user's own
+    /// bundle (the ConceptQuery convention). Unknown → 400.
+    fn parse(raw: Option<&str>) -> Result<Self, RevRejection> {
+        match raw.unwrap_or("user") {
+            "user" => Ok(RevScope::User),
+            "skills" => Ok(RevScope::Skills),
+            "library" => Ok(RevScope::Library),
+            _ => Err((
+                StatusCode::BAD_REQUEST,
+                "unknown scope (user | skills | library)",
+            )),
+        }
+    }
+
+    /// The redirect/query-param spelling (library never redirects —
+    /// restores are refused there — so no string is needed).
+    fn as_param(self) -> &'static str {
+        match self {
+            RevScope::User => "user",
+            RevScope::Skills => "skills",
+            RevScope::Library => "library",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RevisionsQuery {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    /// The revision number — parsed manually so a missing/non-numeric/0
+    /// value answers the spec's 400 (a typed extractor would reject the
+    /// request with an uncontrolled body).
+    #[serde(default)]
+    n: Option<String>,
+}
+
+/// Canonicalize the query's concept path (leading slash, like every
+/// other handler); absent → 400.
+fn revisions_canonical(raw: Option<&str>) -> Result<String, RevRejection> {
+    let Some(path) = raw else {
+        return Err((StatusCode::BAD_REQUEST, "missing path"));
+    };
+    Ok(format!("/{}", path.trim_start_matches('/')))
+}
+
+/// Parse the 1-based revision number: missing/non-numeric/0 → 400.
+fn revisions_revision_no(raw: Option<&str>) -> Result<u64, RevRejection> {
+    let Some(text) = raw else {
+        return Err((StatusCode::BAD_REQUEST, "missing revision number"));
+    };
+    let no: u64 = text
+        .trim()
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid revision number"))?;
+    if no == 0 {
+        return Err((StatusCode::BAD_REQUEST, "revision numbers are 1-based"));
+    }
+    Ok(no)
+}
+
+/// Map a RevisionStore failure: a missing revision is a clean 404;
+/// everything else is a server-side fault (logged, generic body — the
+/// file's convention).
+fn revisions_error_response(e: RevisionsError, ctx: &'static str) -> Response {
+    match &e {
+        RevisionsError::NotFound { .. } => error_response(StatusCode::NOT_FOUND, "not found"),
+        other => {
+            tracing::error!(error = %other, ctx);
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// Whether `user` may read `canonical` in the library scope: the
+/// concept's book slug must sit on a global-read shelf (or the reader
+/// is an admin) — concept_view's library posture, extracted so the
+/// revisions routes share it.
+async fn library_path_visible(state: &AppState, user: &SessionUser, canonical: &str) -> bool {
+    let slug = canonical
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".md")
+        .to_string();
+    match state.store.book_by_slug(&slug).await {
+        Ok(Some(book)) => {
+            let global_read = state
+                .store
+                .bookshelf_is_global_read(book.bookshelf_id)
+                .await
+                .unwrap_or(false);
+            global_read || user.role == Role::Admin
+        }
+        _ => false,
+    }
+}
+
+/// GET /api/v1/revisions?scope= — the scope's per-path revisions index
+/// (live AND dead paths; metadata only, no payload text). User scope:
+/// the caller's own bundle; service scopes: admin only (spec §3.2a-2).
+async fn api_revisions_index(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match revisions_index_store(&state, &user, scope).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.list_paths().await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => revisions_error_response(e, "revisions index failed"),
+    }
+}
+
+/// The index route's store: user scope = own bundle (no extra gate —
+/// the session user reads their own undo log); service scopes = admin
+/// only. The returned store borrows from `state`.
+async fn revisions_index_store<'a>(
+    state: &'a AppState,
+    user: &SessionUser,
+    scope: RevScope,
+) -> Result<RevisionStore<'a>, RevRejection> {
+    match scope {
+        RevScope::User => {
+            let master = state
+                .master_key_for(user.user_id)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            Ok(RevisionStore::for_user(
+                state.store.pool(),
+                user.user_id,
+                &master,
+            ))
+        }
+        service @ (RevScope::Skills | RevScope::Library) => {
+            if user.role != Role::Admin {
+                return Err((StatusCode::FORBIDDEN, "admins only"));
+            }
+            let namespace = if matches!(service, RevScope::Skills) {
+                "skills"
+            } else {
+                "library"
+            };
+            Ok(RevisionStore::for_service(
+                state.store.pool(),
+                &state.service_key,
+                namespace,
+            ))
+        }
+    }
+}
+
+/// GET /api/v1/revisions/list?scope=&path= — one path's chain, newest
+/// first (metadata only). Read perms per concept: user own / skills any
+/// / library shelf visibility.
+async fn api_revisions_list(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match read_gate_store_scope(&state, &user, q.scope.as_deref(), &canonical).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.list(&canonical).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => revisions_error_response(e, "revisions list failed"),
+    }
+}
+
+/// GET /api/v1/revisions/snapshot?scope=&path=&n= — one recorded
+/// revision's raw markdown (the same text/markdown posture as
+/// api_get_concept). Read perms as list; `n=0` → 400 (1-based).
+async fn api_revisions_snapshot(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let n = match revisions_revision_no(q.n.as_deref()) {
+        Ok(n) => n,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match read_gate_store_scope(&state, &user, q.scope.as_deref(), &canonical).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.get(&canonical, n).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/markdown")],
+            )
+                .into_response_with_body(text),
+            Err(e) => {
+                tracing::error!(error = %e, "revision snapshot is not utf-8");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+        },
+        Err(e) => revisions_error_response(e, "revision snapshot failed"),
+    }
+}
+
+/// The shared read gate + store for the list/snapshot routes: resolves
+/// the scope (unknown → 400), applies the per-concept read perms, and
+/// opens the scope's RevisionStore (borrowing from `state`). The user
+/// scope needs the caller's master key; skills needs none (any user
+/// reads); library needs shelf visibility (concept_view's posture).
+async fn read_gate_store_scope<'a>(
+    state: &'a AppState,
+    user: &SessionUser,
+    scope_raw: Option<&str>,
+    canonical: &str,
+) -> Result<RevisionStore<'a>, RevRejection> {
+    let scope = RevScope::parse(scope_raw)?;
+    match scope {
+        RevScope::User => {
+            let master = state
+                .master_key_for(user.user_id)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            Ok(RevisionStore::for_user(
+                state.store.pool(),
+                user.user_id,
+                &master,
+            ))
+        }
+        RevScope::Skills => Ok(RevisionStore::for_service(
+            state.store.pool(),
+            &state.service_key,
+            "skills",
+        )),
+        RevScope::Library => {
+            if !library_path_visible(state, user, canonical).await {
+                return Err((StatusCode::FORBIDDEN, "bookshelf is not global-read"));
+            }
+            Ok(RevisionStore::for_service(
+                state.store.pool(),
+                &state.service_key,
+                "library",
+            ))
+        }
+    }
+}
+
+/// POST /api/v1/revisions/restore?scope=&path=&n= — apply a recorded
+/// revision through the store's normal stamped write path. WRITE perms
+/// precede the store: user own / skills admin / library ALWAYS 403.
+/// Content-Type application/json answers `{"restored_to": n}`; a form
+/// POST answers 303 to the concept viewer (the CSRF middleware gates
+/// the form variant). A snapshot that no longer parses is the caller's
+/// bad input → 400 with the concept parse error text (the same posture
+/// as the PUT-concept route's lifecycle rejects).
+async fn api_revisions_restore(
+    State(state): State<AppState>,
+    user: SessionUser,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let is_form = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let n = match revisions_revision_no(q.n.as_deref()) {
+        Ok(n) => n,
+        Err(rej) => return revisions_reject(rej),
+    };
+    // The WRITE gate doubles as the store dispatch: a forbidden scope
+    // answers 403 before any 404/other store signal (no oracle through
+    // the permission gate).
+    let result = match scope {
+        RevScope::User => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => {
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                }
+            };
+            ConceptStore::for_user(&state.store, user.user_id, master)
+                .with_provenance(format!("web:{}", user.username))
+                .restore(&canonical, n)
+                .await
+        }
+        RevScope::Skills if user.role == Role::Admin => {
+            ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            )
+            .with_provenance(format!("web:{}", user.username))
+            .restore(&canonical, n)
+            .await
+        }
+        RevScope::Skills => return error_response(StatusCode::FORBIDDEN, "admins only"),
+        RevScope::Library => return error_response(StatusCode::FORBIDDEN, "library is read-only"),
+    };
+    match result {
+        Ok(()) => {
+            crate::state::Metrics::inc(&state.metrics.concepts_written);
+            if is_form {
+                Redirect::to(&format!(
+                    "/concept?path={}&scope={}",
+                    pages::urlencoding_encode(&canonical),
+                    scope.as_param() // library never restores, so never "library"
+                ))
+                .into_response()
+            } else {
+                Json(serde_json::json!({ "restored_to": n })).into_response()
+            }
+        }
+        Err(mycelium_store::ConceptStoreError::Revisions(RevisionsError::NotFound { .. }))
+        | Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "not found")
+        }
+        Err(
+            e @ (mycelium_store::ConceptStoreError::Parse(_)
+            | mycelium_store::ConceptStoreError::Reserved(_)
+            | mycelium_store::ConceptStoreError::QueuePath(_)),
+        ) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "revision restore failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
