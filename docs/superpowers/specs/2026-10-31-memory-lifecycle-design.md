@@ -212,6 +212,51 @@ Surfaces:
 - `/admin`: embeddings section (form + probe dot), dream section (interval/enabled/backfill button + last-run readouts), system page embedding indicator.
 - Docs: `api.md` (memory_query hits default + synthesize + include_inactive; revisions REST; search_vectors lifecycle), `configuration.md` (both config rows), `deployment.md` (embeddings operator section sizing + degradation, dream schedule, revisions storage/retention).
 
+### 3.2a Implementation amendments (stream ledger, dated)
+
+### 2026-10-31 — step 2 (revisions)
+
+The following amendments bind; they are rulings recorded during step 2 planning.
+
+1. **`concept_revisions` gains `path TEXT NOT NULL`** (after `path_token`).
+   Reason: path tokens are one-way HMAC; `delete` erases the registry row
+   (`scope_files`) and the index rows, so a dead path's display name would be
+   unrecoverable — §3.2's browser page REQUIRES listing deleted paths. The
+   plaintext path matches this codebase's established SQL posture
+   (`scope_files` title/type, `search_tokens`/`search_docs` `concept_path` —
+   audit metadata in SQL; content stays encrypted). Migration 0010 is amended
+   in place (branch unmerged, migration never deployed).
+2. **Axum route naming**: `{*path}` wildcards cannot be mid-path, so §3.2's
+   "per-path `GET …/revisions`" routes concrete out as query-param routes:
+   `GET /api/v1/revisions?scope=<s>` (scope-level per-path index, dead paths
+   included, meta only), `GET /api/v1/revisions/list?scope=<s>&path=<p>`
+   (per-path revision index, meta only), `GET
+   /api/v1/revisions/snapshot?scope=<s>&path=<p>&n=<no>` (one revision's
+   markdown snapshot for diffing),
+   `POST /api/v1/revisions/restore?scope=<s>&path=<p>&n=<no>` (restore).
+3. **Revision payload convention (explicit)**: `create` rows carry the
+   created content; every other op row carries the PRE-mutation snapshot
+   (the file's raw markdown as it stood immediately before the change, no
+   re-serialization); `restore` rows that UNDELETE carry an empty payload (no
+   prior state exists). Restore-to-N therefore restores `payload(N)` literally
+   (frontmatter + body as it stood, then provenance re-stamps per §3.1), as
+   §3.2 specifies. Restoring the `delete` row reproduces pre-delete content.
+4. **Prune mechanics**: keep the newest `revision_retention` rows per
+   concept (monotonic contiguous numbering ⇒ `revision_no <= MAX -
+   retention`); pruned rows are irrecoverable. Retention is read through a
+   process-global set at boot from the sealed `lifecycle` config row
+   (clamp 25–2000 on save AND load; default 200 when the row is absent);
+   step 2 wires the boot read ahead of every seed/sweep write, step 5's
+   admin section updates it live.
+5. **Revision-op capture**: ops derive mechanically at the ConceptStore
+   boundary (`scope_files` existence ⇒ create vs update; delete path ⇒
+   delete); restore uses a dedicated `ConceptStore::restore(path, n)`; the
+   deprecated-tag boot sweep tags its writes `migration` via an explicit
+   builder (`with_revision_op("migration")`). `merge`/`consolidate` are
+   reserved tags for step 5's dream call sites. The `/mutation-queue/`
+   staging-note bypass writes NO revision (queue-internal scaffolding, not
+   user concepts).
+
 ## 4. Crypto model (unchanged invariants)
 
 - No new key hierarchy. Existing `MasterKey`/KEK/DEK layering untouched.
