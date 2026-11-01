@@ -291,7 +291,8 @@ the step-2 block binds step 2.
    exists only while a scope's sweep is failed or pending, never mid-boot:
    the sweep is awaited inline before the listener opens); `n_docs` and
    `avgdl` come from `COUNT(length)`/`SUM(length)` (NULL rows excluded from
-   both); `avgdl == 0` leaves only the tf-saturation term (no NaN).
+   both — superseded by 11 below, which restores `COUNT(*)`; read 11 for
+   the live rule); `avgdl == 0` leaves only the tf-saturation term (no NaN).
 6. **Hit shape**: both surfaces (MCP `memory_query` hits and the agent's
    `search_knowledge`) return the spec's nine fields `{scope, path, title,
    description, score, timestamp, confirmed_at, status, superseded_by}`
