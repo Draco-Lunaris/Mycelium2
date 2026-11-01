@@ -456,10 +456,12 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 /// `concurrent_runners_cannot_double_run`, `pending_job_runs_on_later_tick`,
 /// `spawn_wakes_on_notify` — `run_pending` → `ingest_one` hits the
 /// default URL and notes backend-down, or ok on a host with Ollama).
-/// Success path tests note ok only — and the passive hooks stamp
-/// success on the machine the test's own driver feeds — but none of
-/// the enumerated chat-side assertions depend on the chat machine's
-/// statics.
+/// Success-path tests elsewhere note ok only — and each client's
+/// passive hooks stamp just that client's own machine, so a chat-side
+/// success can never move an `EMBEDDING_HEALTH` snapshot. The
+/// enumerated chat-side tests instead reset `LLM_HEALTH` and pin
+/// `LLM_LAST_SUCCESS` before asserting: the guard is what protects
+/// that reset-to-read window.
 ///
 /// The embeddings client takes the same guard — exactly ten tests in
 /// `embeddings.rs::tests`:
@@ -473,18 +475,20 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 /// `embed_batch_truncates_input_at_the_char_cap`,
 /// `probe_once_returns_dims_and_rejects_over_4096`, and
 /// `a_healthy_embed_success_stamps_only_the_embeddings_machine` (which
-/// pins both machines' isolation). Eight of them drive `embed_batch`,
-/// whose passive hooks feed ONLY `EMBEDDING_HEALTH`;
+/// pins both machines' isolation). Nine of them drive `embed_batch`
+/// (the eight `embed_batch_*` pins plus the isolation pin), whose
+/// passive hooks feed ONLY `EMBEDDING_HEALTH`;
 /// `probe_once_returns_dims_and_rejects_over_4096` drives
 /// `probe_once`, which is pinned to feed NOTHING. Either way a
 /// machine-feed can never race another machine's pinned snapshot,
-/// because it is the same lock the llm-side tests hold. The pure
-/// classifier pin `backend_down_class_pins` drives no client and takes
-/// no guard, nor do the five config-row pins
-/// (defaults/clamp/roundtrip/redaction). An async mutex because the
-/// guarded tests hold it across awaits; tokio's mutex never poisons,
-/// so one failed test cannot
-/// wedge the rest.
+/// because it is the same lock the llm-side tests hold.
+///
+/// The pure classifier pin `backend_down_class_pins` constructs a raw
+/// `reqwest::Client` (127.0.0.1:1) — it drives no `EmbeddingsClient`,
+/// so no passive hook fires — and takes no guard, nor do the five
+/// config-row pins (defaults/clamp/roundtrip/redaction). An async
+/// mutex because the guarded tests hold it across awaits; tokio's
+/// mutex never poisons, so one failed test cannot wedge the rest.
 #[cfg(test)]
 pub(crate) static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
