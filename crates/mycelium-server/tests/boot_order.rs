@@ -150,4 +150,14 @@ fn embedding_health_is_synced_before_the_vector_workers() {
         "the vector worker's spawn must precede the probe task's in main.rs \
          (worker at {worker}, probe at {probe})"
     );
+    assert!(
+        probe < serve,
+        "the embeddings probe must spawn before serve() in main.rs \
+         (probe at {probe}, serve at {serve})"
+    );
+    assert!(
+        worker < serve,
+        "the vector worker must spawn before serve() in main.rs \
+         (worker at {worker}, serve at {serve})"
+    );
 }

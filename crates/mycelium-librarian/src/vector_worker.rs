@@ -375,6 +375,8 @@ impl VectorWorker {
 
             for (slot, (path, _)) in chunk.iter().enumerate() {
                 let Some(vec) = ordered.get(slot) else {
+                    tracing::warn!(scope = %scope_id, path = %path, slot,
+                        "embedding batch returned too few vectors — slot skipped (unreachable per ordered_vectors' contract, which rejects a short batch as malformed)");
                     continue;
                 };
                 match vs.upsert(path, &cfg.model, vec.len() as u32, vec).await {
@@ -487,7 +489,7 @@ impl VectorWorker {
                 Ok(master) => master,
                 Err(e) => {
                     tracing::warn!(user_id = %user_id, error = %e,
-                        "boot backlog: master key unrecoverable — user scope skipped (retries next tick)");
+                        "boot backlog: master key unrecoverable — user scope skipped (backlog resumes at the next boot; queue writes retry next tick)");
                     continue;
                 }
             };

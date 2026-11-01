@@ -956,6 +956,13 @@ async fn embedding_probe_task_reaches_green_then_red_then_disabled() {
     })
     .await;
 
+    // The probe never stamps the success sentinel: through the ok
+    // probes, the three 503s, and the recovery's ok probes above,
+    // EMB_LAST_SUCCESS stayed 0 — probe_once feeds machine + dims only
+    // (the "last success" stamp is the model-call hook's). Pinned right
+    // before the Disabled leg, the run's last phase.
+    assert_eq!(EMB_LAST_SUCCESS.load(Ordering::Relaxed), 0);
+
     // Row deleted → Disabled within two ticks.
     state.config.delete("embeddings").await.unwrap();
     poll_state_until(BackendState::Disabled, "Disabled after the row is deleted").await;
