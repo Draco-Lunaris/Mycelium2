@@ -106,6 +106,25 @@ async fn record_assigns_monotonic_revision_numbers() {
     let json = serde_json::to_string(&entries[0]).unwrap();
     assert!(json.contains("\"op\":\"update\""));
     assert!(!json.contains("type:"));
+
+    // (R3 rider) The empty-payload convention (§3.2a-3) pins at the raw
+    // layer too: a recorded EMPTY payload lists as empty in the meta,
+    // the markdown-payload rows do not. No decrypt is involved — the
+    // meta derives from the stored envelope length.
+    let n3 = rs
+        .record(path, "restore", "restored to revision 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(n3, 3, "the empty restore row joins the chain normally");
+    let empties = rs.list(path).await.unwrap();
+    assert!(
+        empties[0].payload_empty,
+        "the recorded-empty restore row lists empty: {empties:?}"
+    );
+    assert!(
+        !empties[1].payload_empty && !empties[2].payload_empty,
+        "the markdown-payload rows list non-empty"
+    );
 }
 
 #[tokio::test]
@@ -230,31 +249,14 @@ async fn list_paths_includes_dead_paths_and_liveness() {
     let alive = "/notes/alive.md";
     let dead = "/notes/dead.md";
 
-    // Through the real ConceptStore boundary, so scope_files carries the
-    // `live` side of the index. (ConceptStore does not record revisions
-    // itself yet — that wiring is Task 2; the test records explicitly.)
+    // Task 2 wired the boundary hook: the ConceptStore's own puts and
+    // deletes write the rows now. `alive` keeps a single-put chain;
+    // `dead` is put and then deleted — dead, but its chain stays listed.
     cs.put(&concept(alive, "Alive", "kept body zebra"))
-        .await
-        .unwrap();
-    rs.record(alive, "create", "concept created", &markdown("v1 alive"))
         .await
         .unwrap();
 
     cs.put(&concept(dead, "Dead", "doomed body")).await.unwrap();
-    rs.record(dead, "create", "concept created", &markdown("v1 dead"))
-        .await
-        .unwrap();
-    rs.record_as(
-        dead,
-        "update",
-        "web:dana",
-        "concept updated",
-        &markdown("v2 dead"),
-    )
-    .await
-    .unwrap();
-    // Then the concept is deleted: the registry row (and file + index
-    // rows) vanish, but the revision chain must stay listed.
     cs.delete(dead).await.unwrap();
 
     let paths = rs.list_paths().await.unwrap();
@@ -270,9 +272,17 @@ async fn list_paths_includes_dead_paths_and_liveness() {
     assert_eq!(alive_row.last_op, "create");
     assert!(!dead_row.live, "a deleted concept is dead but still listed");
     assert_eq!(dead_row.latest_no, 2);
-    assert_eq!(dead_row.last_op, "update");
+    assert_eq!(dead_row.last_op, "delete");
     assert!(!alive_row.last_op_at.is_empty());
     assert!(!dead_row.last_op_at.is_empty());
+
+    // A delete row carries the pre-delete state (hook contract §3.2a-3) —
+    // restoring it re-creates the concept (pinned fully by Task 2's
+    // restore tests; here: the dead path's chain stays nameable).
+    assert_eq!(
+        rs.get(dead, 2).await.unwrap(),
+        rs.get(dead, 1).await.unwrap()
+    );
 }
 
 #[tokio::test]
@@ -389,7 +399,11 @@ async fn retention_clamps_everywhere() {
 #[tokio::test]
 async fn sync_lifecycle_row_reads_clamped_value() {
     let _retention = retention_lock().await;
-    set_revision_retention(DEFAULT_REVISION_RETENTION);
+    // Deliberately NOT the default: an absent row must RESET the global
+    // to the default, not leave whatever was live before the sync (a
+    // sync that no-oped on the absent row would still pass a
+    // default-before/default-after assert).
+    set_revision_retention(500);
     let (_dir, store) = store().await;
     let config = ConfigStore::new(store.pool().clone());
     let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
@@ -402,7 +416,7 @@ async fn sync_lifecycle_row_reads_clamped_value() {
     assert_eq!(
         revision_retention(),
         200,
-        "absent lifecycle row keeps the default"
+        "absent lifecycle row resets the global to the default"
     );
 
     // A persisted value of 9 clamps ON LOAD: the global can never leave

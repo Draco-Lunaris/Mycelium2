@@ -167,6 +167,17 @@ pub struct RevisionEntry {
     pub source: String,
     pub summary: String,
     pub created_at: String,
+    /// The payload convention's emptiness (§3.2a-3), derived WITHOUT
+    /// decrypting: the column stores the AEAD envelope, whose
+    /// empty-plaintext length is the envelope format's fixed overhead
+    /// (`mycelium_crypto::envelope::EMPTY_ENVELOPE_LEN`) and every
+    /// non-empty payload is exactly one byte longer per byte of
+    /// plaintext — so a stored length at or under the overhead decodes
+    /// to nothing restorable. NULL and corrupt-short rows count as
+    /// empty (fail-safe in the no-restore direction). The page layer
+    /// gates restore links and the confirm interstitial on this flag.
+    #[serde(default)]
+    pub payload_empty: bool,
 }
 
 /// One path's revision chain within a scope — the revisions-browser
@@ -192,6 +203,8 @@ pub enum RevisionsError {
     NotFound { path: String, n: u64 },
     #[error("invalid revision op: {0}")]
     InvalidOp(String),
+    #[error("concept_revisions row integrity: {detail}")]
+    Corrupted { detail: String },
 }
 
 /// The revision store for ONE scope — the same per-scope identity as
@@ -385,13 +398,16 @@ impl<'a> RevisionStore<'a> {
         Ok(no)
     }
 
-    /// One path's chain, newest first — metadata only (revision_no, op,
-    /// source, summary, created_at). Deterministic order: revision_no
-    /// DESC, the contract the web revisions list renders from.
+    /// One path's chain, newest first — metadata only: revision_no, op,
+    /// source, summary, created_at, and the payload-emptiness flag (the
+    /// stored envelope's LENGTH compared against the envelope overhead —
+    /// a length comparison, never a decrypt). Deterministic order:
+    /// revision_no DESC, the contract the web revisions list renders
+    /// from.
     pub async fn list(&self, path: &str) -> Result<Vec<RevisionEntry>, RevisionsError> {
         let token = self.path_token_of(path);
-        let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
-            "SELECT revision_no, op, source, summary, created_at
+        let rows: Vec<(i64, String, String, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT revision_no, op, source, summary, created_at, LENGTH(payload)
              FROM concept_revisions
              WHERE scope_id = ? AND path_token = ?
              ORDER BY revision_no DESC",
@@ -400,18 +416,34 @@ impl<'a> RevisionStore<'a> {
         .bind(&token)
         .fetch_all(self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(
-                |(revision_no, op, source, summary, created_at)| RevisionEntry {
-                    revision_no: u64::try_from(revision_no).expect("positive revision_no"),
-                    op,
-                    source,
-                    summary,
-                    created_at,
+                |(revision_no, op, source, summary, created_at, stored_len)| {
+                    let revision_no =
+                        u64::try_from(revision_no).map_err(|_| RevisionsError::Corrupted {
+                            detail: format!("negative revision_no {revision_no}"),
+                        })?;
+                    // Emptiness is exact both ways: envelope length = the
+                    // empty-envelope overhead + plaintext length (AES-GCM
+                    // appends a fixed 16-byte tag). NULL reads as zero;
+                    // a negative LENGTH cannot occur but fails closed.
+                    let stored_len = u64::try_from(stored_len.unwrap_or(0)).map_err(|_| {
+                        RevisionsError::Corrupted {
+                            detail: format!("negative payload length {stored_len:?}"),
+                        }
+                    })?;
+                    Ok(RevisionEntry {
+                        revision_no,
+                        op,
+                        source,
+                        summary,
+                        created_at,
+                        payload_empty: stored_len
+                            <= mycelium_crypto::envelope::EMPTY_ENVELOPE_LEN as u64,
+                    })
                 },
             )
-            .collect())
+            .collect()
     }
 
     /// One revision's decoded raw markdown snapshot (frontmatter +
@@ -468,18 +500,21 @@ impl<'a> RevisionStore<'a> {
         .bind(&self.scope_id)
         .fetch_all(self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(path, latest_no, last_op, last_op_at, live)| RevisionPathEntry {
+        rows.into_iter()
+            .map(|(path, latest_no, last_op, last_op_at, live)| {
+                let latest_no =
+                    u64::try_from(latest_no).map_err(|_| RevisionsError::Corrupted {
+                        detail: format!("negative revision_no {latest_no}"),
+                    })?;
+                Ok(RevisionPathEntry {
                     path,
                     live: live != 0,
-                    latest_no: u64::try_from(latest_no).expect("positive revision_no"),
+                    latest_no,
                     last_op,
                     last_op_at,
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 
     /// Retention prune for one concept (by its path token) — exposed

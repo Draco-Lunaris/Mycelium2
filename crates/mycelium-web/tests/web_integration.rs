@@ -1149,6 +1149,23 @@ async fn skills_scoped_delete_round_trip() {
         "confirm dialog must carry scope=skills: {dlg_html}"
     );
 
+    // Positive control for the gone-check below (R5 rider): while the
+    // skill is live, the skills page does list its title — the same
+    // fetch the gone-check makes — so the post-delete absence is
+    // proven against an in-test positive, not assumed.
+    let live_skills_page = client
+        .get(format!("{base}/skills"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_skills_page.status(), 200);
+    let live_skills_html = live_skills_page.text().await.unwrap();
+    assert!(
+        live_skills_html.contains("Skills Scope Test"),
+        "skills page lists the title while live: {live_skills_html}"
+    );
+
     // (c) POST the delete exactly as the dialog/fallback form does:
     //     303 → /skills (the handler's unconditional redirect), then
     //     the authoritative checks.
@@ -1167,16 +1184,22 @@ async fn skills_scoped_delete_round_trip() {
     assert_eq!(del.status(), 303);
     assert_eq!(del.headers().get("location").unwrap(), "/skills");
 
-    // The skills-scope view 404s: the global skills concept is gone.
-    let gone = client
-        .get(format!(
-            "{base}/concept?path=/skills-scope-test.md&scope=skills"
-        ))
+    // The skills-scope concept is gone from the shelf: the skills page
+    // no longer lists it. (The SSR viewer itself now answers a
+    // dead-but-revision-tracked path with the revisions page instead
+    // of 404 — Task 4's restore links re-create a deleted concept.)
+    let skills_page = client
+        .get(format!("{base}/skills"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(gone.status(), 404, "skills concept must be gone");
+    assert_eq!(skills_page.status(), 200);
+    let skills_html = skills_page.text().await.unwrap();
+    assert!(
+        !skills_html.contains("Skills Scope Test"),
+        "skills concept must be gone: {skills_html}"
+    );
 
     // The private-bundle twin SURVIVES — the scoped delete must not
     // have misrouted into the user bundle.
@@ -4997,6 +5020,2911 @@ async fn rest_put_lifecycle_reject_is_400_and_non_lifecycle_stays_500() {
         reserved.status(),
         500,
         "non-lifecycle store errors stay 500"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------- Revisions REST (Task 3: index, list, snapshot, restore) ----------
+//
+// The four routes are query-param shaped (spec §3.2a-2). These tests pin
+// the happy paths (JSON + form restore variants), the dead-path behavior,
+// the 403 matrix, the 400/404 matrix, and the DELETE-missing-concept 404
+// rider. Helpers below mirror the inline login/user-creation blocks the
+// file already repeats.
+
+/// Login as the pre-seeded admin; returns (session cookie, csrf token).
+async fn login_admin(client: &reqwest::Client, base: &str) -> (String, String) {
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "admin"), ("password", ADMIN_PASSWORD)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
+}
+
+/// Create a regular user through the real admin form, log them in;
+/// returns (session cookie, csrf token).
+async fn create_and_login_user(
+    client: &reqwest::Client,
+    base: &str,
+    admin_cookie: &str,
+    admin_csrf: &str,
+    name: &str,
+) -> (String, String) {
+    let create = client
+        .post(format!("{base}/admin/users"))
+        .header("cookie", admin_cookie)
+        .header("x-csrf-token", admin_csrf)
+        .form(&[
+            ("username", name),
+            ("email", &format!("{name}@example.com")),
+            ("password", "a long enough password here 22"),
+            ("role", "user"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 200, "test user creation must succeed");
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[
+            ("username", name),
+            ("password", "a long enough password here 22"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_from_page(client, &format!("{base}/"), &cookie).await;
+    (cookie, csrf)
+}
+
+/// PUT a concept into the logged-in user's private bundle via the REST
+/// route; asserts the 201.
+async fn rest_put(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    markdown: &str,
+) {
+    let r = client
+        .put(format!("{base}/api/v1/concepts{}", path))
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .json(&serde_json::json!({ "markdown": markdown }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "rest put {path} must succeed");
+}
+
+/// GET the user-scope concept markdown via the REST route (asserts 200,
+/// returns the raw text/markdown body).
+async fn rest_get_markdown(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    path: &str,
+) -> String {
+    let r = client
+        .get(format!("{base}/api/v1/concepts{}", path))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "rest get {path} must succeed");
+    r.text().await.unwrap()
+}
+
+/// Restore happy paths (spec §3.2a-2): both the JSON and the native-form
+/// variants restore the recorded content, the index/list shapes and DESC
+/// order hold, and the form variant is CSRF-gated. The payload
+/// convention (§3.2a-3) is pinned too: `create` rows carry the created
+/// content; every later row carries the PRE-mutation snapshot (rev 2 =
+/// the v1 state, rev 3 = the v2 state), so restoring to revision N puts
+/// the concept back at the content that row recorded.
+#[tokio::test]
+async fn revisions_rest_round_trip_json_and_form() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Three recorded versions of one concept.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv One\n---\n\nfirst body",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Two\n---\n\nsecond body",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Three\n---\n\nthird body",
+    )
+    .await;
+
+    // Index: one path with the latest revision at the head of its chain.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 200, "revisions index must answer");
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entries = idx_json.as_array().expect("index is a JSON array");
+    let entry = entries
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .expect("the concept's path appears in the index");
+    assert_eq!(
+        entry["live"], true,
+        "a live concept's index entry is live: {entry}"
+    );
+    assert_eq!(entry["latest_no"], 3, "three puts: {entry}");
+    assert_eq!(entry["last_op"], "update", "index entry: {entry}");
+    assert!(
+        entry["last_op_at"].as_str().is_some_and(|t| !t.is_empty()),
+        "last_op_at present: {entry}"
+    );
+    // No payload text anywhere in the index (metadata only).
+    let idx_text = serde_json::to_string(&idx_json).unwrap();
+    assert!(
+        !idx_text.contains("first body") && !idx_text.contains("second body"),
+        "the index must not carry payload text: {idx_text}"
+    );
+
+    // List: DESC order, one row per revision, provenance threaded.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/rv.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "revisions list must answer");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().expect("list is a JSON array");
+    assert_eq!(rows.len(), 3, "three revisions listed: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 3, "newest first: {list_json}");
+    assert_eq!(
+        rows[0]["op"], "update",
+        "newest is the third put: {list_json}"
+    );
+    assert_eq!(rows[1]["revision_no"], 2);
+    assert_eq!(rows[1]["op"], "update");
+    assert_eq!(rows[2]["revision_no"], 1);
+    assert_eq!(rows[2]["op"], "create");
+    for row in rows {
+        assert_eq!(
+            row["source"], "web:admin",
+            "the REST put's provenance stamp lands in the row: {row}"
+        );
+        assert!(
+            row["created_at"].as_str().is_some_and(|t| !t.is_empty()),
+            "created_at present: {row}"
+        );
+        assert!(
+            row["summary"].as_str().is_some_and(|t| !t.is_empty()),
+            "summary present: {row}"
+        );
+    }
+    // No payload text in the list either.
+    let list_text = serde_json::to_string(&list_json).unwrap();
+    assert!(
+        !list_text.contains("first body") && !list_text.contains("second body"),
+        "the list must not carry payload text: {list_text}"
+    );
+
+    // Snapshot n=1: the created content (create rows carry it).
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200, "snapshot n=1 must answer");
+    assert!(
+        snap.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/markdown")),
+        "snapshot is raw markdown"
+    );
+    let snap_one = snap.text().await.unwrap();
+    assert!(
+        snap_one.contains("Rv One") && snap_one.contains("first body"),
+        "snapshot n=1 is the created v1: {snap_one}"
+    );
+    assert!(!snap_one.contains("Rv Two"), "n=1 must not show v2");
+
+    // Snapshot n=2: the update row's PRE-mutation snapshot — the
+    // recorded v1 state, byte-for-byte the same bytes the create row
+    // recorded (both are the concept as it stood after put one).
+    let snap2 = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let snap_two = snap2.text().await.unwrap();
+    assert_eq!(
+        snap_one, snap_two,
+        "rev 2 records the pre-update state of put two"
+    );
+
+    // Snapshot n=3: the third put's pre-state — the v2 content, the
+    // distinct second recorded state.
+    let snap3 = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let snap_three = snap3.text().await.unwrap();
+    assert!(
+        snap_three.contains("Rv Two") && snap_three.contains("second body"),
+        "snapshot n=3 is the pre-put state: {snap_three}"
+    );
+    assert!(!snap_three.contains("Rv Three"), "n=3 is the v2 state");
+
+    // JSON restore: application/json POST answers {"restored_to": n}
+    // and the live concept is exactly the row's recorded content (rev
+    // 3's snapshot: the v2 state).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "JSON restore must answer 200");
+    let restored: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restored["restored_to"], 3, "restore body: {restored}");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv Two") && back.contains("second body") && !back.contains("Rv Three"),
+        "the live concept is rev 3's recorded content: {back}"
+    );
+
+    // The restore itself is a recorded revision (reversible undo chain).
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/rv.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 4, "restore appended a revision: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 4);
+    assert_eq!(rows[0]["op"], "restore");
+    assert_eq!(rows[0]["source"], "web:admin");
+    assert!(
+        rows[0]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("restored to revision 3")),
+        "restore summary: {list_json}"
+    );
+    assert_eq!(rows[1]["revision_no"], 3);
+    assert_eq!(rows[1]["op"], "update");
+    assert_eq!(rows[2]["revision_no"], 2);
+    assert_eq!(rows[2]["op"], "update");
+    assert_eq!(rows[3]["revision_no"], 1);
+    assert_eq!(rows[3]["op"], "create");
+
+    // Updated index: the restore at the head, still live.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .unwrap();
+    assert_eq!(entry["latest_no"], 4, "index entry: {entry}");
+    assert_eq!(entry["last_op"], "restore", "index entry: {entry}");
+
+    // Form restore (the browser path): 303 redirect to the concept
+    // viewer; the csrf_token rides as a form field, params in the query.
+    // Restoring to rev 2 puts back ITS recorded content (the v1 state).
+    let restore2 = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore2.status(), 303, "form restore redirects");
+    assert_eq!(
+        restore2.headers().get("location").unwrap(),
+        "/concept?path=/rv.md&scope=user",
+        "form restore redirects to the concept viewer"
+    );
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv One") && back.contains("first body") && !back.contains("Rv Two"),
+        "the live concept is rev 2's recorded state: {back}"
+    );
+
+    // CSRF gate on the form variant: no token in the form body → the
+    // middleware's 403, before the handler runs — and the concept is
+    // left untouched.
+    let csrfless = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("n=2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csrfless.status(), 403, "form restore carries no CSRF token");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv One"),
+        "a rejected restore left the concept untouched: {back}"
+    );
+
+    // (Task 4 rider) The rejection is observable as "nothing was
+    // written", not just a status: the chain still ends at revision 5
+    // (the form restore's own row) — a rejected restore appended
+    // nothing and disturbed nothing.
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/revisions/list?path=/rv.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.len(),
+        5,
+        "the rejected restore appended nothing: {list:?}"
+    );
+    assert_eq!(
+        list[0]["revision_no"], 5,
+        "the head is still the good restore's row: {list:?}"
+    );
+    assert_eq!(list[0]["op"], "restore", "head op unchanged: {list:?}");
+    let idx: serde_json::Value = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = idx
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/rv.md")
+        .unwrap();
+    assert_eq!(
+        entry["latest_no"], 5,
+        "index latest_no unchanged by the rejected POST: {entry}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Dead paths stay in the index with live=false and the delete op; the
+/// restore undeletes; error matrix: unknown/missing n, unknown scope,
+/// missing revision, missing path, missing path param.
+#[tokio::test]
+async fn revisions_index_dead_path_and_error_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/doomed.md",
+        "---\ntype: Note\ntitle: Doomed\n---\n\ndoomed body",
+    )
+    .await;
+
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/doomed.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+
+    // The dead path stays listed (the plaintext path column carries the
+    // display name long after the registry row is gone) with the delete
+    // op at its head.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/doomed.md")
+        .expect("a deleted path stays in the index");
+    assert_eq!(entry["live"], false, "deleted is not live: {entry}");
+    assert_eq!(entry["latest_no"], 2, "create + delete: {entry}");
+    assert_eq!(entry["last_op"], "delete", "index entry: {entry}");
+
+    // The delete row's payload is the pre-delete state: the content
+    // chain survives the era (metadata says delete, the snapshot is the
+    // concept as it stood).
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200, "the deletion-era snapshot answers");
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Doomed") && snap_text.contains("doomed body"),
+        "the delete row records the pre-delete content: {snap_text}"
+    );
+
+    // The chain survives beyond the era: restoring a deleted chain's
+    // revision re-creates the concept at its original path.
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/doomed.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "undeleting restore: {restore:?}");
+    let restored: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restored["restored_to"], 1);
+    let back = rest_get_markdown(&client, &base, &cookie, "/doomed.md").await;
+    assert!(
+        back.contains("Doomed") && back.contains("doomed body"),
+        "the undeleted concept is v1 again: {back}"
+    );
+
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    let entry = idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/doomed.md")
+        .unwrap();
+    assert_eq!(entry["live"], true, "restored to live again: {entry}");
+    assert_eq!(entry["latest_no"], 3, "index entry: {entry}");
+    assert_eq!(entry["last_op"], "restore", "index entry: {entry}");
+
+    // Error matrix.
+    // A never-existed path: snapshot 404, list a 200 empty chain, restore 404.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/nothing.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 404, "no snapshots for a path with no chain");
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/nothing.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    assert!(list_json.as_array().unwrap().is_empty());
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/nothing.md&n=1"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 404, "nothing to restore");
+
+    // A known path with an out-of-range revision: 404.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n=99"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 404, "revision 99 does not exist");
+
+    // n=0 → 400 (1-based); non-numeric n → 400; missing n → 400.
+    for bad_n in ["0", "abc", ""] {
+        let snap = client
+            .get(format!(
+                "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md&n={bad_n}"
+            ))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(snap.status(), 400, "n={bad_n:?} must be 400");
+        let json: serde_json::Value = snap.json().await.unwrap();
+        assert!(
+            json["error"].as_str().is_some(),
+            "400 body is the JSON error shape: {json}"
+        );
+    }
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/doomed.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 400, "snapshot requires n");
+
+    // Unknown scope → 400 on every route that reads it.
+    for url in [
+        "/api/v1/revisions?scope=admin",
+        "/api/v1/revisions/list?scope=admin&path=/doomed.md",
+        "/api/v1/revisions/snapshot?scope=admin&path=/doomed.md&n=1",
+        "/api/v1/revisions/restore?scope=admin&path=/doomed.md&n=1",
+    ] {
+        let req = if url.contains("restore") {
+            client
+                .post(format!("{base}{url}"))
+                .header("cookie", &cookie)
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            client
+                .get(format!("{base}{url}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(req.status(), 400, "unknown scope: {url}");
+    }
+
+    // A list without a path param → 400.
+    let no_path = client
+        .get(format!("{base}/api/v1/revisions/list?scope=user"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_path.status(), 400, "list requires a path");
+
+    shutdown.cancel();
+}
+
+/// The 403 matrix (spec §3.2a-2): non-admin index + restore forbidden on
+/// the skills scope (any-user read stays allowed), library restore
+/// forbidden ALWAYS — admin or not, existing path or not (the perm check
+/// precedes the store) — and another user's private-bundle path follows
+/// the api_get_concept posture (not found in the caller's own scope).
+#[tokio::test]
+async fn revisions_permission_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // A skills-scope concept with a two-revision chain (form puts —
+    // writes to the skills shelf are admin-only via the form).
+    let put1 = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-rev.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk V1\n---\n\nskill first body",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put1.status(), 303);
+    let put2 = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-rev.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk V2\n---\n\nskill second body",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put2.status(), 303);
+
+    // Skills INDEX: admin only — a non-admin gets 403.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=skills"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 403, "non-admin skills index is forbidden");
+    let idx_json: serde_json::Value = idx.json().await.unwrap();
+    assert!(
+        idx_json["error"].as_str().is_some(),
+        "403 body is the JSON error shape: {idx_json}"
+    );
+    // ...while the admin (and any user through list/snapshot) may read.
+    let admin_idx = client
+        .get(format!("{base}/api/v1/revisions?scope=skills"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_idx.status(), 200, "admin skills index answers");
+    let admin_idx_json: serde_json::Value = admin_idx.json().await.unwrap();
+    let entry = admin_idx_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/sk-rev.md")
+        .expect("skills revisions sit in the skills index: {admin_idx_json}");
+    assert_eq!(entry["latest_no"], 2, "two form puts: {entry}");
+    assert_eq!(entry["live"], true);
+    assert_eq!(entry["last_op"], "update");
+
+    // Skills LIST/SNAPSHOT: any user may read.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-rev.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "skills revisions are readable by all");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "both revisions visible: {list_json}");
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=skills&path=/sk-rev.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Sk V1") && snap_text.contains("skill first body"),
+        "mallory reads the recorded v1: {snap_text}"
+    );
+
+    // Skills RESTORE: admin only — before the store, even for a path
+    // that does not exist (no 404 oracle for the permission gate).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=skills&path=/sk-rev.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        403,
+        "non-admin skills restore is forbidden"
+    );
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=skills&path=/never-a-skill.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        403,
+        "the perm gate precedes the 404 store miss"
+    );
+
+    // Library: restore is ALWAYS forbidden — admin or not, path or not.
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=library&path=/anywhere.md&n=1"
+        ))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 403, "library restore: admin 403 too");
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=library&path=/anywhere.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .header("x-csrf-token", &mallory_csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 403, "library restore: non-admin 403");
+
+    // Library LIST/SNAPSHOT: shelf-visibility gated. A path whose book
+    // slug is not on a global-read shelf (here: no book row at all)
+    // follows concept_view's library-invisibility posture → 403.
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=library&path=/invisible/book.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 403, "invisible library path: 403");
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/invisible/book.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 403, "invisible library path: 403");
+
+    // Another user's private-bundle path: api_get_concept posture — the
+    // route reads the CALLER's own scope, so a foreign path is "not
+    // found" (404), indistinguishable from a never-existed path.
+    rest_put(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "/a-secret.md",
+        "---\ntype: Note\ntitle: Secret\n---\n\nsecret body",
+    )
+    .await;
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=user&path=/a-secret.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap.status(),
+        404,
+        "mallory's own bundle has no such path: 404"
+    );
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=user&path=/a-secret.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    assert!(
+        list_json.as_array().unwrap().is_empty(),
+        "mallory's chain for that path is empty: {list_json}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Library positives: a real book ingested onto a global-read shelf —
+/// a non-admin lists and snapshots its catalog revisions (shelf
+/// visibility), and the library index itself stays admin-only.
+#[tokio::test]
+async fn revisions_library_visible_book_reads() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    for name in ["Public Shelf"] {
+        let create = client
+            .post(format!("{base}/admin/bookshelves"))
+            .header("cookie", &admin_cookie)
+            .header("x-csrf-token", &admin_csrf)
+            .form(&[("name", name), ("global", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), 303);
+    }
+
+    let boundary = "revisionsboundary1";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    // Guard: inline-ingest passive health notes (see books_count_…).
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &admin_cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
+    assert_eq!(
+        upload_json["status"], "done",
+        "ingest ran inline: {upload_json}"
+    );
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Library index: admin only.
+    let idx = client
+        .get(format!("{base}/api/v1/revisions?scope=library"))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx.status(), 403, "non-admin library index is forbidden");
+    let admin_idx = client
+        .get(format!("{base}/api/v1/revisions?scope=library"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_idx.status(), 200, "admin library index answers");
+    let admin_idx_json: serde_json::Value = admin_idx.json().await.unwrap();
+    let entries = admin_idx_json.as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e["path"] == "/my-book/book.md")
+        .expect("the catalog hub has revisions: {admin_idx_json}");
+    assert_eq!(entry["live"], true);
+
+    // The hub chain (global-read shelf → visible to a non-admin).
+    let list = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=library&path=/my-book/book.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200, "visible book: mallory reads revisions");
+    let list_json: serde_json::Value = list.json().await.unwrap();
+    let rows = list_json.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the hub was put once: {list_json}");
+    assert_eq!(rows[0]["revision_no"], 1);
+    assert_eq!(rows[0]["op"], "create");
+
+    // The recorded catalog snapshot carries the chapter titles.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/my-book/book.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Chapter One") && snap_text.contains("Chapter Two"),
+        "the hub's snapshot is the recorded catalog: {snap_text}"
+    );
+
+    // A chapter file's snapshot too.
+    let snap = client
+        .get(format!(
+            "{base}/api/v1/revisions/snapshot?scope=library&path=/my-book/ch-1-chapter-one.md&n=1"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snap.status(), 200);
+    let snap_text = snap.text().await.unwrap();
+    assert!(
+        snap_text.contains("Intro text about zebras"),
+        "the chapter's snapshot is the recorded chapter text: {snap_text}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The dead library asymmetry (the re-review correction): a replace
+/// re-ingest deletes the old chapters through `delete_book`, and every
+/// `ConceptStore::delete` records a revision row — dead library paths
+/// are ROUTINE, and the viewer serves their history read-only instead
+/// of the plain 404 the old comment wrongly justified ("nothing deletes
+/// a library concept"). Posture matches the live branch's
+/// "a history is still a read": rows render for admins AND global-read
+/// users, restore/confirm never offer (library hard-false), undelete is
+/// not implied, and no editor grid renders on a dead page.
+#[tokio::test]
+async fn dead_library_path_serves_readonly_revision_history() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[("name", "Revision Shelf"), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    // Create the book, then REPLACE it with different chapter names:
+    // the replace flow deletes the old catalog (delete_book → one
+    // revision row per concept), so `/my-book/ch-1-chapter-one.md` ends
+    // up dead-but-tracked — the routine state this fix serves.
+    for (boundary, chapters, replace) in [("dead-lib-1", BOOK, false), ("dead-lib-2", BOOK2, true)]
+    {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Revision Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ];
+        if replace {
+            fields.push(("replace", "1"));
+        }
+        let body = multipart_body(boundary, &fields, Some(("file", "book.md", chapters)));
+        let upload_json: serde_json::Value = {
+            let _health_guard = HEALTH_TEST_LOCK.lock().await;
+            let upload = client
+                .post(format!("{base}/api/v1/ingest"))
+                .header("cookie", &admin_cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upload.status(), 202);
+            upload.json().await.unwrap()
+        };
+        assert_eq!(
+            upload_json["status"], "done",
+            "ingest ran inline: {upload_json}"
+        );
+    }
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // The /revisions browser (admin-only page) lists the dead chapter
+    // row with its deleted badge and the link into the per-concept
+    // viewer — the row's target used to be a plain 404.
+    let (status, browser_html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=library").await;
+    assert_eq!(status, 200);
+    assert!(
+        browser_html.contains(r#"href="/concept?path=/my-book/ch-1-chapter-one.md&scope=library""#),
+        "the dead chapter row links into the viewer: {browser_html}"
+    );
+    assert!(
+        browser_html.contains(r#"<span class="chip chip--danger">deleted</span>"#),
+        "the dead row carries the deleted badge: {browser_html}"
+    );
+    assert!(
+        browser_html.contains(r#"<td data-label="Title">Chapter One</td>"#),
+        "the dead row's latest title decodes from the delete row's payload: {browser_html}"
+    );
+
+    for (who, cookie) in [("admin", &admin_cookie), ("mallory", &mallory_cookie)] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            cookie,
+            "path=/my-book/ch-1-chapter-one.md&scope=library",
+        )
+        .await;
+        assert_eq!(status, 200, "{who}: a dead library path serves its history");
+        assert!(
+            html.contains("Revision history (newest first)."),
+            "{who}: the history surface renders: {html}"
+        );
+        assert!(
+            html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+            "{who}: the delete row is visible in the list: {html}"
+        );
+        assert!(
+            html.contains(r#"<td data-label="Date">"#),
+            "{who}: each row renders its relative date: {html}"
+        );
+        // The read-only dead posture: no re-create editor, no restore
+        // affordance on any row (payload-empty or not — there is no
+        // restore for the scope at all), no activate offer, and no
+        // "restoring re-creates" implication (undelete is impossible
+        // for the library scope, so the page must not suggest it).
+        assert!(
+            !html.contains("editor-grid") && !html.contains("concept-editor-form"),
+            "{who}: no editor grid on a dead page: {html}"
+        );
+        assert!(
+            !html.contains(">restore<") && !html.contains("Restore revision"),
+            "{who}: no restore affordance for any revision row: {html}"
+        );
+        assert!(
+            !html.contains("Set status: active"),
+            "{who}: no activate form: {html}"
+        );
+        assert!(
+            html.contains("This concept is deleted") && !html.contains("re-creates it"),
+            "{who}: the dead note states the deletion without implying restoration: {html}"
+        );
+        assert!(
+            html.contains("(library — read-only)"),
+            "{who}: the library scope note renders: {html}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// The dead-path flow INHERITS the library visibility gate (it runs
+/// before the get): a non-admin gets 403 for a private-shelf book's
+/// dead chapter — the history never leaks through the gate — while the
+/// admin (the gate's bypass arm) reads that same dead history.
+#[tokio::test]
+async fn dead_library_private_shelf_stays_forbidden() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+
+    // private shelf: no global-read flag.
+    let create = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[("name", "Secret Dead Shelf"), ("global", "0")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 303);
+
+    for (boundary, chapters, replace) in [("deadpriv-1", BOOK, false), ("deadpriv-2", BOOK2, true)]
+    {
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("csrf_token", admin_csrf.as_str()),
+            ("bookshelf", "Secret Dead Shelf"),
+            ("slug", "secret-book"),
+            ("title", "Secret Book"),
+        ];
+        if replace {
+            fields.push(("replace", "1"));
+        }
+        let body = multipart_body(boundary, &fields, Some(("file", "book.md", chapters)));
+        let upload_json: serde_json::Value = {
+            let _health_guard = HEALTH_TEST_LOCK.lock().await;
+            let upload = client
+                .post(format!("{base}/api/v1/ingest"))
+                .header("cookie", &admin_cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(upload.status(), 202);
+            upload.json().await.unwrap()
+        };
+        assert_eq!(
+            upload_json["status"], "done",
+            "ingest ran inline: {upload_json}"
+        );
+    }
+
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Non-admin, non-visible book: 403, and the surface does not leak.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/secret-book/ch-1-chapter-one.md&scope=library",
+    )
+    .await;
+    assert_eq!(status, 403, "a private-shelf dead path stays gated: {html}");
+    assert!(
+        html.contains("bookshelf is not global-read"),
+        "the gate's message: {html}"
+    );
+    assert!(
+        !html.contains("Revision history") && !html.contains("delete"),
+        "the dead history does not leak through the 403: {html}"
+    );
+
+    // Admin: the gate's bypass arm — the same dead path serves history.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &admin_cookie,
+        "path=/secret-book/ch-1-chapter-one.md&scope=library",
+    )
+    .await;
+    assert_eq!(status, 200, "admin reads the private dead path's history");
+    assert!(
+        html.contains("Revision history (newest first)."),
+        "the admin's dead surface renders: {html}"
+    );
+    assert!(
+        !html.contains(">restore<") && !html.contains("concept-editor-form"),
+        "the admin's dead surface stays restore-free and grid-free: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Rider (from Task 2's review): since the store fails loudly on a
+/// missing concept's delete, the REST DELETE maps the store's NotFound
+/// to 404 — a never-existed path and the re-delete of an already-deleted
+/// path both answer 404 instead of the legacy 204-swallow posture.
+#[tokio::test]
+async fn rest_delete_missing_concept_returns_404() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Never-existed path: 404.
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/never-was.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        del.status(),
+        404,
+        "deleting a concept that never existed is 404"
+    );
+    let json: serde_json::Value = del.json().await.unwrap();
+    assert_eq!(json["error"], "not found", "error shape: {json}");
+
+    // The re-delete: 204 once, then 404.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/del-target.md",
+        "---\ntype: Note\ntitle: Del Target\n---\n\nbody",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/del-target.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "first delete succeeds");
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/del-target.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 404, "the re-delete answers 404");
+
+    shutdown.cancel();
+}
+
+// ---------- Revisions pages (Task 4: list, diff, restore, set-active) ----------
+
+/// GET the SSR concept page; returns (status, html). No redirects
+/// followed — the pages answer 200 in place (404/403 bodies included).
+async fn concept_page(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    query: &str,
+) -> (reqwest::StatusCode, String) {
+    let r = client
+        .get(format!("{base}/concept?{query}"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let html = r.text().await.unwrap();
+    (status, html)
+}
+
+/// The revisions list page: newest-first rows (op chip, provenance
+/// source, relative date, bounded summary, per-row restore link), the
+/// compare form with the HEAD sentinel named "current", and — without
+/// JS — the editor still front and center.
+#[tokio::test]
+async fn revisions_page_renders_rows_and_compare_form() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv One\n---\n\nfirst body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Two\n---\n\nsecond body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/rv.md",
+        "---\ntype: Note\ntitle: Rv Three\n---\n\nthird body\n",
+    )
+    .await;
+
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/rv.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Revisions"),
+        "revisions block renders: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Revision">#3</td>"#),
+        "row #3 renders: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Revision">#1</td>"#),
+        "row #1 renders: {html}"
+    );
+    let pos3 = html.find(r#"data-label="Revision">#3</td>"#).unwrap();
+    let pos1 = html.find(r#"data-label="Revision">#1</td>"#).unwrap();
+    assert!(pos3 < pos1, "rows run newest-first: {html}");
+    // Op chips: create accented, update neutral.
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--neutral">update</span></td>"#
+        ),
+        "update chip: {html}"
+    );
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--accent">create</span></td>"#
+        ),
+        "create chip: {html}"
+    );
+    // Provenance source and bounded summary.
+    assert!(
+        html.contains(r#"<td data-label="Source">web:admin</td>"#),
+        "source cell: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Summary">concept updated</td>"#)
+            && html.contains(r#"<td data-label="Summary">concept created</td>"#),
+        "summaries: {html}"
+    );
+    // Relative date ("ago" bands or "just now" on a fast clock).
+    assert!(
+        (html.contains("ago") || html.contains("just now"))
+            && html.contains(r#"<td data-label="Date">"#),
+        "relative date: {html}"
+    );
+    // Per-row restore links (revision confirm params on the page).
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1&restore_confirm=3""#)
+            && html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1&restore_confirm=1""#),
+        "per-row restore links: {html}"
+    );
+    // Compare form: GET /concept with the HEAD sentinel named "current".
+    assert!(
+        html.contains(r#"<form method="get" action="/concept""#)
+            && html.contains("concept-revisions-diff"),
+        "compare form: {html}"
+    );
+    assert!(
+        html.contains(r#"name="diff_from""#) && html.contains(r#"name="diff_to""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="">current</option>"#),
+        "HEAD sentinel: {html}"
+    );
+    assert!(
+        html.contains(r#"<option value="3">rev 3</option>"#)
+            && html.contains(r#"<option value="1">rev 1</option>"#),
+        "revision options: {html}"
+    );
+    // The editor is still the front region in list mode.
+    assert!(
+        html.contains("concept-editor-form"),
+        "editor present: {html}"
+    );
+    // No inline scripts anywhere (CSP-safe, form-driven only).
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Without the revs param the plain editor page has no revisions
+    // block at all (no restore links, no compare form).
+    let (status, plain) = concept_page(&client, &base, &cookie, "path=/rv.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !plain.contains("Revisions") && !plain.contains("restore_confirm="),
+        "plain editor carries no revisions block: {plain}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Escaping: the provenance source (hostile username), the diff's
+/// snapshot side, and every other row are rendered escaped — no raw
+/// markup can reach the page from file content or metadata.
+#[tokio::test]
+async fn revisions_page_escapes_rows_and_diff() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) = create_and_login_user(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "eviluser<img src=x onerror=alert(1)>",
+    )
+    .await;
+
+    // One hostile body, then an update — so the HEAD↔#2 diff carries
+    // the hostile v1 text on the snapshot side.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil.md",
+        "---\ntype: Note\ntitle: Evil\n---\n\n<script>alert(1)</script>\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil.md",
+        "---\ntype: Note\ntitle: Evil\n---\n\nharmless body\n",
+    )
+    .await;
+
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/evil.md&revs=1").await;
+    assert_eq!(status, 200);
+    // The provenance stamp is their hostile username — rendered ESCAPED.
+    assert!(
+        html.contains("web:eviluser&lt;img src=x onerror=alert(1)&gt;"),
+        "hostile source cell escaped: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x"),
+        "no raw injected attribute markup: {html}"
+    );
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Diff view: the snapshot's hostile body appears escaped in <pre>.
+    let (status, diff) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/evil.md&revs=1&diff_from=&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(diff.contains("<pre"), "diff renders in a pre: {diff}");
+    assert!(
+        diff.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "snapshot side escaped: {diff}"
+    );
+    assert!(
+        !diff.contains("<script>alert(1)</script>"),
+        "no raw script text: {diff}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The diff view: HEAD↔N and revision↔revision unified diffs carry both
+/// sides (current body words AND recorded snapshot words), label the
+/// two texts, and link back; broken/absent params fall back to the
+/// plain revisions list. Extremely long diffs truncate.
+#[tokio::test]
+async fn revisions_diff_view_head_and_rev_pairs() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    for (title, body) in [
+        ("Rv One", "first body"),
+        ("Rv Two", "second body"),
+        ("Rv Three", "third body"),
+    ] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/rv.md",
+            &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+        )
+        .await;
+    }
+
+    // HEAD (current) vs revision #3: both sides present.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #3"),
+        "diff heading: {html}"
+    );
+    assert!(
+        html.contains("--- current") && html.contains("+++ revision #3"),
+        "unified labels: {html}"
+    );
+    assert!(
+        html.contains("third body") && html.contains("second body"),
+        "both sides render: {html}"
+    );
+    // The editor region is replaced by the diff region.
+    assert!(
+        !html.contains("concept-editor-form"),
+        "diff view has no editor form: {html}"
+    );
+    // Still linked back to the list and the plain editor.
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user&revs=1""#),
+        "back to revisions: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/concept?path=/rv.md&scope=user""#),
+        "back to plain editor: {html}"
+    );
+    assert!(html.contains("Revisions"), "list stays below: {html}");
+
+    // Revision↔revision: #1 (v1) vs #3 (v2) — first vs second body.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=1&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from revision #1 to revision #3")
+            && html.contains("--- revision #1")
+            && html.contains("+++ revision #3"),
+        "rev-rev heading and labels: {html}"
+    );
+    assert!(
+        html.contains("first body") && html.contains("second body"),
+        "rev-rev sides: {html}"
+    );
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+
+    // Broken/absent combos fall back to the plain revisions list.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=&diff_to=",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Diff: from"),
+        "HEAD↔HEAD is the list: {html}"
+    );
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=99&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Diff: from"),
+        "a missing snapshot side falls back to the list: {html}"
+    );
+
+    // (R4 rider) A garbage STRING from-side pins page_revision_param's
+    // posture — absent/blank/non-numeric ⇒ None ⇒ the HEAD sentinel —
+    // so `diff_from=abc` resolves exactly as the blank case does: the
+    // same HEAD↔n diff (the page 200s; the non-numeric never 400s).
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&diff_from=abc&diff_to=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #3"),
+        "non-numeric from = blank from (the HEAD sentinel): {html}"
+    );
+
+    // Extremely long diffs truncate — the two sides must actually
+    // differ line-for-line, or the context radius keeps the unified
+    // output small no matter how long both texts are.
+    let big_a = "---\ntype: Note\ntitle: Big\n---\n\n".to_string() + &"line\n".repeat(4100);
+    let big_b = "---\ntype: Note\ntitle: Big\n---\n\n".to_string() + &"lineX\n".repeat(4100);
+    rest_put(&client, &base, &cookie, &csrf, "/big.md", &big_a).await;
+    rest_put(&client, &base, &cookie, &csrf, "/big.md", &big_b).await;
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/big.md&revs=1&diff_from=1&diff_to=",
+    )
+    .await;
+    assert_eq!(status, 200, "big diff answers");
+    assert!(html.contains("truncated"), "over-cap diffs say so: {html}");
+
+    shutdown.cancel();
+}
+
+/// The restore-confirm interstitial for a LIVE target: it shows what
+/// gets replaced (current vs snapshot previews) and the actual POST
+/// round-trips the snapshot's content through Task 3's restore route.
+#[tokio::test]
+async fn revisions_restore_confirm_live_and_round_trip() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    for (title, body) in [
+        ("Rv One", "first body"),
+        ("Rv Two", "second body"),
+        ("Rv Three", "third body"),
+    ] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/rv.md",
+            &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+        )
+        .await;
+    }
+
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&restore_confirm=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Restore revision #3"),
+        "confirm heading: {html}"
+    );
+    assert!(
+        html.contains("Restoring replaces the current concept"),
+        "confirm copy: {html}"
+    );
+    assert!(
+        html.contains("Current (will be replaced)") && html.contains("third body"),
+        "current preview shows what is replaced: {html}"
+    );
+    assert!(
+        html.contains("Snapshot (restored instead)") && html.contains("second body"),
+        "snapshot preview shows what comes back: {html}"
+    );
+    // The actual POST: Task 3's restore route with the params in the
+    // query and the CSRF token as a form field.
+    assert!(
+        html.contains(
+            r#"<form method="post" action="/api/v1/revisions/restore?scope=user&path=/rv.md&n=3">"#
+        ),
+        "restore form targets the REST route: {html}"
+    );
+    assert!(html.contains(r#"name="csrf_token""#), "csrf field: {html}");
+    assert!(
+        !html.contains("concept-editor-form"),
+        "interstitial replaces the editor: {html}"
+    );
+
+    // The round trip: the form POST restores the snapshot's content.
+    let posted = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/rv.md&n=3"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303, "the confirm form's POST restores");
+    let back = rest_get_markdown(&client, &base, &cookie, "/rv.md").await;
+    assert!(
+        back.contains("Rv Two") && back.contains("second body") && !back.contains("Rv Three"),
+        "the live concept is the snapshot: {back}"
+    );
+
+    // An unrecorded revision number falls back to the list page.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/rv.md&revs=1&restore_confirm=99",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Restoring replaces"),
+        "unknown revision → plain list: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Undelete: a deleted concept's page is the revisions list (no
+/// editor), the confirm interstitial says it will re-create at the
+/// path, and the POST resurrects the content.
+#[tokio::test]
+async fn revisions_undelete_confirm_on_dead_path() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/doomed.md",
+        "---\ntype: Note\ntitle: Doomed\n---\n\ndoomed body\n",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/doomed.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "delete succeeds");
+
+    // The dead path's page: the revisions list, no editor.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/doomed.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Revisions"),
+        "list renders for a dead path: {html}"
+    );
+    assert!(
+        html.contains(
+            r#"<td data-label="Operation"><span class="chip chip--danger">delete</span></td>"#
+        ),
+        "delete row: {html}"
+    );
+    assert!(
+        html.contains("re-creates it at /doomed.md"),
+        "dead-path note: {html}"
+    );
+    assert!(
+        !html.contains("concept-editor-form"),
+        "a dead concept has nothing to edit: {html}"
+    );
+    // (R2 rider) The read-only editor grid is gone too — the dead
+    // path's page is the history/undelete surface, not an editor
+    // (the concept_editor doc comment's contract).
+    assert!(
+        !html.contains("editor-grid"),
+        "a dead path renders no editor grid: {html}"
+    );
+
+    // The confirm interstitial: rev #2 is the delete row, whose
+    // snapshot is the pre-delete content — restoring it re-creates
+    // the concept at its path.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/doomed.md&revs=1&restore_confirm=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Restore revision #2") && html.contains("re-creates it at /doomed.md"),
+        "dead confirm: {html}"
+    );
+    assert!(
+        !html.contains("Current (will be replaced)"),
+        "no live content to replace: {html}"
+    );
+    assert!(
+        html.contains("Snapshot (restored instead)") && html.contains("doomed body"),
+        "snapshot preview: {html}"
+    );
+    // The restore POST resurrects the concept at its path.
+    let posted = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/doomed.md&n=2"
+        ))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303);
+    let back = rest_get_markdown(&client, &base, &cookie, "/doomed.md").await;
+    assert!(
+        back.contains("doomed body"),
+        "the concept is live again: {back}"
+    );
+
+    // (R3 rider) The chain now ends with the undelete-restore row (an
+    // EMPTY payload — spec §3.2a-3). On the live page that row's cell
+    // carries no restore link — restoring it is the snapshot-parse 400
+    // the page must not invite — while non-empty rows keep theirs.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/doomed.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("restored to revision 2"),
+        "the empty restore row renders in the list: {html}"
+    );
+    assert!(
+        !html.contains("restore_confirm=3"),
+        "the empty-payload row offers no restore link: {html}"
+    );
+    assert!(
+        html.contains("restore_confirm=2"),
+        "non-empty rows keep their restore links: {html}"
+    );
+    // And the confirm URL for the empty row falls back to the plain
+    // revisions list (the unknown-revision posture).
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/doomed.md&revs=1&restore_confirm=3",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !html.contains("Restore revision #3"),
+        "empty-payload confirm URL falls back to the list: {html}"
+    );
+    assert!(
+        html.contains("restored to revision 2"),
+        "the list renders at the fallback: {html}"
+    );
+
+    // A never-existed path has no chain: no interstitial — the legacy
+    // new-concept editor (template) still answers.
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/ghost.md&revs=1").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("concept-editor-form") && html.contains("Path (e.g. /notes/my-note.md)"),
+        "no chain → legacy new-concept editor: {html}"
+    );
+    assert!(
+        !html.contains("Revisions"),
+        "no revisions block for an untracked path: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Read-only hides restore: library scope rows never show restore
+/// links (admin or not) and there is no interstitial; a global skill
+/// is restorable only for admins — a non-admin sees the rows but no
+/// restore links.
+#[tokio::test]
+async fn revisions_restore_hidden_on_readonly_scopes() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // A two-version global skill (form-PUT into the skills shelf).
+    for (title, body) in [
+        ("Sk One", "skill first body"),
+        ("Sk Two", "skill second body"),
+    ] {
+        let put = client
+            .post(format!("{base}/concept"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[
+                ("path", "/sk-rev.md"),
+                ("scope", "skills"),
+                (
+                    "markdown",
+                    &format!("---\ntype: Note\ntitle: {title}\n---\n\n{body}\n"),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 303, "skills put");
+    }
+
+    // Mallory reads the skills concept's list without restore links.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-rev.md&scope=skills&revs=1",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<td data-label="Revision">#2</td>"#),
+        "rows render for a non-admin reader: {html}"
+    );
+    assert!(
+        !html.contains("restore_confirm="),
+        "no restore links for a skills non-admin: {html}"
+    );
+    // …but the admin's own page of the same concept offers restore.
+    let (a_status, admin_html) = concept_page(
+        &client,
+        &base,
+        &cookie,
+        "path=/sk-rev.md&scope=skills&revs=1",
+    )
+    .await;
+    assert_eq!(a_status, 200);
+    assert!(
+        admin_html.contains("restore_confirm="),
+        "admin sees restore links in skills: {admin_html}"
+    );
+    // Diff is a read — allowed for a non-admin in skills.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-rev.md&scope=skills&revs=1&diff_from=&diff_to=2",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("Diff: from current to revision #2"),
+        "skills diff readable for a non-admin: {html}"
+    );
+
+    // A global-read library book: rows render for everyone, restore
+    // links for NOBODY, and the interstitial never appears.
+    let shelf = client
+        .post(format!("{base}/admin/bookshelves"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[("name", "Public Shelf"), ("global", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shelf.status(), 303);
+    let boundary = "rvpagesboundary1";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf_token", csrf.as_str()),
+            ("bookshelf", "Public Shelf"),
+            ("slug", "my-book"),
+            ("title", "My Book"),
+        ],
+        Some(("file", "book.md", BOOK)),
+    );
+    let upload_json: serde_json::Value = {
+        let _health_guard = HEALTH_TEST_LOCK.lock().await;
+        let upload = client
+            .post(format!("{base}/api/v1/ingest"))
+            .header("cookie", &cookie)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), 202);
+        upload.json().await.unwrap()
+    };
+    assert_eq!(upload_json["status"], "done", "{upload_json}");
+
+    for (who, name) in [(&mallory_cookie, "mallory"), (&cookie, "admin")] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            who,
+            "path=/my-book/book.md&scope=library&revs=1",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Revisions") && !html.contains("restore_confirm="),
+            "library rows never offer restore ({name}): {html}"
+        );
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            who,
+            "path=/my-book/book.md&scope=library&revs=1&restore_confirm=1",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !html.contains("Restoring replaces"),
+            "no library interstitial ({name}): {html}"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+/// "Set status: active": offered for a paused (retired) concept, clears
+/// status/superseded_by while keeping valid_to, writes through the
+/// stamped store (a provenance'd update revision lands), and answers a
+/// 303 back to the viewer.
+#[tokio::test]
+async fn concept_activate_clears_status_and_superseded_by() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/paused.md",
+        "---\ntype: Note\ntitle: Paused\nstatus: retired\nsuperseded_by: /elsewhere.md\nvalid_to: 2030-01-01T00:00:00Z\n---\n\npaused body\n",
+    )
+    .await;
+
+    // The offer: a no-JS form with the path hidden in (no scope for the
+    // user shelf — the absent scope is user).
+    let (status, html) = concept_page(&client, &base, &cookie, "path=/paused.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<form method="post" action="/concept/activate">"#),
+        "activate form renders for a retired concept: {html}"
+    );
+    assert!(html.contains("Set status: active"), "{html}");
+    assert!(
+        html.contains(r#"name="path" value="/paused.md""#) && html.contains(r#"name="csrf_token""#),
+        "activate form fields: {html}"
+    );
+
+    // An active concept does not offer the button.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/live.md",
+        "---\ntype: Note\ntitle: Live\n---\n\nlive body\n",
+    )
+    .await;
+    let (status, plain) = concept_page(&client, &base, &cookie, "path=/live.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !plain.contains("/concept/activate"),
+        "no activate offer for an active concept: {plain}"
+    );
+
+    // POST (form-encoded, csrf as a field): 303 back to the viewer.
+    let posted = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("path=/paused.md&csrf_token={csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), 303, "activate redirects");
+    assert_eq!(
+        posted.headers().get("location").unwrap(),
+        "/concept?path=/paused.md&scope=user"
+    );
+
+    // The concept is unpause: no status, no superseded_by, valid_to
+    // untouched, content intact.
+    let back = rest_get_markdown(&client, &base, &cookie, "/paused.md").await;
+    assert!(back.contains("paused body"), "body kept: {back}");
+    assert!(
+        !back.contains("status:") && !back.contains("superseded_by:"),
+        "status and superseded_by cleared: {back}"
+    );
+    assert!(back.contains("valid_to: "), "valid_to is untouched: {back}");
+
+    // The offer is gone and the activation wrote a stamped revision.
+    let (status, after) = concept_page(&client, &base, &cookie, "path=/paused.md").await;
+    assert_eq!(status, 200);
+    assert!(
+        !after.contains("/concept/activate"),
+        "no activate offer after activation: {after}"
+    );
+    let list = client
+        .get(format!("{base}/api/v1/revisions/list?path=/paused.md"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let rows: Vec<serde_json::Value> = list.json().await.unwrap();
+    assert_eq!(rows.len(), 2, "the activation wrote one revision: {rows:?}");
+    assert_eq!(rows[0]["op"], "update");
+    assert_eq!(
+        rows[0]["source"], "web:admin",
+        "stamped store put: {rows:?}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Activate's permission matrix: skills non-admin 403 (and nothing is
+/// written), library always 403 (before any store work — a nonexistent
+/// path in a refused scope must not oracle), unknown path 404, and the
+/// CSRFless form variant hits the middleware 403.
+#[tokio::test]
+async fn concept_activate_permission_matrix() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // A paused (superseded) skill by the admin — also proves the offer
+    // fires for the superseded status, not just retired.
+    let put = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .form(&[(
+            "path",
+            "/sk-paused.md",
+        ), (
+            "scope",
+            "skills",
+        ), (
+            "markdown",
+            "---\ntype: Note\ntitle: Sk Paused\nstatus: superseded\nsuperseded_by: /other.md\n---\n\nsk body\n",
+        )])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 303, "skills seed put");
+
+    // Skills non-admin: 403, and nothing is written (no revision
+    // appended). Also proves the superseded status is recognized.
+    let denied = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "path=/sk-paused.md&scope=skills&csrf_token={mallory_csrf}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403, "skills activate is admin-only");
+    let rows: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-paused.md"
+        ))
+        .header("cookie", &mallory_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the 403 wrote nothing: {rows:?}");
+
+    // Unknown path in the user scope: 404.
+    let missing = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("path=/nowhere.md&csrf_token={mallory_csrf}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404, "unknown concept → 404");
+
+    // The library is always read-only for activate — and the 403
+    // answers before the store (the path need not exist to answer).
+    let library = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "path=/nowhere-at-all.md&scope=library&csrf_token={csrf}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(library.status(), 403, "library activate refuses");
+
+    // The CSRFless form variant hits the middleware's 403.
+    let csrfless = client
+        .post(format!("{base}/concept/activate"))
+        .header("cookie", &mallory_cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("path=/sk-paused.md&scope=skills")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csrfless.status(), 403, "activate carries a CSRF check");
+    let admin_rows: Vec<serde_json::Value> = client
+        .get(format!(
+            "{base}/api/v1/revisions/list?scope=skills&path=/sk-paused.md"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_rows.len(),
+        1,
+        "no refused activate wrote anything: {admin_rows:?}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The skills shelf's LIVE branch offers "Set status: active" to the
+/// skills admin for a paused global skill — either pausing status
+/// (retired or superseded; the POST endpoint already accepts them,
+/// proven by concept_activate_permission_matrix) — and a non-admin
+/// (a global-read user) sees no offer: the offer is editable-gated.
+/// Rationale (Task 4 rider R1): the plan's per-concept rule is
+/// unqualified by scope, and step 5's dream retires global:skills
+/// concepts — an admin needs the UI revive path.
+#[tokio::test]
+async fn skills_concept_activate_offer_admin_only() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &cookie, &csrf, "mallory").await;
+
+    // Both pausing statuses, seeded on the global skills shelf (the
+    // form-PUT shape concept_activate_permission_matrix proves works;
+    // each row's lifecycle fields copy that test's known-good seed).
+    let retired_md = "---\ntype: Skill\ntitle: Sk Retired\nstatus: retired\nsuperseded_by: /elsewhere.md\nvalid_to: 2030-01-01T00:00:00Z\n---\n\nsk body\n";
+    let superseded_md = "---\ntype: Skill\ntitle: Sk Superseded\nstatus: superseded\nsuperseded_by: /other.md\n---\n\nsk body\n";
+    for (path, markdown) in [
+        ("/sk-retired.md", retired_md),
+        ("/sk-superseded.md", superseded_md),
+    ] {
+        let put = client
+            .post(format!("{base}/concept"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .form(&[("path", path), ("scope", "skills"), ("markdown", markdown)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 303, "skills seed put {path}");
+    }
+
+    // (a) The skills admin's page of a paused skill offers the
+    // activate affordance for either status, posting the skills scope.
+    for path in ["/sk-retired.md", "/sk-superseded.md"] {
+        let (status, html) = concept_page(
+            &client,
+            &base,
+            &cookie,
+            &format!("path={path}&scope=skills"),
+        )
+        .await;
+        assert_eq!(status, 200, "{path} page loads for the admin");
+        assert!(
+            html.contains(r#"<form method="post" action="/concept/activate">"#)
+                && html.contains("Set status: active"),
+            "activate offer on a paused skill ({path}): {html}"
+        );
+        assert!(
+            html.contains(r#"name="scope" value="skills""#),
+            "the offer posts the skills scope ({path}): {html}"
+        );
+    }
+
+    // (b) A non-admin (global read) loads the same page: no offer.
+    let (status, html) = concept_page(
+        &client,
+        &base,
+        &mallory_cookie,
+        "path=/sk-retired.md&scope=skills",
+    )
+    .await;
+    assert_eq!(status, 200, "the non-admin still views the concept");
+    assert!(
+        !html.contains("/concept/activate") && !html.contains("Set status: active"),
+        "no activate offer for a non-admin: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------- Revisions browser page (Task 5: the scope-level index) ----------
+
+/// GET the revisions browser page (returns status + HTML body; empty
+/// query → `/revisions?`, the user's own bundle).
+async fn revisions_browser_page(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    query: &str,
+) -> (reqwest::StatusCode, String) {
+    let r = client
+        .get(format!("{base}/revisions?{query}"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let html = r.text().await.unwrap();
+    (status, html)
+}
+
+/// The user-scope browser (Task 5's row shape): the caller's own paths —
+/// live AND deleted — with live/deleted badges, last-op chips and dates
+/// in path order, and every path linking into Task 4's per-path view
+/// (dead paths included — the deleted row's link opens its history
+/// page, which now exists).
+#[tokio::test]
+async fn revisions_browser_user_scope_lists_paths_badges_links() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Live path: two revisions (create + update); deleted path: create
+    // + delete (the REST delete records its row at the boundary).
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a-live.md",
+        "---\ntype: Note\ntitle: Live One\n---\n\nfirst live body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a-live.md",
+        "---\ntype: Note\ntitle: Live Two\n---\n\nsecond live body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/b-dead.md",
+        "---\ntype: Note\ntitle: Dead One\n---\n\ndead body\n",
+    )
+    .await;
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/b-dead.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204, "the delete must land (dead path)");
+
+    // The browser page: no scope param → the user's own bundle.
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page must render: {html}");
+    // Both paths listed; rows run in path order (a-live < b-dead).
+    let pos_a = html.find("/a-live.md").expect("live path listed");
+    let pos_b = html
+        .find("/b-dead.md")
+        .expect("a deleted path is listed unconditionally");
+    assert!(pos_a < pos_b, "rows run in path order: {html}");
+    // Badges: the live row carries the live chip, the deleted row the
+    // deleted one.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#),
+        "live badge: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">deleted</span>"#),
+        "deleted badge: {html}"
+    );
+    // Every row links into the per-path view with its scope spelled.
+    assert!(
+        html.contains(r#"href="/concept?path=/a-live.md&scope=user""#),
+        "live row link: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/concept?path=/b-dead.md&scope=user""#),
+        "deleted row link: {html}"
+    );
+    // Last op renders as the op chip: update on the live row, delete on
+    // the dead one.
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">update</span>"#),
+        "update chip: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+        "delete chip: {html}"
+    );
+    // Dates render (relative bands or "just now" on a fast clock).
+    assert!(
+        html.contains(r#"<td data-label="Last op at">"#)
+            && (html.contains("ago") || html.contains("just now")),
+        "last-op dates: {html}"
+    );
+
+    // Functional link: the deleted path's row link opens Task 4's
+    // history-only page for the dead path (its restore lives there).
+    let (status, page) = concept_page(&client, &base, &cookie, "path=/b-dead.md&scope=user").await;
+    assert_eq!(status, 200, "the dead path's per-path page loads");
+    assert!(
+        page.contains("concept deleted"),
+        "the dead path's history renders from the link target: {page}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The title column decodes the NEWEST PAYLOAD (spec §3.2a-3's payload
+/// convention, the page's named source): an updated concept shows the
+/// title as it stood BEFORE its newest recorded op — not the live
+/// frontmatter ("Titled Two", not the live "Titled Three"); after a
+/// delete it shows the pre-delete title; and a live row whose newest
+/// payload is empty (the undelete-restore row records NO payload) falls
+/// back to the registry's live title.
+#[tokio::test]
+async fn revisions_browser_title_column_from_newest_payload() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (cookie, csrf) = login_admin(&client, &base).await;
+
+    // Three puts: One (create), Two, Three. The newest payload (rev 3)
+    // records the PRE-put state of the third put — the "Two" content.
+    for title in ["One", "Two", "Three"] {
+        rest_put(
+            &client,
+            &base,
+            &cookie,
+            &csrf,
+            "/titled.md",
+            &format!("---\ntype: Note\ntitle: Titled {title}\n---\n\n{title} body\n"),
+        )
+        .await;
+    }
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page must render: {html}");
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Two</td>"#),
+        "the newest payload's title (the third put's pre-state) renders: {html}"
+    );
+    assert!(
+        !html.contains("Titled Three"),
+        "the live title is not this page's source: {html}"
+    );
+
+    // Delete: the delete row's payload is the pre-delete content — the
+    // page still names the path's last recorded title.
+    let del = client
+        .delete(format!("{base}/api/v1/concepts/titled.md"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 204);
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Three</td>"#),
+        "the delete row's payload (pre-delete state) supplies the title: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--danger">delete</span>"#),
+        "the dead row says delete: {html}"
+    );
+
+    // Undeleting restore: the newest row carries NO payload (§3.2a-3's
+    // empty undelete-restore row) while the path is live again — the
+    // title falls back to the registry's live title (the one truth the
+    // undo log's payload column can't give).
+    let restore = client
+        .post(format!(
+            "{base}/api/v1/revisions/restore?scope=user&path=/titled.md&n=4"
+        ))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "the undelete restore lands");
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#),
+        "restored to live: {html}"
+    );
+    assert!(
+        html.contains(r#"<td data-label="Title">Titled Three</td>"#),
+        "live registry title on the empty-payload row: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Service-scope browses are admin-only PAGES — a non-admin gets the
+/// 403 in place (never a redirect: a redirect is discoverable signal),
+/// no rows leak on the denial — while the admin renders the scope's
+/// rows (title decoded from the newest payload) and its empty library
+/// state. An unknown scope is a 400 (the REST parse's convention).
+#[tokio::test]
+async fn revisions_browser_service_scopes_admin_only() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, _mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // A skills-scope concept with a chain, so the admin's page has a row.
+    let put = client
+        .post(format!("{base}/concept"))
+        .header("cookie", &admin_cookie)
+        .header("x-csrf-token", &admin_csrf)
+        .form(&[
+            ("path", "/sk-browser.md"),
+            ("scope", "skills"),
+            (
+                "markdown",
+                "---\ntype: Skill\ntitle: Sk Browser\n---\n\nskill body\n",
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 303, "skills seed put");
+
+    // Non-admin: 403 on BOTH service scopes — in place, and nothing of
+    // the scope's content leaks through the denial.
+    for scope in ["skills", "library"] {
+        let r = client
+            .get(format!("{base}/revisions?scope={scope}"))
+            .header("cookie", &mallory_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "non-admin {scope} browser is forbidden");
+        assert!(
+            r.headers().get("location").is_none(),
+            "the 403 must not redirect ({scope})"
+        );
+        let body = r.text().await.unwrap();
+        assert!(
+            !body.contains("sk-browser"),
+            "no scoped rows leak through the 403 ({scope}): {body}"
+        );
+    }
+    // ...while the user scope needs no admin (and a non-admin's page
+    // offers no service-scope chips they could not reach).
+    let (status, own_html) = revisions_browser_page(&client, &base, &mallory_cookie, "").await;
+    assert_eq!(status, 200, "the user scope needs no admin: {own_html}");
+    assert!(
+        !own_html.contains("/revisions?scope=skills")
+            && !own_html.contains("/revisions?scope=library"),
+        "no service-scope chips on a non-admin's page: {own_html}"
+    );
+
+    // Admin: the skills scope renders the row and links into the
+    // per-path page; the library scope renders (empty state here — no
+    // ingest needed to pin the page's shape).
+    let (status, html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=skills").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(r#"href="/concept?path=/sk-browser.md&scope=skills""#),
+        "skills row link carries the scope: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="chip chip--neutral">live</span>"#)
+            && html.contains(r#"<td data-label="Title">Sk Browser</td>"#),
+        "skills row badge + decoded title: {html}"
+    );
+    let (status, page) = concept_page(
+        &client,
+        &base,
+        &admin_cookie,
+        "path=/sk-browser.md&scope=skills",
+    )
+    .await;
+    assert_eq!(status, 200, "the row's link target loads");
+    assert!(
+        page.contains("Sk Browser"),
+        "the row's link target renders the concept: {page}"
+    );
+    let (status, html) =
+        revisions_browser_page(&client, &base, &admin_cookie, "scope=library").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("No revisions yet"),
+        "an empty scope renders the empty state: {html}"
+    );
+    assert!(
+        html.contains(r#"href="/revisions?scope=skills""#)
+            && html.contains(r#"href="/revisions?scope=user""#),
+        "the admin's scope-switch chips: {html}"
+    );
+
+    // Unknown scope → 400 (the REST parse's convention, shared).
+    let r = client
+        .get(format!("{base}/revisions?scope=nope"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "unknown scope is a bad request");
+
+    shutdown.cancel();
+}
+
+/// The browser lists the CALLER's own user store only (the session
+/// user's id scopes `RevisionStore::for_user`): another user's private
+/// bundle never crosses the page — no path, no decoded title. And the
+/// page navigates without script: anchors only (no forms, no inline
+/// scripts anywhere).
+#[tokio::test]
+async fn revisions_browser_owner_isolation_and_no_js() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (mallory_cookie, mallory_csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    rest_put(
+        &client,
+        &base,
+        &admin_cookie,
+        &admin_csrf,
+        "/admin-secret.md",
+        "---\ntype: Note\ntitle: Admin Secret\n---\n\nadmin body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &mallory_cookie,
+        &mallory_csrf,
+        "/mallory.md",
+        "---\ntype: Note\ntitle: Mallory Note\n---\n\nmallory body\n",
+    )
+    .await;
+
+    // Mallory's page: her row only; neither the admin's path nor title.
+    let (status, html) = revisions_browser_page(&client, &base, &mallory_cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    assert!(html.contains("/mallory.md"), "her own row: {html}");
+    assert!(
+        !html.contains("admin-secret"),
+        "another user's path is invisible: {html}"
+    );
+    assert!(
+        !html.contains("Admin Secret"),
+        "another user's title is invisible: {html}"
+    );
+
+    // No script, no forms: navigation is anchors alone (no-JS usable).
+    assert!(!html.contains("<script>"), "no inline scripts: {html}");
+    assert!(
+        !html.contains("<form"),
+        "nothing on the page needs JS: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Escape parity with `revisions_page_escapes_rows_and_diff` (Task 4):
+/// hostile content RECORD in the newest snapshot's bytes — a `<script>`
+/// title and an attribute-injecting `<img>` title — reaches the
+/// browser page's raw-markup title slot ONLY escaped (`&lt;…&gt;`),
+/// never as live markup. The hostile body riding the same snapshot is
+/// inert here (a browser row renders titles, not bodies).
+#[tokio::test]
+async fn revisions_browser_page_escapes_hostile_payload_content() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil1.md",
+        "---\ntype: Note\ntitle: <script>alert('t')</script>\n---\n\nbody\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/evil2.md",
+        "---\ntype: Note\ntitle: <img src=x onerror=alert(1)>\n---\n\n<script>alert('b')</script>\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    // Both recorded titles render ESCAPED — hostile snapshot bytes can
+    // only compose into the trusted-markup slot through html_escape.
+    assert!(
+        html.contains("&lt;script&gt;alert('t')&lt;/script&gt;"),
+        "script title escaped: {html}"
+    );
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "img title escaped: {html}"
+    );
+    assert!(
+        !html.contains("<script>alert"),
+        "no raw script title text: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x onerror"),
+        "no raw injected attribute markup: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// Hostile-PATH escape pin (Task 5 re-review rider): the REST put
+/// route's canonicalization is leading-slash ONLY (no character
+/// whitelist), so a concept at a path carrying `<script>` markup IS
+/// seedable. The browser page's path cell must render that anchor text
+/// `html_escape`d like every other user-derived fragment — the href
+/// already carries the path percent-encoded, the cell text must arrive
+/// as `&lt;`/`&gt;` entities with no raw `<script>` markup anywhere in
+/// the page (same assertion shape as
+/// `revisions_browser_page_escapes_hostile_payload_content` for record
+/// content).
+#[tokio::test]
+async fn revisions_browser_page_escapes_hostile_path_markup() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Seedable through the real REST route (201 pinned by rest_put).
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/a<script>b.md",
+        "---\ntype: Note\ntitle: Path Shape\n---\n\nbody\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "scope=user").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    // The row's path cell renders the path ESCAPED — composing the raw
+    // path into the cell would leave live `<script>` markup in the page.
+    assert!(
+        html.contains("/a&lt;script&gt;b.md"),
+        "path escaped in the row cell: {html}"
+    );
+    assert!(
+        !html.contains("<script>"),
+        "no raw script markup from the path: {html}"
+    );
+
+    shutdown.cancel();
+}
+
+/// The registry-title fallback is EXCLUSIVE to empty-payload rows: a
+/// live concept whose newest recorded payload decodes fine but has NO
+/// title in frontmatter shows the muted `(no title)` placeholder — the
+/// CURRENT live title is never substituted for what the undo log
+/// recorded (that would make the title column lie about the snapshot).
+#[tokio::test]
+async fn revisions_browser_untitled_payload_keeps_placeholder_not_registry() {
+    let (base, shutdown, _dir, _pool) = boot().await;
+    let client = client();
+    let (admin_cookie, admin_csrf) = login_admin(&client, &base).await;
+    let (cookie, csrf) =
+        create_and_login_user(&client, &base, &admin_cookie, &admin_csrf, "mallory").await;
+
+    // Create titleless, then an update that ADDS the title: the newest
+    // recorded snapshot (the update's pre-mutation state) is still
+    // titleless while the live concept is titled.
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/untitled-now.md",
+        "---\ntype: Note\n---\n\nfirst body\n",
+    )
+    .await;
+    rest_put(
+        &client,
+        &base,
+        &cookie,
+        &csrf,
+        "/untitled-now.md",
+        "---\ntype: Note\ntitle: Live Titled\n---\n\nsecond body\n",
+    )
+    .await;
+
+    let (status, html) = revisions_browser_page(&client, &base, &cookie, "").await;
+    assert_eq!(status, 200, "the page renders: {html}");
+    assert!(
+        html.contains(r#"href="/concept?path=/untitled-now.md&scope=user""#),
+        "the row is present: {html}"
+    );
+    assert!(
+        html.contains(r#"<span class="muted">(no title)</span>"#),
+        "the untitled snapshot shows the placeholder: {html}"
+    );
+    assert!(
+        !html.contains("Live Titled"),
+        "the live title is never substituted for the recorded one: {html}"
     );
 
     shutdown.cancel();

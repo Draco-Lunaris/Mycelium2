@@ -9,6 +9,11 @@
 //! runs against `DEFAULT_CAPACITY` instead of the operator's
 //! `max_parallel`.
 //!
+//! The memory-lifecycle spec §3.2a-4 adds a second guard on the same
+//! principle: revision retention must be synced from the stored
+//! `lifecycle` row BEFORE the packaged-skill seed, because the seed
+//! writes concepts (and revisions) — retention must be live first.
+//!
 //! This is asserted over `src/main.rs`'s source rather than by timing:
 //! the ordering is a property of the boot sequence, and a runtime probe
 //! of it would be a race.
@@ -55,4 +60,19 @@ fn llm_gate_is_synced_before_the_boot_sweeps_and_workers() {
             "the LLM gate sync must come before {what} in main.rs (sync at {sync}, {what} at {at})"
         );
     }
+}
+
+#[test]
+fn lifecycle_retention_is_synced_before_the_packaged_skill_seed() {
+    let src = main_rs();
+    // Retention sync (memory-lifecycle spec §3.2a-4).
+    let sync = only_at(&src, "sync_lifecycle_from_store(");
+    // The seed writes concepts (and revisions) — retention must be live.
+    let seed = only_at(&src, "seed_packaged_skills(");
+
+    assert!(
+        sync < seed,
+        "the lifecycle sync must come before the packaged-skill seed in main.rs \
+         (sync at {sync}, seed at {seed})"
+    );
 }

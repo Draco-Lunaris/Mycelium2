@@ -6,14 +6,15 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use similar::TextDiff;
 use uuid::Uuid;
 
 use mycelium_auth::rbac::{Role, SessionUser};
-use mycelium_core::concept::Concept;
+use mycelium_core::concept::{Concept, LifecycleStatus};
 use mycelium_core::search::SearchQuery;
 use mycelium_store::{
-    ConceptStore, FileRepo, Scope, SkillBundleError, SkillGroup, bundle_skill_files,
-    chat::ChatError, group_skills,
+    ConceptStore, FileRepo, RevisionPathEntry, RevisionStore, RevisionsError, Scope,
+    SkillBundleError, SkillGroup, bundle_skill_files, chat::ChatError, group_skills,
 };
 
 use crate::middleware::SessionId;
@@ -153,6 +154,17 @@ pub fn api_routes() -> Router<AppState> {
         // Skill bundle download: deterministic zip of a nested skill
         // (global shelf for everyone, private skills owner-only).
         .route("/skills/{slug}/bundle", get(skill_bundle))
+        // Concept revisions (spec §3.2a-2): the undo log's mechanical
+        // REST surfaces — the per-path index (live AND dead paths), one
+        // path's chain, one snapshot, and the restore. Query-param
+        // shaped (axum 0.8 wildcards cannot sit mid-path, so `?path=`
+        // + `?scope=` carry the concept identity; the same convention
+        // as the /concept pages). NO era or confirmation logic here —
+        // the UI's confirm interstitial is the pages layer (Task 4).
+        .route("/revisions", get(api_revisions_index))
+        .route("/revisions/list", get(api_revisions_list))
+        .route("/revisions/snapshot", get(api_revisions_snapshot))
+        .route("/revisions/restore", post(api_revisions_restore))
 }
 
 // ---------- JSON API ----------
@@ -427,6 +439,11 @@ async fn api_get_concept(
 }
 
 /// DELETE /api/v1/concepts/{path}.
+///
+/// Since the lifecycle store (Task 2) fails loudly on a missing
+/// concept's delete (the re-delete contract), a NotFound maps to 404 —
+/// the legacy FileRepo swallow (which answered 204 for a path that was
+/// never there) is gone at this layer.
 async fn api_delete_concept(
     State(state): State<AppState>,
     user: SessionUser,
@@ -440,9 +457,561 @@ async fn api_delete_concept(
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.delete(&canonical).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "not found")
+        }
         Err(e) => {
             tracing::error!(error = %e, "concept delete failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+// ---------- Revisions REST (spec §3.2a-2) ----------
+//
+// Query-param shaped: axum 0.8 `{*path}` wildcards cannot sit mid-path,
+// so the concept identity rides as `?scope=` + `?path=` (the /concept
+// pages' convention). Every route is mechanical — the era/confirmation
+// logic is the UI's (Task 4), never the API's. Perms (mirroring
+// concept_view's scope posture):
+//   READ (index/list/snapshot): user scope = the caller's own bundle;
+//   skills list/snapshot = any user; library = shelf visibility
+//   (concept_view's library posture); the INDEX of a service scope is
+//   admin only.
+//   WRITE (restore): user own / skills admin / library never.
+
+/// The revisions routes' refusal, before it becomes a `Response`: a
+/// (status, message) pair. Every refusal on these routes is a static
+/// status + text pair, so the small pair rides the `Result`'s Err
+/// variant and `revisions_reject` materializes it at the return site —
+/// a whole `Response` there would be a large-error return
+/// (clippy::result_large_err; the same shape as chat_api's `Admission`
+/// enum).
+type RevRejection = (StatusCode, &'static str);
+
+/// Materialize a refusal at its return site.
+fn revisions_reject((status, message): RevRejection) -> Response {
+    error_response(status, message)
+}
+
+/// One of the three revisions scopes (query-param values).
+#[derive(Debug, Clone, Copy)]
+enum RevScope {
+    User,
+    Skills,
+    Library,
+}
+
+impl RevScope {
+    /// Parse the `?scope=` value; absent defaults to the user's own
+    /// bundle (the ConceptQuery convention). Unknown → 400.
+    fn parse(raw: Option<&str>) -> Result<Self, RevRejection> {
+        match raw.unwrap_or("user") {
+            "user" => Ok(RevScope::User),
+            "skills" => Ok(RevScope::Skills),
+            "library" => Ok(RevScope::Library),
+            _ => Err((
+                StatusCode::BAD_REQUEST,
+                "unknown scope (user | skills | library)",
+            )),
+        }
+    }
+
+    /// The redirect/query-param spelling (library never redirects —
+    /// restores are refused there — so no string is needed).
+    fn as_param(self) -> &'static str {
+        match self {
+            RevScope::User => "user",
+            RevScope::Skills => "skills",
+            RevScope::Library => "library",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RevisionsQuery {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    /// The revision number — parsed manually so a missing/non-numeric/0
+    /// value answers the spec's 400 (a typed extractor would reject the
+    /// request with an uncontrolled body).
+    #[serde(default)]
+    n: Option<String>,
+}
+
+/// Canonicalize the query's concept path (leading slash, like every
+/// other handler); absent → 400.
+fn revisions_canonical(raw: Option<&str>) -> Result<String, RevRejection> {
+    let Some(path) = raw else {
+        return Err((StatusCode::BAD_REQUEST, "missing path"));
+    };
+    Ok(format!("/{}", path.trim_start_matches('/')))
+}
+
+/// Parse the 1-based revision number: missing/non-numeric/0 → 400.
+fn revisions_revision_no(raw: Option<&str>) -> Result<u64, RevRejection> {
+    let Some(text) = raw else {
+        return Err((StatusCode::BAD_REQUEST, "missing revision number"));
+    };
+    let no: u64 = text
+        .trim()
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid revision number"))?;
+    if no == 0 {
+        return Err((StatusCode::BAD_REQUEST, "revision numbers are 1-based"));
+    }
+    Ok(no)
+}
+
+/// Map a RevisionStore failure: a missing revision is a clean 404;
+/// everything else is a server-side fault (logged, generic body — the
+/// file's convention).
+fn revisions_error_response(e: RevisionsError, ctx: &'static str) -> Response {
+    match &e {
+        RevisionsError::NotFound { .. } => error_response(StatusCode::NOT_FOUND, "not found"),
+        other => {
+            tracing::error!(error = %other, ctx);
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// Whether `user` may read `canonical` in the library scope: the
+/// concept's book slug must sit on a global-read shelf (or the reader
+/// is an admin) — concept_view's library posture, extracted so the
+/// revisions routes share it.
+async fn library_path_visible(state: &AppState, user: &SessionUser, canonical: &str) -> bool {
+    let slug = canonical
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".md")
+        .to_string();
+    match state.store.book_by_slug(&slug).await {
+        Ok(Some(book)) => {
+            let global_read = state
+                .store
+                .bookshelf_is_global_read(book.bookshelf_id)
+                .await
+                .unwrap_or(false);
+            global_read || user.role == Role::Admin
+        }
+        _ => false,
+    }
+}
+
+/// GET /api/v1/revisions?scope= — the scope's per-path revisions index
+/// (live AND dead paths; metadata only, no payload text). User scope:
+/// the caller's own bundle; service scopes: admin only (spec §3.2a-2).
+async fn api_revisions_index(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match revisions_index_store(&state, &user, scope).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.list_paths().await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => revisions_error_response(e, "revisions index failed"),
+    }
+}
+
+/// The index route's store: user scope = own bundle (no extra gate —
+/// the session user reads their own undo log); service scopes = admin
+/// only. The returned store borrows from `state`.
+async fn revisions_index_store<'a>(
+    state: &'a AppState,
+    user: &SessionUser,
+    scope: RevScope,
+) -> Result<RevisionStore<'a>, RevRejection> {
+    match scope {
+        RevScope::User => {
+            let master = state
+                .master_key_for(user.user_id)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            Ok(RevisionStore::for_user(
+                state.store.pool(),
+                user.user_id,
+                &master,
+            ))
+        }
+        service @ (RevScope::Skills | RevScope::Library) => {
+            if user.role != Role::Admin {
+                return Err((StatusCode::FORBIDDEN, "admins only"));
+            }
+            let namespace = if matches!(service, RevScope::Skills) {
+                "skills"
+            } else {
+                "library"
+            };
+            Ok(RevisionStore::for_service(
+                state.store.pool(),
+                &state.service_key,
+                namespace,
+            ))
+        }
+    }
+}
+
+/// GET /api/v1/revisions/list?scope=&path= — one path's chain, newest
+/// first (metadata only). Read perms per concept: user own / skills any
+/// / library shelf visibility.
+async fn api_revisions_list(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match read_gate_store_scope(&state, &user, q.scope.as_deref(), &canonical).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.list(&canonical).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => revisions_error_response(e, "revisions list failed"),
+    }
+}
+
+/// GET /api/v1/revisions/snapshot?scope=&path=&n= — one recorded
+/// revision's raw markdown (the same text/markdown posture as
+/// api_get_concept). Read perms as list; `n=0` → 400 (1-based).
+async fn api_revisions_snapshot(
+    State(state): State<AppState>,
+    user: SessionUser,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let n = match revisions_revision_no(q.n.as_deref()) {
+        Ok(n) => n,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let store = match read_gate_store_scope(&state, &user, q.scope.as_deref(), &canonical).await {
+        Ok(store) => store,
+        Err(rej) => return revisions_reject(rej),
+    };
+    match store.get(&canonical, n).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/markdown")],
+            )
+                .into_response_with_body(text),
+            Err(e) => {
+                tracing::error!(error = %e, "revision snapshot is not utf-8");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+        },
+        Err(e) => revisions_error_response(e, "revision snapshot failed"),
+    }
+}
+
+/// The shared read gate + store for the list/snapshot routes: resolves
+/// the scope (unknown → 400), applies the per-concept read perms, and
+/// opens the scope's RevisionStore (borrowing from `state`). The user
+/// scope needs the caller's master key; skills needs none (any user
+/// reads); library needs shelf visibility (concept_view's posture).
+async fn read_gate_store_scope<'a>(
+    state: &'a AppState,
+    user: &SessionUser,
+    scope_raw: Option<&str>,
+    canonical: &str,
+) -> Result<RevisionStore<'a>, RevRejection> {
+    let scope = RevScope::parse(scope_raw)?;
+    match scope {
+        RevScope::User => {
+            let master = state
+                .master_key_for(user.user_id)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            Ok(RevisionStore::for_user(
+                state.store.pool(),
+                user.user_id,
+                &master,
+            ))
+        }
+        RevScope::Skills => Ok(RevisionStore::for_service(
+            state.store.pool(),
+            &state.service_key,
+            "skills",
+        )),
+        RevScope::Library => {
+            if !library_path_visible(state, user, canonical).await {
+                return Err((StatusCode::FORBIDDEN, "bookshelf is not global-read"));
+            }
+            Ok(RevisionStore::for_service(
+                state.store.pool(),
+                &state.service_key,
+                "library",
+            ))
+        }
+    }
+}
+
+/// POST /api/v1/revisions/restore?scope=&path=&n= — apply a recorded
+/// revision through the store's normal stamped write path. WRITE perms
+/// precede the store: user own / skills admin / library ALWAYS 403.
+/// Content-Type application/json answers `{"restored_to": n}`; a form
+/// POST answers 303 to the concept viewer (the CSRF middleware gates
+/// the form variant). A snapshot that no longer parses is the caller's
+/// bad input → 400 with the concept parse error text (the same posture
+/// as the PUT-concept route's lifecycle rejects).
+async fn api_revisions_restore(
+    State(state): State<AppState>,
+    user: SessionUser,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<RevisionsQuery>,
+) -> Response {
+    let is_form = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let canonical = match revisions_canonical(q.path.as_deref()) {
+        Ok(c) => c,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let n = match revisions_revision_no(q.n.as_deref()) {
+        Ok(n) => n,
+        Err(rej) => return revisions_reject(rej),
+    };
+    // The WRITE gate doubles as the store dispatch: a forbidden scope
+    // answers 403 before any 404/other store signal (no oracle through
+    // the permission gate).
+    let result = match scope {
+        RevScope::User => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => {
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                }
+            };
+            ConceptStore::for_user(&state.store, user.user_id, master)
+                .with_provenance(format!("web:{}", user.username))
+                .restore(&canonical, n)
+                .await
+        }
+        RevScope::Skills if user.role == Role::Admin => {
+            ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            )
+            .with_provenance(format!("web:{}", user.username))
+            .restore(&canonical, n)
+            .await
+        }
+        RevScope::Skills => return error_response(StatusCode::FORBIDDEN, "admins only"),
+        RevScope::Library => return error_response(StatusCode::FORBIDDEN, "library is read-only"),
+    };
+    match result {
+        Ok(()) => {
+            crate::state::Metrics::inc(&state.metrics.concepts_written);
+            if is_form {
+                Redirect::to(&format!(
+                    "/concept?path={}&scope={}",
+                    pages::urlencoding_encode(&canonical),
+                    scope.as_param() // library never restores, so never "library"
+                ))
+                .into_response()
+            } else {
+                Json(serde_json::json!({ "restored_to": n })).into_response()
+            }
+        }
+        Err(mycelium_store::ConceptStoreError::Revisions(RevisionsError::NotFound { .. }))
+        | Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "not found")
+        }
+        Err(
+            e @ (mycelium_store::ConceptStoreError::Parse(_)
+            | mycelium_store::ConceptStoreError::Reserved(_)
+            | mycelium_store::ConceptStoreError::QueuePath(_)),
+        ) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "revision restore failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+// ---------- Revisions browser page (Task 5: GET /revisions) ----------
+
+#[derive(Deserialize)]
+pub struct RevisionsPageQuery {
+    /// The scope to browse — absent → the caller's own bundle (the
+    /// ConceptQuery convention).
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// GET /revisions — the scope-level revisions browser page (spec §3.2:
+/// "owner for user scopes; admin for service scopes" listing every path
+/// with revisions, live or deleted). The revisions REST INDEX's exact
+/// perm matrix ([`revisions_index_store`]): user scope = the session
+/// user's own bundle; skills/library = admin only, answered IN PLACE as
+/// 403 — never a redirect, which would signal which scopes exist. Rows
+/// in path order, each linking into Task 4's per-concept page (which
+/// now serves dead paths' history).
+pub async fn revisions_view(
+    State(state): State<AppState>,
+    user: SessionUser,
+    session: SessionId,
+    Query(q): Query<RevisionsPageQuery>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let scope = match RevScope::parse(q.scope.as_deref()) {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    let rev_store = match revisions_index_store(&state, &user, scope).await {
+        Ok(s) => s,
+        Err(rej) => return revisions_reject(rej),
+    };
+    // The registry-title fallback's concept store (see
+    // [`revisions_row_title`]): the same scope's live concepts.
+    let cs = match scope {
+        RevScope::User => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(error = %e, "revisions browser: master key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                }
+            };
+            ConceptStore::for_user(&state.store, user.user_id, master)
+        }
+        RevScope::Skills => ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.skills_dir(),
+            "skills",
+        ),
+        RevScope::Library => ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        ),
+    };
+    let paths = match rev_store.list_paths().await {
+        Ok(paths) => paths,
+        Err(e) => {
+            // A store fault answers in place: the page shell with the
+            // error banner (the books page's posture) — not a 500, not
+            // a bare error body.
+            tracing::error!(error = %e, "revisions browser listing failed");
+            return pages::revisions_page(
+                &user,
+                &csrf,
+                scope.as_param(),
+                &[],
+                Some("The revision history could not be loaded."),
+            )
+            .into_response();
+        }
+    };
+    let mut rows = Vec::with_capacity(paths.len());
+    for entry in &paths {
+        let title = revisions_row_title(&rev_store, &cs, entry).await;
+        rows.push(pages::RevisionPathRow {
+            path: entry.path.clone(),
+            live: entry.live,
+            title,
+            last_op: entry.last_op.clone(),
+            last_op_at: entry.last_op_at.clone(),
+        });
+    }
+    pages::revisions_page(&user, &csrf, scope.as_param(), &rows, None).into_response()
+}
+
+/// One browser row's title (Task 5's "latest title"): the NEWEST
+/// recorded payload's frontmatter title, decoded through the same
+/// `get` + parse path the snapshot REST route uses (§3.2a-3's payload
+/// convention — create rows carry the created content, every other row
+/// the pre-mutation state, so this is the latest title the undo log
+/// recorded). The registry-title fallback is EXCLUSIVE to the
+/// empty-payload row: `get` returning EMPTY bytes (after the AEAD open
+/// this is the same fact [`RevisionEntry::payload_empty`] derives from
+/// the envelope's stored length — an empty plaintext seals to exactly
+/// the envelope's empty overhead — i.e. the §3.2a-3 "recorded no
+/// content" marker, the undelete-restore row by design) on a LIVE row
+/// means the log recorded nothing, so the live registry may supply the
+/// title; a dead row has none. Anything ELSE — a titled or an untitled
+/// frontmatter, non-UTF8 bytes, a parse fault, a decode fault — answers
+/// from the payload only: an undecodable or simply untitled snapshot
+/// shows the muted `(no title)` placeholder, never a live-title
+/// substitution that would pretend the log recorded what it didn't.
+/// Faults log per row and never page-fatal.
+async fn revisions_row_title(
+    rev_store: &RevisionStore<'_>,
+    cs: &ConceptStore<'_>,
+    entry: &RevisionPathEntry,
+) -> Option<String> {
+    match rev_store.get(&entry.path, entry.latest_no).await {
+        // The §3.2a-3 empty-payload row (the undelete-restore marker):
+        // the parse path is never entered (no frontmatter warn for the
+        // designed case), and a live row alone may fall back to the
+        // registry — the only fallback that exists.
+        Ok(bytes) if bytes.is_empty() => {
+            if !entry.live {
+                return None;
+            }
+            match cs.get(&entry.path).await {
+                Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
+                Err(e) => {
+                    tracing::warn!(path = entry.path, error = %e, "browser row registry title");
+                    None
+                }
+            }
+        }
+        // A recorded payload answers for itself — titled (the
+        // snapshot's title, however stale) or untitled (muted). Decode
+        // or parse faults degrade that row to None with a log; the
+        // registry is never substituted for a payload we could read.
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => match Concept::parse(&entry.path, &text) {
+                Ok(concept) => concept.frontmatter.title.filter(|t| !t.is_empty()),
+                Err(e) => {
+                    tracing::warn!(
+                        path = entry.path,
+                        error = %e,
+                        "browser row snapshot frontmatter"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = entry.path, error = %e, "browser row snapshot bytes");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                path = entry.path,
+                n = entry.latest_no,
+                error = %e,
+                "browser row snapshot decode"
+            );
+            None
         }
     }
 }
@@ -874,6 +1443,7 @@ pub async fn concept_submit(
                 frontmatter_error.as_deref(),
                 form.scope.as_deref(),
                 true,
+                None,
             )
             .into_response();
         }
@@ -912,12 +1482,15 @@ pub async fn concept_submit(
                         Some(&e.to_string()),
                         Some("skills"),
                         true,
+                        None,
                     )
                     .into_response()
                 }
             }
         }
-        // The library is read-only (ingest is the only writer).
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
         Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
         // Default: the user's private bundle.
         _ => {
@@ -948,6 +1521,7 @@ pub async fn concept_submit(
                         Some(&e.to_string()),
                         None,
                         true,
+                        None,
                     )
                     .into_response()
                 }
@@ -965,6 +1539,24 @@ pub struct ConceptQuery {
     /// (new private skill in the user bundle).
     #[serde(default)]
     pub scope: Option<String>,
+    // The revisions surface (Task 4). All four are lenient
+    // Option<String> rather than typed numbers ON PURPOSE: the
+    // compare form legitimately submits blank values (`diff_from=`
+    // is the "" HEAD sentinel option), which a `u64`/`u8` extractor
+    // would 400-reject; the page answers by falling back to the plain
+    // view instead. See `page_revision_param`.
+    /// Any Some>0 → render the revisions block (list/confirm/diff).
+    #[serde(default)]
+    pub revs: Option<String>,
+    /// Diff "from" side: blank/absent = HEAD (current content).
+    #[serde(default)]
+    pub diff_from: Option<String>,
+    /// Diff "to" side: blank/absent = HEAD (current content).
+    #[serde(default)]
+    pub diff_to: Option<String>,
+    /// Show the restore-confirm interstitial for this revision.
+    #[serde(default)]
+    pub restore_confirm: Option<String>,
 }
 
 /// GET /concept — view/edit (path given) or new (new=1).
@@ -1003,10 +1595,11 @@ pub async fn concept_view(
             None,
             query.scope.as_deref(),
             true,
+            None,
         )
         .into_response();
     }
-    let Some(path) = query.path else {
+    let Some(path) = &query.path else {
         return Redirect::to("/").into_response();
     };
     let canonical = format!("/{}", path.trim_start_matches('/'));
@@ -1019,11 +1612,35 @@ pub async fn concept_view(
                 &state.store.skills_dir(),
                 "skills",
             );
+            let rev_store =
+                RevisionStore::for_service(state.store.pool(), &state.service_key, "skills");
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let editable = user.role == Role::Admin;
                     let (preview, _) = pages::build_preview_html(&markdown);
+                    let surface = revisions_surface(
+                        &rev_store,
+                        &canonical,
+                        "skills",
+                        editable,
+                        Some(&markdown),
+                        &query,
+                    )
+                    .await;
+                    // The activate offer computes like the user branch's:
+                    // the plan's per-concept rule ("Set status: active"
+                    // when the status is paused) is unqualified by scope,
+                    // and /concept/activate already accepts skills admins —
+                    // the page merely offers what the endpoint does. (The
+                    // dead branch stays false: a dead path has no
+                    // lifecycle status — its flow is the restore
+                    // interstitial. Library stays false: read-only.)
+                    let activation = concept_is_paused(&canonical, &markdown);
+                    let extras = pages::ConceptExtras {
+                        revisions: surface,
+                        activation,
+                    };
                     pages::concept_editor(
                         &user,
                         &csrf,
@@ -1033,35 +1650,55 @@ pub async fn concept_view(
                         None,
                         Some("skills"),
                         editable,
+                        Some(&extras),
                     )
                     .into_response()
+                }
+                Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+                    // Deleted but revision-tracked → the dead-path
+                    // revisions page (restore links = re-create);
+                    // untracked paths keep the plain 404.
+                    match revisions_surface(
+                        &rev_store,
+                        &canonical,
+                        "skills",
+                        user.role == Role::Admin,
+                        None,
+                        &query,
+                    )
+                    .await
+                    {
+                        Some(surface) => {
+                            let extras = pages::ConceptExtras {
+                                revisions: Some(surface),
+                                activation: false,
+                            };
+                            let (preview, _) = pages::build_preview_html("");
+                            pages::concept_editor(
+                                &user,
+                                &csrf,
+                                &canonical,
+                                "",
+                                preview,
+                                None,
+                                Some("skills"),
+                                false,
+                                Some(&extras),
+                            )
+                            .into_response()
+                        }
+                        None => pages::not_found().into_response(),
+                    }
                 }
                 Err(_) => pages::not_found().into_response(),
             }
         }
         // Library catalogs: read-only, shelf-visibility gated.
         Some("library") => {
-            // Visibility: the concept's book slug must be on a
-            // global-read shelf (or the reader is an admin).
-            let slug = canonical
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(".md")
-                .to_string();
-            let visible = match state.store.book_by_slug(&slug).await {
-                Ok(Some(book)) => {
-                    let global_read = state
-                        .store
-                        .bookshelf_is_global_read(book.bookshelf_id)
-                        .await
-                        .unwrap_or(false);
-                    global_read || user.role == Role::Admin
-                }
-                _ => false,
-            };
-            if !visible {
+            // Visibility: the same gate the revisions routes use —
+            // the concept's book slug must be on a global-read shelf
+            // (or the reader is an admin).
+            if !library_path_visible(&state, &user, &canonical).await {
                 return error_response(StatusCode::FORBIDDEN, "bookshelf is not global-read");
             }
             let cs = ConceptStore::for_service(
@@ -1070,10 +1707,27 @@ pub async fn concept_view(
                 &state.store.library_dir(),
                 "library",
             );
+            let rev_store =
+                RevisionStore::for_service(state.store.pool(), &state.service_key, "library");
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let (preview, _) = pages::build_preview_html(&markdown);
+                    // The library is read-only: rows render (a history
+                    // is still a read), restore never does.
+                    let surface = revisions_surface(
+                        &rev_store,
+                        &canonical,
+                        "library",
+                        false,
+                        Some(&markdown),
+                        &query,
+                    )
+                    .await;
+                    let extras = pages::ConceptExtras {
+                        revisions: surface,
+                        activation: false,
+                    };
                     pages::concept_editor(
                         &user,
                         &csrf,
@@ -1083,8 +1737,50 @@ pub async fn concept_view(
                         None,
                         Some("library"),
                         false,
+                        Some(&extras),
                     )
                     .into_response()
+                }
+                Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+                    // Dead library revision rows are ROUTINE: a replace
+                    // re-ingest deletes the old chapters through
+                    // `delete_book`, and every `ConceptStore::delete`
+                    // records a write-ahead revision row — the
+                    // /revisions browser lists them and links here. So
+                    // the dead path mirrors the skills/user arms: build
+                    // the dead surface (no live markdown — no HEAD side
+                    // to diff or restore against) with the library's
+                    // hard-false restore flag. The page is a history
+                    // read, full stop: restore/confirm never offer
+                    // (restore 403s for the scope), no editor grid,
+                    // undelete not implied. Untracked paths and store
+                    // faults keep the plain 404. The visibility gate ran
+                    // above, so a global-read reader gets the same
+                    // read-only posture the live branch gives it.
+                    match revisions_surface(&rev_store, &canonical, "library", false, None, &query)
+                        .await
+                    {
+                        Some(surface) => {
+                            let extras = pages::ConceptExtras {
+                                revisions: Some(surface),
+                                activation: false,
+                            };
+                            let (preview, _) = pages::build_preview_html("");
+                            pages::concept_editor(
+                                &user,
+                                &csrf,
+                                &canonical,
+                                "",
+                                preview,
+                                None,
+                                Some("library"),
+                                false,
+                                Some(&extras),
+                            )
+                            .into_response()
+                        }
+                        None => pages::not_found().into_response(),
+                    }
                 }
                 Err(_) => pages::not_found().into_response(),
             }
@@ -1095,25 +1791,78 @@ pub async fn concept_view(
                 Ok(m) => m,
                 Err(_) => return pages::not_found().into_response(),
             };
+            // The revision store borrows the master key; build it
+            // before ConceptStore::for_user moves it.
+            let rev_store = RevisionStore::for_user(state.store.pool(), user.user_id, &master);
             let cs = ConceptStore::for_user(&state.store, user.user_id, master);
             match cs.get(&canonical).await {
                 Ok(concept) => {
                     let markdown = concept.to_markdown().unwrap_or_default();
                     let (preview, _) = pages::build_preview_html(&markdown);
+                    let surface = revisions_surface(
+                        &rev_store,
+                        &canonical,
+                        "user",
+                        true,
+                        Some(&markdown),
+                        &query,
+                    )
+                    .await;
+                    let activation = concept_is_paused(&canonical, &markdown);
+                    let extras = pages::ConceptExtras {
+                        revisions: surface,
+                        activation,
+                    };
                     pages::concept_editor(
-                        &user, &csrf, &canonical, &markdown, preview, None, None, true,
+                        &user,
+                        &csrf,
+                        &canonical,
+                        &markdown,
+                        preview,
+                        None,
+                        None,
+                        true,
+                        Some(&extras),
                     )
                     .into_response()
                 }
                 Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
-                    // Unknown path → the new-concept editor seeded with
-                    // the default Note template (the legacy
-                    // new_concept_page behavior).
-                    let template =
-                        "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n";
-                    let (preview, _) = pages::build_preview_html(template);
-                    pages::concept_editor(&user, &csrf, "", template, preview, None, None, true)
-                        .into_response()
+                    // Deleted but revision-tracked → the dead-path
+                    // revisions page (restore = re-create at the
+                    // path). Never-tracked paths keep the legacy
+                    // new-concept editor seeded with the default Note
+                    // template (the legacy new_concept_page behavior).
+                    match revisions_surface(&rev_store, &canonical, "user", true, None, &query)
+                        .await
+                    {
+                        Some(surface) => {
+                            let extras = pages::ConceptExtras {
+                                revisions: Some(surface),
+                                activation: false,
+                            };
+                            let (preview, _) = pages::build_preview_html("");
+                            pages::concept_editor(
+                                &user,
+                                &csrf,
+                                &canonical,
+                                "",
+                                preview,
+                                None,
+                                None,
+                                false,
+                                Some(&extras),
+                            )
+                            .into_response()
+                        }
+                        None => {
+                            let template = "---\ntype: Note\ntitle: New concept\ndescription: \ntags: []\n---\n\n";
+                            let (preview, _) = pages::build_preview_html(template);
+                            pages::concept_editor(
+                                &user, &csrf, "", template, preview, None, None, true, None,
+                            )
+                            .into_response()
+                        }
+                    }
                 }
                 Err(_) => pages::not_found().into_response(),
             }
@@ -1121,6 +1870,224 @@ pub async fn concept_view(
     }
 }
 
+// ---------- Concept-page revisions (Task 4: list, diff, confirm) ----------
+
+/// Max lines of a rendered unified diff on the concept page (an
+/// extremely long diff truncates with a note instead of ballooning the
+/// page).
+const DIFF_MAX_LINES: usize = 4000;
+
+/// Lenient parse of the concept page's revision params: absent, blank,
+/// or non-(1-based)-numeric all mean "not given". The compare form
+/// submits blank values (its `""` HEAD sentinel option), so a typed
+/// `u64` extractor would 400-reject a plain form submit; the page
+/// answers by falling back to the plain view instead — the same
+/// unknown-input rationale as [`revisions_revision_no`], softer
+/// because this is a page, not the API.
+fn page_revision_param(raw: Option<&str>) -> Option<u64> {
+    let v = raw?;
+    if v.is_empty() {
+        return None;
+    }
+    v.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// The live concept "awaits revival": status retired or superseded
+/// (the two pausing statuses — `active` is the unpause target). A
+/// frontmatter that no longer parses is simply not paused.
+fn concept_is_paused(source_path: &str, markdown: &str) -> bool {
+    matches!(
+        Concept::parse(source_path, markdown).ok().and_then(|c| {
+            c.frontmatter
+                .status
+                .as_deref()
+                .and_then(LifecycleStatus::parse)
+        }),
+        Some(LifecycleStatus::Superseded) | Some(LifecycleStatus::Retired)
+    )
+}
+
+/// Build the concept page's revisions surface (Task 4) from a
+/// revision-tracked path: the list of entries plus the mode —
+/// restore-confirm (when a confirmable revision was asked for and the
+/// scope may restore), diff (when at least one side names a revision),
+/// or the plain list. `None` on an empty chain or a store fault — the
+/// caller falls back to the legacy page (no revisions block on an
+/// untracked path; a history-view fault must not block the editor).
+///
+/// `live_markdown` is the live concept's markdown when the concept
+/// exists (the diff's HEAD side and the confirm page's "current"
+/// preview); `None` marks a deleted path (no HEAD side to diff or
+/// restore-against — dead chains diff only revision↔revision, and the
+/// confirm page's copy says the restore re-creates the concept).
+///
+/// `revs` gates the block only on LIVE pages (no `revs` → `None`: the
+/// plain editor, the everyday view). A deleted path always shows its
+/// history instead of the editor — the editor would clobber a chain
+/// the restore flow is meant to revive.
+async fn revisions_surface(
+    rev_store: &RevisionStore<'_>,
+    canonical: &str,
+    scope_param: &'static str,
+    restore_ready: bool,
+    live_markdown: Option<&str>,
+    query: &ConceptQuery,
+) -> Option<pages::RevisionsSurface> {
+    if live_markdown.is_some() && page_revision_param(query.revs.as_deref()).is_none() {
+        return None;
+    }
+    let entries = match rev_store.list(canonical).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                path = canonical,
+                error = %e,
+                "revisions list for the concept page failed"
+            );
+            return None;
+        }
+    };
+    if entries.is_empty() {
+        return None;
+    }
+    let dead = live_markdown.is_none();
+
+    // Mode: confirm first (it is the page's answer to a per-row
+    // restore click), then diff, then the plain list. An empty-payload
+    // revision (the undelete-restore row) is NOT confirmable — its
+    // restore post is the snapshot-parse 400, so a confirm URL for one
+    // falls back to the list, like an unknown revision number.
+    if restore_ready
+        && let Some(n) = page_revision_param(query.restore_confirm.as_deref())
+        && entries
+            .iter()
+            .any(|e| e.revision_no == n && !e.payload_empty)
+    {
+        // The row's labels first (the entries move into the surface
+        // after the borrow ends).
+        let (op, summary) = match entries.iter().find(|e| e.revision_no == n) {
+            Some(row) => (row.op.clone(), row.summary.clone()),
+            None => (String::new(), String::new()),
+        };
+        match rev_store.get(canonical, n).await {
+            Ok(bytes) => {
+                return Some(pages::RevisionsSurface {
+                    path: canonical.to_string(),
+                    scope_param,
+                    restore_ready,
+                    dead,
+                    entries,
+                    mode: pages::RevisionsMode::Confirm(pages::ConfirmData {
+                        n,
+                        op,
+                        summary,
+                        snapshot_text: String::from_utf8_lossy(&bytes).into_owned(),
+                        current_text: live_markdown.map(str::to_string),
+                    }),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = canonical,
+                    n,
+                    error = %e,
+                    "restore-confirm snapshot read failed"
+                );
+            }
+        }
+    }
+
+    let from = page_revision_param(query.diff_from.as_deref());
+    let to = page_revision_param(query.diff_to.as_deref());
+    if (from.is_some() || to.is_some())
+        && let Some(mode) = build_diff_mode(rev_store, canonical, live_markdown, from, to).await
+    {
+        return Some(pages::RevisionsSurface {
+            path: canonical.to_string(),
+            scope_param,
+            restore_ready,
+            dead,
+            entries,
+            mode,
+        });
+    }
+
+    Some(pages::RevisionsSurface {
+        path: canonical.to_string(),
+        scope_param,
+        restore_ready,
+        dead,
+        entries,
+        mode: pages::RevisionsMode::List,
+    })
+}
+
+/// One diff side's text: HEAD (the live concept's markdown) or a
+/// revision's snapshot. An unresolvable side (unknown revision, or the
+/// HEAD side of a dead path) → None — the caller falls back to the
+/// plain list rather than showing a broken compare.
+async fn diff_side_text(
+    rev_store: &RevisionStore<'_>,
+    canonical: &str,
+    live_markdown: Option<&str>,
+    side: Option<u64>,
+) -> Option<String> {
+    match side {
+        None => live_markdown.map(str::to_string),
+        Some(n) => match rev_store.get(canonical, n).await {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => {
+                tracing::warn!(
+                    path = canonical,
+                    n = n,
+                    error = %e,
+                    "diff snapshot read failed"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Compute the unified diff of the two resolved sides (`similar`'s
+/// `TextDiff` in unified form, context radius 3). The page renders the
+/// lines ESCAPED in a `<pre>` — here they are data, not markup. Over
+/// [`DIFF_MAX_LINES`] the line list truncates (the page says so).
+async fn build_diff_mode(
+    rev_store: &RevisionStore<'_>,
+    canonical: &str,
+    live_markdown: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Option<pages::RevisionsMode> {
+    let from_text = diff_side_text(rev_store, canonical, live_markdown, from).await?;
+    let to_text = diff_side_text(rev_store, canonical, live_markdown, to).await?;
+    let diff = TextDiff::from_lines(&from_text, &to_text);
+    let label = |side: Option<u64>, head: &str| match side {
+        Some(n) => format!("revision #{n}"),
+        None => head.to_string(),
+    };
+    let from_label = label(from, "current");
+    let to_label = label(to, "current");
+    let rendered = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&from_label, &to_label)
+        .to_string();
+    let all_lines: Vec<&str> = rendered.lines().collect();
+    let truncated = all_lines.len() > DIFF_MAX_LINES;
+    let lines: Vec<String> = all_lines
+        .into_iter()
+        .take(DIFF_MAX_LINES)
+        .map(ToOwned::to_owned)
+        .collect();
+    Some(pages::RevisionsMode::Diff(pages::DiffData {
+        from_label,
+        to_label,
+        lines,
+        truncated,
+    }))
+}
 #[derive(Deserialize)]
 pub struct DeleteForm {
     pub path: String,
@@ -1150,7 +2117,9 @@ pub async fn concept_delete(
             let _ = cs.delete(&canonical).await;
             Redirect::to("/skills").into_response()
         }
-        // The library is read-only (ingest is the only writer).
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
         Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
         // Default: the user's private bundle.
         _ => {
@@ -1179,6 +2148,99 @@ pub struct ChapterRow {
     pub index: u32,
     pub anchor: String,
     pub title: String,
+}
+
+// ---------- Concept activation (Task 4) ----------
+
+/// POST /concept/activate — "Set status: active" on a paused concept
+/// (lifecycle spec §4): clears `status` and `superseded_by` (the
+/// concept's other lifecycle history — `valid_to` — is untouched) and
+/// writes the result through the NORMAL stamped put, so provenance
+/// applies and the activation itself records an update revision.
+/// Session-authorized, editable scopes only (skills: admin; the
+/// library never); a missing concept answers 404.
+pub async fn concept_activate(
+    State(state): State<AppState>,
+    user: SessionUser,
+    axum::Form(form): axum::Form<DeleteForm>,
+) -> Response {
+    let canonical = format!("/{}", form.path.trim_start_matches('/'));
+    match form.scope.as_deref() {
+        // Global skills shelf: admin-only writes.
+        Some("skills") => {
+            if user.role != Role::Admin {
+                return error_response(StatusCode::FORBIDDEN, "admins only");
+            }
+            let cs = ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            )
+            .with_provenance(format!("web:{}", user.username));
+            activate_and_redirect(cs, &canonical, "skills").await
+        }
+        // User-facing write routes refuse the library scope; the
+        // librarian's ingest flow (including a replace re-ingest's
+        // catalog delete) is the library's writer.
+        Some("library") => error_response(StatusCode::FORBIDDEN, "library is read-only"),
+        // Default: the user's private bundle.
+        _ => {
+            let master = match state.master_key_for(user.user_id).await {
+                Ok(m) => m,
+                Err(_) => return pages::not_found().into_response(),
+            };
+            let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+                .with_provenance(format!("web:{}", user.username));
+            activate_and_redirect(cs, &canonical, "user").await
+        }
+    }
+}
+
+/// The activate tail both scopes share: read the concept (its page
+/// offered this button only while paused — a direct call against any
+/// live concept is a no-op clear), drop the pausing fields, and re-put
+/// through the stamped store. Redirects to the concept viewer, the
+/// same viewer redirect the restore form answers.
+async fn activate_and_redirect(
+    cs: ConceptStore<'_>,
+    canonical: &str,
+    scope_param: &'static str,
+) -> Response {
+    match cs.get(canonical).await {
+        Ok(mut concept) => {
+            concept.frontmatter.status = None;
+            concept.frontmatter.superseded_by = None;
+            match cs.put(&concept).await {
+                Ok(()) => Redirect::to(&format!(
+                    "/concept?path={}&scope={}",
+                    pages::urlencoding_encode(canonical),
+                    scope_param
+                ))
+                .into_response(),
+                Err(e) => concept_activate_error(e),
+            }
+        }
+        Err(mycelium_store::ConceptStoreError::NotFound(_)) => {
+            error_response(StatusCode::NOT_FOUND, "not found")
+        }
+        Err(e) => concept_activate_error(e),
+    }
+}
+
+/// Activate writes are normal puts: the lifecycle/parse rejects ride
+/// the PUT-concept posture (400 with the parse text); everything else
+/// is a server fault (logged, generic body).
+fn concept_activate_error(e: mycelium_store::ConceptStoreError) -> Response {
+    match &e {
+        mycelium_store::ConceptStoreError::Parse(_) => {
+            error_response(StatusCode::BAD_REQUEST, &e.to_string())
+        }
+        _ => {
+            tracing::error!(error = %e, "concept activate failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
 }
 
 /// GET /books — browse bookshelves (mockup 07). Users see global-read

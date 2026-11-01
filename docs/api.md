@@ -18,7 +18,91 @@ The frontmatter must parse and `type` is required; frontmatter whose
 rejected with `400` carrying the concept parse error text. `201` on success.
 
 ### `DELETE /api/v1/concepts/{*path}`
-Delete a concept. `204` on success.
+Delete a concept. `204` on success. Deleting a path that no concept
+occupies answers `404` (the re-delete contract — the store fails
+loudly and the route maps it).
+
+## Revisions
+
+Every concept change records an undo revision first (the write-ahead
+log — one full markdown snapshot per change). Four routes read and
+restore that log. Scopes are the concept-store ones: `user` (the
+caller's private bundle, the default), `skills` (the global skills
+shelf), `library` (the book catalogs).
+
+Permission matrix (mirroring the concept viewer's posture):
+
+| Scope | Index | List/Snapshot | Restore |
+|---|---|---|---|
+| `user` | own bundle | own bundle | own bundle |
+| `skills` | admin only | any user | admin only |
+| `library` | admin only | global-read shelf (or admin) | never — always `403` |
+
+`403`s answer before the store runs, so a forbidden restore cannot
+probe whether a snapshot exists. Unknown or missing `scope` → `400`
+(`user` when omitted); `n=0` or non-numeric → `400` (revisions are
+1-based); a missing revision → `404`.
+
+### `GET /api/v1/revisions?scope=<scope>`
+The scope's per-path index — every path with revisions, live or
+deleted:
+
+```json
+[{"path": "/notes/todo.md", "live": true, "latest_no": 7,
+  "last_op": "update", "last_op_at": "2026-10-31T12:00:00+00:00"}]
+```
+
+Metadata only — payload text is never in the index. A deleted path
+stays listed (`"live": false`) so its chain remains reachable.
+
+### `GET /api/v1/revisions/list?scope=<scope>&path=</notes/todo.md>`
+One path's chain, newest first:
+
+```json
+[{"revision_no": 7, "op": "update", "source": "web:alice",
+  "summary": "concept updated",
+  "created_at": "2026-10-31T12:00:00+00:00"}]
+```
+
+`op` is one of `create`, `update`, `delete`, `restore`, `merge`,
+`consolidate`, `migration`; `source` is the actor's provenance stamp.
+A path with no revisions (never had one, or out of the caller's scope)
+answers `200 []` — indistinguishable between callers.
+
+### `GET /api/v1/revisions/snapshot?scope=<scope>&path=...&n=<n>`
+One revision's raw markdown (`text/markdown`), exactly as recorded.
+The payload convention: a `create` row carries the created content;
+every later row carries the pre-mutation snapshot (the concept as it
+stood before that operation) — so restoring to revision `n` puts back
+the content that row recorded. `404` when the revision (or the whole
+chain) is absent or belongs to another scope.
+
+### `POST /api/v1/revisions/restore?scope=<scope>&path=...&n=<n>`
+Apply revision `n` through the normal stamped write path (the
+ConceptStore restore): the restored content commits as a NEW revision
+(`op: restore`, summary `restored to revision <n>`, source the
+caller's provenance), so the restore itself is reversible. Restoring a
+deleted chain's revision re-creates the concept at its original path.
+The restored `status` is whatever the snapshot says — restore is
+literal.
+
+- `Content-Type: application/json` POST answers `200
+  {"restored_to": n}` (the CSRF token rides the `x-csrf-token`
+  header).
+- A form POST (`application/x-www-form-urlencoded`, the `csrf_token`
+  field) answers `303` redirect to `/concept?path=…&scope=…`
+  — only that content type takes the redirect path; a form sent as
+  `multipart/form-data` (also CSRF-checked, field or header) answers
+  the `200` JSON instead.
+
+A snapshot that no longer parses (frontmatter a current build rejects)
+answers `400` with the concept parse error text — the same posture as
+the PUT-concept route's lifecycle rejects. The §3.2a-3 undelete-marker
+row — the EMPTY-payload `restore` revision recorded when a delete is
+undone — also answers this bad-parse `400`: scripts enumerating a chain
+will hit `400` on that newest row of a freshly-undeleted path and should
+target the row before it (the web UI hides restore affordances on
+empty-payload rows). The library scope refuses restores outright.
 
 ## Graph and search
 
