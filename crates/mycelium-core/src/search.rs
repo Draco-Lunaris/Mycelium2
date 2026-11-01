@@ -513,12 +513,13 @@ mod tests {
         assert!((got - got4).abs() < 1e-9, "doc_len leaked: {got} vs {got4}");
     }
 
-    /// Long/short corpus for the length-normalization tests: `/a.md` is
-    /// title "Alpha Note" + body `rust rust rust` + the 197 filler tokens
-    /// `n001..n199` (202 tokens total), `/b.md` is title "Beta Note" +
-    /// body `rust` (3 tokens). Both match `rust`; corpus avgdl = 102.5.
+    /// Long/short corpus for the length-normalization tests: `/a.md` =
+    /// title "Alpha Note" (tokens `alpha`, `note`) plus body `rust rust
+    /// rust` and the 197 filler tokens `n001..n197` = 202 tokens; `/b.md`
+    /// = title "Beta Note" plus body `rust` = 3 tokens. Both match `rust`;
+    /// corpus avgdl is (202 + 3) / 2 = 102.5.
     fn long_short_index() -> InMemoryIndex {
-        let fillers: String = (1..=199).map(|i| format!(" n{i:03}")).collect();
+        let fillers: String = (1..=197).map(|i| format!(" n{i:03}")).collect();
         let mut idx = InMemoryIndex::new();
         idx.add(&concept(
             "/a.md",
@@ -545,23 +546,25 @@ mod tests {
         let want_a = idf * 6.6 / (3.0 + 1.2 * (1.0 - 0.75 + 0.75 * 202.0 / 102.5));
         let want_b = idf * 2.2 / (1.0 + 1.2 * (1.0 - 0.75 + 0.75 * 3.0 / 102.5));
         assert!(
-            (hits[0].score - want_b).abs() < 1e-4,
+            (hits[0].score - want_b).abs() < 1e-6,
             "short doc: {} vs {want_b}",
             hits[0].score
         );
         assert!(
-            (hits[1].score - want_a).abs() < 1e-4,
+            (hits[1].score - want_a).abs() < 1e-6,
             "long doc: {} vs {want_a}",
             hits[1].score
         );
-        // Pinned magnitudes (plan): A ≈ 0.23712, B ≈ 0.30243.
+        // Pinned magnitudes: the index's exact f32 scores for this corpus
+        // (the plan's literals 0.23712/0.30243 were approximations, ~5e-5
+        // off the exact 202/102.5-corpus values).
         assert!(
-            (hits[1].score - 0.23712).abs() < 1e-4,
+            (hits[1].score - 0.23717058).abs() < 1e-6,
             "long doc: {}",
             hits[1].score
         );
         assert!(
-            (hits[0].score - 0.30243).abs() < 1e-4,
+            (hits[0].score - 0.30241647).abs() < 1e-6,
             "short doc: {}",
             hits[0].score
         );
@@ -611,14 +614,18 @@ mod tests {
             ["/v.md"]
         );
 
-        // df stays sane: "zebra" matches only the new doc, and the corpus
-        // is TWO docs (/v.md, /c3.md) — not three with v1's postings live.
+        // df stays sane: "zebra" matches only /c3.md (df 1). With the old
+        // accumulating add the stale /v.md posting still matched "zebra",
+        // so the resurrected doc would fail the paths assertion below
+        // before any score is compared.
         idx.add(&concept("/c3.md", "C3", "zebra shared")).unwrap();
         let hits = idx.search(&SearchQuery::new(vec!["zebra".into()])).unwrap();
         assert_eq!(paths(&hits), ["/c3.md"]);
         // Both docs tokenize to 3 tokens → avgdl 3, ratio 1; df 1 of n 2
-        // → idf ln(1 + 1.5/1.5) = ln(2); tf term 1·2.2/(1 + 1.2). A stale
-        // three-doc corpus would score visibly lower (idf ln(1 + 2.5/1.5)).
+        // → idf ln(1 + 1.5/1.5) = ln(2); tf term 1·2.2/(1 + 1.2). Had the
+        // stale posting been scored instead: the docs map is path-keyed, so
+        // n stays 2 while df would rise to 2, idf ln(1 + 0.5/2.5) = ln(1.2)
+        // ≈ 0.18 — visibly below ln(2) ≈ 0.69.
         let want = 2.0f32.ln() * (2.2 / (1.0 + 1.2));
         assert!(
             (hits[0].score - want).abs() < 1e-4,
