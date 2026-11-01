@@ -38,10 +38,12 @@ use crate::state::AppState;
 /// and the write-side provenance on the ConceptStore).
 const MIGRATION_LABEL: &str = "migration";
 
-/// The sweep's only hard-failure surface: enumerating the user scopes.
-/// Everything else — master-key recovery, listing, reading, writing —
-/// is logged and continued so one bad scope or concept cannot stall
-/// the boot for the rest.
+/// The boot sweeps' shared hard-failure surface (both sweeps use this
+/// enum): enumerating the user scopes is the only thing that can fail
+/// a sweep outright. Everything else — master-key recovery, the
+/// per-scope candidate/listing queries, reindexing, reading and
+/// rewriting — is logged and continued so one bad scope or concept
+/// cannot stall the boot for the rest.
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error("user enumeration query failed: {0}")]
@@ -88,33 +90,76 @@ fn is_deprecated_tag(tag: &str) -> bool {
     tag.trim().to_lowercase() == "deprecated"
 }
 
-/// The boot sweep (idempotent, predicate-driven — no marker row): every
-/// user scope + the global:skills scope; a scope whose master key fails
-/// is logged and skipped (retried next boot); a per-concept failure is
-/// logged and the rest of the scope continues. Returns the number of
-/// concepts migrated across all scopes — the count is for observability
-/// only; the sweep never drives boot decisions.
+/// The deprecated-tag boot sweep (idempotent, predicate-driven — no
+/// marker row): every user scope + the global:skills scope; a scope
+/// whose master key fails is logged and skipped (retried next boot); a
+/// per-concept failure is logged and the rest of the scope continues.
+/// Returns the number of concepts migrated across all scopes — the
+/// count is for observability only; the sweep never drives boot
+/// decisions.
+///
+/// Scope enumeration + master-key recovery are SHARED with the
+/// length-backfill sweep (`sweep_targets`); this sweep's write-side
+/// stamps (`with_provenance` + `with_revision_op` = `migration`) are
+/// attached per element HERE, at the call site — the shared fn returns
+/// stores unstamped. The `global:library` shelf `sweep_targets`
+/// returns is deliberately SKIPPED in this loop: this sweep rewrites
+/// concepts, and the library shelf is generated/book content the
+/// ingest worker owns — never rewritten by lifecycle sweeps (the
+/// index-only backfill DOES sweep it).
 pub async fn migrate_deprecated_tags(state: &AppState) -> Result<u32, LifecycleError> {
     let mut migrated: u32 = 0;
+    for cs in sweep_targets(state, "lifecycle sweep").await? {
+        let scope = cs.scope_id();
+        if scope == "global:library" {
+            continue; // a concept-rewriting sweep — the library shelf stays out
+        }
+        let cs = cs
+            .with_provenance(MIGRATION_LABEL)
+            .with_revision_op(MIGRATION_LABEL);
+        migrated += sweep_scope(&cs, &scope).await;
+    }
+    Ok(migrated)
+}
 
-    // Service scope: the global skills shelf ONLY. `global:library` is
-    // deliberately absent — generated/book content the ingest worker
-    // owns, never rewritten by lifecycle sweeps.
-    let skills = ConceptStore::for_service(
-        &state.store,
-        (*state.service_key).clone(),
-        &state.store.skills_dir(),
-        "skills",
-    )
-    .with_provenance(MIGRATION_LABEL)
-    .with_revision_op(MIGRATION_LABEL);
-    migrated += sweep_scope(&skills, "global:skills").await;
+/// The lifecycle sweeps' shared scope enumeration: the two service
+/// shelves (`global:skills` from the skills dir, `global:library` from
+/// the library dir) and every user scope, in that order — skills
+/// first, library second, then the users in id order (raw SQL on the
+/// pool, the queue-worker sweep's below-auth-layer shape; ORDER BY id
+/// keeps user iteration deterministic across boots).
+///
+/// The user enumeration is the sweeps' one hard-failure surface (this
+/// fn's `?`); an unreadable user id or an unrecoverable master key
+/// logs one warn and is dropped from the returned set (a failed scope
+/// simply retriggers next boot). Each sweep's `label` is prefixed into
+/// the message so the shared branches' log lines stay attributable.
+///
+/// The stores are returned UNSTAMPED (no provenance, no revision op);
+/// each sweep attaches what its writes need at its own call site —
+/// the deprecated sweep tags its rewrites per element, while the
+/// index-only backfill attaches nothing (§3.2a-4: no concept writes
+/// exist to stamp).
+async fn sweep_targets<'a>(
+    state: &'a AppState,
+    label: &str,
+) -> Result<Vec<ConceptStore<'a>>, LifecycleError> {
+    let service_key = (*state.service_key).clone();
+    let mut stores = vec![
+        ConceptStore::for_service(
+            &state.store,
+            service_key.clone(),
+            &state.store.skills_dir(),
+            "skills",
+        ),
+        ConceptStore::for_service(
+            &state.store,
+            service_key,
+            &state.store.library_dir(),
+            "library",
+        ),
+    ];
 
-    // Every user scope, enumerated with raw SQL on the pool (the
-    // queue-worker sweep's shape: the sweep works below the auth
-    // layer). ORDER BY id keeps user iteration deterministic across
-    // boots. A user row whose key is unrecoverable skips one scope —
-    // the predicate-driven sweep simply retriggers next boot.
     let users: Vec<(String,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
         .fetch_all(state.store.pool())
         .await?;
@@ -123,7 +168,7 @@ pub async fn migrate_deprecated_tags(state: &AppState) -> Result<u32, LifecycleE
             Ok(u) => u,
             Err(e) => {
                 tracing::warn!(user = %id, error = %e,
-                    "lifecycle sweep: user row id unreadable — scope skipped");
+                    "{label}: user row id unreadable — scope skipped");
                 continue;
             }
         };
@@ -133,16 +178,13 @@ pub async fn migrate_deprecated_tags(state: &AppState) -> Result<u32, LifecycleE
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(user_id = %user_id, error = %e,
-                    "lifecycle sweep: master key unrecoverable — user scope skipped (retries next boot)");
+                    "{label}: master key unrecoverable — user scope skipped (retries next boot)");
                 continue;
             }
         };
-        let cs = ConceptStore::for_user(&state.store, user_id, master)
-            .with_provenance(MIGRATION_LABEL)
-            .with_revision_op(MIGRATION_LABEL);
-        migrated += sweep_scope(&cs, &format!("user:{user_id}")).await;
+        stores.push(ConceptStore::for_user(&state.store, user_id, master));
     }
-    Ok(migrated)
+    Ok(stores)
 }
 
 /// One scope's pass: the registry's listing (already path-ascending —
@@ -206,14 +248,14 @@ async fn sweep_scope(cs: &ConceptStore<'_>, scope: &str) -> u32 {
 /// attached (`with_provenance`/`with_revision_op` stamp concept
 /// writes; there are none here, §3.2a-4).
 ///
-/// Scope iteration mirrors `migrate_deprecated_tags`: `global:skills`
-/// and `global:library` via `ConceptStore::for_service`, then every
-/// user scope — raw `SELECT id FROM users ORDER BY id`, master-key
-/// recovery per user, an unreadable id or unrecoverable key logging
-/// one warn and skipping that scope (it retries next boot). Per scope
-/// the candidates come from raw pool SQL on the SAME scope string the
-/// sweep logs (`cs.scope_id()` — built the same way the encrypted
-/// index builds its scope id, so the labels can't drift apart).
+/// Scope iteration is the SHARED `sweep_targets` enumeration (the deprecated
+/// sweep's too): both service shelves + every user scope — raw
+/// `SELECT id FROM users ORDER BY id`, master-key recovery per user,
+/// an unreadable id or unrecoverable key logging one warn and skipping
+/// that scope (it retries next boot). Per scope the candidates come
+/// from raw pool SQL on the SAME scope string the sweep logs
+/// (`cs.scope_id()` — built the same way the encrypted index builds
+/// its scope id, so the labels can't drift apart).
 ///
 /// The `/mutation-queue/` prefix is EXCLUDED from the candidates
 /// (Task-2 review ruling's controller note): the queue's staging notes
@@ -231,44 +273,13 @@ async fn sweep_scope(cs: &ConceptStore<'_>, scope: &str) -> u32 {
 /// scopes — observability only; the sweep never drives boot decisions.
 pub async fn backfill_index_lengths(state: &AppState) -> Result<u32, LifecycleError> {
     let mut backfilled: u32 = 0;
-
-    // Service scopes — BOTH namespaces swept here (unlike the
-    // deprecated-tag sweep, whose library exclusion exists because it
-    // rewrites concepts; reindex is index-only). No provenance /
-    // revision-op builders: nothing concept-shaped is written.
-    for (dir, namespace) in [
-        (state.store.skills_dir(), "skills"),
-        (state.store.library_dir(), "library"),
-    ] {
-        let cs =
-            ConceptStore::for_service(&state.store, (*state.service_key).clone(), &dir, namespace);
-        backfilled += backfill_scope(&state.store, &cs).await;
-    }
-
-    // Every user scope, enumerated with raw SQL on the pool — the
-    // migrate_deprecated_tags shape verbatim: unreadable ids and
-    // unrecoverable keys log one warn and skip one scope.
-    let users: Vec<(String,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
-        .fetch_all(state.store.pool())
-        .await?;
-    for (id,) in users {
-        let user_id: Uuid = match id.parse() {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!(user = %id, error = %e,
-                    "length backfill sweep: user row id unreadable — scope skipped");
-                continue;
-            }
-        };
-        let master: MasterKey = match state.master_key_for(user_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(user_id = %user_id, error = %e,
-                    "length backfill sweep: master key unrecoverable — user scope skipped (retries next boot)");
-                continue;
-            }
-        };
-        let cs = ConceptStore::for_user(&state.store, user_id, master);
+    // The shared enumeration returns both service shelves (unlike the
+    // deprecated-tag sweep's loop, whose library element is SKIPPED —
+    // an exclusion that exists only because it rewrites concepts;
+    // `reindex` is index-only, so BOTH library namespaces are looped
+    // here) and every user scope. NOTHING is attached per element:
+    // index-only, no concept writes to stamp (§3.2a-4).
+    for cs in sweep_targets(state, "length backfill sweep").await? {
         backfilled += backfill_scope(&state.store, &cs).await;
     }
     Ok(backfilled)
@@ -309,7 +320,10 @@ async fn backfill_scope(store: &Store, cs: &ConceptStore<'_>) -> u32 {
         match cs.reindex(&path).await {
             Ok(()) => {
                 backfilled += 1;
-                tracing::info!(scope = %scope, path = %path,
+                // Per-row visibility at DEBUG — the backfill is
+                // bulk-cardinality; the aggregate lands at info via
+                // main.rs's `Ok(n) if n > 0` arm.
+                tracing::debug!(scope = %scope, path = %path,
                     "length backfill sweep: reindexed NULL-length index row");
             }
             Err(e) => {
@@ -600,10 +614,10 @@ mod tests {
             }
         }
 
-        // Both scopes' user scopes:
-        // Pre-sweep: both legacy rows NULL-length AND matched by the
-        // history token (proving the planted pre-state, so the post-sweep
-        // "no longer matches" is non-vacuous).
+        // Pre-sweep assertions for BOTH seeded scopes (user + skills):
+        // each legacy row is NULL-length AND matched by the planted
+        // history token — proving the pre-state, so the post-sweep
+        // "no longer matches" is non-vacuous.
         let user_scope = user_cs.scope_id();
         let skills_scope = skills_cs.scope_id();
         let pool = state.store.pool();
@@ -815,6 +829,65 @@ mod tests {
         assert!(
             search_paths(&library_cs, "zebracorn").await.is_empty(),
             "the library scope's history token must stop matching"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_continues_past_a_concept_read_fault() {
+        let (state, _dir, user, master) = boot_state().await;
+
+        // Seed one GOOD user row (a real concept, put normally) ...
+        let user_cs = ConceptStore::for_user(&state.store, user, master.clone());
+        let c = history_concept("/notes/good.md", "good body facts\n\n# History\nzebracorn");
+        user_cs.put(&c).await.unwrap();
+        let scope = user_cs.scope_id();
+        let pool = state.store.pool();
+        sqlx::query("UPDATE search_docs SET length = NULL WHERE concept_path = ?")
+            .bind("/notes/good.md")
+            .execute(pool)
+            .await
+            .unwrap();
+        // ...next to a DEAD row: an index resident whose concept file
+        // never lands (the per-concept fault shape — reindex's `get`
+        // fails NotFound). The payload blob is filler; the sweep must
+        // not touch the row (reindex faults before any payload work).
+        sqlx::query(
+            "INSERT INTO search_docs (scope, concept_path, payload, length, lifecycle_status) \
+             VALUES (?, '/notes/dead.md', x'', NULL, NULL)",
+        )
+        .bind(&scope)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Pre-sweep: both candidates present, both NULL.
+        assert_eq!(
+            stored_length(pool, &scope, "/notes/good.md").await,
+            None,
+            "the good row is a candidate (NULL length)"
+        );
+        assert_eq!(
+            stored_length(pool, &scope, "/notes/dead.md").await,
+            None,
+            "the dead row is a candidate (NULL length)"
+        );
+
+        // The sweep returns Ok: the dead row is a per-concept fault
+        // (logged, the pass continues); the good row still backfills.
+        let count = backfill_index_lengths(&state).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "the count is the GOOD rows only — a fault is not a count"
+        );
+        assert_eq!(
+            stored_length(pool, &scope, "/notes/good.md").await,
+            Some(tokenize(&searchable_text(&c)).len() as i64),
+            "the good row's length is backfilled"
+        );
+        assert_eq!(
+            stored_length(pool, &scope, "/notes/dead.md").await,
+            None,
+            "the dead row stays NULL — the fault reindexed nothing"
         );
     }
 
