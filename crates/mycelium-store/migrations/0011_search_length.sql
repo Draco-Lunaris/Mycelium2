@@ -1,0 +1,17 @@
+-- 0011_search_length.sql
+-- BM25 length column (spec: docs/superpowers/specs/2026-10-31-memory-lifecycle-design.md §3.3; §3.2a-3/4/5).
+--
+-- search_docs.length: the token count of a concept's searchable_text
+-- (title + description + tags + the `# History`-cut body), stored at `put`
+-- so BM25 length normalization reads it without re-tokenizing (spec §3.3).
+-- NULL for rows written before this migration — §3.2a-4's index-only
+-- `ConceptStore::reindex` boot sweep backfills them (no concept write, no
+-- registry touch, NO revision row). §3.2a-5: scoring treats a NULL length as
+-- 0 (still returned, transiently over-boosted) and derives n_docs/avgdl from
+-- COUNT(length)/SUM(length), so NULL rows are excluded from the corpus
+-- statistics until the sweep lands.
+--
+-- A NEW migration, not an amendment to 0010 (§3.2a-3): 0010 is merged,
+-- shipped history and cannot be amended; `search_vectors` already exists
+-- there (created empty, written by step 4). The BM25 length column ships here.
+ALTER TABLE search_docs ADD COLUMN length INTEGER;
