@@ -407,6 +407,19 @@ the earlier blocks bind their plans.
     configured — the observation belongs to the 30s probe worker). Boot
     order pin: sync_embedding_from_store < vector-worker spawn <
     embedding-probe spawn < serve.
+19. **§6.2's end-to-end supersede acceptance is demonstrated by step 4's
+    dream cosine-dupes work (Task 6), not the composer (Task 5)** — review
+    ruling. "Hybrid recall guarantees the supersede flow" means recall of
+    the still-ACTIVE original through a rephrased duplicate (no shared
+    tokens) so the dedup/supersede machinery can find it; the composer
+    test covers exactly that recall half. The pools stay ACTIVE-ONLY in
+    BOTH sources — a superseded row never ranks (spec §6.1 corollary,
+    "status filter cuts before pooling", Task 3's cache pins); the
+    implementer report's "status-blind vec pool" phrasing was wrong and is
+    retracted. Related: `SearchMode::VectorOnly` deliberately bypasses the
+    health machine — the embed's own result is the truth for a diagnostic
+    mode; a failing backend yields an empty pool, which is the truthful
+    reading.
 
 ## 4. Crypto model (unchanged invariants)
 
