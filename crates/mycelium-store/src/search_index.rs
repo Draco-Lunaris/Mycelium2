@@ -362,7 +362,7 @@ mod tests {
     use super::*;
     use crate::Store;
     use mycelium_core::concept::{Concept, Frontmatter};
-    use mycelium_core::search::is_active_status;
+    use mycelium_core::search::{SearchMode, is_active_status};
 
     fn concept(path: &str, title: &str, body: &str) -> Concept {
         Concept::new(
@@ -395,6 +395,7 @@ mod tests {
             terms,
             include_global: false,
             status_filter: StatusFilter::All,
+            mode: SearchMode::Auto,
         }
     }
 
@@ -512,6 +513,7 @@ mod tests {
                     terms: terms.iter().map(|t| (*t).to_string()).collect(),
                     include_global: false,
                     status_filter: filter,
+                    mode: SearchMode::Auto,
                 };
                 let encrypted = index.search(&query).await.unwrap();
                 let memory = oracle.search(&query).unwrap();

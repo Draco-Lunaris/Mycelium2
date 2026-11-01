@@ -533,6 +533,7 @@ impl QueueWorker {
         let scopes = AgentScopes {
             skills: None,
             library: None,
+            embeddings: None,
             read_stack_text: None,
             visible_slugs: None,
             trace: Some(TraceSink {

@@ -10,7 +10,7 @@
 //! every entry point working when no LLM backend is reachable.
 
 use mycelium_core::concept::Concept;
-use mycelium_core::search::SearchQuery;
+use mycelium_core::search::{SearchMode, SearchQuery};
 use mycelium_store::{ConceptStore, ConceptStoreError};
 
 use crate::llm::{ConversationTurn, LlmClient, StepOutput, ToolCall, tool_spec};
@@ -110,6 +110,13 @@ pub struct AgentScopes<'a> {
     /// Trace persistence (optional — None disables recording). The pool
     /// + scope id identify the caller's trace rows (`user:<uuid>`).
     pub trace: Option<TraceSink>,
+    /// The embeddings client the hybrid composer embeds the QUESTION
+    /// with (memory-lifecycle §3.3). None (or an embed failure, or an
+    /// unhealthy backend) → the composer stays lexical — never an
+    /// error. Built per surface from the sealed `embeddings` config
+    /// row; the embed call never touches the LLM gate (Task 2's
+    /// constraint: embedding traffic shares no wait queue).
+    pub embeddings: Option<crate::embeddings::EmbeddingsClient>,
 }
 
 /// Bookshelf-visibility check for a library catalog path: the book's
@@ -135,75 +142,275 @@ fn library_path_visible(scopes: &AgentScopes<'_>, path: &str) -> bool {
 /// search result (spec §3.2a-6).
 pub type ScopedHit = (String, mycelium_core::search::SearchResult);
 
+/// How the composer combines its sources for ONE request (memory-
+/// lifecycle spec §3.3): the lexical pools always exist, the vector
+/// pools ride the embeddings client and the health machine (Auto) or
+/// the explicit mode. The question's embedding is computed ONCE per
+/// request — the enum carries it so every scope shares it.
+enum FuseSources {
+    /// The pre-vector composer, byte-for-byte (explicit Lexical mode,
+    /// or Auto with no workable vector source).
+    LexicalOnly,
+    /// Per-scope lexical+vector pools fused by RRF (Auto's healthy arm).
+    Hybrid { qvec: Vec<f32>, model: String },
+    /// Vector pools only, no lexical fallback — the truthful
+    /// diagnostic. Scores ARE the raw cosine (not an RRF weighting).
+    VecOnly { qvec: Vec<f32>, model: String },
+}
+
+/// The per-pool cap entering the fusion: ranked lexical hits and cosine
+/// rows per scope (spec §3.3: 50 — beyond rank ~50 the RRF terms are
+/// indistinguishable anyway).
+const LEX_POOL: usize = 50;
+
+/// The QUESTION's embedding — the composer's shared qvec — with the
+/// backend's model name (the vector rows' filter key). None: no client,
+/// no terms, an empty embedding, or any embed FAILURE (that one
+/// debug-logs and degrades — never an error).
+async fn question_qvec(
+    query: &SearchQuery,
+    embedding: Option<&crate::embeddings::EmbeddingsClient>,
+) -> Option<(Vec<f32>, String)> {
+    let client = embedding?;
+    let question_text = query.terms.join(" ");
+    if question_text.is_empty() {
+        return None;
+    }
+    let vec = match client.embed_batch(&[question_text]).await {
+        Ok(vecs) => vecs.into_iter().next().filter(|v| !v.is_empty())?,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "question embed failed: the composer degrades per its mode"
+            );
+            return None;
+        }
+    };
+    Some((vec, client.model().to_string()))
+}
+
+/// One scope's LEXICAL pool: the scope's search results (the index
+/// returns them ranked — score desc, path asc), cut to [`LEX_POOL`]. A
+/// search fault contributes nothing and logs at warn (the pool
+/// posture — the rest of the request stays ranked).
+async fn ranked_lex_pool(
+    cs: &ConceptStore<'_>,
+    tag: &str,
+    query: &SearchQuery,
+) -> Vec<mycelium_core::search::SearchResult> {
+    match cs.search(query).await {
+        Ok(hits) => hits.into_iter().take(LEX_POOL).collect(),
+        Err(e) => {
+            tracing::warn!(
+                scope = tag,
+                error = %e,
+                "cross-scope search failed: scope contributes no hits"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// One scope's VECTOR pool: the scope's `top_cosine` rows under the
+/// embeddings backend's model, already ranked (cosine desc — see
+/// `VectorStore::top_cosine`). A fault contributes nothing (the pool
+/// posture).
+async fn vec_pool(cs: &ConceptStore<'_>, qvec: &[f32], model: &str) -> Vec<(String, f32)> {
+    match cs.vectors().top_cosine(qvec, model, LEX_POOL).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cross-scope vector pool failed: scope contributes no hits"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Title + snippet for a fused candidate that produced NO lexical hit —
+/// from the owning scope's own store, matching BOTH indexes' derivation
+/// exactly (frontmatter title else the path; the body's first 200 chars,
+/// trimmed). A read/parse FAULT keeps the candidate with the path as
+/// title and an empty snippet (hit_fields's keep-the-hit posture).
+async fn enrich_hit(cs: &ConceptStore<'_>, path: &str) -> (String, String) {
+    match cs.get(path).await {
+        Ok(concept) => {
+            let title = concept
+                .frontmatter
+                .title
+                .clone()
+                .unwrap_or_else(|| concept.source_path.clone());
+            let snippet = concept
+                .body
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            (title, snippet)
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %path,
+                error = %e,
+                "vector candidate enrichment fault: hit stays, fields minimal"
+            );
+            (path.to_string(), String::new())
+        }
+    }
+}
+
 /// The shared cross-scope hit helper behind BOTH the MCP `memory_query`
 /// hits default (cap = the caller's `limit`, `query_top_k` when absent,
-/// ≤ 64) and the agent's `search_knowledge` tool (cap 10, §3.2a-10):
-/// the user's private bundle first, then the global skills shelf, then
-/// the library catalog filtered by bookshelf visibility — exactly as
-/// the agent arm collected before this consolidation. Sort: score
-/// descending, ties broken by concept path ascending (deterministic),
-/// truncation LAST. BM25 scores are corpus-relative (the scope tag is
-/// provenance), so scoring is per-corpus and the tag carries which.
+/// ≤ 64), the agent's `search_knowledge` tool (cap 10, §3.2a-10), and
+/// the web REST search's composer (which passes the user store as
+/// `None` when its master key is unusable — the global shelves stay
+/// reachable, exactly the pre-fusion posture). Scope order: the
+/// caller's private bundle, then the global skills shelf, then the
+/// library catalog — filtered by bookshelf visibility.
+///
+/// `query.mode` selects the sources the composer combines (the lexical
+/// ENGINES never read it — every pool's scoring is done by the index or
+/// `top_cosine`). Auto (default): when an embeddings client is
+/// configured AND the embeddings health machine is Green/Yellow, each
+/// scope's lexical top-50 fuses with its vector top-50 by RRF, then the
+/// merged fused scores sort cross-scope (fused ranks are comparable
+/// across scopes — that IS RRF's point, ledger §3.2a-14). VectorOnly:
+/// vector pools only, scores are the raw cosine, NO lexical fallback
+/// (an empty pool stays empty). Lexical: the pre-vector composer,
+/// byte-for-byte. Degradations (no client, Red/Disabled health, a
+/// failed question embed) are a debug log — NEVER an error in either
+/// mode (in VectorOnly the truthful result is the empty list).
+///
+/// The QUESTION's embedding is one `embed_batch` call per request,
+/// computed before the scope loops; it shares NO LLM gate (Task 2's
+/// constraint — embedding traffic has no wait queue).
+///
+/// Library visibility follows the ruling's shape: the lexical arm keeps
+/// its in-arm filter; in the vector modes the filter applies AFTER the
+/// fusion (invisible candidates compete for fusion ranks but never
+/// surface). A scope-search fault contributes no hits and logs at warn
+/// — hit_fields's posture. Truncation to `cap` happens LAST.
 pub async fn cross_scope_hits(
-    store: &ConceptStore<'_>,
+    store: Option<&ConceptStore<'_>>,
     scopes: &AgentScopes<'_>,
     query: &SearchQuery,
     cap: usize,
+    embedding: Option<&crate::embeddings::EmbeddingsClient>,
 ) -> Vec<ScopedHit> {
+    let fuse = match query.mode {
+        SearchMode::Lexical => FuseSources::LexicalOnly,
+        SearchMode::VectorOnly => match question_qvec(query, embedding).await {
+            Some((qvec, model)) => FuseSources::VecOnly { qvec, model },
+            None => return Vec::new(),
+        },
+        SearchMode::Auto => {
+            let healthy = matches!(
+                crate::llm_health::embedding_state(),
+                crate::llm_health::BackendState::Green | crate::llm_health::BackendState::Yellow
+            );
+            if let (Some(_), true) = (embedding, healthy) {
+                match question_qvec(query, embedding).await {
+                    Some((qvec, model)) => FuseSources::Hybrid { qvec, model },
+                    // The embed failed: degrade to lexical (debug-logged
+                    // inside question_qvec).
+                    None => FuseSources::LexicalOnly,
+                }
+            } else {
+                FuseSources::LexicalOnly
+            }
+        }
+    };
+
+    // The scope sources in composer order. The user option keeps the
+    // pre-fusion posture: an unusable master key contributes no user
+    // hits while the global shelves stay searchable.
+    let sources: [(&'static str, Option<&ConceptStore<'_>>); 3] = [
+        ("user", store),
+        ("skills", scopes.skills.as_ref()),
+        ("library", scopes.library.as_ref()),
+    ];
+
     let mut all_hits: Vec<ScopedHit> = Vec::new();
-
-    // A scope-search FAULT is not a tool fault: the scope contributes
-    // no hits and the fault logs (muted, as a warning) — hit_fields's
-    // posture. The hits from the other scopes stay ranked.
-
-    // 1. User's private bundle (always searched).
-    match store.search(query).await {
-        Ok(hits) => {
-            for h in hits {
-                all_hits.push(("user".to_string(), h));
-            }
-        }
-        Err(e) => tracing::warn!(
-            scope = "user",
-            error = %e,
-            "cross-scope search failed: scope contributes no hits"
-        ),
-    }
-
-    // 2. Global skills shelf (if available).
-    if let Some(ref skills) = scopes.skills {
-        match skills.search(query).await {
-            Ok(hits) => {
-                for h in hits {
-                    all_hits.push(("skills".to_string(), h));
-                }
-            }
-            Err(e) => tracing::warn!(
-                scope = "skills",
-                error = %e,
-                "cross-scope search failed: scope contributes no hits"
-            ),
-        }
-    }
-
-    // 3. Global library catalog (if available), filtered by the caller's
-    //    bookshelf visibility.
-    if let Some(ref library) = scopes.library {
-        match library.search(query).await {
-            Ok(hits) => {
-                for h in hits {
-                    if !library_path_visible(scopes, &h.concept_path) {
-                        continue;
+    for (tag, scope_cs) in sources {
+        let Some(cs) = scope_cs else {
+            continue;
+        };
+        match &fuse {
+            FuseSources::LexicalOnly => match cs.search(query).await {
+                Ok(hits) => {
+                    for h in hits {
+                        if tag == "library" && !library_path_visible(scopes, &h.concept_path) {
+                            continue;
+                        }
+                        all_hits.push((tag.to_string(), h));
                     }
-                    all_hits.push(("library".to_string(), h));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        scope = tag,
+                        error = %e,
+                        "cross-scope search failed: scope contributes no hits"
+                    );
+                }
+            },
+            FuseSources::Hybrid { qvec, model } => {
+                let lex_hits = ranked_lex_pool(cs, tag, query).await;
+                let vector_pool = vec_pool(cs, qvec, model).await;
+                if lex_hits.is_empty() && vector_pool.is_empty() {
+                    continue;
+                }
+                let lex_pairs: Vec<(String, f32)> = lex_hits
+                    .iter()
+                    .map(|h| (h.concept_path.clone(), h.score))
+                    .collect();
+                let fused = mycelium_core::search::rrf_fuse(
+                    &lex_pairs,
+                    &vector_pool,
+                    &mycelium_store::revisions::rrf_params(),
+                );
+                for (path, fused_score) in fused {
+                    let (title, snippet) = match lex_hits.iter().find(|h| h.concept_path == path) {
+                        Some(h) => (h.title.clone(), h.snippet.clone()),
+                        None => enrich_hit(cs, &path).await,
+                    };
+                    all_hits.push((
+                        tag.to_string(),
+                        mycelium_core::search::SearchResult {
+                            concept_path: path,
+                            title,
+                            snippet,
+                            score: fused_score,
+                        },
+                    ));
                 }
             }
-            Err(e) => tracing::warn!(
-                scope = "library",
-                error = %e,
-                "cross-scope search failed: scope contributes no hits"
-            ),
+            FuseSources::VecOnly { qvec, model } => {
+                for (path, cos) in vec_pool(cs, qvec, model).await {
+                    let (title, snippet) = enrich_hit(cs, &path).await;
+                    all_hits.push((
+                        tag.to_string(),
+                        mycelium_core::search::SearchResult {
+                            concept_path: path,
+                            title,
+                            snippet,
+                            score: cos,
+                        },
+                    ));
+                }
+            }
         }
+    }
+
+    // Library visibility rides AFTER fusion in the vector modes (the
+    // invisible candidates compete for fusion ranks but never surface —
+    // ledger §3.2a-14); the lexical arm keeps its in-arm filter above,
+    // byte-for-byte.
+    if !matches!(fuse, FuseSources::LexicalOnly) {
+        all_hits.retain(|(scope, hit)| {
+            scope != "library" || library_path_visible(scopes, &hit.concept_path)
+        });
     }
 
     // Sort by score descending, then path ascending for determinism.
@@ -723,7 +930,8 @@ async fn execute_tool_tracked(
             // does NOT use the admin-tunable query_top_k): hundreds of
             // catalog concepts would drown the model and burn its step
             // budget reading them one by one.
-            let all_hits = cross_scope_hits(store, scopes, &q, 10).await;
+            let all_hits =
+                cross_scope_hits(Some(store), scopes, &q, 10, scopes.embeddings.as_ref()).await;
 
             // Every hit reaches the model in the full ten-field QueryHit
             // shape (§3.2a-6): the lifecycle/provenance fields come from
@@ -1768,6 +1976,7 @@ mod tests {
         let scopes = AgentScopes {
             skills: None,
             library: None,
+            embeddings: None,
             read_stack_text: None,
             visible_slugs: None,
             trace: None,
@@ -1934,6 +2143,7 @@ mod tests {
         AgentScopes {
             skills: None,
             library: None,
+            embeddings: None,
             read_stack_text: None,
             visible_slugs: None,
             trace: None,

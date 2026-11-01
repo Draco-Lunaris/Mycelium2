@@ -14,6 +14,7 @@ fn no_scopes<'a>() -> AgentScopes<'a> {
     AgentScopes {
         skills: None,
         library: None,
+        embeddings: None,
         read_stack_text: None,
         visible_slugs: None,
         trace: None,
@@ -455,6 +456,7 @@ fn scopes_with_library<'a>(
     AgentScopes {
         skills: None,
         library: Some(library),
+        embeddings: None,
         read_stack_text: None,
         visible_slugs,
         trace: None,

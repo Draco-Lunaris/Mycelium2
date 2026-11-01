@@ -286,6 +286,13 @@ impl EmbeddingsClient {
         }
     }
 
+    /// The configured embedding model name — the composer's filter key
+    /// against the vector rows (`VectorStore` rows carry the model that
+    /// produced them; a question must score only same-model rows).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// The embed request with auth (Bearer when a key is configured,
     /// bare otherwise) — the single POST site every caller goes through.
     async fn post_embeddings(

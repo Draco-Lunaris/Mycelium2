@@ -26,6 +26,20 @@ pub fn is_active_status(status: Option<&str>) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SearchMode {
+    /// Fuse lexical results with vector results when the embeddings
+    /// backend is configured and healthy; degrade to lexical-only
+    /// otherwise (never an error).
+    #[default]
+    Auto,
+    /// Lexical pools only — the pre-vector behavior, byte-for-byte.
+    Lexical,
+    /// Vector pools only, with NO lexical fallback: a deliberately
+    /// honest diagnostic (an empty pool stays empty).
+    VectorOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub terms: Vec<String>,
@@ -37,11 +51,18 @@ pub struct SearchQuery {
     /// Lifecycle filter: [`StatusFilter::ActiveOnly`] (the default) skips
     /// docs whose status is in [`NON_ACTIVE_STATUSES`].
     pub status_filter: StatusFilter,
+    /// Which sources the search COMPOSER combines (the hybrid composer
+    /// in mycelium-librarian / mycelium-web). **The lexical engines
+    /// IGNORE this field**: [`SearchIndex::search`] only ever scores
+    /// lexically — the mode selects which pools the composer builds
+    /// around the engine's results, not how those pools are scored.
+    pub mode: SearchMode,
 }
 
 impl SearchQuery {
     pub fn new(terms: Vec<String>) -> Self {
         Self {
+            mode: SearchMode::default(),
             terms,
             include_global: false,
             status_filter: StatusFilter::default(),
@@ -109,6 +130,107 @@ pub fn searchable_text(concept: &Concept) -> String {
         .sum();
     text.push_str(&concept.body[..body_len]);
     text
+}
+
+/// Query-fusion primitives (memory-lifecycle spec §3.3): the weights
+/// the hybrid composer uses and the two functions both consumer sites
+/// (mycelium-librarian's `cross_scope_hits` and mycelium-web's
+/// `search_all_scopes`) share.
+///
+/// Reciprocal Rank Fusion: every pool is a DISTINCT source of truth, so
+/// only each pool's RANK (position, 1-based) is consumed — the fused
+/// score of a candidate is the sum of its per-pool terms, and because
+/// ranks (not raw scores) drive the arithmetic, fused scores are
+/// comparable ACROSS scopes. That cross-scope comparability is the
+/// reason the composer fuses per scope and merges afterwards.
+///
+/// The hybrid composer's formula constants. Spec-set defaults (k 60 —
+/// the classic rank-softening constant — and equal weights); the
+/// `lifecycle` config row retunes all three at runtime via
+/// `mycelium_store::revisions::rrf_params()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RrfParams {
+    /// The rank-softening constant: larger values flatten rank
+    /// differences (position 1 scores 1/(k+1), position 50 scores
+    /// 1/(k+50)).
+    pub rrf_k: f32,
+    /// The lexical pool's weight.
+    pub w_lex: f32,
+    /// The vector pool's weight.
+    pub w_vec: f32,
+}
+
+impl Default for RrfParams {
+    fn default() -> Self {
+        RrfParams {
+            rrf_k: 60.0,
+            w_lex: 1.0,
+            w_vec: 1.0,
+        }
+    }
+}
+
+/// Cosine similarity of two vectors: `a·b / (|a|·|b|)`. Callers filter
+/// dimensions (and model) first, so the pools only ever compare
+/// same-model rows — mismatched or empty lengths return 0.0, as does a
+/// zero-norm guard (a zero vector is similarity-0 to everything, not a
+/// NaN, and never the 1.0 self-similarity trap).
+#[must_use]
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "the vector composer filters dimensions before calling cosine"
+    );
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom == 0.0 || denom.is_nan() {
+        return 0.0;
+    }
+    dot / denom
+}
+
+/// Fuse two already-ranked pools (rank 1 = best, in position order)
+/// into one ranked list of `(path, fused_score)`: each candidate's
+/// fused score is `w/(k + rank)` summed over the pools it appears in,
+/// an absent pool contributing that term as 0 (see the module-level
+/// fusion docs). Output sorted by fused score descending, ties broken
+/// by path ascending.
+#[must_use]
+pub fn rrf_fuse(
+    lex_pool: &[(String, f32)],
+    vec_pool: &[(String, f32)],
+    params: &RrfParams,
+) -> Vec<(String, f32)> {
+    // Accumulate by path; a duplicate path inside ONE pool would sum
+    // twice, but pools are distinct-path by construction (ranked search
+    // results / one vector row per path).
+    let mut scores: std::collections::BTreeMap<String, f32> = std::collections::BTreeMap::new();
+    for (rank, (path, _)) in lex_pool.iter().enumerate() {
+        *scores.entry(path.clone()).or_insert(0.0) +=
+            params.w_lex / (params.rrf_k + rank as f32 + 1.0);
+    }
+    for (rank, (path, _)) in vec_pool.iter().enumerate() {
+        *scores.entry(path.clone()).or_insert(0.0) +=
+            params.w_vec / (params.rrf_k + rank as f32 + 1.0);
+    }
+    let mut out: Vec<(String, f32)> = scores.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
 }
 
 /// Shared BM25 parameters and scorer.
@@ -631,6 +753,176 @@ mod tests {
             (hits[0].score - want).abs() < 1e-4,
             "{} vs {want}",
             hits[0].score
+        );
+    }
+
+    #[test]
+    fn lexical_engines_ignore_mode() {
+        // `SearchQuery.mode` selects which sources a COMPOSER combines —
+        // the score engines never read it: an index searched under
+        // VectorOnly still returns lexical matches (the composer builds
+        // the pools; the index only ever scores lexically).
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept("/a.md", "Deploy Rust", "how to deploy"))
+            .ok();
+        let mut q = SearchQuery::new(vec!["rust".into()]);
+        q.mode = SearchMode::VectorOnly;
+        assert_eq!(paths(&idx.search(&q).unwrap()), ["/a.md"]);
+        q.mode = SearchMode::Lexical;
+        assert_eq!(paths(&idx.search(&q).unwrap()), ["/a.md"]);
+    }
+
+    #[test]
+    fn rrf_fuse_math_and_ties() {
+        let params = RrfParams::default();
+        // The default constants (spec-set: k 60, equal weights).
+        assert_eq!(params.rrf_k, 60.0);
+        assert_eq!(params.w_lex, 1.0);
+        assert_eq!(params.w_vec, 1.0);
+
+        // Hand-computed main case: lex [A,B] (A rank 1, B rank 2), vec
+        // [B,C] (B rank 1, C rank 2). Ranks are 1-based positions in the
+        // already-ranked pools: B = 1/(60+2) + 1/(60+1), A = 1/(60+1),
+        // C = 1/(60+2) → order B, A, C.
+        let lex = vec![("/a.md".to_string(), 30.0), ("/b.md".to_string(), 20.0)];
+        let vectors = vec![("/b.md".to_string(), 0.9), ("/c.md".to_string(), 0.8)];
+        let out = rrf_fuse(&lex, &vectors, &params);
+        // A nested fn (not a closure) so the return's lifetime ties to
+        // the argument properly.
+        fn paths_of(o: &[(String, f32)]) -> Vec<&str> {
+            o.iter().map(|(p, _)| p.as_str()).collect()
+        }
+        fn score_of(o: &[(String, f32)], p: &str) -> f32 {
+            o.iter()
+                .find(|(q, _)| q == p)
+                .unwrap_or_else(|| panic!("{p} missing from {o:?}"))
+                .1
+        }
+        assert_eq!(paths_of(&out), vec!["/b.md", "/a.md", "/c.md"]);
+        let want_b = 1.0 / (60.0 + 2.0) + 1.0 / (60.0 + 1.0);
+        let want_a = 1.0 / (60.0 + 1.0);
+        let want_c = 1.0 / (60.0 + 2.0);
+        assert!(
+            (score_of(&out, "/b.md") - want_b).abs() < 1e-6,
+            "B: {} vs {want_b}",
+            score_of(&out, "/b.md")
+        );
+        assert!(
+            (score_of(&out, "/a.md") - want_a).abs() < 1e-6,
+            "A: {} vs {want_a}",
+            score_of(&out, "/a.md")
+        );
+        assert!(
+            (score_of(&out, "/c.md") - want_c).abs() < 1e-6,
+            "C: {} vs {want_c}",
+            score_of(&out, "/c.md")
+        );
+
+        // Tie + pool ORDER (not path order) drives ranks: /b.md is at
+        // lex rank 1 (its score leads), tying /z.md at vec rank 1 —
+        // both fuse to 1/(60+1) and the path-ascending tiebreak orders
+        // them, with the rank-2 lexical candidate last.
+        let lex = vec![("/b.md".to_string(), 9.0), ("/a.md".to_string(), 2.0)];
+        let vectors = vec![("/z.md".to_string(), 0.5)];
+        let out = rrf_fuse(&lex, &vectors, &params);
+        assert_eq!(paths_of(&out), vec!["/b.md", "/z.md", "/a.md"]);
+        assert_eq!(
+            score_of(&out, "/b.md"),
+            score_of(&out, "/z.md"),
+            "same rank in opposite pools fuses to the same score"
+        );
+        assert!((score_of(&out, "/b.md") - 1.0 / 61.0).abs() < 1e-6);
+        assert!((score_of(&out, "/a.md") - 1.0 / 62.0).abs() < 1e-6);
+
+        // An absent pool contributes that term as 0 — from either side.
+        let out = rrf_fuse(&[("/a.md".to_string(), 1.0)], &[], &params);
+        assert_eq!(paths_of(&out), vec!["/a.md"]);
+        assert!((out[0].1 - 1.0 / 61.0).abs() < 1e-6);
+        let out = rrf_fuse(&[], &[("/a.md".to_string(), 1.0)], &params);
+        assert_eq!(paths_of(&out), vec!["/a.md"]);
+        assert!((out[0].1 - 1.0 / 61.0).abs() < 1e-6);
+
+        // Both pools empty → empty output.
+        assert!(rrf_fuse(&[], &[], &params).is_empty());
+
+        // A vector-only pool ranks by its own positions: 1/61, 1/62,
+        // 1/63 — order preserved.
+        let vectors = vec![
+            ("/b.md".to_string(), 0.9),
+            ("/c.md".to_string(), 0.8),
+            ("/d.md".to_string(), 0.7),
+        ];
+        let out = rrf_fuse(&[], &vectors, &params);
+        assert_eq!(paths_of(&out), vec!["/b.md", "/c.md", "/d.md"]);
+        assert!((out[0].1 - 1.0 / 61.0).abs() < 1e-6);
+        assert!((out[1].1 - 1.0 / 62.0).abs() < 1e-6);
+        assert!((out[2].1 - 1.0 / 63.0).abs() < 1e-6);
+
+        // The weights scale their own term — a shrunk vector weight
+        // flips the default ordering (under equal weights /b.md's fused
+        // score leads; with w_vec 0.01 the lexical rank alone wins).
+        let params = RrfParams {
+            rrf_k: 60.0,
+            w_lex: 1.0,
+            w_vec: 0.01,
+        };
+        let lex = vec![("/a.md".to_string(), 1.0), ("/b.md".to_string(), 0.5)];
+        let vectors = vec![("/b.md".to_string(), 0.9)];
+        let out = rrf_fuse(&lex, &vectors, &params);
+        assert_eq!(paths_of(&out), vec!["/a.md", "/b.md"]);
+        let want_a = 1.0 / 61.0;
+        let want_b = 1.0 / 62.0 + 0.01 / 61.0;
+        assert!(
+            (score_of(&out, "/a.md") - want_a).abs() < 1e-6,
+            "A: {} vs {want_a}",
+            score_of(&out, "/a.md")
+        );
+        assert!(
+            (score_of(&out, "/b.md") - want_b).abs() < 1e-6,
+            "B: {} vs {want_b}",
+            score_of(&out, "/b.md")
+        );
+        // ...and w_lex scales the lexical term (5.0, no vector pool:
+        // 5/61 and 5/62).
+        let params = RrfParams {
+            rrf_k: 60.0,
+            w_lex: 5.0,
+            w_vec: 1.0,
+        };
+        let lex = vec![("/a.md".to_string(), 1.0), ("/b.md".to_string(), 0.5)];
+        let out = rrf_fuse(&lex, &[], &params);
+        assert!(
+            (score_of(&out, "/a.md") - 5.0 / 61.0).abs() < 1e-6,
+            "w_lex scales: {}",
+            score_of(&out, "/a.md")
+        );
+        assert!(
+            (score_of(&out, "/b.md") - 5.0 / 62.0).abs() < 1e-6,
+            "w_lex scales: {}",
+            score_of(&out, "/b.md")
+        );
+    }
+
+    #[test]
+    fn cosine_basics() {
+        // Same direction (any positive scale) → 1.
+        assert!((cosine(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((cosine(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]) - 1.0).abs() < 1e-6);
+        // Orthogonal → 0; opposite → −1.
+        assert!(cosine(&[1.0, 0.0], &[0.0, 5.0]).abs() < 1e-6);
+        assert!((cosine(&[1.0, 0.0], &[-3.0, 0.0]) + 1.0).abs() < 1e-6);
+        // The zero-norm guard returns 0.0 (not the 1.0 self-similarity
+        // trap, not NaN).
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 1.0], &[0.0, 0.0]), 0.0);
+        // 0-length inputs → 0.0.
+        assert_eq!(cosine(&[], &[]), 0.0);
+        // The hybrid acceptance test's pair, by value: the near-parallel
+        // query vector against the doc vector ≈ 0.898.
+        let c = cosine(&[0.9, 0.44, 0.0], &[1.0, 0.0, 0.0]);
+        assert!(
+            (c - 0.9 / (0.9f32 * 0.9 + 0.44 * 0.44).sqrt()).abs() < 1e-6,
+            "{c}"
         );
     }
 }

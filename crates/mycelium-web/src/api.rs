@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_core::concept::{Concept, LifecycleStatus};
-use mycelium_core::search::SearchQuery;
+use mycelium_core::search::{SearchMode, SearchQuery};
 use mycelium_store::{
     ConceptStore, FileRepo, RevisionPathEntry, RevisionStore, RevisionsError, Scope,
     SkillBundleError, SkillGroup, bundle_skill_files, chat::ChatError, group_skills,
@@ -20,6 +20,23 @@ use mycelium_store::{
 use crate::middleware::SessionId;
 use crate::pages;
 use crate::state::AppState;
+
+/// The optional `mode` query parameter (GET /api/v1/search + /search)
+/// parsed into the composer's [`SearchMode`]: `auto` (the default —
+/// fused when the embeddings backend is configured and healthy) /
+/// `lexical` / `vector_only`. Unknown values → HTTP 400 (this is an
+/// API-level misuse, not a degradation — the degrade rules cover
+/// backend weather, never a caller's spelling).
+pub(crate) fn parse_mode_param(
+    mode: &Option<String>,
+) -> Result<mycelium_core::search::SearchMode, StatusCode> {
+    match mode.as_deref().unwrap_or("auto") {
+        "auto" => Ok(SearchMode::Auto),
+        "lexical" => Ok(SearchMode::Lexical),
+        "vector_only" => Ok(SearchMode::VectorOnly),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
 
 /// Construct the librarian agent's cross-scope capabilities from a store
 /// and service key (global skills + library + full-text book search).
@@ -57,6 +74,14 @@ pub(crate) fn build_agent_scopes<'a>(
             &store.library_dir(),
             "library",
         )),
+        // Scoped OUT of the hybrid-retrieval stream (memory-lifecycle
+        // §3.3 wires the two retrieval surfaces: MCP memory_query hits
+        // + the REST search): this scope list serves the chat-runner
+        // agent and the mutation-queue drain-fallback — deterministic
+        // add/delete work, and a try-class worker must not take
+        // embeddings latency on its critical path (the query-priority
+        // invariant).
+        embeddings: None,
         read_stack_text,
         visible_slugs,
         trace: Some(mycelium_librarian::agent::TraceSink {
@@ -234,6 +259,10 @@ pub struct SearchParams {
     q: String,
     #[serde(default)]
     global: Option<String>,
+    /// Optional retrieval mode: `auto` (default) / `lexical` /
+    /// `vector_only`. Unknown names → HTTP 400 (parse_mode_param).
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// One merged search result, tagged with the scope it came from so the
@@ -248,100 +277,105 @@ pub struct ScopedResult {
 }
 
 /// Run a cross-scope search: the user's private bundle plus (by
-/// default on the web) the global skills shelf and the library
-/// catalogs. Library hits from admin-private bookshelves are filtered
-/// out for non-admins (visibility post-filter — the index has no
-/// shelf metadata, so the DB decides).
+/// default on the web) the global skills shelf and the library catalogs.
+/// The composition itself is the SHARED librarian composer
+/// (`cross_scope_hits`) — one fused pipeline, not a web-local copy: the
+/// scope order, RRF weights, caps and sort rule match the MCP hit path
+/// exactly. Library hits from admin-private bookshelves are filtered
+/// out for non-admins (visibility post-filter baked into the composer
+/// via the scope list's `visible_slugs`). The user scope is `None` when
+/// the master key is unusable — the global shelves stay reachable,
+/// exactly the pre-fusion posture. Web passes NO per-hit cap
+/// (`usize::MAX`): the page ranked everything, and the fusion keeps
+/// that (its pools are bounded per scope).
 async fn search_all_scopes(
     state: &AppState,
     user: &SessionUser,
     query: &SearchQuery,
     include_global: bool,
 ) -> Vec<ScopedResult> {
-    let mut results: Vec<ScopedResult> = Vec::new();
-    if let Ok(master) = state.master_key_for(user.user_id).await {
-        let cs = ConceptStore::for_user(&state.store, user.user_id, master);
-        for r in cs.search(query).await.unwrap_or_default() {
-            results.push(ScopedResult {
-                concept_path: r.concept_path,
-                title: r.title,
-                snippet: r.snippet,
-                score: r.score,
-                scope: "user",
-            });
-        }
-    }
-    if include_global {
-        let skills = ConceptStore::for_service(
-            &state.store,
-            (*state.service_key).clone(),
-            &state.store.skills_dir(),
-            "skills",
-        );
-        for r in skills.search(query).await.unwrap_or_default() {
-            results.push(ScopedResult {
-                concept_path: r.concept_path,
-                title: r.title,
-                snippet: r.snippet,
-                score: r.score,
-                scope: "skills",
-            });
-        }
-        let library = ConceptStore::for_service(
-            &state.store,
-            (*state.service_key).clone(),
-            &state.store.library_dir(),
-            "library",
-        );
-        for r in library.search(query).await.unwrap_or_default() {
-            // Visibility post-filter: a library hit belongs to a book;
-            // only global-read shelves (or admins) may see it.
-            let slug = r
-                .concept_path
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(".md")
-                .to_string();
-            let visible = match state.store.book_by_slug(&slug).await {
-                Ok(Some(book)) => {
-                    let global_read = state
-                        .store
-                        .bookshelf_is_global_read(book.bookshelf_id)
-                        .await
-                        .unwrap_or(false);
-                    global_read || user.role == Role::Admin
-                }
-                _ => false, // no DB row → not a book catalog → hide
-            };
-            if visible {
-                results.push(ScopedResult {
-                    concept_path: r.concept_path,
-                    title: r.title,
-                    snippet: r.snippet,
-                    score: r.score,
-                    scope: "library",
-                });
-            }
-        }
-    }
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.concept_path.cmp(&b.concept_path))
-    });
-    results
+    let master = state.master_key_for(user.user_id).await.ok();
+    let user_cs = master.map(|m| ConceptStore::for_user(&state.store, user.user_id, m));
+    let (skills, library) = if include_global {
+        (
+            Some(ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.skills_dir(),
+                "skills",
+            )),
+            Some(ConceptStore::for_service(
+                &state.store,
+                (*state.service_key).clone(),
+                &state.store.library_dir(),
+                "library",
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    // One embeddings client per request, from the sealed `embeddings`
+    // row, reusing the SHARED lifecycle composer (the MCP hit path
+    // passes the same shape). Row absent/undecryptable → None → the
+    // composer degrades to lexical, never an error (never a fabricated
+    // default client — unwrap_or_default would point at
+    // localhost:11434).
+    let embeddings =
+        crate::state::decrypt_config::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+            &state.config,
+            &state.service_key,
+            "embeddings",
+        )
+        .await
+        .map(|cfg| mycelium_librarian::embeddings::EmbeddingsClient::new(&cfg.clamp()));
+    let scopes = mycelium_librarian::agent::AgentScopes {
+        skills,
+        library,
+        embeddings,
+        read_stack_text: None,
+        // Bookshelf visibility, precomputed as a slug set (the same
+        // tables book_by_slug consulted per hit before) — None for
+        // admins (the option IS the allowlist-or-unrestricted shape).
+        visible_slugs: visible_library_slugs(state, user).await,
+        trace: None,
+    };
+    mycelium_librarian::agent::cross_scope_hits(
+        user_cs.as_ref(),
+        &scopes,
+        query,
+        usize::MAX,
+        scopes.embeddings.as_ref(),
+    )
+    .await
+    .into_iter()
+    .map(|(tag, hit)| ScopedResult {
+        concept_path: hit.concept_path,
+        title: hit.title,
+        snippet: hit.snippet,
+        score: hit.score,
+        scope: match tag.as_str() {
+            "user" => "user",
+            "skills" => "skills",
+            _ => "library",
+        },
+    })
+    .collect()
 }
 
-/// GET /api/v1/search?q=...&global=1 — user bundle (+ global shelves when
-/// global=1, the web default per DESIGN).
+/// GET /api/v1/search?q=...&global=1&mode=auto|lexical|vector_only —
+/// user bundle (+ global shelves when global=1, the web default per
+/// DESIGN). Unknown `mode` values → 400.
 async fn api_search(
     State(state): State<AppState>,
     user: SessionUser,
     Query(params): Query<SearchParams>,
 ) -> Response {
+    let mode = match parse_mode_param(&params.mode) {
+        Ok(mode) => mode,
+        Err(status) => {
+            return error_response(status, "invalid mode (auto | lexical | vector_only)");
+        }
+    };
     let terms = params
         .q
         .split_whitespace()
@@ -349,6 +383,7 @@ async fn api_search(
         .collect::<Vec<_>>();
     let mut query = SearchQuery::new(terms);
     query.include_global = params.global.as_deref() != Some("0");
+    query.mode = mode;
     let results = search_all_scopes(&state, &user, &query, query.include_global).await;
     crate::state::Metrics::inc(&state.metrics.searches_total);
     Json(results).into_response()
@@ -2423,6 +2458,15 @@ pub async fn search_view(
 ) -> Response {
     let csrf = pages::current_csrf(&state, &session).await;
     let query = params.get("q").map(String::as_str).unwrap_or("");
+    let mode = match parse_mode_param(&params.get("mode").cloned()) {
+        Ok(mode) => mode,
+        // Parsed BEFORE the empty-query early-return: a bad `mode` is
+        // 400 even on a blank page — the caller's spelling, not a
+        // search outcome.
+        Err(status) => {
+            return error_response(status, "invalid mode (auto | lexical | vector_only)");
+        }
+    };
     // The scope filter only applies when it names a real scope;
     // anything else renders the unfiltered list.
     let scope = match params.get("scope") {
@@ -2438,6 +2482,7 @@ pub async fn search_view(
         .collect::<Vec<_>>();
     let mut search = SearchQuery::new(terms);
     search.include_global = true; // web default: bundle + global shelves
+    search.mode = mode;
     let mut results = search_all_scopes(&state, &user, &search, true).await;
     // Server-side scope filter: the page renders what the chips promise.
     if let Some(scope) = scope {

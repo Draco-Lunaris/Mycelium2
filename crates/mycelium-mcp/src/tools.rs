@@ -92,6 +92,14 @@ async fn agent_scopes<'a>(
             &state.store.library_dir(),
             "library",
         )),
+        // The hybrid retrieval composer's vector source, built here (the
+        // memory_query surface owns its config plumbing): the sealed
+        // `embeddings` row decrypts under the service key; an ABSENT row
+        // (or an unkeyed default client — never built) leaves the
+        // composer lexical. NOT copied from agent_client's
+        // `unwrap_or_default().clamp()`: a fabricated localhost:11434
+        // client would send real questions to a stranger's server.
+        embeddings: build_embeddings_client(state).await,
         read_stack_text,
         visible_slugs,
         trace: Some(mycelium_librarian::agent::TraceSink {
@@ -99,6 +107,26 @@ async fn agent_scopes<'a>(
             scope_id: format!("user:{}", user.user_id),
         }),
     }
+}
+
+/// The embeddings client for the retrieval composer, from the sealed
+/// `embeddings` config row (memory-lifecycle §3.3). Row absent /
+/// corrupt / undecryptable → None → the composer degrades to lexical
+/// (cross_scope_hits logs nothing here — the row absence is the
+/// configured state, not a fault). The client is CLAMPED on load, the
+/// same posture as agent_client's LLM row.
+async fn build_embeddings_client(
+    state: &McpState,
+) -> Option<mycelium_librarian::embeddings::EmbeddingsClient> {
+    let cfg =
+        mycelium_store::config::get_sealed::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+            &state.config,
+            &state.service_key,
+            "embeddings",
+        )
+        .await?
+        .clamp();
+    Some(mycelium_librarian::embeddings::EmbeddingsClient::new(&cfg))
 }
 
 /// The librarian agent's LLM client from the runtime config (admin-
@@ -300,7 +328,14 @@ pub async fn memory_query(
     if k == 0 {
         return Ok(QueryOutput::Hits(vec![]));
     }
-    let scoped = mycelium_librarian::agent::cross_scope_hits(&cs, &scopes, &query, k).await;
+    let scoped = mycelium_librarian::agent::cross_scope_hits(
+        Some(&cs),
+        &scopes,
+        &query,
+        k,
+        scopes.embeddings.as_ref(),
+    )
+    .await;
     let mut out = Vec::with_capacity(scoped.len());
     for (scope, hit) in &scoped {
         // The lifecycle fields come from the hit's own scope's store;

@@ -11,9 +11,11 @@ use mycelium_crypto::keys::{ServiceKey, generate_master_key};
 use mycelium_crypto::store_keys::IndexKeys;
 use mycelium_crypto::{aead_open, aead_seal};
 use mycelium_store::revisions::{
-    DEFAULT_QUERY_TOP_K, DEFAULT_REVISION_RETENTION, LifecycleConfig, RevisionStore,
-    RevisionsError, op_summary, query_top_k, revision_retention, set_query_top_k,
-    set_revision_retention, sync_lifecycle_from_store,
+    DEFAULT_DEDUP_COSINE, DEFAULT_QUERY_TOP_K, DEFAULT_REVISION_RETENTION, DEFAULT_RRF_K,
+    DEFAULT_RRF_WEIGHT, LifecycleConfig, RevisionStore, RevisionsError, dedup_cosine, op_summary,
+    query_top_k, revision_retention, rrf_params, set_dedup_cosine, set_query_top_k,
+    set_revision_retention, set_rrf_k, set_rrf_weight_lex, set_rrf_weight_vec,
+    sync_lifecycle_from_store,
 };
 use mycelium_store::{ConceptStore, ConfigStore, Store, config};
 use uuid::Uuid;
@@ -39,6 +41,20 @@ struct TopKDefaults;
 impl Drop for TopKDefaults {
     fn drop(&mut self) {
         set_query_top_k(DEFAULT_QUERY_TOP_K);
+    }
+}
+
+/// Restores the four memory-lifecycle step-4 fusion statics on drop —
+/// the same shape as [`TopKDefaults`], declared AFTER the lock so the
+/// restore happens while the lock is held.
+struct FusionDefaults;
+
+impl Drop for FusionDefaults {
+    fn drop(&mut self) {
+        set_rrf_k(DEFAULT_RRF_K);
+        set_rrf_weight_lex(DEFAULT_RRF_WEIGHT);
+        set_rrf_weight_vec(DEFAULT_RRF_WEIGHT);
+        set_dedup_cosine(DEFAULT_DEDUP_COSINE);
     }
 }
 
@@ -564,6 +580,125 @@ async fn lifecycle_old_row_defaults_query_top_k() {
         .await
         .unwrap();
     assert_eq!(query_top_k(), 8, "the sync applies the defaulted field");
+}
+
+/// A hand-edited row carrying only the pre-fusion fields: an older
+/// build's shape, kept valid by the fusion fields' serde defaults.
+fn old_row_json() -> serde_json::Value {
+    serde_json::json!({ "revision_retention": 200, "query_top_k": 8 })
+}
+
+#[tokio::test]
+async fn lifecycle_row_gains_the_fusion_fields() {
+    let _retention = retention_lock().await;
+    let _fusion = FusionDefaults;
+    // Deliberately NOT the defaults: a sync over the old row would
+    // otherwise look like a no-op (the top-k test's reasoning, mirrored).
+    set_rrf_k(90);
+    set_dedup_cosine(0.5);
+    let (_dir, store) = store().await;
+    let config = ConfigStore::new(store.pool().clone());
+    let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
+
+    // Absent row → the defaults (the llm-row pattern: missing keeps
+    // defaults, so an absent row RESETS the global, it never keeps).
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    let params = rrf_params();
+    assert_eq!(params.rrf_k, 60.0, "absent row resets rrf_k");
+    assert_eq!(params.w_lex, 1.0, "absent row resets the lexical weight");
+    assert_eq!(params.w_vec, 1.0, "absent row resets the vector weight");
+    assert_eq!(
+        dedup_cosine(),
+        0.92,
+        "absent row resets the dedup threshold"
+    );
+
+    // An older build's row predates the fusion fields; serde's
+    // `#[serde(default)]` keeps it valid — the fields parse as the
+    // defaults, both through a direct read and through the sync.
+    config
+        .set(
+            "lifecycle",
+            &config::seal_config(&service_key, "lifecycle", &old_row_json()),
+        )
+        .await
+        .unwrap();
+    let parsed = config::get_sealed::<LifecycleConfig>(&config, &service_key, "lifecycle")
+        .await
+        .unwrap();
+    assert_eq!(parsed.rrf_k, 60, "old row default rrf_k");
+    assert_eq!(parsed.rrf_weight_lex, 1.0, "old row default lexical weight");
+    assert_eq!(parsed.rrf_weight_vec, 1.0, "old row default vector weight");
+    assert_eq!(parsed.dedup_cosine, 0.92, "old row default dedup threshold");
+
+    // A stored row stamps ALL the fusion statics through the sync, u32 →
+    // f32 at the seam (`rrf_params`).
+    let sealed = config::seal_config(
+        &service_key,
+        "lifecycle",
+        &serde_json::json!({
+            "revision_retention": 200,
+            "query_top_k": 8,
+            "rrf_k": 100,
+            "rrf_weight_lex": 0.5,
+            "rrf_weight_vec": 0.25,
+            "dedup_cosine": 0.99
+        }),
+    );
+    config.set("lifecycle", &sealed).await.unwrap();
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    let params = rrf_params();
+    assert_eq!(params.rrf_k, 100.0, "sync stamps the stored rrf_k");
+    assert_eq!(params.w_lex, 0.5, "sync stamps the stored lexical weight");
+    assert_eq!(params.w_vec, 0.25, "sync stamps the stored vector weight");
+    assert_eq!(dedup_cosine(), 0.99, "sync stamps the stored threshold");
+
+    // Clamps bind at the setters (which are also the LOAD-side clamp —
+    // a hand-edited row can never widen the tunables). Floors:
+    set_rrf_k(0);
+    assert_eq!(rrf_params().rrf_k, 1.0, "rrf_k floor (range 1..=1024)");
+    set_rrf_weight_lex(-3.0);
+    assert_eq!(rrf_params().w_lex, 0.0, "weight floor");
+    set_dedup_cosine(0.1);
+    assert_eq!(dedup_cosine(), 0.5, "dedup floor");
+    // ...and ceilings (the brief's sketch pins w 12 → 10 and cosine 2.0
+    // → 1.0 explicitly).
+    set_rrf_k(2000);
+    assert_eq!(rrf_params().rrf_k, 1024.0, "rrf_k ceiling");
+    set_rrf_weight_lex(12.0);
+    assert_eq!(rrf_params().w_lex, 10.0, "weight ceiling");
+    set_rrf_weight_vec(12.0);
+    assert_eq!(rrf_params().w_vec, 10.0, "weight ceiling");
+    set_dedup_cosine(2.0);
+    assert_eq!(dedup_cosine(), 1.0, "dedup ceiling");
+
+    // NaN guards every f32 field: the setters fold NaN to the field's
+    // default (f32::clamp propagates NaN — the explicit guard is the
+    // only thing standing between a NaN row and a NaN-scored composer).
+    set_rrf_weight_lex(f32::NAN);
+    assert_eq!(rrf_params().w_lex, DEFAULT_RRF_WEIGHT);
+    set_rrf_weight_vec(f32::NAN);
+    assert_eq!(rrf_params().w_vec, DEFAULT_RRF_WEIGHT);
+    set_dedup_cosine(f32::NAN);
+    assert_eq!(dedup_cosine(), DEFAULT_DEDUP_COSINE);
+
+    // The struct clamp the admin save path applies carries the same
+    // NaN guard (serde_json cannot encode NaN, but a constructed row
+    // can reach it directly — the clamp is the save-side guard).
+    let nan_row = LifecycleConfig {
+        rrf_weight_lex: f32::NAN,
+        rrf_weight_vec: f32::NAN,
+        dedup_cosine: f32::NAN,
+        ..Default::default()
+    };
+    let clamped = nan_row.clamp();
+    assert_eq!(clamped.rrf_weight_lex, DEFAULT_RRF_WEIGHT);
+    assert_eq!(clamped.rrf_weight_vec, DEFAULT_RRF_WEIGHT);
+    assert_eq!(clamped.dedup_cosine, DEFAULT_DEDUP_COSINE);
 }
 
 #[test]

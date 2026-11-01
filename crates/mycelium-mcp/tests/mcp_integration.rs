@@ -2123,6 +2123,7 @@ async fn memory_query_top_k_default_and_ceiling() {
     let lifecycle = mycelium_store::revisions::LifecycleConfig {
         revision_retention: mycelium_store::revisions::DEFAULT_REVISION_RETENTION,
         query_top_k: 2,
+        ..mycelium_store::revisions::LifecycleConfig::default()
     };
     h.state
         .config
