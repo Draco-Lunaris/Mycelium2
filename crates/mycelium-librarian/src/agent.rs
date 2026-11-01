@@ -725,18 +725,47 @@ async fn execute_tool_tracked(
             // budget reading them one by one.
             let all_hits = cross_scope_hits(store, scopes, &q, 10).await;
 
-            let hits_json: Vec<serde_json::Value> = all_hits
-                .iter()
-                .map(|(scope, h)| {
-                    serde_json::json!({
-                        "path": h.concept_path,
-                        "title": h.title,
-                        "snippet": h.snippet,
-                        "score": h.score,
-                        "scope": scope,
-                    })
-                })
-                .collect();
+            // Every hit reaches the model in the full ten-field QueryHit
+            // shape (§3.2a-6): the lifecycle/provenance fields come from
+            // the hit's OWN scope store — the user store for user hits,
+            // the matching AgentScopes store for global ones. A read
+            // fault keeps the hit with None fields (hit_fields's
+            // posture); a scope with no store to read from is the
+            // all-None shape too. The model judges staleness from these
+            // fields itself (prompt rules cite them).
+            let mut hits_json: Vec<serde_json::Value> = Vec::with_capacity(all_hits.len());
+            for (scope, h) in all_hits {
+                let fields = match scope.as_str() {
+                    "user" => hit_fields(store, &h.concept_path).await,
+                    "skills" => match &scopes.skills {
+                        Some(cs) => hit_fields(cs, &h.concept_path).await,
+                        None => HitFields::none(),
+                    },
+                    "library" => match &scopes.library {
+                        Some(cs) => hit_fields(cs, &h.concept_path).await,
+                        None => HitFields::none(),
+                    },
+                    _ => HitFields::none(),
+                };
+                let hit = QueryHit {
+                    scope,
+                    path: h.concept_path,
+                    title: h.title,
+                    description: fields.description,
+                    snippet: h.snippet,
+                    score: h.score,
+                    timestamp: fields.timestamp,
+                    confirmed_at: fields.confirmed_at,
+                    status: fields.status,
+                    superseded_by: fields.superseded_by,
+                };
+                hits_json.push(
+                    serde_json::to_value(&hit)
+                        // QueryHit is strings, one f32 and Option<String>s:
+                        // serialization cannot fail.
+                        .expect("QueryHit of strings and f32 always serializes"),
+                );
+            }
 
             if !hits_json.is_empty() {
                 Ok((serde_json::json!({ "hits": hits_json }).to_string(), None))
@@ -1237,7 +1266,7 @@ Answer the user's question from the knowledge base. Search, read the relevant co
 RETRIEVAL PROTOCOL — search is keyword-based, not semantic, so one empty search proves nothing:
 1. Search with the question's key terms.
 2. On a miss, retry once or twice with synonyms, broader terms, or related entities.
-3. Still nothing? Check the bundle layout (above, or via list_directory) and read_concept EVERY concept whose type, name, or description could plausibly relate.
+3. Still nothing? Check the bundle layout (above, or via list_directory) and read_concept EVERY concept whose type, name, or description could plausibly relate. Search hits carry lifecycle fields (status, superseded_by, confirmed_at). A hit with status: superseded is an old version — follow its superseded_by to the current concept instead of enriching it; a retired hit is withdrawn knowledge — never restate it as current without checking a live source.
 4. Only after steps 1-3 may you answer that the knowledge base has no coverage; then suggest what concept could be added."
         }
         AgentMode::Mutate => {
@@ -1247,7 +1276,7 @@ The input is knowledge to persist or a change to apply — NOT a message to repl
 
 WRITE PROTOCOL:
 1. Search for concepts the knowledge relates to or belongs to; read the strongest candidates.
-2. CHECK FOR CONTRADICTION. If the new knowledge conflicts with an existing concept, update it — never leave two contradictory claims standing. When replacing a concept entirely, set its status to superseded and its superseded_by to the new concept's path (rule 8).
+2. CHECK FOR CONTRADICTION. If the new knowledge conflicts with an existing concept, update it — never leave two contradictory claims standing. When replacing a concept entirely, set its status to superseded and its superseded_by to the new concept's path (rule 8). Search hits carry lifecycle fields (status, superseded_by, confirmed_at). A hit with status: superseded is an old version — follow its superseded_by to the current concept instead of enriching it; a retired hit is withdrawn knowledge — never restate it as current without checking a live source.
 3. ENRICH OVER CREATE: a fact that belongs to an existing concept gets patched into it; only a distinct entity gets its own concept.
 4. LINK BOTH WAYS: new concepts must be wired into the graph — link related concepts and patch them to reference back.
 5. Finish with a one-sentence summary of what changed and the paths touched."
@@ -1542,6 +1571,153 @@ mod tests {
             ),
             "MUTATE step 2 lost its supersede hint:\n{section}"
         );
+    }
+
+    // ---- §3.3: the prompt cites the hit lifecycle fields ----
+    //
+    // The sentence is copy-pinned from the step-3 plan (byte-exact): the
+    // calling model reads it to judge hit staleness itself, so the wording
+    // is the contract, not an example of it.
+
+    const HIT_LIFECYCLE_SENTENCE: &str = "Search hits carry lifecycle fields (status, superseded_by, confirmed_at). A hit with status: superseded is an old version — follow its superseded_by to the current concept instead of enriching it; a retired hit is withdrawn knowledge — never restate it as current without checking a live source.";
+
+    #[test]
+    fn system_prompt_mutate_cites_lifecycle_fields() {
+        let section = mode_section(AgentMode::Mutate);
+        assert!(
+            section.contains(HIT_LIFECYCLE_SENTENCE),
+            "MUTATE section lost the hit-lifecycle citation:\n{section}"
+        );
+        // The sentence rides the contradiction step (WRITE PROTOCOL's
+        // step 2, the step after the search step): staleness judgment is
+        // part of deciding whether a hit contradicts. The protocol's
+        // numbering and every other step stay untouched.
+        let search = section.find("1. Search for concepts").unwrap();
+        let contradiction = section.find("2. CHECK FOR CONTRADICTION.").unwrap();
+        let cited = section.find(HIT_LIFECYCLE_SENTENCE).unwrap();
+        let enrich = section.find("3. ENRICH OVER CREATE").unwrap();
+        assert!(
+            search < contradiction && contradiction < cited && cited < enrich,
+            "lifecycle citation must sit in WRITE PROTOCOL step 2:\n{section}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_query_cites_lifecycle_fields() {
+        let section = mode_section(AgentMode::Query);
+        assert!(
+            section.contains(HIT_LIFECYCLE_SENTENCE),
+            "QUERY section lost the hit-lifecycle citation:\n{section}"
+        );
+        // QUERY gains exactly this ONE sentence after step 3 ("Still
+        // nothing?") — the retrieval ladder keeps its four numbered steps
+        // and their wording (§3.3 specifies MUTATE only; this citation is
+        // the single sanctioned QUERY addition).
+        let step3 = section.find("3. Still nothing?").unwrap();
+        let cited = section.find(HIT_LIFECYCLE_SENTENCE).unwrap();
+        let step4 = section.find("4. Only after steps 1-3").unwrap();
+        assert!(
+            step3 < cited && cited < step4,
+            "lifecycle citation must sit after QUERY step 3, before step 4:\n{section}"
+        );
+    }
+
+    // ---- §3.2a-6: search_knowledge hits carry the ten-field shape ----
+
+    #[tokio::test]
+    async fn search_knowledge_hits_carry_lifecycle_fields() {
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, uuid::Uuid::new_v4(), master);
+        // A superseded concept carrying the full lifecycle set…
+        cs.put(&Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("Old widget".into()),
+                description: Some("superseded widget facts".into()),
+                timestamp: Some("2026-01-01T00:00:00Z".into()),
+                status: Some("superseded".into()),
+                superseded_by: Some("/new.md".into()),
+                ..Default::default()
+            },
+            "widget facts from last year".into(),
+            "/old.md".into(),
+        ))
+        .await
+        .unwrap();
+        // …and a plain active concept with none of them: absent fields
+        // must still serialize (as null) — every hit carries the shape.
+        cs.put(&Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("Widget overview".into()),
+                ..Default::default()
+            },
+            "widget overview current".into(),
+            "/active.md".into(),
+        ))
+        .await
+        .unwrap();
+
+        let scopes = bare_scopes();
+        let call = tool_call(
+            "search_knowledge",
+            r#"{"query":"widget","include_inactive":true}"#,
+        );
+        let mut rec = crate::trace::TraceRecorder::new();
+        let (out, _) = execute_tool_tracked(&cs, &scopes, &call, true, &mut rec)
+            .await
+            .expect("search tool must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let hits = parsed["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "both concepts match 'widget': {parsed}");
+
+        // Every hit carries the full ten-field QueryHit shape (serde_json's
+        // default map is a BTreeMap, so the wire keys come out sorted).
+        let expected_keys = [
+            "confirmed_at",
+            "description",
+            "path",
+            "scope",
+            "score",
+            "snippet",
+            "status",
+            "superseded_by",
+            "timestamp",
+            "title",
+        ];
+        for hit in hits {
+            let keys: Vec<&str> = hit
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, expected_keys, "hit must carry all ten fields: {hit}");
+        }
+
+        let old = hits.iter().find(|h| h["path"] == "/old.md").unwrap();
+        assert_eq!(old["scope"], "user");
+        assert_eq!(old["title"], "Old widget");
+        assert_eq!(old["description"], "superseded widget facts");
+        assert_eq!(old["status"], "superseded");
+        assert_eq!(old["superseded_by"], "/new.md");
+        assert_eq!(old["timestamp"], "2026-01-01T00:00:00Z");
+        // confirmed_at is stamped at put — the hit mirrors the STORED field.
+        let stored = cs.get("/old.md").await.unwrap();
+        assert_eq!(
+            old["confirmed_at"],
+            serde_json::json!(stored.frontmatter.confirmed_at)
+        );
+        assert!(!old["snippet"].as_str().unwrap().is_empty());
+        assert!(old["score"].as_f64().unwrap() > 0.0);
+
+        // A hit without lifecycle fields keeps every key with a null value
+        // — the shape never conditionally shrinks.
+        let active = hits.iter().find(|h| h["path"] == "/active.md").unwrap();
+        assert!(active["status"].is_null());
+        assert!(active["superseded_by"].is_null());
+        assert!(active["description"].is_null());
     }
 
     #[test]
