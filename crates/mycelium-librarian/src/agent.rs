@@ -152,26 +152,57 @@ pub async fn cross_scope_hits(
 ) -> Vec<ScopedHit> {
     let mut all_hits: Vec<ScopedHit> = Vec::new();
 
+    // A scope-search FAULT is not a tool fault: the scope contributes
+    // no hits and the fault logs (muted, as a warning) — hit_fields's
+    // posture. The hits from the other scopes stay ranked.
+
     // 1. User's private bundle (always searched).
-    for h in store.search(query).await.unwrap_or_default() {
-        all_hits.push(("user".to_string(), h));
+    match store.search(query).await {
+        Ok(hits) => {
+            for h in hits {
+                all_hits.push(("user".to_string(), h));
+            }
+        }
+        Err(e) => tracing::warn!(
+            scope = "user",
+            error = %e,
+            "cross-scope search failed: scope contributes no hits"
+        ),
     }
 
     // 2. Global skills shelf (if available).
     if let Some(ref skills) = scopes.skills {
-        for h in skills.search(query).await.unwrap_or_default() {
-            all_hits.push(("skills".to_string(), h));
+        match skills.search(query).await {
+            Ok(hits) => {
+                for h in hits {
+                    all_hits.push(("skills".to_string(), h));
+                }
+            }
+            Err(e) => tracing::warn!(
+                scope = "skills",
+                error = %e,
+                "cross-scope search failed: scope contributes no hits"
+            ),
         }
     }
 
     // 3. Global library catalog (if available), filtered by the caller's
     //    bookshelf visibility.
     if let Some(ref library) = scopes.library {
-        for h in library.search(query).await.unwrap_or_default() {
-            if !library_path_visible(scopes, &h.concept_path) {
-                continue;
+        match library.search(query).await {
+            Ok(hits) => {
+                for h in hits {
+                    if !library_path_visible(scopes, &h.concept_path) {
+                        continue;
+                    }
+                    all_hits.push(("library".to_string(), h));
+                }
             }
-            all_hits.push(("library".to_string(), h));
+            Err(e) => tracing::warn!(
+                scope = "library",
+                error = %e,
+                "cross-scope search failed: scope contributes no hits"
+            ),
         }
     }
 
@@ -199,6 +230,22 @@ pub struct HitFields {
     pub superseded_by: Option<String>,
 }
 
+impl HitFields {
+    /// The all-None fields of a hit whose underlying concept could not
+    /// be read (a read/parse FAULT keeps the hit, §3.2a-6) or whose
+    /// scope has no individual store to read from.
+    #[must_use]
+    pub fn none() -> HitFields {
+        HitFields {
+            description: None,
+            timestamp: None,
+            confirmed_at: None,
+            status: None,
+            superseded_by: None,
+        }
+    }
+}
+
 /// Read [`HitFields`] for `path` from `cs` (`cs.get` → frontmatter). A
 /// read or parse FAULT does not drop the hit — every field reads as
 /// `None` and the fault logs (muted, as a warning) — the
@@ -215,13 +262,7 @@ pub async fn hit_fields(cs: &ConceptStore<'_>, path: &str) -> HitFields {
         },
         Err(e) => {
             tracing::warn!(path, error = %e, "hit fields unavailable: hit kept, fields None");
-            HitFields {
-                description: None,
-                timestamp: None,
-                confirmed_at: None,
-                status: None,
-                superseded_by: None,
-            }
+            HitFields::none()
         }
     }
 }

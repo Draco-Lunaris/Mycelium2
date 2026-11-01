@@ -29,6 +29,19 @@ async fn retention_lock() -> tokio::sync::MutexGuard<'static, ()> {
     RETENTION_LOCK.lock().await
 }
 
+/// Restores the process-global `query_top_k` on drop, so a failing
+/// assertion cannot leak a set value into the next test (the store-side
+/// counterpart of the MCP suite's guard; the retention tests keep their
+/// literal end-of-test resets — pre-existing idiom, out of this branch's
+/// churn).
+struct TopKDefaults;
+
+impl Drop for TopKDefaults {
+    fn drop(&mut self) {
+        set_query_top_k(DEFAULT_QUERY_TOP_K);
+    }
+}
+
 async fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
@@ -443,6 +456,7 @@ async fn sync_lifecycle_row_reads_clamped_value() {
 #[tokio::test]
 async fn query_top_k_clamps_everywhere() {
     let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
     // Below the floor → the floor: zero stays meaningful only as an
     // explicit CALLER request (spec §3.2a-7), never as a stored/static
     // value.
@@ -455,16 +469,15 @@ async fn query_top_k_clamps_everywhere() {
     set_query_top_k(2);
     assert_eq!(query_top_k(), 2);
     // The "never set" default is the constant this process-global is
-    // initialized from (the retention pin's shape, mirrored; tests in
-    // this binary share the static and set it back to the default on
-    // exit).
+    // initialized from (the retention pin's shape, mirrored); the
+    // TopKDefaults guard restores the default on exit).
     assert_eq!(DEFAULT_QUERY_TOP_K, 8);
-    set_query_top_k(DEFAULT_QUERY_TOP_K);
 }
 
 #[tokio::test]
 async fn sync_lifecycle_row_reads_clamped_query_top_k() {
     let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
     // Deliberately NOT the default: an absent row must RESET the global
     // to the default, not leave whatever was live before the sync (the
     // retention sync test's reasoning, mirrored).
@@ -518,13 +531,12 @@ async fn sync_lifecycle_row_reads_clamped_query_top_k() {
         64,
         "stored 200 clamps to the ceiling on load"
     );
-
-    set_query_top_k(DEFAULT_QUERY_TOP_K);
 }
 
 #[tokio::test]
 async fn lifecycle_old_row_defaults_query_top_k() {
     let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
     // Deliberately NOT the default: a sync over the old row would
     // otherwise look like a no-op.
     set_query_top_k(2);
@@ -552,8 +564,6 @@ async fn lifecycle_old_row_defaults_query_top_k() {
         .await
         .unwrap();
     assert_eq!(query_top_k(), 8, "the sync applies the defaulted field");
-
-    set_query_top_k(DEFAULT_QUERY_TOP_K);
 }
 
 #[test]

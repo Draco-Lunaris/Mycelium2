@@ -213,24 +213,26 @@ pub async fn memory_query(
         .await
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
-    // Cross-scope capabilities: the agent run consumes them via the
-    // query cache, the hits path reads them directly.
+
+    // The cached wrapper's layer 1 (v1 parity) answers identical repeats
+    // from the fingerprint-invalidated cache — no agent run, no tokens.
+    // It is checked BEFORE the scopes build (a cache hit needs none of
+    // the cross-scope stores) and before any admission: a cache hit must
+    // never wait on the gate, even a saturated one.
+    if args.synthesize == Some(true)
+        && let Some(hit) = mycelium_librarian::query_cache::cached_answer(&cs, &args.question).await
+    {
+        return Ok(QueryOutput::Answer(AgentAnswer { answer: hit.answer }));
+    }
+
+    // Cross-scope capabilities: the agent run and the hits path both
+    // read them.
     let scopes = agent_scopes(state, user).await;
 
     // Agent path (spec §3.3): `synthesize: true` is the exact agent flow.
     if args.synthesize == Some(true)
         && let Some((client, llm_cfg)) = agent_client(state).await
     {
-        // The cached wrapper's layer 1 (v1 parity) answers identical
-        // repeats from the fingerprint-invalidated cache — no agent
-        // run, no tokens. It costs no LLM time, so it is served before
-        // any admission: a cache hit must never wait on the gate, even
-        // a saturated one.
-        if let Some(hit) = mycelium_librarian::query_cache::cached_answer(&cs, &args.question).await
-        {
-            return Ok(QueryOutput::Answer(AgentAnswer { answer: hit.answer }));
-        }
-
         // Spec §3.3: admission is bounded by `query_wait_secs`. The
         // permit is held across the whole cached run — both the hot
         // lookup's call and the deep agent loop talk to the LLM. No
@@ -285,13 +287,15 @@ pub async fn memory_query(
         query.status_filter = mycelium_core::search::StatusFilter::All;
     }
     // §3.2a-7: the caller's limit, defaulting to the admin-tunable
-    // query_top_k and hard-capped at 64. A literal 0 stays zero. (The
-    // u32→usize widening is lossless: the clamp bounds the value 1..=64
-    // and usize is at least 32 bits.)
+    // query_top_k and hard-capped at the top_k range's ceiling — shared
+    // with the agent tool's own cap (§3.2a-7/§3.2a-10). A literal 0
+    // stays zero. (The u32→usize widenings are lossless: the clamp
+    // bounds the value 1..=64 and usize is at least 32 bits.)
+    const HARD_HIT_CEILING: usize = mycelium_store::revisions::QUERY_TOP_K_RANGE.1 as usize;
     let k = args
         .limit
         .unwrap_or_else(|| mycelium_store::revisions::query_top_k() as usize)
-        .min(64);
+        .min(HARD_HIT_CEILING);
     let scoped = mycelium_librarian::agent::cross_scope_hits(&cs, &scopes, &query, k).await;
     let mut out = Vec::with_capacity(scoped.len());
     for (scope, hit) in &scoped {
@@ -309,13 +313,7 @@ pub async fn memory_query(
             Some(scope_cs) => {
                 mycelium_librarian::agent::hit_fields(scope_cs, &hit.concept_path).await
             }
-            None => mycelium_librarian::agent::HitFields {
-                description: None,
-                timestamp: None,
-                confirmed_at: None,
-                status: None,
-                superseded_by: None,
-            },
+            None => mycelium_librarian::agent::HitFields::none(),
         };
         out.push(mycelium_librarian::agent::QueryHit {
             scope: scope.clone(),

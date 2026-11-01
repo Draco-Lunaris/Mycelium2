@@ -188,8 +188,9 @@ impl LifecycleConfig {
 /// same reason `sync_llm_gate_from_store` precedes the workers).
 ///
 /// Missing or undecryptable row simply means the defaults (`get_sealed`
-/// is intentionally lenient — the llm-row pattern); a value outside the
-/// range clamps through [`set_revision_retention`] on the way in.
+/// is intentionally lenient — the llm-row pattern); a value outside its
+/// range clamps through [`set_revision_retention`] or
+/// [`set_query_top_k`] on the way in.
 pub async fn sync_lifecycle_from_store(
     config: &ConfigStore,
     service_key: &ServiceKey,

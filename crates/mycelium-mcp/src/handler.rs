@@ -34,13 +34,13 @@ impl MyceliumMcpServer {
 
 #[tool_router]
 impl MyceliumMcpServer {
-    /// Answer a question from the calling user's private knowledge
-    /// base. The librarian agent synthesizes a grounded answer (with
-    /// sources); without an LLM backend the tool returns ranked
-    /// keyword-search hits instead.
+    /// Answer a question from the knowledge base. The DEFAULT returns
+    /// BM25-ranked hits with zero LLM calls, spanning the caller's
+    /// private bundle, the global skills shelf, and the visible library
+    /// catalog — `synthesize: true` opts into the librarian agent.
     #[tool(
         name = "mycelium2_memory_query",
-        description = "Answer a natural-language question from the user's private knowledge base. The librarian agent searches, reads the relevant concepts, and synthesizes a grounded answer citing bundle paths. (Without an LLM backend configured, returns ranked keyword-search hits instead.)"
+        description = "Answer a natural-language question from the knowledge base. Default (no flags): BM25-ranked hits with zero LLM calls, spanning the caller's private bundle, the global skills shelf, and the visible library catalog — each hit tagged with its scope and carrying title, path, snippet, and lifecycle fields (status, confirmed_at, superseded_by). synthesize=true opts into the librarian agent's search-read-synthesize loop (a grounded answer citing paths); that path degrades to hits when no LLM backend is reachable."
     )]
     async fn memory_query(
         &self,
@@ -58,24 +58,7 @@ impl MyceliumMcpServer {
             tools::QueryOutput::Answer(a) => {
                 Ok(CallToolResult::success(vec![ContentBlock::text(a.answer)]))
             }
-            tools::QueryOutput::Hits(results) => {
-                if results.is_empty() {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(
-                        "no concepts matched the question",
-                    )]));
-                }
-                let text = results
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "## {}\npath: {}\nscore: {:.2}\n{}\n",
-                            r.title, r.path, r.score, r.snippet
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-            }
+            tools::QueryOutput::Hits(results) => query_hits_result(&results),
         }
     }
 
@@ -283,4 +266,65 @@ impl ServerHandler for MyceliumMcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
     }
+}
+
+/// The hits arm's wire result (spec §3.2a-12) — the ten §3.2a-6 fields
+/// actually reach the wire, in both faces:
+///
+/// (a) the per-hit text template extended with the hit's `scope` and the
+///     lifecycle lines (`status`/`confirmed_at`/`superseded_by`, compact,
+///     after the snippet; omitted entirely when `None`);
+/// (b) `structuredContent` = `{"hits": [...]}` — the schema-facing
+///     delivery carrying every hit's ten fields;
+/// (c) an EMPTY list keeps the isError "no concepts matched the
+///     question" result — a literal `limit: 0` result is
+///     indistinguishable from a miss on the wire (documented; §3.2a-7's
+///     zero-honoring lives at the function boundary, and the isolation
+///     probes key on isError-on-none).
+pub fn query_hits_result(
+    results: &[mycelium_librarian::agent::QueryHit],
+) -> Result<CallToolResult, ErrorData> {
+    if results.is_empty() {
+        return Ok(CallToolResult::error(vec![ContentBlock::text(
+            "no concepts matched the question",
+        )]));
+    }
+    let text = results
+        .iter()
+        .map(|r| {
+            let mut block = format!(
+                "## {}\npath: {}\nscore: {:.2}\n{}\n",
+                r.title, r.path, r.score, r.snippet
+            );
+            block.push_str("scope: ");
+            block.push_str(&r.scope);
+            block.push('\n');
+            if let Some(status) = &r.status {
+                block.push_str("status: ");
+                block.push_str(status);
+                block.push('\n');
+            }
+            if let Some(confirmed_at) = &r.confirmed_at {
+                block.push_str("confirmed_at: ");
+                block.push_str(confirmed_at);
+                block.push('\n');
+            }
+            if let Some(superseded_by) = &r.superseded_by {
+                block.push_str("superseded_by: ");
+                block.push_str(superseded_by);
+                block.push('\n');
+            }
+            block
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hits = serde_json::to_value(results).map_err(|e| {
+        tracing::error!(error = %e, "memory_query hits: structuredContent serialization failed");
+        ErrorData::internal_error("internal storage error", None)
+    })?;
+    // `CallToolResult` is #[non_exhaustive]: the optional field is set
+    // by mutation, not by struct construction.
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(serde_json::json!({ "hits": hits }));
+    Ok(result)
 }
