@@ -332,6 +332,20 @@ the step-2 block binds step 2.
     concurrent-add window). NULL-length rows still score as length 0 —
     over-boosted, present, never an error — and the
     `null_length_scoring_guard` test gains ordering + non-negativity pins.
+12. **MCP wire delivery of hits (Task-3 review ruling — supersedes the
+    plan's "handler.rs:58–62 serializes whatever the arms carry" premise,
+    which was wrong: the handler formats a fixed four-field text
+    template)**: the hits arm's wire result carries BOTH (a) the text
+    template extended per hit with `scope` and the lifecycle fields
+    (`status`/`confirmed_at`/`superseded_by` — compact lines after the
+    snippet) and (b) `structuredContent` = `{"hits": [...]}` — the
+    schema-facing delivery of §3.2a-6's ten-field shape; the MCP
+    integration wire tests read `structuredContent`, not the live Rust
+    value. AND (c) empty render: an empty hits list keeps the existing
+    isError "no concepts matched the question" content — a literal
+    `limit: 0` result is indistinguishable from a miss on the wire
+    (documented; §3.2a-7's zero-honoring lives at the function boundary;
+    the isolation probes key on isError-on-none).
 
 ## 4. Crypto model (unchanged invariants)
 
