@@ -455,6 +455,56 @@ async fn stale_model_rows_are_ignored_by_the_dream_signal() {
     }
 }
 
+/// Population counts LIVE rows, not raw rows (review R1): a Red
+/// backend plus ONE live fresh row and one ORPHAN fresh row (its
+/// concept never existed) under the same model — the raw count of 2
+/// would admit the cosine branch, whose only live concept then rides
+/// no scan at all (embedded concepts skip jaccard, and the orphan
+/// pairs with nothing), silently killing the title pair. The live
+/// count of 1 keeps the branch absent and the jaccard pair surfaces.
+#[tokio::test]
+async fn population_counts_live_rows_not_orphan_rows() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    // Red the honest way: 3 consecutive failed observations.
+    for _ in 0..3 {
+        EMBEDDING_HEALTH.note_failure();
+    }
+    assert!(matches!(
+        EMBEDDING_HEALTH.state(),
+        mycelium_librarian::llm_health::BackendState::Red
+    ));
+    let (llm_url, requests) =
+        capturing_mock_llm(vec![text_response("Maintenance complete.")]).await;
+    let (base, _shutdown, _dir, state) = boot(&llm_url).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    const DUP_A: &str = "/orphanpop/rebuild-one.md";
+    const DUP_B: &str = "/orphanpop/rebuild-two.md";
+    seed(&state, DUP_A, "Index Rebuild Notes", &[DUP_B]).await;
+    seed(&state, DUP_B, "Index Rebuild Notes", &[DUP_A]).await;
+    // One live fresh row + one orphan row, both under MODEL.
+    upsert_vec(&state, DUP_A, MODEL, &[1.0, 0.0, 0.0]).await;
+    upsert_vec(&state, "/gone/never-a-concept.md", MODEL, &[0.0, 1.0, 0.0]).await;
+
+    let report = post_dream(&cl, &base, &cookie, &csrf).await;
+    assert_eq!(
+        report["ran"], true,
+        "the orphan row must not admit the cosine branch and drop the pair: {report}"
+    );
+    let reqs = requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    let instruction = instruction_of(reqs.first().unwrap());
+    let section = section_of(&instruction, "LIKELY DUPLICATES")
+        .expect("the jaccard pair survives the Red + orphan-row shape");
+    assert!(
+        section.contains(&format!("- {DUP_A} ↔ {DUP_B}")),
+        "live-count population keeps the branch absent: {section}"
+    );
+}
+
 /// Top-2 pruning (the brief's candidate condition beyond the
 /// threshold): the hub and the far concept sit at cosine ≈ 0.985 ≥
 /// 0.92, but the far one is in no hub-side top-2 and the hub is in no

@@ -197,7 +197,8 @@ async fn duplicate_candidates(
 /// (a degraded embedding layer degrades dream to v1 — it never fails
 /// the dream).
 ///
-/// Population: ≥2 fresh rows under one current model. Stale rows —
+/// Population: ≥2 LIVE fresh rows under one current model — rows of
+/// deleted concepts are orphaned and count for nothing. Stale rows —
 /// written under a different model, the corpus invalidation's marker —
 /// count for neither population nor scoring, and rows only score
 /// against rows of the same model and dimensionality.
@@ -220,21 +221,6 @@ async fn cosine_candidates(
         }
     };
     let fresh: Vec<_> = rows.into_iter().filter(|r| !r.stale).collect();
-    let mut per_model: HashMap<&str, usize> = HashMap::new();
-    for row in &fresh {
-        *per_model.entry(row.model.as_str()).or_default() += 1;
-    }
-    let populated = per_model.values().any(|n| *n >= 2);
-    // The same gate set the fusion composer uses (Task 5): Green and
-    // Yellow proceed, Red/Disabled fall back — unless the scope's own
-    // fresh rows speak for the signal regardless of the backend.
-    let healthy = matches!(
-        embedding_state(),
-        BackendState::Green | BackendState::Yellow
-    );
-    if !healthy && !populated {
-        return (BTreeSet::new(), HashSet::new());
-    }
     // Row token → live concept path (rows are keyed by the same
     // one-way HMAC token; a row whose concept is gone falls away).
     let by_token: HashMap<String, &str> = concepts
@@ -255,6 +241,26 @@ async fn cosine_candidates(
         })
         .collect();
     let embedded: HashSet<String> = live.iter().map(|(path, ..)| (*path).to_string()).collect();
+    // Population counts LIVE fresh rows per model: an orphan row (its
+    // concept deleted) must not admit the branch under an unhealthy
+    // backend — it pairs with nothing, yet it would pull the scope's
+    // live concepts out of the jaccard scan (embedded concepts ride
+    // only the cosine branch, which for them yields nothing).
+    let mut per_model: HashMap<&str, usize> = HashMap::new();
+    for (_, model, _, _) in &live {
+        *per_model.entry(*model).or_default() += 1;
+    }
+    let populated = per_model.values().any(|n| *n >= 2);
+    // The same gate set the fusion composer uses (Task 5): Green and
+    // Yellow proceed, Red/Disabled fall back — unless the scope's own
+    // live fresh rows speak for the signal regardless of the backend.
+    let healthy = matches!(
+        embedding_state(),
+        BackendState::Green | BackendState::Yellow
+    );
+    if !healthy && !populated {
+        return (BTreeSet::new(), HashSet::new());
+    }
     let mut groups: HashMap<(&str, u32), Vec<usize>> = HashMap::new();
     for (i, (_, model, dims, _)) in live.iter().enumerate() {
         groups.entry((model, *dims)).or_default().push(i);
