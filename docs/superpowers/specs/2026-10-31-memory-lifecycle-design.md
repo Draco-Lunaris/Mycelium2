@@ -315,6 +315,22 @@ the step-2 block binds step 2.
 10. **The agent's `search_knowledge` keeps its 10-hit cap** — a model-facing
     step budget, not the admin-tunable `query_top_k`; §3.3 does not tie
     them.
+11. **Corpus-stat universe correction (step-3 Task-2 review ruling)**:
+    amendment 5's `COUNT(length)` for `n_docs` is revoked — a NULL-length
+    row still owns postings, so `df` (scoped rows per token) can exceed
+    `COUNT(length)`, making idf negative and turning the NULL-length
+    "over-boost" into a demotion (worst mid-boot when 0011 has run but a
+    scope's sweep has not: every term's idf goes negative and higher tf
+    ranks lower). Amended: `n_docs = COUNT(*) FROM search_docs WHERE
+    scope = ?` (EVERY scoped row — exactly the oracle's `docs.len()`,
+    restoring oracle equivalence in the NULL case), `avgdl =
+    COALESCE(SUM(length), 0) / n_docs` (NULL rows count in `N` but add
+    nothing to the sum), `avgdl == 0` guard unchanged; AND the store's
+    `bm25_score` call site clamps `n.max(df)` as a hard invariant guard
+    (callee contract: `df` must not exceed `n_docs`; covers the transient
+    concurrent-add window). NULL-length rows still score as length 0 —
+    over-boosted, present, never an error — and the
+    `null_length_scoring_guard` test gains ordering + non-negativity pins.
 
 ## 4. Crypto model (unchanged invariants)
 
