@@ -257,6 +257,65 @@ The following amendments bind; they are rulings recorded during step 2 planning.
    staging-note bypass writes NO revision (queue-internal scaffolding, not
    user concepts).
 
+### 2026-11-01 — step 3 (BM25 + memory_query hits default)
+
+Rulings recorded during step 3 planning; they bind the step-3 plan the way
+the step-2 block binds step 2.
+
+1. **Non-negative BM25 idf**: `idf = ln(1 + (N − df + 0.5)/(df + 0.5))`
+   (Lucene's form). Plain Robertson idf turns negative when df > N/2, and
+   step-3 scoring is sum-over-terms — a term present in half the corpus
+   would *subtract* from every multi-term hit. Deterministic, no ranking
+   inversion.
+2. **Query terms are deduped before scoring on BOTH indexes.** The store
+   index already deduped (distinct sort+dedup before the term pass); the
+   in-memory oracle did not (a duplicated term double-counted raw TF).
+   Under BM25 a repeated query term must not double the term weight; both
+   sides now agree on identical inputs.
+3. **`search_docs.length` ships as migration `0011_search_length.sql`.**
+   The spec's "one migration 0010 for the whole stream" predates a
+   discovery from steps 1–2: 0010 is merged (shipped history) and cannot be
+   amended; `search_vectors` already exists (created empty by 0010, written
+   by step 4). The BM25 length column is a NEW migration.
+4. **Backfill = index-only reindex sweep** (the concrete shape of §3.3's
+   "boot re-put sweep"): candidates are `search_docs` rows with `length IS
+   NULL`, per scope; the sweep reads each concept and re-adds it to the
+   index directly (`ConceptStore::reindex`) — no concept write, no registry
+   touch, **no revision row**, provenance/`confirmed_at` untouched. Because
+   it never writes a concept, the deprecated-tag sweep's `global:library`
+   exclusion does NOT apply: library index rows are swept too. The reindex
+   re-applies §3.0's `# History` token split to legacy rows (their indexed
+   text predates step 1's code).
+5. **`length NULL` scoring guards**: a scored doc row with missing length
+   counts as length 0 (still returned, transiently over-boosted — the state
+   exists only while a scope's sweep is failed or pending, never mid-boot:
+   the sweep is awaited inline before the listener opens); `n_docs` and
+   `avgdl` come from `COUNT(length)`/`SUM(length)` (NULL rows excluded from
+   both); `avgdl == 0` leaves only the tf-saturation term (no NaN).
+6. **Hit shape**: both surfaces (MCP `memory_query` hits and the agent's
+   `search_knowledge`) return the spec's nine fields `{scope, path, title,
+   description, score, timestamp, confirmed_at, status, superseded_by}`
+   PLUS `snippet` (additive — the spec's list omits it but the model and
+   harness callers use the preview; keep it). `QueryOutput::Hits(Vec<
+   QueryHit>)` replaces `Vec<SearchResult>`; `concept_path` renames to
+   `path` — an output-shape change, recorded here; api.md's memory_query
+   schema lands in step 5's docs sweep.
+7. **Caller `limit` ceiling**: absent ⇒ `query_top_k()`; an explicit
+   `limit` is honored but hard-capped at 64 (shared ceiling with the
+   admin-tunable range 1–64 — the same query-amplification surface); a
+   literal `limit: 0` stays zero hits (not silently 1).
+8. **`include_inactive` on the MCP tool affects the hits path only**; the
+   synthesis path's filtering is the agent's own `search_knowledge`
+   argument (model-controlled, shipped in step 1).
+9. **The in-memory oracle's re-add REPLACES prior postings** for the same
+   path. Previously a re-add *accumulated* (the old content's postings
+   stayed live, inflating df and resurrecting dropped terms) — a
+   test-reference bug that BM25's df term makes load-bearing. The store
+   index already replaces (DELETE-then-INSERT); the two sides now agree.
+10. **The agent's `search_knowledge` keeps its 10-hit cap** — a model-facing
+    step budget, not the admin-tunable `query_top_k`; §3.3 does not tie
+    them.
+
 ## 4. Crypto model (unchanged invariants)
 
 - No new key hierarchy. Existing `MasterKey`/KEK/DEK layering untouched.
