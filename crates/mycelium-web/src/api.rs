@@ -3893,6 +3893,193 @@ pub async fn admin_test_llm(
     Redirect::to(&format!("/admin/llm?{verdict}")).into_response()
 }
 
+/// GET /admin/embeddings — the embeddings-backend card on its own
+/// page; hosts POST /admin/embeddings.
+pub async fn admin_embeddings_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    // Clamped for rendering: a stale (or hand-edited) out-of-range row
+    // must not put an unenforceable value back in the box.
+    let embeddings =
+        crate::state::decrypt_config::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+            &state.config,
+            &state.service_key,
+            "embeddings",
+        )
+        .await
+        .unwrap_or_default()
+        .clamp();
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_embeddings_page(
+        &admin,
+        &csrf,
+        &embeddings,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct EmbeddingsForm {
+    pub base_url: String,
+    pub model: String,
+    /// Blank = keep the currently stored key (no approved way to clear
+    /// a key exists; mirrors LlmForm — the key is never rendered back,
+    /// so blank is how an edit re-saves its key).
+    pub api_key: Option<String>,
+    /// Carried as raw strings, not `u32`: a missing field (an old
+    /// cached form) and a non-numeric one must both mean "keep the
+    /// stored value", never a 422/500 that loses the base_url/model
+    /// edit. Out-of-range values are clamped, not rejected.
+    pub timeout_secs: Option<String>,
+    pub batch: Option<String>,
+}
+
+/// A submitted tunable, or `stored` when the field is absent, blank, or
+/// not a number. Range enforcement is `EmbeddingsConfig::clamp`'s job
+/// (the [`llm_field`] twin).
+fn embeddings_field(submitted: Option<&String>, stored: u32) -> u32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(stored)
+}
+
+/// POST /admin/embeddings — save the embeddings config (admin only).
+/// The whole config (api_key is the sensitive part) seals under the
+/// service key before storage, mirroring the LLM config handling. A
+/// blank api_key keeps the stored key; the key is never rendered back
+/// to the browser. The tunables are clamped BEFORE sealing (the row at
+/// rest is always in range). No gate call: embeddings has none.
+pub async fn admin_save_embeddings(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<EmbeddingsForm>,
+) -> Response {
+    // The existing config (blank-key keep reads through it) or the
+    // default (a first save from a keyless store keeps no key).
+    let existing =
+        crate::state::decrypt_config::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+            &state.config,
+            &state.service_key,
+            "embeddings",
+        )
+        .await
+        .unwrap_or_default();
+    let api_key = match form.api_key.as_deref().map(str::trim) {
+        None | Some("") => existing.api_key.clone(),
+        Some(k) => Some(k.to_string()),
+    };
+    // Any tunable the form did not carry (or carried as junk) keeps the
+    // stored value — an old cached form still saves base_url/model
+    // without resetting the tunables.
+    let cfg = mycelium_librarian::embeddings::EmbeddingsConfig {
+        base_url: form.base_url.trim().to_string(),
+        model: form.model.trim().to_string(),
+        api_key,
+        timeout_secs: embeddings_field(form.timeout_secs.as_ref(), existing.timeout_secs),
+        batch: embeddings_field(form.batch.as_ref(), existing.batch),
+    }
+    // Clamp before sealing: the row at rest is always in range.
+    .clamp();
+    // Seal (serialize + AEAD); a failure must not land plaintext.
+    let sealed = crate::state::seal_config(&state.service_key, "embeddings", &cfg);
+    if let Err(e) = state.config.set("embeddings", &sealed).await {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode(&e.to_string())
+        ))
+        .into_response();
+    }
+    Redirect::to("/admin/embeddings?ok=Embeddings%20config%20saved").into_response()
+}
+
+/// POST /admin/embeddings/test — probe the embeddings backend with one
+/// real vector request (one `embed_batch`). Row-first: after a save
+/// the CURRENT STORED row is probed (the page's hint says so — save
+/// first, then test); with no stored row the submitted form values
+/// drive the probe (first-run test-before-save). Nothing is persisted.
+/// The failure reason is bounded and stripped of any upstream body —
+/// only the status code rides the redirect (full detail logged
+/// server-side).
+pub async fn admin_test_embeddings(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<EmbeddingsForm>,
+) -> Response {
+    let stored = crate::state::decrypt_config::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+        &state.config,
+        &state.service_key,
+        "embeddings",
+    )
+    .await;
+    if stored.is_none() && (form.base_url.trim().is_empty() || form.model.trim().is_empty()) {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode(
+                "nothing to test: no saved embeddings config and the form carries no URL/model",
+            )
+        ))
+        .into_response();
+    }
+    // Row-first; no row → the submitted form against the default
+    // tunables (a single direct call ignores the submitted tunables,
+    // mirroring admin_test_llm).
+    let cfg = stored.unwrap_or_else(|| mycelium_librarian::embeddings::EmbeddingsConfig {
+        base_url: form.base_url.trim().to_string(),
+        model: form.model.trim().to_string(),
+        api_key: form
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
+        ..Default::default()
+    });
+    let client = mycelium_librarian::embeddings::EmbeddingsClient::new(&cfg);
+    let verdict = match client.embed_batch(&["test probe".to_string()]).await {
+        Ok(vectors) => {
+            let dims = vectors.first().map_or(0, |v| v.len());
+            format!("ok=connected%20%E2%80%94%20response%20dimensions:{dims}")
+        }
+        Err(e) => {
+            let reason = embedding_test_reason(&e);
+            tracing::warn!(error = %e, "embeddings test connection failed");
+            format!(
+                "error={}",
+                pages::urlencoding_encode(&format!(
+                    "test connection failed: {}",
+                    mycelium_librarian::llm_health::short_detail(reason),
+                ))
+            )
+        }
+    };
+    Redirect::to(&format!("/admin/embeddings?{verdict}")).into_response()
+}
+
+/// The bounded, non-leaking test-connection failure reason: the
+/// upstream STATUS surfaces (a mis-pasted URL or revoked key is
+/// visible in seconds), but never its body — an upstream body can
+/// carry anything, and the flash text rides a URL. Transport failures
+/// say "did not answer"; a malformed response is this module's own
+/// diagnostic. The caller bounds the composed string through
+/// `llm_health::short_detail`.
+fn embedding_test_reason(e: &mycelium_librarian::embeddings::EmbeddingError) -> String {
+    match e {
+        mycelium_librarian::embeddings::EmbeddingError::Status { status, .. } => {
+            format!("HTTP {status}")
+        }
+        mycelium_librarian::embeddings::EmbeddingError::Request(_) => {
+            "the backend did not answer".to_string()
+        }
+        mycelium_librarian::embeddings::EmbeddingError::Malformed(m) => m.clone(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct BookshelfForm {
     pub name: String,
