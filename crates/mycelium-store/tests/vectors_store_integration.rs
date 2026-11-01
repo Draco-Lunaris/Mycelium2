@@ -305,6 +305,10 @@ async fn deleted_concepts_loose_their_vector_rows() {
         f.vs.load_rows().await.unwrap().is_empty(),
         "row removed directly"
     );
+    // remove_row is IDEMPOTENT (review pin): the delete hook runs it on
+    // an already-gone row and Ok is the correct answer (no NotFound arm
+    // to handle).
+    f.vs.remove_row("/a.md").await.unwrap();
     // The delete also dropped the decoded cache: a fresh build has no
     // entry for the token (a hook failure would return the pre-delete
     // snapshot above unchanged).
@@ -407,6 +411,15 @@ async fn decoded_cache_excludes_non_active_concepts() {
         hits[0].1
     );
 
+    // (review ruling) Dead rows drop BEFORE the truncate: query the
+    // axis where the (dead) c row ranks clearly above the live a row
+    // (0.9/0.9055 vs 0.1/0.9055) and take top=1 — the dead row still
+    // gives up its slot, so a LIVE entry fills the top-1 (take-then-map
+    // arithmetic would return an empty list here).
+    let hits = f.vs.top_cosine(&[0.1f32, 0.9], "m-x", 1).await.unwrap();
+    assert_eq!(hits.len(), 1, "the dead row does not eat a live slot");
+    assert_eq!(hits[0].0, "/a.md");
+
     // The free invalidate_scope the hooks also call drops the decoded
     // cache without any put: hand-remove a.md's SEARCH row after the
     // cache holds it — only a post-invalidate rebuild (a fresh
@@ -429,6 +442,20 @@ async fn decoded_cache_excludes_non_active_concepts() {
             .iter()
             .any(|r| r.path_token == f.vs.path_token_of("/c.md")),
         "c.md is still an active search row, so it re-enters the cache"
+    );
+
+    // (review pin 3) The stale skip applies at the cache level too:
+    // stale-mark every row and the rebuilt snapshot keeps none of them.
+    let stale_count = f.vs.mark_scope_stale().await.unwrap();
+    assert_eq!(
+        stale_count, 3,
+        "all three rows (a, b, c) were living and now stale"
+    );
+    invalidate_scope(f.vs.scope_id());
+    let stale_view = f.vs.cache_scope().await.unwrap();
+    assert!(
+        stale_view.rows.is_empty(),
+        "stale rows never re-enter the cache"
     );
 }
 
@@ -559,5 +586,126 @@ async fn corrupt_row_is_loud_in_load_rows_but_skipped_in_the_cache() {
     assert!(
         rows.rows.is_empty(),
         "the corrupt row is dropped, not fatal"
+    );
+}
+
+/// The build/insert race (review R1, IMPORTANT): an invalidation landing
+/// while a build is fetching must never survive as the installed
+/// snapshot. A build that fetched before the change either re-checks its
+/// epoch at the install (same critical section as the removal contends
+/// on) and rebuilds, or its stale install is chased out by the
+/// invalidation's mutex-ordered entry removal — the post-race entry is
+/// clean under every interleaving. Both orders pinned: observe-after-
+/// invalidate (the trailing hand-invalidate) and the hostile in-flight
+/// race (the flock).
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_epoch_recheck_never_serves_the_racing_view() {
+    let _guard = lock().await;
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    let (_dir, store) = store().await;
+    let f = fixtures(&store);
+
+    // Seed: two ACTIVE concepts with rows — the pre-change view holds
+    // both, so the superseded row below is genuinely the bait.
+    f.cs.put(&concept("/a.md", "A", "alpha")).await.unwrap();
+    let _queued = drain_queue(VECTOR_QUEUE_CAPACITY);
+    f.cs.put(&concept("/c.md", "C", "gamma")).await.unwrap();
+    let _queued = drain_queue(VECTOR_QUEUE_CAPACITY);
+    f.vs.upsert("/a.md", "m-x", 2, &[1.0f32, 0.0])
+        .await
+        .unwrap();
+    f.vs.upsert("/c.md", "m-x", 2, &[0.0f32, 1.0])
+        .await
+        .unwrap();
+    let a_token = f.vs.path_token_of("/a.md");
+    let c_token = f.vs.path_token_of("/c.md");
+
+    let prechange = f.vs.cache_scope().await.unwrap();
+    assert!(
+        prechange.rows.iter().any(|r| r.path_token == a_token),
+        "the pre-change view holds a"
+    );
+    assert!(
+        prechange.rows.iter().any(|r| r.path_token == c_token),
+        "the pre-change view holds c"
+    );
+
+    // Drop the entry so the racing flock's builds all fetch fresh.
+    invalidate_scope(f.vs.scope_id());
+
+    // The hostile flock: 8 concurrent builds (all miss, all fetch) plus
+    // one superseder whose put rewrites c's status and invalidates
+    // while they are mid-flight. Pool contention guarantees real
+    // interleaving on separate threads. A racing build may legitimately
+    // RETURN a pre-change view only if its install preceded the
+    // supersede — the pinned invariant is the entry at the post-join
+    // read, not each racing future's immediate result.
+    let mut builds = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let user = f._user;
+        let master = f.master.clone();
+        builds.push(tokio::spawn(async move {
+            let vs = VectorStore::for_user(store.pool(), user, &master);
+            vs.cache_scope().await
+        }));
+    }
+    let superseder = {
+        let store = store.clone();
+        let user = f._user;
+        let master = f.master.clone();
+        tokio::spawn(async move {
+            let cs = ConceptStore::for_user(&store, user, master);
+            cs.put(&concept_with_status(
+                "/c.md",
+                "C",
+                "gamma",
+                Some("superseded"),
+            ))
+            .await
+        })
+    };
+    for build in builds {
+        build.await.unwrap().unwrap();
+    }
+    superseder.await.unwrap().unwrap();
+
+    // THE INVARIANT: no racing build may have left the pre-change view
+    // installed — the superseded concept's row is not served.
+    let post = f.vs.cache_scope().await.unwrap();
+    assert!(
+        post.rows.iter().any(|r| r.path_token == a_token),
+        "a.md survives the race"
+    );
+    assert!(
+        post.rows.iter().all(|r| r.path_token != c_token),
+        "no pre-change view survived the supersede"
+    );
+    // And the read boundary holds too (defense in depth):
+    let hits = f.vs.top_cosine(&[1.0f32, 0.0], "m-x", 10).await.unwrap();
+    assert!(
+        hits.iter().all(|(path, _)| path != "/c.md"),
+        "the superseded concept never ranks"
+    );
+
+    // Order B, explicitly: invalidate-then-observe — the hand-invalidate
+    // drops the entry and the rebuild sees the post-change state only.
+    invalidate_scope(f.vs.scope_id());
+    let again = f.vs.cache_scope().await.unwrap();
+    assert!(
+        again.rows.iter().all(|r| r.path_token != c_token),
+        "the post-invalidate rebuild excludes the superseded row"
+    );
+    assert!(
+        again.rows.iter().any(|r| r.path_token == a_token),
+        "the post-invalidate rebuild keeps the active row"
+    );
+
+    // The supersede enqueued its embed work (the put hook); the flock's
+    // builds enqueue nothing, so the depth is exactly c's pair.
+    assert_eq!(vector_queue_depth(), 1);
+    assert_eq!(
+        drain_queue(VECTOR_QUEUE_CAPACITY),
+        vec![(f.vs.scope_id().to_string(), c_token)]
     );
 }

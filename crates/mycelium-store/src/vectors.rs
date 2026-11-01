@@ -25,7 +25,10 @@
 //! the queue, and the worker owns the stale corpus-invalidations. The
 //! decoded cache is invalidated by concept writes only; a vector-only
 //! change (a worker upsert) leaves the snapshot until the scope's next
-//! concept write or an explicit [`invalidate_scope`].
+//! concept write or an explicit [`invalidate_scope`]. Every invalidation
+//! also bumps an in-process epoch, and a build re-checks it before it
+//! installs — a fetch that raced an invalidation rebuilds (the racing
+//! view is never served).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -60,6 +63,13 @@ static SCOPE_VECTORS: Mutex<Option<HashMap<String, Arc<ScopeVectors>>>> = Mutex:
 /// The write-hook queue: (scope_id, path_token) pairs pending embed
 /// work. Enqueue-only via [`enqueue_write`], FIFO via [`drain_queue`].
 static VECTOR_QUEUE: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
+
+/// Invalidation epoch: [`invalidate_scope`] bumps it FIRST (before it
+/// removes the cache entry), so a cache build can detect an invalidation
+/// that raced its fetch and rebuild rather than install an obsolete
+/// snapshot — the build/insert race fix (see
+/// [`VectorStore::cache_scope`]).
+static CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum VectorError {
@@ -301,6 +311,11 @@ impl<'a> VectorStore<'a> {
         {
             rows.insert(
                 token,
+                // Lenient dims on purpose: this enumeration only ranks
+                // re-work — a corrupt dims errs toward "needs work"
+                // (0 mismatches every learned target) rather than
+                // failing the whole enumeration; the loud integrity
+                // errors live in decode_row (load_rows' strict path).
                 (row_model, u32::try_from(dims).unwrap_or(0), stale != 0),
             );
         }
@@ -325,10 +340,11 @@ impl<'a> VectorStore<'a> {
     /// Cosine ranking over cached-or-built rows: rows of the query's
     /// model/dims only (stale rows are absent from the cache by
     /// construction), cosine > 0 per row, sorted (cosine desc,
-    /// path_token asc), top taken, then tokens mapped to plaintext
-    /// paths via the plaintext registry (`scope_files.path`). A
-    /// candidate whose registry path vanished is a dead row and drops —
-    /// never a result that cannot be read.
+    /// path_token asc), tokens mapped to plaintext paths via the
+    /// plaintext registry (`scope_files.path`) with dead rows dropped,
+    /// THEN the top taken — the list carries up to `top` LIVE entries
+    /// even when dead rows fill the tail (a result that cannot be read
+    /// is never one of them).
     pub async fn top_cosine(
         &self,
         qvec: &[f32],
@@ -351,12 +367,13 @@ impl<'a> VectorStore<'a> {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        scored.truncate(top);
         if scored.is_empty() {
             return Ok(vec![]);
         }
         // The registry is plaintext; the token mapping is computed, the
-        // dead-row drop is exact.
+        // dead-row drop is exact — and it happens BEFORE the truncate
+        // (review ruling): the final list carries up to `top` LIVE
+        // entries even when dead rows occupy the tail of the sort.
         let paths: Vec<(String,)> = sqlx::query_as("SELECT path FROM scope_files WHERE scope = ?")
             .bind(&self.scope_id)
             .fetch_all(self.pool)
@@ -365,19 +382,25 @@ impl<'a> VectorStore<'a> {
             .into_iter()
             .map(|(path,)| (self.path_token_of(&path), path))
             .collect();
-        Ok(scored
+        let mut hits: Vec<(String, f32)> = scored
             .into_iter()
             .filter_map(|(token, c)| by_token.get(&token).map(|path| (path.clone(), c)))
-            .collect())
+            .collect();
+        hits.truncate(top);
+        Ok(hits)
     }
 
     /// The scope's decoded cache, built on first use after an
-    /// invalidation. The build applies the ACTIVE-SET filter (spec §6.1
-    /// corollary): a superseded/retired concept's row, or any row whose
-    /// search row has vanished (deleted concept), never re-enters the
-    /// cache. Skips are debug-grade (an unavailable vector row is an
+    /// invalidation (the build's fetch+filter is [`Self::fetch_kept`];
+    /// skips are debug-grade (an unavailable vector row is an
     /// availability question), except decode-integrity damage, warned
-    /// once per process; `load_rows` stays the strict path.
+    /// once per process; `load_rows` stays the strict path).
+    ///
+    /// Build/insert race: the invalidation epoch is captured BEFORE the
+    /// fetch phase and re-checked before the install. A build whose
+    /// fetch raced an [`invalidate_scope`] rebuilds once (bounded) — an
+    /// obsolete snapshot is never installed after the invalidation that
+    /// removed it.
     pub async fn cache_scope(&self) -> Result<Arc<ScopeVectors>, VectorError> {
         {
             let guard = SCOPE_VECTORS.lock().unwrap();
@@ -387,7 +410,44 @@ impl<'a> VectorStore<'a> {
                 return Ok(Arc::clone(hit));
             }
         }
-        // Active (or NULL-status) concept tokens as of this build.
+        let epoch = CACHE_EPOCH.load(Ordering::Acquire);
+        let arc = Self::snapshot_of(self.fetch_kept().await?);
+        {
+            // The re-check sits in the SAME critical section as the
+            // install. An invalidation runs bump-first-then-remove, and
+            // its removal contends on this mutex — so a build that
+            // misses the bump by a hair either rebuilds (the load sees
+            // it) or has the removal ordered strictly after its insert:
+            // the stale snapshot never outlives the invalidation.
+            let mut guard = SCOPE_VECTORS.lock().unwrap();
+            if CACHE_EPOCH.load(Ordering::Acquire) == epoch {
+                guard
+                    .get_or_insert_with(HashMap::new)
+                    .insert(self.scope_id.clone(), Arc::clone(&arc));
+                return Ok(arc);
+            }
+        }
+        // Pass 1 — bounded (the build is at most 2 passes): this fetch
+        // is strictly newer than the bump that triggered it (each bump
+        // follows its change), so this pass installs unconditionally. A
+        // further invalidation between its install and the next read is
+        // the freshness class the module doc records (the NEXT write
+        // invalidates again).
+        let arc = Self::snapshot_of(self.fetch_kept().await?);
+        SCOPE_VECTORS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(self.scope_id.clone(), Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// One fetch pass of a cache build: the scope's raw rows filtered to
+    /// the ACTIVE set (spec §6.1 corollary) — a superseded/retired
+    /// concept's row, or any row whose search row has vanished (deleted
+    /// concept), never re-enters the cache.
+    async fn fetch_kept(&self) -> Result<Vec<CacheRow>, VectorError> {
+        // Active (or NULL-status) concept tokens as of this fetch.
         let actives: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT concept_path, lifecycle_status FROM search_docs WHERE scope = ?",
         )
@@ -455,18 +515,19 @@ impl<'a> VectorStore<'a> {
                 Err(other) => return Err(other),
             }
         }
-        let snapshot = ScopeVectors {
-            model: kept.first().map(|r| r.model.clone()).unwrap_or_default(),
+        Ok(kept)
+    }
+
+    /// Wrap decoded rows into the scope's snapshot: the first row's
+    /// model is the informational header ("" when empty — never assumed
+    /// for ranking; `top_cosine` filters per row), the wall-clock build
+    /// time feeds downstream staleness decisions.
+    fn snapshot_of(rows: Vec<CacheRow>) -> Arc<ScopeVectors> {
+        Arc::new(ScopeVectors {
+            model: rows.first().map(|r| r.model.clone()).unwrap_or_default(),
             built_at: std::time::Instant::now(),
-            rows: kept,
-        };
-        let arc = Arc::new(snapshot);
-        SCOPE_VECTORS
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(self.scope_id.clone(), Arc::clone(&arc));
-        Ok(arc)
+            rows,
+        })
     }
 
     /// Fetch the scope's raw rows (token order — deterministic for every
@@ -531,7 +592,12 @@ impl<'a> VectorStore<'a> {
 
 /// Drop a scope's decoded cache — the ConceptStore write hooks call
 /// this; the next [`VectorStore::cache_scope`] rebuilds from the rows.
+/// The bump is FIRST: a build re-checking the epoch at its install (in
+/// the same cache-mutex critical section) either sees it and rebuilds,
+/// or its install is ordered before the removal — which chases the
+/// stale entry out.
 pub fn invalidate_scope(scope_id: &str) {
+    CACHE_EPOCH.fetch_add(1, Ordering::Release);
     let mut guard = SCOPE_VECTORS.lock().unwrap();
     if let Some(map) = guard.as_mut() {
         map.remove(scope_id);
