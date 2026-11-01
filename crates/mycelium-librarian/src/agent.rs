@@ -291,7 +291,10 @@ async fn enrich_hit(cs: &ConceptStore<'_>, path: &str) -> (String, String) {
 /// its in-arm filter; in the vector modes the filter applies AFTER the
 /// fusion (invisible candidates compete for fusion ranks but never
 /// surface). A scope-search fault contributes no hits and logs at warn
-/// — hit_fields's posture. Truncation to `cap` happens LAST.
+/// — hit_fields's posture. Truncation to `cap` happens LAST, and the
+/// vector modes ride it one step further: their title/snippet
+/// enrichment (a full decrypt-and-parse per candidate) runs AFTER the
+/// truncate — survivors only, since enrichment never affects scores.
 pub async fn cross_scope_hits(
     store: Option<&ConceptStore<'_>>,
     scopes: &AgentScopes<'_>,
@@ -371,9 +374,16 @@ pub async fn cross_scope_hits(
                     &mycelium_store::revisions::rrf_params(),
                 );
                 for (path, fused_score) in fused {
+                    // Lexical hits carry the index's own fields for
+                    // free (the derivation enrich_hit mirrors); a
+                    // vector-only candidate is an empty-title
+                    // PLACEHOLDER — enriched after the truncate below,
+                    // survivors only. The lexical index's title is
+                    // never empty (it falls back to the path), so the
+                    // empty title unambiguously marks the placeholder.
                     let (title, snippet) = match lex_hits.iter().find(|h| h.concept_path == path) {
                         Some(h) => (h.title.clone(), h.snippet.clone()),
-                        None => enrich_hit(cs, &path).await,
+                        None => (String::new(), String::new()),
                     };
                     all_hits.push((
                         tag.to_string(),
@@ -387,14 +397,16 @@ pub async fn cross_scope_hits(
                 }
             }
             FuseSources::VecOnly { qvec, model } => {
+                // Placeholders (empty title), like the Hybrid arm's
+                // vector-only candidates — enrichment runs after the
+                // truncate, survivors only.
                 for (path, cos) in vec_pool(cs, qvec, model).await {
-                    let (title, snippet) = enrich_hit(cs, &path).await;
                     all_hits.push((
                         tag.to_string(),
                         mycelium_core::search::SearchResult {
                             concept_path: path,
-                            title,
-                            snippet,
+                            title: String::new(),
+                            snippet: String::new(),
                             score: cos,
                         },
                     ));
@@ -423,6 +435,30 @@ pub async fn cross_scope_hits(
             .then_with(|| a.1.concept_path.cmp(&b.1.concept_path))
     });
     all_hits.truncate(cap);
+
+    // The vector modes' deferred enrichment, survivors only (the
+    // truncated tail — up to LEX_POOL-sized pools per scope — never
+    // decrypts): a placeholder hit's empty title resolves to the full
+    // concept read now. The LexicalOnly arm never produces an empty
+    // title (its hits carry the index's own, which falls back to the
+    // path), so the pass is skipped there entirely.
+    if !matches!(fuse, FuseSources::LexicalOnly) {
+        let pending: Vec<usize> = all_hits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, hit))| hit.title.is_empty().then_some(i))
+            .collect();
+        for i in pending {
+            let tag = all_hits[i].0.as_str();
+            let Some((_, scope_cs)) = sources.iter().find(|(t, _)| tag == *t) else {
+                continue;
+            };
+            let Some(cs) = scope_cs else { continue };
+            let (title, snippet) = enrich_hit(cs, &all_hits[i].1.concept_path).await;
+            all_hits[i].1.title = title;
+            all_hits[i].1.snippet = snippet;
+        }
+    }
     all_hits
 }
 

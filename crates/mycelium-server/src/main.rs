@@ -238,7 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Vector worker (memory-lifecycle spec §3.3): drains the bounded
     // write-hook queue into the vector rows, then rebuilds stale scopes
     // (bounded per tick) and enqueues the boot backlog on the first
-    // tick. Spawned with the other long-lived workers, after the
+    // PRESENT-config tick (an absent row defers it — the operator's
+    // post-boot save backfills the pre-existing corpus without a
+    // restart). Spawned with the other long-lived workers, after the
     // posture was seeded and synced from the stored row.
     state.vector_worker.clone().spawn(shutdown.clone());
 

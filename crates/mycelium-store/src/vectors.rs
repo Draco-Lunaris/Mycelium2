@@ -27,8 +27,9 @@
 //! change (a worker upsert) leaves the snapshot until the scope's next
 //! concept write or an explicit [`invalidate_scope`]. Every invalidation
 //! also bumps an in-process epoch, and a build re-checks it before it
-//! installs — a fetch that raced an invalidation rebuilds (the racing
-//! view is never served).
+//! installs — a fetch that raced an invalidation rebuilds (bounded
+//! retries; beyond the bound the snapshot is served transiently, never
+//! installed).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -70,6 +71,13 @@ static VECTOR_QUEUE: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::ne
 /// snapshot — the build/insert race fix (see
 /// [`VectorStore::cache_scope`]).
 static CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The build/insert race's retry bound: a cache build re-checks the
+/// epoch at its install and rebuilds when its fetch raced an
+/// invalidation — at most [`CACHE_BUILD_PASSES`] passes total. Beyond
+/// the bound a caller is served its last snapshot transiently (never
+/// installed — see [`VectorStore::cache_scope`]).
+const CACHE_BUILD_PASSES: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VectorError {
@@ -424,17 +432,28 @@ impl<'a> VectorStore<'a> {
         Ok(hits)
     }
 
-    /// The scope's decoded cache, built on first use after an
-    /// invalidation (the build's fetch+filter is [`Self::fetch_kept`];
-    /// skips are debug-grade (an unavailable vector row is an
-    /// availability question), except decode-integrity damage, warned
-    /// once per process; `load_rows` stays the strict path).
+    /// The decoded cache, built on first use after an invalidation (the
+    /// build's fetch+filter is [`Self::fetch_kept`]; skips are
+    /// debug-grade (an unavailable vector row is an availability
+    /// question), except decode-integrity damage, warned once per
+    /// process; `load_rows` stays the strict path).
     ///
-    /// Build/insert race: the invalidation epoch is captured BEFORE the
-    /// fetch phase and re-checked before the install. A build whose
-    /// fetch raced an [`invalidate_scope`] rebuilds once (bounded) — an
-    /// obsolete snapshot is never installed after the invalidation that
-    /// removed it.
+    /// Build/insert race (bounded): each pass snapshots the
+    /// invalidation epoch BEFORE its fetch and re-checks it inside the
+    /// install mutex. A build whose fetch raced an [`invalidate_scope`]
+    /// rebuilds — retried to [`CACHE_BUILD_PASSES`] passes total, every
+    /// pass installing ONLY on an epoch match. A second invalidation
+    /// landing during a retry-pass's fetch is thus also caught (its
+    /// bump+remove complete before that install; the match check
+    /// refuses it) — the stale snapshot can never outlive the
+    /// invalidation that removed it. Exhausting the bound (an
+    /// invalidation storm racing every pass) serves the last computed
+    /// snapshot for THIS call only, transiently — never installed, so
+    /// the next `cache_scope` rebuilds from scratch. That residual
+    /// freshness class: the served snapshot is the rows as of one
+    /// pass's fetch instant (at most one pending invalidation behind —
+    /// each failed re-check proved a newer bump before that fetch), a
+    /// transient observation, never a persistent stale entry.
     pub async fn cache_scope(&self) -> Result<Arc<ScopeVectors>, VectorError> {
         {
             let guard = SCOPE_VECTORS.lock().unwrap();
@@ -444,35 +463,38 @@ impl<'a> VectorStore<'a> {
                 return Ok(Arc::clone(hit));
             }
         }
-        let epoch = CACHE_EPOCH.load(Ordering::Acquire);
-        let arc = Self::snapshot_of(self.fetch_kept().await?);
-        {
-            // The re-check sits in the SAME critical section as the
-            // install. An invalidation runs bump-first-then-remove, and
-            // its removal contends on this mutex — so a build that
-            // misses the bump by a hair either rebuilds (the load sees
-            // it) or has the removal ordered strictly after its insert:
-            // the stale snapshot never outlives the invalidation.
-            let mut guard = SCOPE_VECTORS.lock().unwrap();
-            if CACHE_EPOCH.load(Ordering::Acquire) == epoch {
-                guard
-                    .get_or_insert_with(HashMap::new)
-                    .insert(self.scope_id.clone(), Arc::clone(&arc));
-                return Ok(arc);
+        let mut epoch = CACHE_EPOCH.load(Ordering::Acquire);
+        let mut arc = Self::snapshot_of(self.fetch_kept().await?);
+        for pass in 0..CACHE_BUILD_PASSES {
+            {
+                // The re-check sits in the SAME critical section as the
+                // install. An invalidation runs bump-first-then-remove,
+                // and its removal contends on this mutex — so a build
+                // that misses the bump by a hair either rebuilds (the
+                // load sees it) or has the removal ordered strictly
+                // after its insert: the stale snapshot never outlives
+                // the invalidation.
+                let mut guard = SCOPE_VECTORS.lock().unwrap();
+                if CACHE_EPOCH.load(Ordering::Acquire) == epoch {
+                    guard
+                        .get_or_insert_with(HashMap::new)
+                        .insert(self.scope_id.clone(), Arc::clone(&arc));
+                    return Ok(arc);
+                }
+            }
+            // An invalidation raced this pass's fetch: rebuild from the
+            // newer epoch. The LAST pass skips the refetch — its
+            // snapshot is served transiently below (never installed).
+            if pass + 1 < CACHE_BUILD_PASSES {
+                epoch = CACHE_EPOCH.load(Ordering::Acquire);
+                arc = Self::snapshot_of(self.fetch_kept().await?);
             }
         }
-        // Pass 1 — bounded (the build is at most 2 passes): this fetch
-        // is strictly newer than the bump that triggered it (each bump
-        // follows its change), so this pass installs unconditionally. A
-        // further invalidation between its install and the next read is
-        // the freshness class the module doc records (the NEXT write
-        // invalidates again).
-        let arc = Self::snapshot_of(self.fetch_kept().await?);
-        SCOPE_VECTORS
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(self.scope_id.clone(), Arc::clone(&arc));
+        tracing::debug!(
+            scope = %self.scope_id,
+            passes = CACHE_BUILD_PASSES,
+            "vector cache: too many raced builds — serving the snapshot transiently, not installed"
+        );
         Ok(arc)
     }
 
@@ -683,9 +705,15 @@ fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The private cosine — dot over |a|·|b| (the same math core's scorer
-/// uses; Task 5 unifies consumers on the core fn). Non-finite results
-/// (zero vectors: NaN) are cut by the query path's cosine > 0 rule.
+/// The private cosine — dot over |a|·|b|, KEPT LOCAL on purpose: its
+/// edge semantics differ from `mycelium_core::search::cosine` (the
+/// composer's and dream's fn) — a min-length prefix loop with NO
+/// zero-norm guard, correct here because `top_cosine` pre-filters the
+/// rows it feeds this fn (same model + exact dims match) and cuts
+/// non-finite results (zero vectors: NaN) with its `cosine > 0` rule.
+/// Core's fn instead returns 0 on a length mismatch or zero norm. The
+/// two fns must NOT be silently merged — a merge changes the edge
+/// semantics of whichever path picks up the other's behavior.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
     for i in 0..a.len().min(b.len()) {

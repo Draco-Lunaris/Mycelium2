@@ -311,7 +311,12 @@ impl EmbeddingsClient {
     /// input order. Every input is truncated to
     /// [`EMBED_INPUT_MAX_CHARS`] chars first; an empty batch is an
     /// early `Ok(vec![])` (nothing is POSTed and nothing is observed —
-    /// the backend saw no traffic to report on).
+    /// the backend saw no traffic to report on). A served vector longer
+    /// than the [`MAX_EMBEDDING_DIMS`] sanity cap (the probe's
+    /// config-level bound, now enforced on every batch) is
+    /// `Malformed` — rejected BEFORE the success choke, so an over-cap
+    /// model never stamps the health machine Green nor lands an
+    /// over-cap row in the decoded vector cache.
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let result = self.embed_batch_impl(texts).await;
         record_outcome(&result);
@@ -347,6 +352,22 @@ impl EmbeddingsClient {
         let parsed: EmbedResponse = serde_json::from_slice(&bytes)
             .map_err(|e| EmbeddingError::Malformed(format!("invalid embeddings JSON body: {e}")))?;
         let vectors = ordered_vectors(parsed.data, texts.len())?;
+        // The dims cap, per served vector, BEFORE the success choke:
+        // over-cap dims are the probe's config-level class (embedding a
+        // text column against the wrong backend) — a successful stamp
+        // here would flip a config-level Red to Green (defeating the
+        // worker's Red pause) and the decoded cache would hold over-cap
+        // rows.
+        if let Some((i, vector)) = vectors
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.len() > MAX_EMBEDDING_DIMS)
+        {
+            return Err(EmbeddingError::Malformed(format!(
+                "model dims {} exceeds the {MAX_EMBEDDING_DIMS} cap — config-level problem (vector at index {i})",
+                vector.len()
+            )));
+        }
         record_emb_success(&vectors);
         Ok(vectors)
     }
@@ -417,7 +438,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use crate::llm_health::{EMB_LAST_SUCCESS, EMBEDDING_DIMS};
+    use crate::llm_health::{BackendState, EMB_LAST_SUCCESS, EMBEDDING_DIMS, embedding_snapshot};
 
     use axum::response::IntoResponse;
 
@@ -612,6 +633,53 @@ mod tests {
         let err = client.embed_batch(&["a".into()]).await.unwrap_err();
         assert!(matches!(err, EmbeddingError::Malformed(_)), "{err}");
         assert!(!err.is_backend_down());
+    }
+
+    /// An over-cap batch vector (>4096 dims) is Malformed — the
+    /// probe's config-level class, now enforced in the BATCH path —
+    /// and is rejected BEFORE the success choke: the health machine is
+    /// left exactly as the test set it (stays Red, no re-stamp),
+    /// `EMB_LAST_SUCCESS` stays 0 and no dims stamp lands, so an
+    /// over-cap model can never defeat the worker's Red pause nor land
+    /// an over-cap row in the decoded cache.
+    #[tokio::test]
+    async fn embed_batch_rejects_over_cap_vectors_before_the_success_stamp() {
+        let _guard = crate::llm_health::health_test_guard().await;
+        let _globals = EmbGlobals;
+        reset_emb_globals();
+        // Drive the machine Red the way real consecutive backend
+        // failures would (3 notes — the state the worker's Red pause
+        // reads).
+        for _ in 0..3 {
+            crate::llm_health::EMBEDDING_HEALTH.note_failure();
+        }
+
+        let (url, _auth, _bodies) = embeddings_mock(200, dims_json(8192)).await;
+        let client = EmbeddingsClient::new(&cfg_for(url, None));
+        let err = client.embed_batch(&["t".into()]).await.unwrap_err();
+        assert!(matches!(err, EmbeddingError::Malformed(_)), "{err}");
+        // Config-level, not backend weather — the failure must NOT have
+        // fed the machine either (Malformed is never backend-down).
+        assert!(!err.is_backend_down(), "{err}");
+        assert!(
+            format!("{err}").contains("4096"),
+            "the cap names itself in the error: {err}"
+        );
+
+        // Nothing was stamped: the machine is EXACTLY where the test
+        // left it, and both sentinels stay untouched.
+        let s = embedding_snapshot();
+        assert_eq!(s.state, BackendState::Red, "no note fired: {s:?}");
+        assert_eq!(
+            s.consecutive_failures, 3,
+            "the over-cap response fed no observation: {s:?}"
+        );
+        assert_eq!(
+            EMB_LAST_SUCCESS.load(Ordering::Relaxed),
+            0,
+            "no success stamp"
+        );
+        assert_eq!(EMBEDDING_DIMS.load(Ordering::Relaxed), 0, "no dims stamp");
     }
 
     /// The Bearer header rides the request only when a key is

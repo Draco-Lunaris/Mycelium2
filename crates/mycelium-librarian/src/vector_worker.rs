@@ -30,11 +30,14 @@
 //!    re-embeds up to [`STALE_ROWS_PER_TICK`] rows per tick from the
 //!    registry's own backlog enumeration, then invalidates again. A
 //!    larger backlog simply resumes next tick.
-//! 7. Boot backlog (FIRST tick only, per process): every scope's
-//!    `backlog_paths` re-enters the queue (writes that happened before
-//!    a worker ever saw them), bounded by the queue itself — at
+//! 7. Boot backlog (first PRESENT-config tick, per process): every
+//!    scope's `backlog_paths` re-enters the queue (writes that happened
+//!    before a worker ever saw them), bounded by the queue itself — at
 //!    capacity a NEW item is dropped and the remainder resumes next
-//!    boot.
+//!    boot. The flag defers while the embeddings row is absent or
+//!    unreadable (the fresh-deployment posture: the operator saves the
+//!    config post-boot, and the pre-existing corpus backfills at the
+//!    first tick that actually reads a row — no restart).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -120,16 +123,18 @@ impl VectorWorker {
     async fn run(self: Arc<Self>, shutdown: CancellationToken, tick: Duration) {
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The boot backlog fires on the FIRST executed tick only —
-        // taken BEFORE each tick so a Red-skipped first tick consumes
-        // the flag (an era-3 backlog must not queue while the model is
-        // down; the next boot re-backlogs whatever was lost).
+        // The boot backlog fires on the first tick whose config read
+        // SUCCEEDS — not the first tick outright. On a fresh deployment
+        // the embeddings row is ABSENT until the operator saves it
+        // (often post-boot): consuming the flag on those ticks would
+        // lose the pre-existing corpus's backfill until a restart. The
+        // tick itself takes the flag the moment the config row is
+        // present (comment on [`VectorWorker::tick`]).
         let mut boot_backlog = true;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let backlog = std::mem::take(&mut boot_backlog);
-                    self.tick(backlog).await;
+                    self.tick(&mut boot_backlog).await;
                 }
                 () = shutdown.cancelled() => {
                     tracing::info!("vector worker task stopped");
@@ -139,11 +144,22 @@ impl VectorWorker {
         }
     }
 
-    /// One tick: the seven phases in turn (module doc).
-    async fn tick(&self, boot_backlog: bool) {
+    /// One tick: the seven phases in turn (module doc). `boot_backlog_flag`
+    /// is the run loop's first-tick flag; the tick consumes it (a take)
+    /// only when the config read reports a PRESENT row — an absent /
+    /// failed / undecryptable row leaves it, so the backlog still fires
+    /// at the first present-config tick (≤ one interval after the
+    /// operator's save).
+    async fn tick(&self, boot_backlog_flag: &mut bool) {
         let Some(cfg) = self.read_config().await else {
             return;
         };
+
+        // The config row is present: the backlog flag is consumed from
+        // here on, even when the Red pause below skips this tick's
+        // enqueue (an era-3 backlog must not queue while the model is
+        // down; the next boot re-backlogs whatever was lost).
+        let boot_backlog = std::mem::take(boot_backlog_flag);
 
         // Prologue: the whole-corpus stale mark rides the learned dims.
         let learned = EMBEDDING_DIMS.load(Ordering::Relaxed);
@@ -459,10 +475,11 @@ impl VectorWorker {
         }
     }
 
-    /// Step 7 (first tick only): every scope's paths lacking their row
-    /// re-enter the queue — writes that happened before a worker ran.
-    /// Overflow drops NEW items (the queue's own rule); whatever was
-    /// dropped resumes on the next boot.
+    /// Step 7 (first present-config tick, per process): every scope's
+    /// paths lacking their row re-enter the queue — writes that
+    /// happened before a worker ran. Overflow drops NEW items (the
+    /// queue's own rule); whatever was dropped resumes on the next
+    /// boot.
     async fn enqueue_boot_backlog(&self, model: &str, learned: u32) {
         // The two service scopes (sweep-targets order: skills, library).
         for ns in ["skills", "library"] {

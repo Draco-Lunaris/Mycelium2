@@ -520,6 +520,69 @@ async fn boot_backlog_is_enqueued_bounded_and_resumed() {
     handle.await.unwrap();
 }
 
+/// The boot backlog survives ticks that exit on the ABSENT embeddings
+/// row (final-review Important 1 — the fresh-deployment adoption path):
+/// the pre-spawn era's 40 concepts (queue drained EMPTY) stay
+/// un-backfilled across several absent-row ticks — the backlog flag is
+/// NOT consumed by them — and the row being SAVED post-boot (the
+/// production seal helper, exactly `admin_save_embeddings`' storage
+/// shape) makes the next tick enqueue the backlog and embed it. No
+/// restart anywhere in the test.
+#[tokio::test]
+async fn boot_backlog_defers_to_a_post_boot_config_save() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    let (url, _shared) = mock_embeddings(vec![vec_resp(DIMS); 6]).await;
+    let env = env().await;
+    // NO embeddings row yet — the fresh-deployment posture.
+    let (cs, vs) = env.user_stores();
+
+    let concepts: Vec<Concept> = (0..40)
+        .map(|i| concept(&format!("/n-{i:02}.md"), &format!("N{i}"), "body"))
+        .collect();
+    cs.put_batch(&concepts).await.unwrap();
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the pre-worker era's queue is empty at spawn"
+    );
+
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+
+    // Several ticks at the absent posture: the flag survives, nothing
+    // enqueues, no rows appear (each absent tick ends at the config
+    // check; TICK_MS×8 gives well past the first-tick interval).
+    tokio::time::sleep(Duration::from_millis(TICK_MS * 8)).await;
+    assert_eq!(
+        vs.load_rows().await.unwrap().len(),
+        0,
+        "the absent row's ticks never created vector rows"
+    );
+    assert_eq!(vector_queue_depth(), 0, "the backlog flag is still held");
+    assert_eq!(
+        EMBEDDING_HEALTH.state(),
+        BackendState::Disabled,
+        "the absent row reads as Disabled"
+    );
+
+    // The operator saves the row post-boot (production seal shape)…
+    write_emb_row(&env.config, &env.service_key, &url, MODEL).await;
+    // …and the FIRST present-config tick backfills the whole corpus —
+    // no restart: the backlog enqueues at that tick, embeds on the next.
+    wait_until("the post-save tick backfilled the whole corpus", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 40 && rows.iter().all(|r| !r.stale && r.model == MODEL))
+            .unwrap_or(false)
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
 /// A deleted concept's stale row is never rebuilt (spec §3.3 Review
 /// Focus 3): the delete hook removes the row directly, and the stale
 /// enumeration keys on the search index's paths — a gone concept is in
