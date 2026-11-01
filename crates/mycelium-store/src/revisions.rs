@@ -199,24 +199,30 @@ pub fn set_dedup_cosine(t: f32) {
     DEDUP_COSINE.store(clamp_dedup_cosine(t).to_bits(), Ordering::Relaxed);
 }
 
-/// The fusion weights as the composer's [`RrfParams`] — the u32 rank
-/// constant widens to f32 (lossless within the clamped range) and the
-/// weights come back off their bit statics. The hybrid composer calls
-/// this per request so step 5's admin retune applies with no restart.
+/// The fusion weights as the composer's [`RrfParams`]: the u32 rank
+/// constant is a direct `as f32` (lossless across the whole clamped
+/// range — 1024 sits far inside f32's ±2^24 exact-integer window)
+/// and the weights come back off their bit statics. The hybrid composer
+/// calls this per request so step 5's admin retune applies with no
+/// restart. Both fields re-apply their range clamp AT THE READ SEAM —
+/// the documented "clamped on every set, get, save and load" holds
+/// even for a value that reached the atomic without going through a
+/// setter ([`query_top_k`]'s precedent).
 #[must_use]
 pub fn rrf_params() -> mycelium_core::search::RrfParams {
     mycelium_core::search::RrfParams {
-        rrf_k: RRF_K.load(Ordering::Relaxed) as f32,
-        w_lex: f32::from_bits(RRF_WEIGHT_LEX.load(Ordering::Relaxed)),
-        w_vec: f32::from_bits(RRF_WEIGHT_VEC.load(Ordering::Relaxed)),
+        rrf_k: clamp_rrf_k(RRF_K.load(Ordering::Relaxed)) as f32,
+        w_lex: clamp_fusion_weight(f32::from_bits(RRF_WEIGHT_LEX.load(Ordering::Relaxed))),
+        w_vec: clamp_fusion_weight(f32::from_bits(RRF_WEIGHT_VEC.load(Ordering::Relaxed))),
     }
 }
 
-/// The process-global dedup cosine threshold (clamped — Task 6's
-/// dream-consolidation reader).
+/// The process-global dedup cosine threshold — clamped (and NaN-guarded
+/// to the default) AT THE READ SEAM too, same precedent. Task 6's
+/// dream-consolidation reader.
 #[must_use]
 pub fn dedup_cosine() -> f32 {
-    f32::from_bits(DEDUP_COSINE.load(Ordering::Relaxed))
+    clamp_dedup_cosine(f32::from_bits(DEDUP_COSINE.load(Ordering::Relaxed)))
 }
 
 /// Deterministic per-op summaries (byte-safe bounded, the queue
@@ -745,5 +751,52 @@ impl<'a> RevisionStore<'a> {
         }
         tx.commit().await?;
         Ok(pruned)
+    }
+}
+
+#[cfg(test)]
+mod fusion_statics_tests {
+    use std::sync::atomic::Ordering;
+
+    /// The read seam is the last line of defense: a value that reached
+    /// an atomic WITHOUT a setter (a future raw seam, a refactor bug)
+    /// must still read clamped — `rrf_params`/`dedup_cosine` re-apply
+    /// their ranges on load. The statics are private, so only an
+    /// in-module test can force out-of-range bits INTO them; the
+    /// forced values are restored via the regular setters so sibling
+    /// tests in this binary read the defaults.
+    #[test]
+    fn readers_reclamp_and_nan_guard_the_stale_bits() {
+        super::RRF_K.store(3000, Ordering::Relaxed);
+        super::RRF_WEIGHT_LEX.store(12.0f32.to_bits(), Ordering::Relaxed);
+        super::RRF_WEIGHT_VEC.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        super::DEDUP_COSINE.store(0.1f32.to_bits(), Ordering::Relaxed);
+
+        let params = super::rrf_params();
+        assert_eq!(
+            params.rrf_k,
+            super::RRF_K_RANGE.1 as f32,
+            "k → 1024 ceiling"
+        );
+        assert_eq!(params.w_lex, 10.0, "weight → 10.0 ceiling");
+        assert_eq!(
+            params.w_vec, 1.0,
+            "NaN bits → the field default (1.0) at the read seam"
+        );
+        assert_eq!(
+            super::dedup_cosine(),
+            0.5,
+            "dedup → 0.5 floor at the read seam"
+        );
+
+        // Restore the defaults via the setters so the binary's other
+        // tests (and Task 6's dream reader) see the shipped values.
+        super::set_rrf_k(super::DEFAULT_RRF_K);
+        super::set_rrf_weight_lex(super::DEFAULT_RRF_WEIGHT);
+        super::set_rrf_weight_vec(super::DEFAULT_RRF_WEIGHT);
+        super::set_dedup_cosine(super::DEFAULT_DEDUP_COSINE);
+        let params = super::rrf_params();
+        assert_eq!((params.rrf_k, params.w_lex, params.w_vec), (60.0, 1.0, 1.0));
+        assert_eq!(super::dedup_cosine(), 0.92);
     }
 }

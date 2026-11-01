@@ -533,6 +533,10 @@ impl QueueWorker {
         let scopes = AgentScopes {
             skills: None,
             library: None,
+            // Hybrid retrieval is scoped OUT of the drain (the web
+            // build_agent_scopes rationale, mirrored here): a try-class
+            // worker must not take embeddings latency on its critical
+            // path — the query-priority invariant.
             embeddings: None,
             read_stack_text: None,
             visible_slugs: None,
