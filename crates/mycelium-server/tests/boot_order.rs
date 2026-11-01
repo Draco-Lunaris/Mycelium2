@@ -14,6 +14,12 @@
 //! `lifecycle` row BEFORE the packaged-skill seed, because the seed
 //! writes concepts (and revisions) — retention must be live first.
 //!
+//! Task 4 of the same spec adds a third: the embeddings posture is
+//! seeded (Disabled — an absent `embeddings` row must not boot as a
+//! live Green) and synced from the stored row BEFORE the vector worker
+//! and the embeddings probe spawn, both of which observe the machine on
+//! their first immediate tick.
+//!
 //! This is asserted over `src/main.rs`'s source rather than by timing:
 //! the ordering is a property of the boot sequence, and a runtime probe
 //! of it would be a race.
@@ -102,5 +108,56 @@ fn backfill_sweep_follows_retention_sync_and_the_deprecated_tag_sweep() {
         deprecated < backfill,
         "the backfill sweep must come after the deprecated-tag sweep in main.rs \
          (deprecated at {deprecated}, backfill at {backfill})"
+    );
+}
+
+/// The embeddings posture is seeded (Disabled) and synced from the
+/// stored `embeddings` row BEFORE the vector worker and the embeddings
+/// probe spawn (both observe the machine on their first immediate
+/// tick); the vector worker's spawn sits with the other long-lived
+/// workers, and the embeddings probe spawn directly follows the LLM
+/// probe's.
+#[test]
+fn embedding_health_is_synced_before_the_vector_workers() {
+    let src = main_rs();
+    // The seed + the sync.
+    let seed = only_at(&src, "EMBEDDING_HEALTH.set_disabled()");
+    let sync = only_at(&src, "sync_embedding_from_store(&state)");
+    // The long-lived vector worker's spawn.
+    let worker = only_at(&src, "state.vector_worker.clone().spawn(shutdown.clone())");
+    // The embeddings probe spawn.
+    let probe = only_at(&src, "spawn_embedding_probe(");
+    let serve = only_at(&src, "mycelium_web::serve(");
+
+    for (what, at) in [
+        ("the vector worker spawn", worker),
+        ("the embeddings probe spawn", probe),
+        ("serve()", serve),
+    ] {
+        assert!(
+            seed < at,
+            "the embeddings seed must come before {what} in main.rs \
+             (seed at {seed}, {what} at {at})"
+        );
+        assert!(
+            sync < at,
+            "the embeddings sync must come before {what} in main.rs \
+             (sync at {sync}, {what} at {at})"
+        );
+    }
+    assert!(
+        worker < probe,
+        "the vector worker's spawn must precede the probe task's in main.rs \
+         (worker at {worker}, probe at {probe})"
+    );
+    assert!(
+        probe < serve,
+        "the embeddings probe must spawn before serve() in main.rs \
+         (probe at {probe}, serve at {serve})"
+    );
+    assert!(
+        worker < serve,
+        "the vector worker must spawn before serve() in main.rs \
+         (worker at {worker}, serve at {serve})"
     );
 }

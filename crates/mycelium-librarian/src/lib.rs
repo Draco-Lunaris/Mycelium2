@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod dream;
+pub mod embeddings;
 pub mod extract;
 pub mod fallback;
 pub mod hot_memory;
@@ -12,8 +13,10 @@ pub mod llm_health;
 pub mod query_cache;
 pub mod queue_worker;
 pub mod trace;
+pub mod vector_worker;
 pub mod worker;
 
+pub use embeddings::{EmbeddingError, EmbeddingsClient, EmbeddingsConfig};
 pub use extract::{
     BookCatalog, BookOutline, ChapterOutline, build_catalog, parse_outline, slugify,
 };

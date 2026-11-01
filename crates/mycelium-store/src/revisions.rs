@@ -109,6 +109,122 @@ pub fn query_top_k() -> u32 {
     clamp_query_top_k(QUERY_TOP_K.load(Ordering::Relaxed))
 }
 
+/// Default fusion rank constant (memory-lifecycle spec §3.5: the
+/// classic RRF k of 60), admin-tunable, range 1–1024.
+pub const DEFAULT_RRF_K: u32 = 60;
+
+/// Accepted range for the fusion rank constant, clamped on EVERY set,
+/// get, save and load.
+pub const RRF_K_RANGE: (u32, u32) = (1, 1024);
+
+/// Default value for BOTH fusion weights (spec §3.5: symmetric 1.0/1.0,
+/// so neither source dominates), admin-tunable per field, shared range
+/// 0.0–10.0.
+pub const DEFAULT_RRF_WEIGHT: f32 = 1.0;
+
+/// Accepted range for both fusion weights (0 keeps a pool usable at 0 —
+/// the composer's term vanishes rather than faulting; 10 caps a
+/// dominate-everything weight).
+pub const RRF_WEIGHT_RANGE: (f32, f32) = (0.0, 10.0);
+
+/// Default candidate-dedup cosine threshold for the dream consolidation
+/// (spec §3.5: 0.92 — near-duplicates only), admin-tunable.
+pub const DEFAULT_DEDUP_COSINE: f32 = 0.92;
+
+/// Accepted range for the dedup threshold: below 0.5 would merge
+/// unrelated candidates, 1.0 only merges byte-equal embeddings.
+pub const DEDUP_COSINE_RANGE: (f32, f32) = (0.5, 1.0);
+
+/// Process-global fusion rank constant, the [`REVISION_RETENTION`]
+/// pattern: initialized to the default, clamped on every set and get.
+/// Set at boot by [`sync_lifecycle_from_store`] and live by step 5's
+/// admin section; read by the hybrid composer (`rrf_params`).
+static RRF_K: AtomicU32 = AtomicU32::new(DEFAULT_RRF_K);
+
+/// The lexical pool's fusion weight, stored as `f32::to_bits()` (the
+/// composer accepts f32; the atomic carries bits — the set/get seam
+/// re-clamps so a stale value can never leave the range).
+static RRF_WEIGHT_LEX: AtomicU32 = AtomicU32::new(DEFAULT_RRF_WEIGHT.to_bits());
+
+/// The vector pool's fusion weight ([`RRF_WEIGHT_LEX`] pattern).
+static RRF_WEIGHT_VEC: AtomicU32 = AtomicU32::new(DEFAULT_RRF_WEIGHT.to_bits());
+
+/// The dream dedup cosine threshold ([`RRF_WEIGHT_LEX`] pattern; Task 6
+/// is the reader).
+static DEDUP_COSINE: AtomicU32 = AtomicU32::new(DEFAULT_DEDUP_COSINE.to_bits());
+
+fn clamp_rrf_k(k: u32) -> u32 {
+    k.clamp(RRF_K_RANGE.0, RRF_K_RANGE.1)
+}
+
+/// A fusion weight clamped to its range with the NaN guard: `f32::clamp`
+/// propagates NaN, so a NaN folds to the field's default instead (a NaN
+/// weight would poison every fused score).
+fn clamp_fusion_weight(w: f32) -> f32 {
+    if w.is_nan() {
+        DEFAULT_RRF_WEIGHT
+    } else {
+        w.clamp(RRF_WEIGHT_RANGE.0, RRF_WEIGHT_RANGE.1)
+    }
+}
+
+/// The dedup threshold's clamp, with the same NaN guard.
+fn clamp_dedup_cosine(t: f32) -> f32 {
+    if t.is_nan() {
+        DEFAULT_DEDUP_COSINE
+    } else {
+        t.clamp(DEDUP_COSINE_RANGE.0, DEDUP_COSINE_RANGE.1)
+    }
+}
+
+/// Set the process-global fusion rank constant. Clamp 1–1024 on EVERY
+/// set — an out-of-range caller can never drive every rank to the same
+/// score or overflow the composer's arithmetic.
+pub fn set_rrf_k(k: u32) {
+    RRF_K.store(clamp_rrf_k(k), Ordering::Relaxed);
+}
+
+/// Set the lexical pool's fusion weight (clamped + NaN-guarded).
+pub fn set_rrf_weight_lex(w: f32) {
+    RRF_WEIGHT_LEX.store(clamp_fusion_weight(w).to_bits(), Ordering::Relaxed);
+}
+
+/// Set the vector pool's fusion weight (clamped + NaN-guarded).
+pub fn set_rrf_weight_vec(w: f32) {
+    RRF_WEIGHT_VEC.store(clamp_fusion_weight(w).to_bits(), Ordering::Relaxed);
+}
+
+/// Set the dream dedup cosine threshold (clamped + NaN-guarded).
+pub fn set_dedup_cosine(t: f32) {
+    DEDUP_COSINE.store(clamp_dedup_cosine(t).to_bits(), Ordering::Relaxed);
+}
+
+/// The fusion weights as the composer's [`RrfParams`]: the u32 rank
+/// constant is a direct `as f32` (lossless across the whole clamped
+/// range — 1024 sits far inside f32's ±2^24 exact-integer window)
+/// and the weights come back off their bit statics. The hybrid composer
+/// calls this per request so step 5's admin retune applies with no
+/// restart. Both fields re-apply their range clamp AT THE READ SEAM —
+/// the documented "clamped on every set, get, save and load" holds
+/// even for a value that reached the atomic without going through a
+/// setter ([`query_top_k`]'s precedent).
+#[must_use]
+pub fn rrf_params() -> mycelium_core::search::RrfParams {
+    mycelium_core::search::RrfParams {
+        rrf_k: clamp_rrf_k(RRF_K.load(Ordering::Relaxed)) as f32,
+        w_lex: clamp_fusion_weight(f32::from_bits(RRF_WEIGHT_LEX.load(Ordering::Relaxed))),
+        w_vec: clamp_fusion_weight(f32::from_bits(RRF_WEIGHT_VEC.load(Ordering::Relaxed))),
+    }
+}
+
+/// The process-global dedup cosine threshold — clamped (and NaN-guarded
+/// to the default) AT THE READ SEAM too, same precedent. Task 6's
+/// dream-consolidation reader.
+#[must_use]
+pub fn dedup_cosine() -> f32 {
+    clamp_dedup_cosine(f32::from_bits(DEDUP_COSINE.load(Ordering::Relaxed)))
+}
+
 /// Deterministic per-op summaries (byte-safe bounded, the queue
 /// receipts' `short_detail` discipline): create→"concept created",
 /// update→"concept updated", delete→"concept deleted", restore→
@@ -148,6 +264,22 @@ pub struct LifecycleConfig {
     /// `limit` (spec §3.3); 1–64, clamped on save and load.
     #[serde(default = "default_query_top_k")]
     pub query_top_k: u32,
+    /// The hybrid composer's fusion rank constant (spec §3.5: 60);
+    /// 1–1024, clamped on save and load.
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: u32,
+    /// The hybrid composer's lexical pool weight (spec §3.5: 1.0);
+    /// 0.0–10.0, clamped on save and load, NaN resets the default.
+    #[serde(default = "default_rrf_weight")]
+    pub rrf_weight_lex: f32,
+    /// The hybrid composer's vector pool weight (spec §3.5: 1.0);
+    /// 0.0–10.0, clamped on save and load, NaN resets the default.
+    #[serde(default = "default_rrf_weight")]
+    pub rrf_weight_vec: f32,
+    /// The dream dedup's cosine threshold (spec §3.5: 0.92); 0.5–1.0,
+    /// clamped on save and load, NaN resets the default.
+    #[serde(default = "default_dedup_cosine")]
+    pub dedup_cosine: f32,
 }
 
 fn default_retention() -> u32 {
@@ -158,11 +290,27 @@ fn default_query_top_k() -> u32 {
     DEFAULT_QUERY_TOP_K
 }
 
+fn default_rrf_k() -> u32 {
+    DEFAULT_RRF_K
+}
+
+fn default_rrf_weight() -> f32 {
+    DEFAULT_RRF_WEIGHT
+}
+
+fn default_dedup_cosine() -> f32 {
+    DEFAULT_DEDUP_COSINE
+}
+
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             revision_retention: DEFAULT_REVISION_RETENTION,
             query_top_k: DEFAULT_QUERY_TOP_K,
+            rrf_k: DEFAULT_RRF_K,
+            rrf_weight_lex: DEFAULT_RRF_WEIGHT,
+            rrf_weight_vec: DEFAULT_RRF_WEIGHT,
+            dedup_cosine: DEFAULT_DEDUP_COSINE,
         }
     }
 }
@@ -170,13 +318,19 @@ impl Default for LifecycleConfig {
 impl LifecycleConfig {
     /// A copy with every field forced into its accepted range — the
     /// SAVE-side clamp (step 5's admin surface applies it before sealing
-    /// the row); the load side clamps through [`set_revision_retention`]
-    /// and [`set_query_top_k`].
+    /// the row); the load side clamps through [`set_revision_retention`],
+    /// [`set_query_top_k`] and the fusion setters. The NaN guard folds a
+    /// NaN weight/threshold to its field's default (`f32::clamp` would
+    /// propagate it).
     #[must_use]
     pub fn clamp(&self) -> LifecycleConfig {
         LifecycleConfig {
             revision_retention: clamp_retention(self.revision_retention),
             query_top_k: clamp_query_top_k(self.query_top_k),
+            rrf_k: clamp_rrf_k(self.rrf_k),
+            rrf_weight_lex: clamp_fusion_weight(self.rrf_weight_lex),
+            rrf_weight_vec: clamp_fusion_weight(self.rrf_weight_vec),
+            dedup_cosine: clamp_dedup_cosine(self.dedup_cosine),
         }
     }
 }
@@ -200,6 +354,10 @@ pub async fn sync_lifecycle_from_store(
         .unwrap_or_default();
     set_revision_retention(cfg.revision_retention);
     set_query_top_k(cfg.query_top_k);
+    set_rrf_k(cfg.rrf_k);
+    set_rrf_weight_lex(cfg.rrf_weight_lex);
+    set_rrf_weight_vec(cfg.rrf_weight_vec);
+    set_dedup_cosine(cfg.dedup_cosine);
     Ok(())
 }
 
@@ -593,5 +751,52 @@ impl<'a> RevisionStore<'a> {
         }
         tx.commit().await?;
         Ok(pruned)
+    }
+}
+
+#[cfg(test)]
+mod fusion_statics_tests {
+    use std::sync::atomic::Ordering;
+
+    /// The read seam is the last line of defense: a value that reached
+    /// an atomic WITHOUT a setter (a future raw seam, a refactor bug)
+    /// must still read clamped — `rrf_params`/`dedup_cosine` re-apply
+    /// their ranges on load. The statics are private, so only an
+    /// in-module test can force out-of-range bits INTO them; the
+    /// forced values are restored via the regular setters so sibling
+    /// tests in this binary read the defaults.
+    #[test]
+    fn readers_reclamp_and_nan_guard_the_stale_bits() {
+        super::RRF_K.store(3000, Ordering::Relaxed);
+        super::RRF_WEIGHT_LEX.store(12.0f32.to_bits(), Ordering::Relaxed);
+        super::RRF_WEIGHT_VEC.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        super::DEDUP_COSINE.store(0.1f32.to_bits(), Ordering::Relaxed);
+
+        let params = super::rrf_params();
+        assert_eq!(
+            params.rrf_k,
+            super::RRF_K_RANGE.1 as f32,
+            "k → 1024 ceiling"
+        );
+        assert_eq!(params.w_lex, 10.0, "weight → 10.0 ceiling");
+        assert_eq!(
+            params.w_vec, 1.0,
+            "NaN bits → the field default (1.0) at the read seam"
+        );
+        assert_eq!(
+            super::dedup_cosine(),
+            0.5,
+            "dedup → 0.5 floor at the read seam"
+        );
+
+        // Restore the defaults via the setters so the binary's other
+        // tests (and Task 6's dream reader) see the shipped values.
+        super::set_rrf_k(super::DEFAULT_RRF_K);
+        super::set_rrf_weight_lex(super::DEFAULT_RRF_WEIGHT);
+        super::set_rrf_weight_vec(super::DEFAULT_RRF_WEIGHT);
+        super::set_dedup_cosine(super::DEFAULT_DEDUP_COSINE);
+        let params = super::rrf_params();
+        assert_eq!((params.rrf_k, params.w_lex, params.w_vec), (60.0, 1.0, 1.0));
+        assert_eq!(super::dedup_cosine(), 0.92);
     }
 }

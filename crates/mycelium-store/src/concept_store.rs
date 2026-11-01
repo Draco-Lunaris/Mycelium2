@@ -13,6 +13,7 @@ use crate::Store;
 use crate::file_repo::{FileRepo, FileRepoError, Scope};
 use crate::revisions::{RevisionStore, RevisionsError, op_summary};
 use crate::search_index::{EncryptedIndex, IndexError};
+use crate::vectors::{self, VectorError, VectorStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConceptStoreError {
@@ -26,6 +27,8 @@ pub enum ConceptStoreError {
     Parse(#[from] mycelium_core::ConceptError),
     #[error("revision log error: {0}")]
     Revisions(#[from] RevisionsError),
+    #[error("vector store error: {0}")]
+    Vector(#[from] VectorError),
     #[error("concept not found: {0}")]
     NotFound(String),
     #[error("{0} is a reserved filename (index.md, log.md, info.md) — system-maintained")]
@@ -85,6 +88,10 @@ pub struct ConceptStore<'a> {
     /// The scope's revision chain (write-ahead undo log keyed off the
     /// same pool + scope keys — spec §3.2).
     revisions: RevisionStore<'a>,
+    /// The scope's vector rows (hybrid retrieval, spec §3.3) — write
+    /// hooks only: a put enqueues the embed work, a delete removes the
+    /// row directly; this store never reads vectors itself.
+    vectors: VectorStore<'a>,
     /// Provenance label stamped into `frontmatter.source` on every put
     /// (e.g. `mcp:<key-label>`, `web:<username>`, `ingest`, `seed`).
     /// `None` preserves the author's own frontmatter (plain reads/tests).
@@ -100,6 +107,13 @@ impl<'a> ConceptStore<'a> {
     /// cache fingerprints and trace sinks.
     pub fn scope_id(&self) -> String {
         self.scope.scope_id()
+    }
+
+    /// The scope's vector-row store (hybrid retrieval, spec §3.3) — the
+    /// write hooks fire inside put/delete; the worker upserts through
+    /// it, the query consumer reads via `cache_scope`/`top_cosine`.
+    pub fn vectors(&self) -> &VectorStore<'a> {
+        &self.vectors
     }
 
     /// Label this store's writes with a provenance source (system
@@ -132,6 +146,7 @@ impl<'a> ConceptStore<'a> {
             EncryptedIndex::for_user(store.pool().clone(), &user_id.to_string(), &master_key);
         // Built before the key moves into the scope enum.
         let revisions = RevisionStore::for_user(store.pool(), user_id, &master_key);
+        let vectors = VectorStore::for_user(store.pool(), user_id, &master_key);
         Self {
             store,
             scope: ConceptScope::User {
@@ -141,6 +156,7 @@ impl<'a> ConceptStore<'a> {
             repo,
             index,
             revisions,
+            vectors,
             provenance: None,
             revision_op: None,
         }
@@ -159,6 +175,7 @@ impl<'a> ConceptStore<'a> {
         let repo = FileRepo::new(dir);
         let index = EncryptedIndex::for_service(store.pool().clone(), &service_key, namespace);
         let revisions = RevisionStore::for_service(store.pool(), &service_key, namespace);
+        let vectors = VectorStore::for_service(store.pool(), &service_key, namespace);
         Self {
             store,
             scope: ConceptScope::Service {
@@ -168,6 +185,7 @@ impl<'a> ConceptStore<'a> {
             repo,
             index,
             revisions,
+            vectors,
             provenance: None,
             revision_op: None,
         }
@@ -378,8 +396,19 @@ impl<'a> ConceptStore<'a> {
             .execute(self.store.pool())
             .await?;
             self.index.add_async(concept).await?;
+            // Vector hook (spec §3.3): the embed work for this concept —
+            // enqueue (scope, token) only (dedup + bounded, no await, no
+            // lock beyond the Mutex push); the row itself is written
+            // asynchronously by the worker's upsert.
+            let token = self.vectors.path_token_of(&concept.source_path);
+            vectors::enqueue_write(&scope_id, &token);
         }
         self.regen_index_md().await?;
+        // Vector cache drop (spec §3.3): one decoded snapshot per scope
+        // id — one write per call invalidates it; the next vector query
+        // rebuilds. (Enqueue-only in the loop: a batched write re-runs
+        // the invalidation once, not per concept.)
+        vectors::invalidate_scope(&scope_id);
         Ok(())
     }
 
@@ -615,6 +644,15 @@ impl<'a> ConceptStore<'a> {
         self.index.remove(path).await?;
         self.repo.delete(path, &self.scope.repo_scope()).await?;
         self.regen_index_md().await?;
+        // Vector hook (spec §3.3): a deleted concept has nothing to
+        // embed — its row is removed DIRECTLY (no queue item), and the
+        // decoded cache drops. The tail order stays strictly additive
+        // on the existing steps (registry → index → file → regen),
+        // so a failing row removal surfaces only after the concept is
+        // fully deleted — the orphaned row is then a dead row (the
+        // active-set filter drops it, never a result).
+        self.vectors.remove_row(path).await?;
+        vectors::invalidate_scope(&scope_id);
         Ok(())
     }
 

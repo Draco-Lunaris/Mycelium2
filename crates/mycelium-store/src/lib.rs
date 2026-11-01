@@ -13,6 +13,7 @@ pub mod revisions;
 pub mod search_index;
 pub mod skill_bundle;
 pub mod skill_group;
+pub mod vectors;
 
 pub use books::{BookRow, BooksError, PendingJobRow};
 pub use chat::{
@@ -41,6 +42,10 @@ pub use revisions::{
 pub use search_index::{EncryptedIndex, IndexError};
 pub use skill_bundle::{SkillBundleError, SkillBundleFile, bundle_skill_files};
 pub use skill_group::{SkillGroup, SkillListings, group_skills};
+pub use vectors::{
+    CacheRow, ScopeVectors, VECTOR_PROCESSED_TOTAL, VECTOR_QUEUE_CAPACITY, VectorError, VectorRow,
+    VectorStore, VectorUpsert, drain_queue, enqueue_write, invalidate_scope, vector_queue_depth,
+};
 
 use std::path::Path;
 

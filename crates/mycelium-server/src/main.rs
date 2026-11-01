@@ -179,6 +179,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => tracing::warn!(error = %e, "index-length backfill sweep failed"),
     }
 
+    // Embeddings posture (memory-lifecycle spec §3.3, the same boot
+    // discipline as the LLM backend's below): the static machine starts
+    // "configured, fresh", which would read Green to the workers' first
+    // ticks. Pin Disabled first (an absent row must not boot as a live
+    // Green), then sync from the stored `embeddings` row — the lift only
+    // learns the row's presence; the tick readers apply the real
+    // observations.
+    mycelium_librarian::llm_health::EMBEDDING_HEALTH.set_disabled();
+    mycelium_web::server::sync_embedding_from_store(&state).await;
+
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -225,6 +235,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )));
     resume.spawn(shutdown.clone());
 
+    // Vector worker (memory-lifecycle spec §3.3): drains the bounded
+    // write-hook queue into the vector rows, then rebuilds stale scopes
+    // (bounded per tick) and enqueues the boot backlog on the first
+    // PRESENT-config tick (an absent row defers it — the operator's
+    // post-boot save backfills the pre-existing corpus without a
+    // restart). Spawned with the other long-lived workers, after the
+    // posture was seeded and synced from the stored row.
+    state.vector_worker.clone().spawn(shutdown.clone());
+
     // Backend health (outage recovery spec §3.1): seed Disabled until
     // the probe's first tick resolves it — the static machine starts
     // "configured, fresh", which would otherwise read Green to a
@@ -233,6 +252,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // probes, or re-pins it (row absent).
     mycelium_librarian::llm_health::LLM_HEALTH.set_disabled();
     mycelium_web::server::spawn_backend_probe(
+        state.clone(),
+        shutdown.clone(),
+        std::time::Duration::from_secs(mycelium_librarian::llm_health::PROBE_INTERVAL_SECS),
+    )
+    .await;
+
+    // The embeddings probe (the memory-lifecycle §3.3 feeder): the same
+    // task shape, immediately after the LLM probe's — a 30 s feeder
+    // whose ok probes re-stamp the learned dims.
+    mycelium_web::server::spawn_embedding_probe(
         state.clone(),
         shutdown.clone(),
         std::time::Duration::from_secs(mycelium_librarian::llm_health::PROBE_INTERVAL_SECS),

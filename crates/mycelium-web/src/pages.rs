@@ -2124,14 +2124,20 @@ pub fn account_page(
 
 // ---------- Admin pages (PR 3: the five-page split) ----------
 
-/// The admin section's TabBar (spec §6's exact labels) with the
-/// current page's tab active — rendered under the page header on
-/// every admin page.
+/// The admin section's TabBar (the Phase-5 spec's five labels plus the
+/// memory-lifecycle stream's Embeddings entry, adjacent to the LLM
+/// one) with the current page's tab active — rendered under the page
+/// header on every admin page.
 fn admin_tabs(active: &str) -> String {
     mycelium_ui::render::render(mycelium_ui::tab_bar(&[
         ("Users", "/admin/users", active == "/admin/users"),
         ("Sign-in", "/admin/sign-in", active == "/admin/sign-in"),
         ("LLM backend", "/admin/llm", active == "/admin/llm"),
+        (
+            "Embeddings",
+            "/admin/embeddings",
+            active == "/admin/embeddings",
+        ),
         ("Library", "/admin/library", active == "/admin/library"),
         ("System", "/admin/system", active == "/admin/system"),
     ]))
@@ -2432,6 +2438,140 @@ pub fn admin_llm_page(
         flash = admin_flash(ok, err),
     );
     layout("LLM backend", Some(user), csrf, "/admin/llm", body)
+}
+
+/// Admin: Embeddings backend — the hybrid-retrieval vector source's
+/// card on its own page (the new POST /admin/embeddings form, cloned
+/// from the LLM page). Above the form: the embeddings probe state —
+/// the embeddings health machine's dot, state word, embedding-dims
+/// readout and down/checked clock (the System page's backend block
+/// shape, fed by `embedding_snapshot()`). The api-key STATUS renders;
+/// the key itself is never rendered back to the browser. `embeddings`
+/// is rendered as given — the caller hands in the CLAMPED config, so
+/// the boxes always show a value a save would actually accept.
+pub fn admin_embeddings_page(
+    user: &SessionUser,
+    csrf: &str,
+    embeddings: &mycelium_librarian::embeddings::EmbeddingsConfig,
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    use std::sync::atomic::Ordering;
+
+    use mycelium_librarian::embeddings::{BATCH_RANGE, TIMEOUT_SECS_RANGE};
+    use mycelium_librarian::llm_health::{BackendState, embedding_snapshot};
+
+    // The embeddings machine's own snapshot — deliberately not the
+    // chat-LLM one. The dot is never the only signal: `aria-label` AND
+    // a visible state word beside it (WCAG — color alone must not
+    // encode state), mirroring the System page's backend block.
+    // Disabled reports no outage clause: a frozen down_since is
+    // "nothing to probe", not a live outage (the same rule /health
+    // applies to `backend_down_seconds`).
+    let snap = embedding_snapshot();
+    let word = snap.state.as_str();
+    let now = chrono::Utc::now().timestamp();
+    let mut health_line = format!(
+        r#"<p><span class="health-dot health-dot--{word}" role="img" aria-label="Embeddings backend health: {word}"></span><strong>Embeddings backend {word}</strong>"#
+    );
+    if snap.state != BackendState::Disabled
+        && let Some(down) = snap.down_since
+    {
+        health_line.push_str(&format!(
+            " <span>down for {}</span>",
+            fmt_waited(now - down as i64)
+        ));
+    }
+    match snap.checked_at {
+        Some(ts) => health_line.push_str(&format!(
+            " <span>last checked {} ago</span>",
+            fmt_waited(now - ts as i64)
+        )),
+        None => health_line.push_str(" <span>never checked</span>"),
+    }
+    health_line.push_str("</p>");
+
+    // 0 = no successful probe yet (the atomic's "unknown" value).
+    let dims = {
+        let loaded = mycelium_librarian::llm_health::EMBEDDING_DIMS.load(Ordering::Relaxed);
+        if loaded == 0 {
+            "unknown (no successful probe yet)".to_string()
+        } else {
+            loaded.to_string()
+        }
+    };
+    let key_status = if embeddings.api_key.is_some() {
+        "stored"
+    } else {
+        "not set"
+    };
+    // One labelled number input per tunable (the LLM page's closure
+    // shape): the range is both a browser-enforced min/max and a
+    // visible hint (server-side the value is clamped, never rejected).
+    let number_field = |label: &str, name: &str, value: u32, range: (u32, u32)| {
+        format!(
+            r#"  <label>{label} ({lo}&ndash;{hi})</label><input name="{name}" type="number" min="{lo}" max="{hi}" value="{value}">
+"#,
+            label = html_escape(label),
+            name = html_escape(name),
+            lo = range.0,
+            hi = range.1,
+            value = html_escape(&value.to_string()),
+        )
+    };
+    let tunables = [
+        number_field(
+            "Embedding timeout (seconds)",
+            "timeout_secs",
+            embeddings.timeout_secs,
+            TIMEOUT_SECS_RANGE,
+        ),
+        number_field(
+            "Batch size (texts per request)",
+            "batch",
+            embeddings.batch,
+            BATCH_RANGE,
+        ),
+    ]
+    .concat();
+    let body_form = format!(
+        r#"<p>{health_line}</p>
+<p class="muted">API key: {key_status}</p>
+<p class="muted">Embedding dimensions: {dims}</p>
+<form method="post" action="/admin/embeddings">
+  <label>OpenAI-compatible base URL</label><input name="base_url" value="{base_url}" placeholder="http://localhost:11434">
+  <label>Model</label><input name="model" value="{model}">
+  <label>API key (sent as a Bearer header; leave blank to keep the current one)</label><input name="api_key" type="password" autocomplete="off">
+  <p class="muted">Tunables — out-of-range values are clamped on save. Test connection probes the SAVED config: save first, then test.</p>
+{tunables}  <button type="submit">Save embeddings config</button>
+  <button type="submit" formaction="/admin/embeddings/test">Test connection</button>
+</form>"#,
+        health_line = health_line,
+        key_status = key_status,
+        dims = html_escape(&dims),
+        base_url = html_escape(&embeddings.base_url),
+        model = html_escape(&embeddings.model),
+    );
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Embeddings backend",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Embeddings backend",
+            TrustedHtml::from_markup(body_form),
+        )),
+        tabs = admin_tabs("/admin/embeddings"),
+        flash = admin_flash(ok, err),
+    );
+    layout(
+        "Embeddings backend",
+        Some(user),
+        csrf,
+        "/admin/embeddings",
+        body,
+    )
 }
 
 /// Admin: Library (mockup 12) — the stack of section cards:

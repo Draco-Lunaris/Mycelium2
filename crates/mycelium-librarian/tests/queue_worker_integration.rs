@@ -237,6 +237,7 @@ fn no_scopes<'a>() -> agent::AgentScopes<'a> {
     agent::AgentScopes {
         skills: None,
         library: None,
+        embeddings: None,
         read_stack_text: None,
         visible_slugs: None,
         trace: None,

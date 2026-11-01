@@ -135,6 +135,11 @@ pub fn build_router_with_shutdown(
             get(api::admin_llm_view).post(api::admin_save_llm),
         )
         .route("/admin/llm/test", post(api::admin_test_llm))
+        .route(
+            "/admin/embeddings",
+            get(api::admin_embeddings_view).post(api::admin_save_embeddings),
+        )
+        .route("/admin/embeddings/test", post(api::admin_test_embeddings))
         .route("/admin/library", get(api::admin_library_view))
         .route("/admin/system", get(api::admin_system_view))
         .route("/admin/oidc", post(api::admin_save_oidc))
@@ -396,6 +401,116 @@ pub async fn spawn_backend_probe(
                 }
             }
             probe_tick(&state).await;
+        }
+    })
+}
+
+/// Seed the process-global embeddings posture from the stored
+/// `embeddings` row at BOOT (memory-lifecycle spec §3.3's boot sync —
+/// the `llm` boot contract again): called before any worker or sweep
+/// that can observe
+/// [`EMBEDDING_HEALTH`](mycelium_librarian::llm_health::EMBEDDING_HEALTH),
+/// so the first observations land on a machine that already knows the
+/// stored posture. The three postures:
+///
+/// - **Absent row** → set_disabled pins Disabled — nothing is
+///   configured, so no probe can succeed, and a live Green would be a
+///   lie on the dot.
+/// - **Present row** → note_configured lifts any Disabled pin. This is
+///   a POSTURE lift only: the row is merely known to exist. A
+///   present-but-undecryptable row feeds no observation (the subtle
+///   one — config problem, not backend weather; the per-tick readers
+///   warn about it instead).
+/// - **Raw-read failure** → warn + leave the machine untouched: even
+///   presence is unknown, so neither pin nor lift is honest.
+///
+/// Nothing here can fail.
+pub async fn sync_embedding_from_store(state: &AppState) {
+    match state.config.raw_get("embeddings").await {
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "embeddings boot sync: config row unreadable — posture left untouched"
+            );
+        }
+        Ok(None) => {
+            mycelium_librarian::llm_health::EMBEDDING_HEALTH.set_disabled();
+        }
+        Ok(Some(_)) => {
+            mycelium_librarian::llm_health::EMBEDDING_HEALTH.note_configured();
+        }
+    }
+}
+
+/// One probe tick against the CURRENT stored `"embeddings"` row — the
+/// embeddings feeder with the same three postures as the LLM tick
+/// above, plus one extra: an ok probe RESTAMPS the learned dims on
+/// EVERY success before noting ok (the dims readout is "last
+/// successful probe", so a model whose dims changes is taken within
+/// one interval, never cached from a first boot).
+///
+/// [`probe_once`](mycelium_librarian::embeddings::probe_once) is pure
+/// and never self-feeds; this tick is the feeding site.
+async fn probe_tick_embedding(state: &AppState) {
+    let raw = match state.config.raw_get("embeddings").await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(error = %e, "embeddings probe: config row unreadable — tick skipped");
+            return;
+        }
+    };
+    let Some(_raw) = raw else {
+        mycelium_librarian::llm_health::EMBEDDING_HEALTH.set_disabled();
+        return;
+    };
+    mycelium_librarian::llm_health::EMBEDDING_HEALTH.note_configured();
+    let Some(cfg) =
+        crate::state::decrypt_config::<mycelium_librarian::embeddings::EmbeddingsConfig>(
+            &state.config,
+            &state.service_key,
+            "embeddings",
+        )
+        .await
+    else {
+        tracing::warn!(
+            "embeddings probe: config row present but undecryptable — \
+             no health observation this tick (config problem, not backend weather)"
+        );
+        return;
+    };
+    match mycelium_librarian::embeddings::probe_once(&cfg).await {
+        Ok(dims) => {
+            mycelium_librarian::llm_health::EMBEDDING_DIMS
+                .store(dims as u32, std::sync::atomic::Ordering::Relaxed);
+            mycelium_librarian::llm_health::EMBEDDING_HEALTH.note_ok();
+        }
+        Err(_) => mycelium_librarian::llm_health::EMBEDDING_HEALTH.note_failure(),
+    }
+}
+
+/// Spawn the embeddings probe task — the periodic
+/// [`EMBEDDING_HEALTH`](mycelium_librarian::llm_health::EMBEDDING_HEALTH)
+/// feeder (memory-lifecycle spec §3.3; the exact shape of
+/// [`spawn_backend_probe`]: immediate first tick, `Delay` catch-up,
+/// select! shutdown arm, per-tick fresh row read — a config swap
+/// applies within one interval).
+pub async fn spawn_embedding_probe(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.cancelled() => {
+                    tracing::info!("embeddings probe task stopped");
+                    return;
+                }
+            }
+            probe_tick_embedding(&state).await;
         }
     })
 }

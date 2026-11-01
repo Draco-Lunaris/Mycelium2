@@ -25,10 +25,22 @@
 //! itself is pure: it reports to its caller and never calls `note_*`, so
 //! probe results are fed exactly once by whoever runs them.
 //!
+//! Two machines share this implementation: the chat-LLM health
+//! ([`LLM_HEALTH`], the registry described above) and the embeddings
+//! health ([`EMBEDDING_HEALTH`]). The machine is shared *by
+//! instantiation* — same thresholds, disabled posture and counters;
+//! only the inputs differ. The chat machine derives its staleness
+//! inputs from the process globals inside [`LlmHealth::state`] /
+//! [`LlmHealth::snapshot`]; every other instance feeds its own inputs
+//! through the per-instance `_at` seams. For embeddings that means
+//! [`EMB_LAST_SUCCESS`] (0 = unknown) and `busy: false` — embedding
+//! calls share no wait queue, so the busy-staleness rule is
+//! structurally unreachable for that instance.
+//!
 //! All state lives behind one mutex; nothing here does I/O. The public
-//! methods stamp `Utc::now()` internally; the `#[doc(hidden)]` `_at`
-//! variants take explicit unix-second clocks so tests pin the transition
-//! and staleness rules deterministically.
+//! methods stamp `Utc::now()` internally; the `_at` variants take
+//! explicit unix-second clocks so tests pin the transition and
+//! staleness rules deterministically.
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
@@ -47,9 +59,28 @@ pub const PROBE_TIMEOUT_SECS: u64 = 5;
 /// Interval between active probes in the background probe task.
 pub const PROBE_INTERVAL_SECS: u64 = 30;
 
-/// The process-global registry. Surfaces and hooks feed / read this;
-/// tests build their own [`LlmHealth::new`] instances instead.
+/// The chat-LLM registry (one of the two process-global machines —
+/// the other is [`EMBEDDING_HEALTH`]). Surfaces and hooks feed / read
+/// this; tests build their own [`LlmHealth::new`] instances instead.
 pub static LLM_HEALTH: LazyLock<LlmHealth> = LazyLock::new(LlmHealth::new);
+
+/// The embeddings backend's health machine: the second instance of the
+/// shared [`LlmHealth`] implementation. Same thresholds, disabled
+/// posture and counters as [`LLM_HEALTH`]; its staleness inputs come
+/// from [`EMB_LAST_SUCCESS`] and a structurally false `busy` (see
+/// [`embedding_state`]).
+pub static EMBEDDING_HEALTH: LazyLock<LlmHealth> = LazyLock::new(LlmHealth::new);
+
+/// Unix seconds of the last successful embedding call; `0` = never
+/// observed (unknown) — the embeddings analogue of
+/// [`crate::llm::LLM_LAST_SUCCESS`]. Read by [`embedding_state`] /
+/// [`embedding_snapshot`]; the embedding call sites write it.
+pub static EMB_LAST_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dimensions of the embeddings backend's vectors once a call has
+/// succeeded; `0` = unknown (declared with the machine it belongs to;
+/// the embedding call sites fill it once a backend reports one).
+pub static EMBEDDING_DIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Backend health states (spec §3.1). Grey dot = Disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,8 +237,10 @@ impl LlmHealth {
         self.state_at(unix_now(), last_model_success, busy)
     }
 
-    /// [`LlmHealth::state`] with explicit clocks (deterministic tests).
-    #[doc(hidden)]
+    /// Per-instance seam: the production `LLM_HEALTH` reads the
+    /// chat-LLM inputs inside `state()`/`snapshot()`; every other
+    /// instance (the embeddings health) feeds its own inputs here.
+    /// Explicit clocks (deterministic tests).
     #[must_use]
     pub fn state_at(&self, now: u64, last_model_success: Option<u64>, busy: bool) -> BackendState {
         self.lock().effective_state(now, last_model_success, busy)
@@ -225,10 +258,11 @@ impl LlmHealth {
         self.snapshot_at(unix_now(), last_model_success, busy)
     }
 
-    /// [`LlmHealth::snapshot`] with explicit clocks (deterministic
-    /// tests). `now` only feeds the staleness derivation; the stored
-    /// clocks pass through unchanged.
-    #[doc(hidden)]
+    /// Per-instance seam: the production `LLM_HEALTH` reads the
+    /// chat-LLM inputs inside `state()`/`snapshot()`; every other
+    /// instance (the embeddings health) feeds its own inputs here.
+    /// Explicit clocks (deterministic tests); `now` only feeds the
+    /// staleness derivation, the stored clocks pass through unchanged.
     #[must_use]
     pub fn snapshot_at(
         &self,
@@ -252,9 +286,10 @@ impl LlmHealth {
         self.note_ok_at(unix_now());
     }
 
-    /// [`LlmHealth::note_ok`] with an explicit clock (deterministic
-    /// tests).
-    #[doc(hidden)]
+    /// Per-instance seam: the production `LLM_HEALTH` reads the
+    /// chat-LLM inputs inside `state()`/`snapshot()`; every other
+    /// instance (the embeddings health) feeds its own inputs here.
+    /// Explicit clock (deterministic tests).
     pub fn note_ok_at(&self, now: u64) {
         let mut inner = self.lock();
         if !inner.configured {
@@ -273,9 +308,10 @@ impl LlmHealth {
         self.note_failure_at(unix_now());
     }
 
-    /// [`LlmHealth::note_failure`] with an explicit clock
-    /// (deterministic tests).
-    #[doc(hidden)]
+    /// Per-instance seam: the production `LLM_HEALTH` reads the
+    /// chat-LLM inputs inside `state()`/`snapshot()`; every other
+    /// instance (the embeddings health) feeds its own inputs here.
+    /// Explicit clock (deterministic tests).
     pub fn note_failure_at(&self, now: u64) {
         let mut inner = self.lock();
         if !inner.configured {
@@ -324,6 +360,33 @@ impl LlmHealth {
             checked_at: None,
         }
     }
+}
+
+/// The embeddings machine's last-success input: [`EMB_LAST_SUCCESS`]
+/// with the `0` (never observed) → `None` mapping.
+#[must_use]
+fn emb_last_success() -> Option<u64> {
+    match EMB_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        ts => Some(ts),
+    }
+}
+
+/// The reported embeddings-backend state: [`EMBEDDING_HEALTH`] fed with
+/// its own inputs — [`emb_last_success`] and `busy: false` (embedding
+/// calls share no wait queue, so the busy-staleness rule is
+/// structurally unreachable for this instance). The chat-LLM globals
+/// are never read here.
+#[must_use]
+pub fn embedding_state() -> BackendState {
+    EMBEDDING_HEALTH.state_at(unix_now(), emb_last_success(), false)
+}
+
+/// [`embedding_state`] as a full [`HealthSnapshot`] for
+/// `/health`-style reads.
+#[must_use]
+pub fn embedding_snapshot() -> HealthSnapshot {
+    EMBEDDING_HEALTH.snapshot_at(unix_now(), emb_last_success(), false)
 }
 
 /// One active probe of the backend: `GET {url}/models` with a
@@ -380,9 +443,10 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
     format!("{}… [truncated]", &s[..end])
 }
 
-/// Serializes the tests that *feed or read the global* `LLM_HEALTH`
-/// against every test whose client drives a passive health note:
-/// `llm_health::tests::public_wrappers_stamp_the_real_clock` and
+/// Serializes the tests that *feed or read the global* health
+/// machines — `LLM_HEALTH` and its embeddings instance
+/// [`EMBEDDING_HEALTH`] — against every test whose client drives a
+/// passive health note: `llm_health::tests::public_wrappers_stamp_the_real_clock` and
 /// `probe_refused_is_unhealthy_and_never_feeds_the_machine`,
 /// `llm.rs::passive_hooks_feed_health`, `unreachable_endpoint_errors`,
 /// `bearer_header_sent_when_key_configured`, `no_header_without_key`,
@@ -392,10 +456,39 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 /// `concurrent_runners_cannot_double_run`, `pending_job_runs_on_later_tick`,
 /// `spawn_wakes_on_notify` — `run_pending` → `ingest_one` hits the
 /// default URL and notes backend-down, or ok on a host with Ollama).
-/// Success-path tests only note ok, which no health test's assertion
-/// depends on. An async mutex because the guarded tests hold it
-/// across awaits; tokio's mutex never poisons, so one failed test cannot
-/// wedge the rest.
+/// Success-path tests elsewhere note ok only — and each client's
+/// passive hooks stamp just that client's own machine, so a chat-side
+/// success can never move an `EMBEDDING_HEALTH` snapshot. The
+/// enumerated chat-side tests instead reset `LLM_HEALTH` and pin
+/// `LLM_LAST_SUCCESS` before asserting: the guard is what protects
+/// that reset-to-read window.
+///
+/// The embeddings client takes the same guard — exactly ten tests in
+/// `embeddings.rs::tests`:
+/// `embed_batch_preserves_input_order_by_index`,
+/// `embed_batch_rejects_an_index_gap`,
+/// `embed_batch_rejects_an_out_of_range_index`,
+/// `embed_batch_rejects_a_duplicate_index`,
+/// `embed_batch_rejects_an_empty_vector`,
+/// `embed_batch_rejects_a_non_finite_value`,
+/// `embed_batch_sends_bearer_only_when_key_configured`,
+/// `embed_batch_truncates_input_at_the_char_cap`,
+/// `probe_once_returns_dims_and_rejects_over_4096`, and
+/// `a_healthy_embed_success_stamps_only_the_embeddings_machine` (which
+/// pins both machines' isolation). Nine of them drive `embed_batch`
+/// (the eight `embed_batch_*` pins plus the isolation pin), whose
+/// passive hooks feed ONLY `EMBEDDING_HEALTH`;
+/// `probe_once_returns_dims_and_rejects_over_4096` drives
+/// `probe_once`, which is pinned to feed NOTHING. Either way a
+/// machine-feed can never race another machine's pinned snapshot,
+/// because it is the same lock the llm-side tests hold.
+///
+/// The pure classifier pin `backend_down_class_pins` constructs a raw
+/// `reqwest::Client` (127.0.0.1:1) — it drives no `EmbeddingsClient`,
+/// so no passive hook fires — and takes no guard, nor do the five
+/// config-row pins (defaults/clamp/roundtrip/redaction). An async
+/// mutex because the guarded tests hold it across awaits; tokio's
+/// mutex never poisons, so one failed test cannot wedge the rest.
 #[cfg(test)]
 pub(crate) static HEALTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -617,6 +710,141 @@ mod tests {
         assert_eq!(fresh.state, BackendState::Green);
         assert_eq!(fresh.consecutive_failures, 0);
         assert_eq!(fresh.checked_at, None, "reset clears the clocks");
+    }
+
+    // ---- the second machine (embeddings) ----
+
+    /// The machine is shared by instantiation: `EMBEDDING_HEALTH` is a
+    /// second, independent instance — its notes move its counters only,
+    /// and its input sentinels start at the unknown `0`.
+    #[tokio::test]
+    async fn the_two_health_instances_transition_independently() {
+        let _guard = health_test_guard().await;
+        LLM_HEALTH.reset_for_test();
+        let fresh = EMBEDDING_HEALTH.reset_for_test();
+        assert_eq!(fresh.state, BackendState::Green);
+        assert_eq!(fresh.consecutive_failures, 0);
+        assert_eq!(fresh.checked_at, None, "reset clears the clocks");
+
+        LLM_HEALTH.note_failure();
+        let llm = LLM_HEALTH.snapshot();
+        assert_eq!(llm.state, BackendState::Yellow, "the chat machine moved");
+        assert_eq!(llm.consecutive_failures, 1);
+        let emb = embedding_snapshot();
+        assert_eq!(
+            emb.consecutive_failures, 0,
+            "the embeddings instance never moves with the chat machine's notes"
+        );
+        assert_eq!(emb.state, BackendState::Green);
+        assert_eq!(emb.down_since, None);
+
+        EMBEDDING_HEALTH.note_failure();
+        let emb = embedding_snapshot();
+        assert_eq!(
+            emb.state,
+            BackendState::Yellow,
+            "the embeddings instance moves on its own note"
+        );
+        assert_eq!(emb.consecutive_failures, 1);
+        assert!(
+            emb.down_since.is_some(),
+            "its first failure opens its own outage window"
+        );
+        assert_eq!(
+            LLM_HEALTH.snapshot().consecutive_failures,
+            1,
+            "the chat machine's counter is unchanged by the embeddings note"
+        );
+
+        assert_eq!(
+            EMB_LAST_SUCCESS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no embedding success recorded: the sentinel reads 0 (unknown)"
+        );
+        assert_eq!(
+            EMBEDDING_DIMS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no embedding dims recorded: 0 (unknown)"
+        );
+    }
+
+    /// The wired embeddings reads feed from `EMB_LAST_SUCCESS` and a
+    /// structurally false `busy` — never from the chat-LLM globals.
+    /// The divergence is observed through the chat side: a busy gate
+    /// with no model success ever recorded is a stale-while-busy Green
+    /// (Yellow) for `LLM_HEALTH.state()`, yet `embedding_state()` stays
+    /// Green; and a fresh stamp on one global never heals the *other*
+    /// machine's stale view (the globals are disjoint, not aliased).
+    #[tokio::test]
+    async fn embedding_state_uses_the_embedding_inputs_and_never_the_llm_ones() {
+        let _guard = health_test_guard().await;
+        LLM_HEALTH.reset_for_test();
+        EMBEDDING_HEALTH.reset_for_test();
+        LLM_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+        EMB_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Hold one gate slot so the process gate reads busy. The try
+        // class never queues, so this cannot starve anyone; the retries
+        // only cover a concurrent drain test transiently holding both
+        // slots (drain permits are held for fast-failing calls).
+        let mut busy_permit = None;
+        for _ in 0..40 {
+            if let Some(permit) = crate::llm_gate::LLM_GATE.try_enter() {
+                busy_permit = Some(permit);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let _busy =
+            busy_permit.expect("a gate slot frees within 200ms (capacity 2, only drain holds any)");
+
+        // Sanity: the staleness rule itself is what the chat side shows.
+        let now = unix_now();
+        assert_eq!(
+            LLM_HEALTH.state_at(now, None, true),
+            BackendState::Yellow,
+            "busy + no success ever is a stale Green (the rule the chat wiring reads)"
+        );
+        assert_eq!(
+            LLM_HEALTH.state(),
+            BackendState::Yellow,
+            "the wired chat fn sees LLM_LAST_SUCCESS = 0 (never) + the busy gate"
+        );
+        assert_eq!(
+            embedding_state(),
+            BackendState::Green,
+            "the wired embeddings fn ignores both chat inputs: unknown success + never-busy stays Green"
+        );
+
+        // A fresh embedding success never heals the chat machine's
+        // stale view — stamping EMB_LAST_SUCCESS must leave the chat
+        // staleness (its own zeroed global, busy gate) exactly Yellow.
+        EMB_LAST_SUCCESS.store(now, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(embedding_state(), BackendState::Green);
+        assert_eq!(
+            LLM_HEALTH.state(),
+            BackendState::Yellow,
+            "a fresh EMB_LAST_SUCCESS must not reach the chat machine's inputs"
+        );
+
+        // And the reverse: a fresh chat stamp heals only the chat
+        // machine, while the embedding sentinel stays 0 (unknown).
+        LLM_LAST_SUCCESS.store(now, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            LLM_HEALTH.state(),
+            BackendState::Green,
+            "fresh model success while busy is unstale"
+        );
+        let s = embedding_snapshot();
+        assert_eq!(s.state, BackendState::Green);
+        assert_eq!(
+            s.consecutive_failures, 0,
+            "the embeddings snapshot never saw the chat machine's notes"
+        );
+
+        // Leave EMB_LAST_SUCCESS at the 0 sentinel (as found) so the
+        // sibling initial-value assertions hold in any test order.
+        EMB_LAST_SUCCESS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ---- probe ----
