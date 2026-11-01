@@ -158,6 +158,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => tracing::warn!(error = %e, "lifecycle boot sweep failed"),
     }
 
+    // Index-length backfill sweep (memory-lifecycle spec §3.2a-4): every
+    // pre-0011 `length IS NULL` search-index row reindexed (`ConceptStore::
+    // reindex` backfills the BM25 length column and re-applies the
+    // `# History` token split to pre-split rows). INDEX-ONLY — no concept
+    // write, no revision row — so the library scope is swept here too
+    // (unlike the deprecated-tag sweep above; rewriting is what excludes
+    // library there), and the mutation queue's staging rows are excluded
+    // (not concepts; the drain self-heals them). Idempotent: the
+    // predicate empties as rows are backfilled; a failed scope retries
+    // next boot.
+    match mycelium_web::lifecycle::backfill_index_lengths(&state).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                count = n,
+                "backfilled search-index lengths (reindexed NULL rows)"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "index-length backfill sweep failed"),
+    }
+
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

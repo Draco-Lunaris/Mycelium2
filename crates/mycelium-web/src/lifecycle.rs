@@ -1,26 +1,34 @@
-//! Lifecycle boot sweep (memory-lifecycle spec §3.0, Task 6): concepts
-//! tagged `deprecated` under the legacy convention are migrated to
-//! `status: retired` at boot. Idempotent and predicate-driven — the
-//! predicate is "the frontmatter carries a tag lowercasing to
-//! `deprecated`", so a migrated concept simply stops matching: no
-//! marker row, no flag needed (each rewrite records a `migration`-
-//! tagged undo-log revision row; a failed scope retries next boot
-//! for free, and a retry of an already-migrated concept writes
-//! nothing — no put, hence no revision row).
+//! Lifecycle boot sweeps (memory-lifecycle spec §3.0 + §3.2a-4):
 //!
-//! Scope: every user scope (raw `SELECT id FROM users`) plus the
-//! `global:skills` service scope. `global:library` is NOT swept —
-//! generated/book content the ingest worker owns; rewriting it is not
-//! this sweep's business.
+//! * `migrate_deprecated_tags` — concepts tagged `deprecated` under the
+//!   legacy convention are migrated to `status: retired` at boot.
+//! * `backfill_index_lengths` — every `search_docs` row whose `length`
+//!   is still NULL (all data predating migration 0011) is reindexed.
 //!
-//! Posture (mirrors the queue worker's and chat resume's boot sweeps):
-//! best-effort, never boot-blocking. Only enumerating the users can
-//! hard-fail; a scope whose master key is unrecoverable is logged and
-//! skipped (it retries next boot), and a per-concept failure is logged
-//! while the rest of that scope completes.
+//! Both are idempotent and predicate-driven — the predicate is a
+//! property the migrated/backfilled row no longer carries ("the
+//! frontmatter carries a tag lowercasing to `deprecated`" / "`length`
+//! is NULL"), so a processed row simply stops matching: no marker row,
+//! no flag needed. The deprecated sweep records a `migration`-tagged
+//! revision row per rewrite (a failed scope retries next boot for
+//! free); the backfill is index-only and writes no revision row at
+//! all (§3.2a-4).
+//!
+//! Scope of `migrate_deprecated_tags`: every user scope (raw
+//! `SELECT id FROM users`) plus the `global:skills` service scope.
+//! `global:library` is NOT swept by it — generated/book content the
+//! ingest worker owns; rewriting it is not that sweep's business (the
+//! backfill sweep below is index-only, so it sweeps library too).
+//!
+//! Posture (mirrors the queue worker's and chat resume's boot sweeps),
+//! both sweeps: best-effort, never boot-blocking. Only enumerating the
+//! users can hard-fail; a scope whose master key is unrecoverable is
+//! logged and skipped (it retries next boot), and a per-concept failure
+//! is logged while the rest of that scope completes.
 
 use mycelium_core::concept::Concept;
 use mycelium_crypto::keys::MasterKey;
+use mycelium_store::Store;
 use mycelium_store::concept_store::ConceptStore;
 use uuid::Uuid;
 
@@ -186,11 +194,140 @@ async fn sweep_scope(cs: &ConceptStore<'_>, scope: &str) -> u32 {
     migrated
 }
 
+/// The index-length backfill sweep (memory-lifecycle spec §3.2a-4):
+/// every `search_docs` row whose `length` is still NULL — all data
+/// predating migration 0011 — is reindexed via
+/// [`ConceptStore::reindex`], which backfills `length` (the BM25 token
+/// count) AND re-applies the `# History` token split to rows indexed
+/// by the pre-split code. Index-only by construction (reindex writes
+/// no concept file, registry row or revision row), so the deprecated
+/// sweep's `global:library` exclusion does not apply — library index
+/// rows are swept too — and NO provenance/revision-op builder is
+/// attached (`with_provenance`/`with_revision_op` stamp concept
+/// writes; there are none here, §3.2a-4).
+///
+/// Scope iteration mirrors `migrate_deprecated_tags`: `global:skills`
+/// and `global:library` via `ConceptStore::for_service`, then every
+/// user scope — raw `SELECT id FROM users ORDER BY id`, master-key
+/// recovery per user, an unreadable id or unrecoverable key logging
+/// one warn and skipping that scope (it retries next boot). Per scope
+/// the candidates come from raw pool SQL on the SAME scope string the
+/// sweep logs (`cs.scope_id()` — built the same way the encrypted
+/// index builds its scope id, so the labels can't drift apart).
+///
+/// The `/mutation-queue/` prefix is EXCLUDED from the candidates
+/// (Task-2 review ruling's controller note): the queue's staging notes
+/// ARE index residents (put_batch_internal → add_async reaches
+/// search_docs) but are NOT concepts — `reindex` refuses the prefix
+/// anyway, and a pre-0011 staging row self-heals: the drain's rewrite
+/// re-stamps `length` post-0011, and rows that never drain are deleted
+/// by the queue's own lifecycle (§3.2a-4's backfill must not touch
+/// non-concept payloads). Residual per-row faults still log + continue
+/// as the net.
+///
+/// Idempotent and predicate-driven — the predicate is `length IS
+/// NULL`, so a backfilled row simply stops matching; no marker row or
+/// flag needed. Returns the number of rows backfilled across all
+/// scopes — observability only; the sweep never drives boot decisions.
+pub async fn backfill_index_lengths(state: &AppState) -> Result<u32, LifecycleError> {
+    let mut backfilled: u32 = 0;
+
+    // Service scopes — BOTH namespaces swept here (unlike the
+    // deprecated-tag sweep, whose library exclusion exists because it
+    // rewrites concepts; reindex is index-only). No provenance /
+    // revision-op builders: nothing concept-shaped is written.
+    for (dir, namespace) in [
+        (state.store.skills_dir(), "skills"),
+        (state.store.library_dir(), "library"),
+    ] {
+        let cs =
+            ConceptStore::for_service(&state.store, (*state.service_key).clone(), &dir, namespace);
+        backfilled += backfill_scope(&state.store, &cs).await;
+    }
+
+    // Every user scope, enumerated with raw SQL on the pool — the
+    // migrate_deprecated_tags shape verbatim: unreadable ids and
+    // unrecoverable keys log one warn and skip one scope.
+    let users: Vec<(String,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
+        .fetch_all(state.store.pool())
+        .await?;
+    for (id,) in users {
+        let user_id: Uuid = match id.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(user = %id, error = %e,
+                    "length backfill sweep: user row id unreadable — scope skipped");
+                continue;
+            }
+        };
+        let master: MasterKey = match state.master_key_for(user_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(user_id = %user_id, error = %e,
+                    "length backfill sweep: master key unrecoverable — user scope skipped (retries next boot)");
+                continue;
+            }
+        };
+        let cs = ConceptStore::for_user(&state.store, user_id, master);
+        backfilled += backfill_scope(&state.store, &cs).await;
+    }
+    Ok(backfilled)
+}
+
+/// One scope's pass of the length backfill: the scope's NULL-length
+/// candidates (raw pool SQL, path-ascending), each reindexed. A
+/// candidate-query failure is a scope fault (logged, scope skipped —
+/// the same posture `sweep_scope` gives a listing failure); a
+/// per-concept reindex fault is logged and the rest of the scope
+/// continues. `cs.scope_id()` supplies the `search_docs.scope` string
+/// AND the log label — one string, no drift.
+///
+/// The exclusion literal carries no `_`/`%` wildcard characters
+/// ("mutation-queue" is hyphenated), so it is a faithful LIKE pattern
+/// needing no ESCAPE clause.
+async fn backfill_scope(store: &Store, cs: &ConceptStore<'_>) -> u32 {
+    let scope = cs.scope_id();
+    let candidates: Result<Vec<(String,)>, sqlx::Error> = sqlx::query_as(
+        "SELECT concept_path FROM search_docs \
+         WHERE scope = ? AND length IS NULL \
+           AND concept_path NOT LIKE '/mutation-queue/%' \
+         ORDER BY concept_path",
+    )
+    .bind(&scope)
+    .fetch_all(store.pool())
+    .await;
+    let candidates = match candidates {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(scope = %scope, error = %e,
+                "length backfill sweep: candidate query failed — scope skipped this boot");
+            return 0;
+        }
+    };
+    let mut backfilled: u32 = 0;
+    for (path,) in candidates {
+        match cs.reindex(&path).await {
+            Ok(()) => {
+                backfilled += 1;
+                tracing::info!(scope = %scope, path = %path,
+                    "length backfill sweep: reindexed NULL-length index row");
+            }
+            Err(e) => {
+                tracing::warn!(scope = %scope, path = %path, error = %e,
+                    "length backfill sweep: reindex failed — skipped, scope continues");
+            }
+        }
+    }
+    backfilled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mycelium_auth::login::LoginService;
     use mycelium_core::concept::Frontmatter;
+    use mycelium_core::search::{searchable_text, tokenize};
+    use mycelium_crypto::store_keys::IndexKeys;
     use mycelium_store::{RevisionEntry, RevisionStore, Store};
 
     // ---- the four spec tests (written FIRST — TDD) ----
@@ -398,6 +535,289 @@ mod tests {
         assert_eq!(book.frontmatter.status, None);
     }
 
+    // ---- the backfill sweep's three spec tests (written FIRST — TDD) ----
+
+    #[tokio::test]
+    async fn backfill_index_lengths_refills_and_retokens() {
+        let (state, _dir, user, master) = boot_state().await;
+
+        // Seed: a user concept + a skills concept, both with a
+        // `# History` body — the §3.2a-4 retokenization reapplication
+        // needs that exact shape (the history text must NOT be
+        // searchable after the backfill reindex).
+        let body = "current body facts\n\n# History\nzebracorn obsolete\n";
+        let user_cs = ConceptStore::for_user(&state.store, user, master.clone());
+        let user_c = history_concept("/notes/legacy.md", body);
+        user_cs.put(&user_c).await.unwrap();
+        let skills_cs = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.skills_dir(),
+            "skills",
+        );
+        let skills_c = history_concept("/skills/legacy-skill.md", body);
+        skills_cs.put(&skills_c).await.unwrap();
+        let skills_keys = IndexKeys::from_service_key(&state.service_key);
+
+        // Simulate the pre-0011 index rows: NULL lengths AND — to make
+        // the retokenization observable at all — the stray `# History`
+        // posting a pre-split row carried (a post-step-1 put does not
+        // index history text; the concept_store.rs reindex test's
+        // legacy simulation).
+        {
+            let pool = state.store.pool();
+            let user_scope = user_cs.scope_id();
+            let skills_scope = skills_cs.scope_id();
+            sqlx::query(
+                "UPDATE search_docs SET length = NULL WHERE concept_path = ? OR concept_path = ?",
+            )
+            .bind("/notes/legacy.md")
+            .bind("/skills/legacy-skill.md")
+            .execute(pool)
+            .await
+            .unwrap();
+            for (scope, path, token) in [
+                (
+                    &user_scope,
+                    "/notes/legacy.md",
+                    IndexKeys::from_master_key(&master).token("zebracorn"),
+                ),
+                (
+                    &skills_scope,
+                    "/skills/legacy-skill.md",
+                    skills_keys.token("zebracorn"),
+                ),
+            ] {
+                sqlx::query(
+                    "INSERT INTO search_tokens (scope, token, concept_path, tf) VALUES (?, ?, ?, 1)",
+                )
+                .bind(scope)
+                .bind(token)
+                .bind(path)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        // Both scopes' user scopes:
+        // Pre-sweep: both legacy rows NULL-length AND matched by the
+        // history token (proving the planted pre-state, so the post-sweep
+        // "no longer matches" is non-vacuous).
+        let user_scope = user_cs.scope_id();
+        let skills_scope = skills_cs.scope_id();
+        let pool = state.store.pool();
+        assert!(
+            stored_length(pool, &user_scope, "/notes/legacy.md")
+                .await
+                .is_none(),
+            "user legacy row starts with NULL length"
+        );
+        assert!(
+            stored_length(pool, &skills_scope, "/skills/legacy-skill.md")
+                .await
+                .is_none(),
+            "skills legacy row starts with NULL length"
+        );
+        let pre_user = search_paths(&user_cs, "zebracorn").await;
+        assert_eq!(
+            pre_user,
+            vec!["/notes/legacy.md".to_string()],
+            "pre-backfill, the stray history token matches on the user scope"
+        );
+        let pre_skills = search_paths(&skills_cs, "zebracorn").await;
+        assert_eq!(
+            pre_skills,
+            vec!["/skills/legacy-skill.md".to_string()],
+            "pre-backfill, the stray history token matches on the skills scope"
+        );
+
+        // The sweep.
+        let count = backfill_index_lengths(&state).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "both seeded legacy rows are backfilled, one per scope"
+        );
+
+        // Lengths restored to the SAME computation the index stamps at
+        // add (never hand-waved).
+        let want_user = tokenize(&searchable_text(&user_c)).len() as i64;
+        assert!(want_user > 0, "the live text tokenizes to > 0 tokens");
+        assert_eq!(
+            stored_length(pool, &user_scope, "/notes/legacy.md").await,
+            Some(want_user),
+            "user legacy row's length is backfilled"
+        );
+        let want_skills = tokenize(&searchable_text(&skills_c)).len() as i64;
+        assert_eq!(
+            stored_length(pool, &skills_scope, "/skills/legacy-skill.md").await,
+            Some(want_skills),
+            "skills legacy row's length is backfilled"
+        );
+
+        // The `# History` split is re-applied on BOTH scopes: the stray
+        // zebracorn postings are gone; the live text still matches.
+        assert!(
+            search_paths(&user_cs, "zebracorn").await.is_empty(),
+            "the user scope's history token must stop matching"
+        );
+        assert!(
+            search_paths(&skills_cs, "zebracorn").await.is_empty(),
+            "the skills scope's history token must stop matching"
+        );
+        assert_eq!(
+            search_paths(&user_cs, "current").await,
+            vec!["/notes/legacy.md".to_string()],
+            "the live text is still searchable (reindex re-added it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_is_idempotent() {
+        let (state, _dir, user, master) = boot_state().await;
+
+        // One legacy user row (NULL length + stray history posting).
+        let user_cs = ConceptStore::for_user(&state.store, user, master.clone());
+        let c = history_concept(
+            "/notes/legacy.md",
+            "current body facts\n\n# History\nzebracorn",
+        );
+        user_cs.put(&c).await.unwrap();
+        let scope = user_cs.scope_id();
+        let pool = state.store.pool();
+        sqlx::query("UPDATE search_docs SET length = NULL WHERE concept_path = ?")
+            .bind("/notes/legacy.md")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO search_tokens (scope, token, concept_path, tf) VALUES (?, ?, ?, 1)",
+        )
+        .bind(&scope)
+        .bind(IndexKeys::from_master_key(&master).token("zebracorn"))
+        .bind("/notes/legacy.md")
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Run 1: backfills the row (count 1) and the predicate empties
+        // DB-wide.
+        let first = backfill_index_lengths(&state).await.unwrap();
+        assert_eq!(first, 1, "the seeded legacy row is backfilled");
+        let nulls_after_first: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM search_docs WHERE length IS NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            nulls_after_first, 0,
+            "the predicate is empty after the first run"
+        );
+        let length_after_first = stored_length(pool, &scope, "/notes/legacy.md").await;
+        assert!(
+            length_after_first.is_some(),
+            "the row's length is backfilled by the first run"
+        );
+
+        // Run 2: nothing matches the predicate — zero backfilled, and
+        // the lengths are stable (byte-for-byte the same column value;
+        // a second re-add would ALSO rewrite the same value, but the
+        // zero count is what proves the predicate miss, not the value).
+        let second = backfill_index_lengths(&state).await.unwrap();
+        assert_eq!(second, 0, "second pass backfills nothing (idempotent)");
+        let nulls_after_second: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM search_docs WHERE length IS NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            nulls_after_second, 0,
+            "the predicate stays empty after the second run"
+        );
+        assert_eq!(
+            stored_length(pool, &scope, "/notes/legacy.md").await,
+            length_after_first,
+            "the backfilled length is stable across runs"
+        );
+        // ...and the stray history token stays gone (nothing re-added
+        // it — the second run never even reads the concept).
+        let stray: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_tokens WHERE scope = ? AND token = ? AND concept_path = ?",
+        )
+        .bind(&scope)
+        .bind(IndexKeys::from_master_key(&master).token("zebracorn"))
+        .bind("/notes/legacy.md")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stray, 0, "the planted history token stays gone after run 2");
+    }
+
+    #[tokio::test]
+    async fn backfill_covers_library_scope() {
+        let (state, _dir, _user, _master) = boot_state().await;
+
+        // Seed a library-scope concept the same way (the deprecated-tag
+        // sweep EXCLUDES this scope — but reindex is index-only, so the
+        // backfill must NOT: §3.2a-4 sweeps library index rows too).
+        let body = "current body facts\n\n# History\nzebracorn obsolete\n";
+        let library_cs = ConceptStore::for_service(
+            &state.store,
+            (*state.service_key).clone(),
+            &state.store.library_dir(),
+            "library",
+        );
+        let c = history_concept("/books/old-book/book.md", body);
+        library_cs.put(&c).await.unwrap();
+        let scope = library_cs.scope_id();
+        let pool = state.store.pool();
+        sqlx::query("UPDATE search_docs SET length = NULL WHERE concept_path = ?")
+            .bind("/books/old-book/book.md")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO search_tokens (scope, token, concept_path, tf) VALUES (?, ?, ?, 1)",
+        )
+        .bind(&scope)
+        .bind(IndexKeys::from_service_key(&state.service_key).token("zebracorn"))
+        .bind("/books/old-book/book.md")
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Pre-sweep: NULL-length AND matched by the planted history
+        // token.
+        assert!(
+            stored_length(pool, &scope, "/books/old-book/book.md")
+                .await
+                .is_none(),
+            "library legacy row starts with NULL length"
+        );
+        assert_eq!(
+            search_paths(&library_cs, "zebracorn").await,
+            vec!["/books/old-book/book.md".to_string()],
+            "pre-backfill, the stray history token matches on the library scope"
+        );
+
+        // The sweep: the library row is reindexed (count 1) — proving
+        // the library inclusion.
+        let count = backfill_index_lengths(&state).await.unwrap();
+        assert_eq!(count, 1, "the library scope's legacy row is backfilled");
+
+        // Its NULL length refilled; the history token gone.
+        let want = tokenize(&searchable_text(&c)).len() as i64;
+        assert_eq!(
+            stored_length(pool, &scope, "/books/old-book/book.md").await,
+            Some(want),
+            "library legacy row's length is backfilled"
+        );
+        assert!(
+            search_paths(&library_cs, "zebracorn").await.is_empty(),
+            "the library scope's history token must stop matching"
+        );
+    }
+
     // ---- the harness ----
 
     /// Boot-shaped harness: a tempdir store + one user whose master
@@ -469,5 +889,41 @@ mod tests {
     /// The op tags of a revision list, in list order (newest first).
     fn ops(revs: &[RevisionEntry]) -> Vec<&str> {
         revs.iter().map(|r| r.op.as_str()).collect()
+    }
+
+    /// A concept whose body carries a `# History` section — the exact
+    /// shape the backfill's retokenization reapplication needs (the
+    /// history text must drop out of the index on re-add).
+    fn history_concept(path: &str, body: &str) -> Concept {
+        Concept::new(
+            Frontmatter {
+                concept_type: "Note".into(),
+                ..Default::default()
+            },
+            body.into(),
+            path.into(),
+        )
+    }
+
+    /// A scope row's `search_docs.length` (None = NULL).
+    async fn stored_length(pool: &sqlx::SqlitePool, scope: &str, path: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT length FROM search_docs WHERE scope = ? AND concept_path = ?")
+            .bind(scope)
+            .bind(path)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Search one scope for a single term; the hit paths, list order.
+    async fn search_paths(cs: &ConceptStore<'_>, term: &str) -> Vec<String> {
+        cs.search(&mycelium_core::search::SearchQuery::new(vec![
+            term.to_string(),
+        ]))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.concept_path)
+        .collect()
     }
 }
