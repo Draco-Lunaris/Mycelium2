@@ -2,12 +2,16 @@
 //!
 //! Terms are HMAC-SHA256 tokens (per-scope key) so plaintext never touches
 //! the database; document payloads (title + snippet) are AEAD envelopes.
-//! Results are ranked by term frequency, matching the in-memory reference
-//! index in mycelium-core (oracle equivalence via `searchable_text`).
+//! Results are ranked by BM25 through the shared `mycelium_core::search`
+//! scorer, matching the in-memory reference index in mycelium-core (oracle
+//! equivalence via `searchable_text`): `df` is the scoped posting-list size
+//! per token, `N` is the scope's row count (`COUNT(*)`) and `avgdl` its mean
+//! length over `search_docs.length` (§3.2a-11), and each doc's length is
+//! that column, captured at `add`.
 
 use mycelium_core::search::{
-    NON_ACTIVE_STATUSES, SearchIndex, SearchQuery, SearchResult, StatusFilter, searchable_text,
-    tokenize,
+    NON_ACTIVE_STATUSES, SearchIndex, SearchQuery, SearchResult, StatusFilter, bm25, bm25_score,
+    searchable_text, tokenize,
 };
 use mycelium_crypto::aead::{aead_open, aead_seal};
 use mycelium_crypto::keys::{MasterKey, ServiceKey};
@@ -95,69 +99,112 @@ impl EncryptedIndex {
         if query.terms.is_empty() {
             return Ok(vec![]);
         }
-        // Score = sum of tf over all query terms (AND not required —
-        // matches the in-memory oracle's OR semantics). One grouped
-        // query per DISTINCT term instead of one round-trip per term:
-        // a 32-term query on a large library is 32 index seeks either
-        // way, but the grouping happens in SQLite, not in N fetches.
+        // Query terms are lowercased and deduped before scoring (§3.2a-2):
+        // under BM25 a repeated term must not double its weight, and the
+        // in-memory oracle dedups the same way. One grouped query per chunk
+        // of DISTINCT terms (grouping happens in SQLite, not in N fetches);
+        // score is OR-style sum over terms (AND is not required — matches the
+        // oracle).
         let mut distinct: Vec<String> = query.terms.iter().map(|t| t.to_lowercase()).collect();
         distinct.sort();
         distinct.dedup();
         let tokens: Vec<String> = distinct.iter().map(|t| self.keys.token(t)).collect();
-        // Lifecycle filter as a SQL predicate on the doc row. The join is
-        // 1:1 (`search_docs` PK is (scope, concept_path)), so `SUM(tf)` is
-        // unaffected; a token row whose doc row vanished drops out here
-        // instead of at the doc load — same result either way.
         let active_only = query.status_filter == StatusFilter::ActiveOnly;
-        let mut scores: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+        // Corpus statistics (§3.3, §3.2a-11): `N = COUNT(*)`, `avgdl =
+        // COALESCE(SUM(length), 0) / N` over the WHOLE scope. N counts EVERY
+        // scoped row — a NULL-length row still owns postings, so it must be
+        // in N or `df` can exceed N and drive idf negative (§3.2a-11). This
+        // is exactly the oracle's `docs.len()` (it counts every doc, active
+        // or not, in both N and avgdl). NULL lengths add 0 to the sum but
+        // count in N; `avgdl == 0` is still guarded below (no NaN).
+        let (n_docs, sum_len): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM search_docs WHERE scope = ?",
+        )
+        .bind(&self.scope_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let n_docs_u = n_docs.max(0) as usize;
+        let avgdl = if n_docs > 0 {
+            sum_len as f32 / n_docs as f32
+        } else {
+            0.0
+        };
+        let params = bm25::Params::default();
+
+        // One grouped token pass per chunk of distinct terms. It selects
+        // `(token, concept_path, tf)` over ALL docs — deliberately NOT
+        // lifecycle-filtered — so per-token `df` is the SCOPED POSTING-LIST
+        // size (§3.3), identical to the oracle's `df = docs.len()`. Each
+        // `search_tokens` row is one distinct (token, path) (its PK), so one
+        // `df += 1` per row counts the posting list; `tf_by_path` keeps each
+        // (path, token) tf for scoring. The lifecycle cut rides on the doc
+        // load below, not here — which is exactly what keeps `df` correct
+        // under ActiveOnly (a hidden doc still contributes to df, only not to
+        // the results).
+        let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut tf_by_path: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, u32>,
+        > = std::collections::HashMap::new();
         for chunk in tokens.chunks(16) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT token, concept_path, tf FROM search_tokens \
+                 WHERE scope = ? AND token IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(&sql).bind(&self.scope_id);
+            for token in chunk {
+                q = q.bind(token);
+            }
+            for (token, path, tf) in q.fetch_all(&self.pool).await? {
+                *df.entry(token.clone()).or_insert(0) += 1;
+                *tf_by_path
+                    .entry(path)
+                    .or_default()
+                    .entry(token)
+                    .or_insert(0) += tf as u32;
+            }
+        }
+
+        // Batch doc load for scored paths (one round-trip per chunk of 64),
+        // now carrying `length` (COALESCE 0 for the transient NULL case —
+        // §3.2a-11: over-boosted but still returned). Under ActiveOnly the
+        // lifecycle cut is a SQL predicate on the plaintext status column —
+        // hidden docs are absent from the RESULTS, not from df/avgdl above.
+        // A path whose doc row vanished mid-scan is simply not returned (skip,
+        // not error). Keys are sorted so the `IN (…)` batch sequence is
+        // deterministic run-to-run (not HashMap-order), per the determinism
+        // convention.
+        let mut results = Vec::with_capacity(tf_by_path.len());
+        let mut scored_paths: Vec<&String> = tf_by_path.keys().collect();
+        scored_paths.sort();
+        for chunk in scored_paths.chunks(64) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = if active_only {
                 let status_holders = vec!["?"; NON_ACTIVE_STATUSES.len()].join(",");
                 format!(
-                    "SELECT t.concept_path, SUM(t.tf) FROM search_tokens t \
-                     JOIN search_docs d \
-                       ON d.scope = t.scope AND d.concept_path = t.concept_path \
-                     WHERE t.scope = ? AND t.token IN ({placeholders}) \
-                       AND (d.lifecycle_status IS NULL \
-                            OR d.lifecycle_status NOT IN ({status_holders})) \
-                     GROUP BY t.concept_path"
+                    "SELECT concept_path, payload, COALESCE(length, 0) FROM search_docs \
+                     WHERE scope = ? AND concept_path IN ({placeholders}) \
+                       AND (lifecycle_status IS NULL \
+                            OR lifecycle_status NOT IN ({status_holders}))"
                 )
             } else {
                 format!(
-                    "SELECT t.concept_path, SUM(t.tf) FROM search_tokens t \
-                     WHERE t.scope = ? AND t.token IN ({placeholders}) \
-                     GROUP BY t.concept_path"
+                    "SELECT concept_path, payload, COALESCE(length, 0) FROM search_docs \
+                     WHERE scope = ? AND concept_path IN ({placeholders})"
                 )
             };
-            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(&self.scope_id);
-            for token in chunk {
-                q = q.bind(token);
+            let mut q = sqlx::query_as::<_, (String, Vec<u8>, i64)>(&sql).bind(&self.scope_id);
+            for path in chunk {
+                q = q.bind(path);
             }
             if active_only {
                 for status in NON_ACTIVE_STATUSES {
                     q = q.bind(status);
                 }
             }
-            for (path, tf) in q.fetch_all(&self.pool).await? {
-                *scores.entry(path).or_insert(0) += tf;
-            }
-        }
-        // Batch doc load: one query for all scored paths instead of a
-        // round-trip per path (a broad term on a big library scores
-        // hundreds of paths).
-        let mut results = Vec::with_capacity(scores.len());
-        for chunk in scores.keys().collect::<Vec<_>>().chunks(64) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT concept_path, payload FROM search_docs \
-                 WHERE scope = ? AND concept_path IN ({placeholders})"
-            );
-            let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql).bind(&self.scope_id);
-            for path in chunk {
-                q = q.bind(path);
-            }
-            for (path, payload_bytes) in q.fetch_all(&self.pool).await? {
+            for (path, payload_bytes, doc_len) in q.fetch_all(&self.pool).await? {
                 let plain = match aead_open(&payload_bytes, path.as_bytes(), self.keys.index_dek())
                 {
                     Ok(p) => p,
@@ -167,12 +214,36 @@ impl EncryptedIndex {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                let score = scores.get(&path).copied().unwrap_or(0);
+                // score = Σ over the DISTINCT terms of the term's BM25
+                // contribution to THIS doc, summed in the sorted `tokens`
+                // order (deterministic across re-runs). A term this doc lacks
+                // (tf 0) or the corpus has never seen (df 0) contributes 0 —
+                // matching the oracle's per-doc sum. `n` is clamped to `df`
+                // (§3.2a-11): the callee documents `df ≤ n_docs`, and `search`
+                // reads N and the postings as separate autocommit queries, so
+                // a concurrent `add_async` commit between them can transiently
+                // raise a token's df above the N already captured — the clamp
+                // keeps idf non-negative for that transient (NULL-length rows
+                // no longer trip it, since N is now COUNT(*)).
+                let path_tfs = tf_by_path.get(&path);
+                let mut score = 0.0f32;
+                for token in &tokens {
+                    let term_df = df.get(token).copied().unwrap_or(0);
+                    if term_df == 0 {
+                        continue;
+                    }
+                    let tf = path_tfs.and_then(|m| m.get(token)).copied().unwrap_or(0);
+                    if tf == 0 {
+                        continue;
+                    }
+                    let term_n = n_docs_u.max(term_df);
+                    score += bm25_score(&params, term_n, term_df, tf, doc_len as u32, avgdl);
+                }
                 results.push(SearchResult {
                     concept_path: path,
                     title: payload.title,
                     snippet: payload.snippet,
-                    score: score as f32,
+                    score,
                 });
             }
         }
@@ -229,11 +300,16 @@ impl EncryptedIndex {
             self.keys.index_dek(),
         )?;
 
-        // Tokenize the canonical searchable text.
+        // Tokenize the canonical searchable text. The token count (repeats
+        // included, equal to Σ tf over `token_counts`) is this doc's BM25
+        // length — bound on the doc row so scoring reads it without
+        // re-tokenizing (spec §3.3).
         let text = searchable_text(concept);
+        let tokens = tokenize(&text);
+        let doc_len = tokens.len() as i64;
         let mut token_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
-        for token in tokenize(&text) {
+        for token in tokens {
             *token_counts.entry(token).or_insert(0) += 1;
         }
 
@@ -266,12 +342,13 @@ impl EncryptedIndex {
         // SQL NULL, unknown values kept verbatim); leniency belongs to
         // `is_active_status` at query time, not to normalization here.
         sqlx::query(
-            "INSERT INTO search_docs (scope, concept_path, payload, lifecycle_status) \
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO search_docs (scope, concept_path, payload, length, lifecycle_status) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&self.scope_id)
         .bind(&concept.source_path)
         .bind(&sealed)
+        .bind(doc_len)
         .bind(concept.frontmatter.status.as_deref())
         .execute(&mut *tx)
         .await?;
@@ -408,13 +485,31 @@ mod tests {
             index.add_async(c).await.unwrap();
             oracle.add(c).ok();
         }
-        // Both filters, both indexes: the lifecycle cut happens before
-        // scoring on both sides, so paths and ordering must still agree —
-        // hidden docs are absent from the results, not from the index.
+        // Now that BOTH indexes score with BM25, ordering alone is no longer
+        // an equivalence test (two scorers can agree on order while
+        // disagreeing on magnitude). Assert BOTH: identical orderings AND
+        // per-path score agreement (|Δ| ≤ 1e-6) for every returned path.
+        //
+        // The superseded `/d.md` shares "rust" and "deploy" with active docs,
+        // so this corpus pins the df rule too: `df` is the scoped posting-list
+        // count (includes the hidden doc), while the lifecycle filter is a
+        // per-result skip — never an index cut — exactly as the oracle does.
+        //
+        // Multi-term queries exercise the sum-over-terms path; the duplicate
+        // cases pin the dedup (§3.2a-2 — a repeated term must not double).
+        let queries: Vec<Vec<&str>> = vec![
+            vec!["rust"],
+            vec!["deploy"],
+            vec!["test"],
+            vec!["zebra"],
+            vec!["rust", "deploy"],
+            vec!["rust", "rust"],
+            vec!["rust", "deploy", "rust"],
+        ];
         for filter in [StatusFilter::ActiveOnly, StatusFilter::All] {
-            for term in ["rust", "deploy", "test", "zebra"] {
+            for terms in &queries {
                 let query = SearchQuery {
-                    terms: vec![term.into()],
+                    terms: terms.iter().map(|t| (*t).to_string()).collect(),
                     include_global: false,
                     status_filter: filter,
                 };
@@ -423,8 +518,27 @@ mod tests {
                 assert_eq!(
                     paths(&encrypted),
                     paths(&memory),
-                    "term {term} filter {filter:?}: ordering mismatch"
+                    "terms {terms:?} filter {filter:?}: ordering mismatch"
                 );
+                assert_eq!(
+                    encrypted.len(),
+                    memory.len(),
+                    "terms {terms:?} filter {filter:?}: length mismatch"
+                );
+                for (enc, mem) in encrypted.iter().zip(&memory) {
+                    assert_eq!(
+                        enc.concept_path, mem.concept_path,
+                        "terms {terms:?} filter {filter:?}: path pairing mismatch"
+                    );
+                    assert!(
+                        (enc.score - mem.score).abs() <= 1e-6,
+                        "terms {terms:?} filter {filter:?} path {}: \
+                         store score {} vs oracle {} (|Δ| > 1e-6)",
+                        enc.concept_path,
+                        enc.score,
+                        mem.score
+                    );
+                }
             }
         }
         // The superseded doc is reachable only with the filter lifted.
@@ -443,6 +557,172 @@ mod tests {
                     .unwrap()
             ),
             vec!["/d.md".to_string()]
+        );
+    }
+
+    /// Acceptance #3: on equal term matches, length normalization stops a
+    /// long enriched concept from outranking a short focused one. `/a.md` is
+    /// long (title + 3× "rust" + 197 fillers), `/b.md` short (title + "rust").
+    /// The pre-BM25 tf-sum scorer ranked the long doc first (tf 3 > 1); BM25
+    /// must rank the short doc first — in BOTH indexes.
+    #[tokio::test]
+    async fn bm25_short_focused_beats_long_enriched_both_indexes() {
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        let mut oracle = mycelium_core::search::InMemoryIndex::new();
+
+        let fillers: String = (1..=197).map(|i| format!(" n{i:03}")).collect();
+        let long = concept("/a.md", "Alpha Note", &format!("rust rust rust{fillers}"));
+        let short = concept("/b.md", "Beta Note", "rust");
+        for c in [&long, &short] {
+            index.add_async(c).await.unwrap();
+            oracle.add(c).ok();
+        }
+
+        let query = SearchQuery::new(vec!["rust".into()]);
+        let store_paths = paths(&index.search(&query).await.unwrap());
+        let memory_paths = paths(&oracle.search(&query).unwrap());
+        assert_eq!(
+            store_paths,
+            vec!["/b.md".to_string(), "/a.md".to_string()],
+            "store: short focused doc must outrank the long enriched one"
+        );
+        assert_eq!(
+            memory_paths,
+            vec!["/b.md".to_string(), "/a.md".to_string()],
+            "oracle: agrees with the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_length_column_tracks_token_count() {
+        // `add_async` binds `search_docs.length` = the token count of the
+        // concept's `searchable_text` (title tokens are PREPENDED, then the
+        // `# History`-cut body). The expected value is computed the exact
+        // same way the index computes it — never hand-waved.
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        let c = concept("/a.md", "Deploy Rust Service", "how to deploy rust");
+        index.add_async(&c).await.unwrap();
+
+        let expected_len = tokenize(&searchable_text(&c)).len() as i64;
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT length FROM search_docs WHERE concept_path = ?")
+                .bind("/a.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(expected_len), "length must equal token count");
+        // Sanity: the token count equals Σ tf over the postings (the length
+        // is the doc's total token count, repeats included).
+        let sum_tf: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(tf), 0) FROM search_tokens WHERE concept_path = ?",
+        )
+        .bind("/a.md")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, Some(sum_tf), "length must equal Σ tf");
+        // The exact expected count is pinned via the same tokenizer, so this
+        // is a real check, not a tautology: title "Deploy Rust Service"
+        // (deploy, rust, service) + body "how to deploy rust" (how, to,
+        // deploy, rust) = 7 tokens.
+        assert_eq!(expected_len, 7);
+    }
+
+    #[tokio::test]
+    async fn readd_replaces_length() {
+        // A re-add REPLACES the doc row (DELETE-then-INSERT), so a shorter
+        // re-add lowers `length` rather than summing onto the old value.
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept(
+                "/a.md",
+                "V1",
+                "alpha beta gamma delta epsilon zeta eta",
+            ))
+            .await
+            .unwrap();
+        let long: Option<i64> =
+            sqlx::query_scalar("SELECT length FROM search_docs WHERE concept_path = ?")
+                .bind("/a.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let short_c = concept("/a.md", "V2", "gamma");
+        index.add_async(&short_c).await.unwrap();
+        let short: Option<i64> =
+            sqlx::query_scalar("SELECT length FROM search_docs WHERE concept_path = ?")
+                .bind("/a.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let want = tokenize(&searchable_text(&short_c)).len() as i64;
+        assert_eq!(short, Some(want), "length must be the re-added count");
+        assert!(
+            short < long,
+            "length must be replaced (short {short:?} < long {long:?}), not summed"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_length_scoring_guard() {
+        // §3.2a-11 (supersedes the amendment-5 wording): a scored doc with
+        // `length = NULL` scores as length 0 — still returned, OVER-boosted,
+        // never an error. The corpus-stat universe is EVERY scoped row, so
+        // `n_docs = COUNT(*)` counts BOTH docs here (a NULL-length row still
+        // owns postings, so it contributes to `df` and must be in `N` — that
+        // is exactly the oracle's `docs.len()`); `avgdl = COALESCE(SUM,0)/N`
+        // counts the NULL row in N but adds 0 to the sum. With /a (NULL) +
+        // /b (length 3) sharing "zebra": N = 2, Σ = 3, avgdl = 3/2 = 1.5.
+        // The over-boost (doc_len 0 → smallest length penalty) must RANK the
+        // NULL-length doc first with non-negative scores — the old
+        // `COUNT(length)` N (1 here) made df (2) exceed N and drove idf
+        // negative, turning the over-boost into a demotion.
+        let (_dir, store) = test_store().await;
+        let master = mycelium_crypto::generate_master_key();
+        let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
+        index
+            .add_async(&concept("/a.md", "Alpha", "zebra alpha details"))
+            .await
+            .unwrap();
+        index
+            .add_async(&concept("/b.md", "Beta", "zebra beta"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE search_docs SET length = NULL WHERE concept_path = ?")
+            .bind("/a.md")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let hits = index
+            .search(&SearchQuery::new(vec!["zebra".into()]))
+            .await
+            .unwrap();
+        // Both present, over-boosted doc first: NULL-length /a.md ranks ABOVE
+        // /b.md (§3.2a-11's over-boost intent, not the amendment-5 demotion).
+        assert_eq!(
+            paths(&hits),
+            vec!["/a.md".to_string(), "/b.md".to_string()],
+            "NULL-length doc must be over-boosted to first, both present: {hits:?}"
+        );
+        // Non-negative idf: N ≥ df, so no term's idf goes negative and drags
+        // the sum below 0.
+        for h in &hits {
+            assert!(
+                h.score >= 0.0,
+                "BM25 idf must stay non-negative (df ≤ N): {} score {}",
+                h.concept_path,
+                h.score
+            );
+        }
+        assert!(
+            hits[0].score >= hits[1].score,
+            "over-boosted NULL-length doc must outrank the length-bearing doc"
         );
     }
 

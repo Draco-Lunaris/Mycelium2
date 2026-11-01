@@ -527,6 +527,30 @@ impl<'a> ConceptStore<'a> {
         Ok(Concept::parse(path, &markdown)?)
     }
 
+    /// Re-index one concept WITHOUT any concept write — the backfill shape of
+    /// the boot sweep (spec §3.2a-4). Reads the stored concept and re-adds it
+    /// to the search index only: this backfills `search_docs.length` for rows
+    /// that predate migration 0011 (`length IS NULL`) and re-applies the
+    /// `# History` token split to rows indexed before step 1's code.
+    ///
+    /// Index-only invariants (§3.2a-4): no file write, no registry upsert,
+    /// **no revision row**, provenance/`confirmed_at` untouched, no `index.md`
+    /// regeneration. Because it never writes a concept, the deprecated-tag
+    /// sweep's `global:library` exclusion does not apply — library index rows
+    /// are swept too. A missing concept fails `NotFound` (the caller's sweep
+    /// skips dead rows); no index rows are written for it. Like every other
+    /// ConceptStore write entry point, it refuses the mutation queue's
+    /// reserved `/mutation-queue/` prefix (staging notes are queue-internal
+    /// scaffolding — the sweep never reindexes them).
+    pub async fn reindex(&self, path: &str) -> Result<(), ConceptStoreError> {
+        if path.starts_with("/mutation-queue/") {
+            return Err(ConceptStoreError::QueuePath(path.to_string()));
+        }
+        let concept = self.get(path).await?;
+        self.index.add_async(&concept).await?;
+        Ok(())
+    }
+
     /// Delete a concept: record the delete's revision row FIRST (with
     /// the pre-delete raw bytes — the write-ahead undo row, spec §3.2),
     /// then registry + index, then the file (a crash leaves an
@@ -664,6 +688,8 @@ fn like_escape(prefix: &str) -> String {
 mod tests {
     use super::*;
     use mycelium_core::concept::Frontmatter;
+    use mycelium_core::search::{searchable_text, tokenize};
+    use mycelium_crypto::store_keys::IndexKeys;
 
     fn concept(path: &str, title: &str, body: &str) -> Concept {
         Concept::new(
@@ -675,6 +701,10 @@ mod tests {
             body.into(),
             path.into(),
         )
+    }
+
+    fn hit_paths(results: &[mycelium_core::search::SearchResult]) -> Vec<String> {
+        results.iter().map(|r| r.concept_path.clone()).collect()
     }
 
     #[tokio::test]
@@ -947,6 +977,174 @@ mod tests {
         assert!(
             chrono::DateTime::parse_from_rfc3339(confirmed).is_ok(),
             "confirmed_at is RFC 3339, got {confirmed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_backfills_length_and_retokens() {
+        // The boot sweep (§3.2a-4) reindexes rows whose `length` is NULL.
+        // reindex reads the concept and re-adds it to the index — which
+        // backfills `length` AND re-applies the `# History` token split to a
+        // legacy row that had the history text indexed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master.clone());
+        let body = "current body facts\n\n# History\nzebracorn obsolete\n";
+        let c = concept("/legacy.md", "Legacy Note", body);
+        cs.put(&c).await.unwrap();
+
+        // Simulate a LEGACY index row (pre-split-awareness, pre-0011):
+        //   (a) `length` is NULL, and
+        //   (b) the `# History` token was indexed (a stray "zebracorn").
+        let scope = cs.scope_id();
+        sqlx::query("UPDATE search_docs SET length = NULL WHERE concept_path = ?")
+            .bind("/legacy.md")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let zebra_token = IndexKeys::from_master_key(&master).token("zebracorn");
+        sqlx::query(
+            "INSERT INTO search_tokens (scope, token, concept_path, tf) VALUES (?, ?, ?, 1)",
+        )
+        .bind(&scope)
+        .bind(&zebra_token)
+        .bind("/legacy.md")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        // Pre-sweep: the legacy row MATCHES the history token (a pre-sweep
+        // doc would have matched) and has a NULL length.
+        let pre_hits = cs
+            .search(&mycelium_core::search::SearchQuery::new(vec![
+                "zebracorn".into(),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(hit_paths(&pre_hits), vec!["/legacy.md".to_string()]);
+        let len_pre: Option<i64> =
+            sqlx::query_scalar("SELECT length FROM search_docs WHERE concept_path = ?")
+                .bind("/legacy.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(len_pre, None, "legacy row starts with NULL length");
+
+        // The reindex sweep step.
+        cs.reindex("/legacy.md").await.unwrap();
+
+        // length backfilled to the searchable_text token count (live text
+        // only — the same computation the index uses, never hand-waved).
+        let want_len = tokenize(&searchable_text(&c)).len() as i64;
+        assert!(want_len > 0, "the live text tokenizes to > 0 tokens");
+        let len_post: Option<i64> =
+            sqlx::query_scalar("SELECT length FROM search_docs WHERE concept_path = ?")
+                .bind("/legacy.md")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(len_post, Some(want_len), "reindex backfills length");
+
+        // The `# History` split is re-applied: the stray zebracorn posting is
+        // gone (a pre-sweep doc WOULD have matched; post-sweep it must not).
+        let post_hits = cs
+            .search(&mycelium_core::search::SearchQuery::new(vec![
+                "zebracorn".into(),
+            ]))
+            .await
+            .unwrap();
+        assert!(
+            post_hits.is_empty(),
+            "reindex must drop `# History` tokens: {post_hits:?}"
+        );
+        // The live text is still searchable (reindex re-added the concept).
+        let live = cs
+            .search(&mycelium_core::search::SearchQuery::new(vec![
+                "current".into(),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(hit_paths(&live), vec!["/legacy.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reindex_writes_no_revision_and_touches_nothing_else() {
+        // §3.2a-4: the reindex sweep is index-only. No concept write, no
+        // registry upsert, NO revision row, provenance/`confirmed_at`
+        // untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master).with_provenance("mcp:test");
+        cs.put(&concept("/notes/a.md", "Alpha Note", "alpha body zebra"))
+            .await
+            .unwrap();
+
+        let scope = cs.scope_id();
+        let rev_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM concept_revisions")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rev_before, 1, "put wrote exactly one revision");
+        let row_before: (String, String) = sqlx::query_as(
+            "SELECT title, updated_at FROM scope_files WHERE scope = ? AND path = ?",
+        )
+        .bind(&scope)
+        .bind("/notes/a.md")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let got_before = cs.get("/notes/a.md").await.unwrap();
+        let confirmed_before = got_before.frontmatter.confirmed_at.clone();
+        let source_before = got_before.frontmatter.source.clone();
+
+        cs.reindex("/notes/a.md").await.unwrap();
+
+        // No revision row written by the reindex.
+        let rev_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM concept_revisions")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rev_after, rev_before, "reindex must not record a revision");
+        // Registry row untouched (title + updated_at identical — the sweep
+        // does not re-stamp the listing).
+        let row_after: (String, String) = sqlx::query_as(
+            "SELECT title, updated_at FROM scope_files WHERE scope = ? AND path = ?",
+        )
+        .bind(&scope)
+        .bind("/notes/a.md")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row_after, row_before, "reindex must not touch the registry");
+        // Concept file untouched: no provenance/`confirmed_at` re-stamp,
+        // body identical (no file write happened).
+        let got_after = cs.get("/notes/a.md").await.unwrap();
+        assert_eq!(got_after.frontmatter.confirmed_at, confirmed_before);
+        assert_eq!(got_after.frontmatter.source, source_before);
+        assert_eq!(got_after.body, got_before.body);
+    }
+
+    #[tokio::test]
+    async fn reindex_refuses_mutation_queue_prefix() {
+        // §3.2a reserved-prefix guard, same posture as put/restore/delete:
+        // reindex refuses staging-note paths before any read/write. Task 5's
+        // sweep skips `/mutation-queue/` paths, so this breaks no sweep.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master);
+        let err = cs
+            .reindex("/mutation-queue/staging/note.md")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ConceptStoreError::QueuePath(_)),
+            "reindex must refuse the queue prefix, got {err}"
         );
     }
 }

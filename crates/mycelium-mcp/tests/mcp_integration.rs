@@ -3,11 +3,14 @@
 //! auth rejection, tools/list, tools/call (memory + skills), and
 //! per-user isolation.
 //!
-//! `memory_query` now admits through the process-global
-//! `llm_gate::LLM_GATE`, so every test in this binary that runs a query
-//! — or holds/reconfigures gate slots — serializes on [`TEST_LOCK`] and
-//! restores the gate's defaults through [`GateDefaults`] (declared after
-//! the lock guard, so the restore happens while the lock is still held).
+//! Since the memory-lifecycle step 3, `memory_query`'s default is the
+//! zero-LLM hits path; the `synthesize: true` path admits through the
+//! process-global `llm_gate::LLM_GATE`. Every test in this binary that
+//! runs a query — or holds/reconfigures gate slots — serializes on
+//! [`TEST_LOCK`] and restores the gate's defaults through [`GateDefaults`]
+//! (declared after the lock guard, so the restore happens while the lock
+//! is still held); query fixtures also hold [`HealthDefaults`], resetting
+//! the process-global `LLM_HEALTH` the query paths passively feed.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,8 +27,10 @@ use mycelium_web::AppState;
 /// Known admin password for the pre-seeded account (tests log in with it).
 const ADMIN_PASSWORD: &str = "admin password known to the test suite!";
 
-/// Serializes all gate-sensitive tests in this binary (every test that
-/// runs `memory_query`, since a query now takes gate capacity).
+/// Serializes the gate-sensitive tests in this binary (the synthesize
+/// path's admission and the direct gate holds) — and, more generally,
+/// every query static's read-write cycle: `memory_query` feeds the
+/// process-global `LLM_HEALTH` and reads the lifecycle `query_top_k`.
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait bound for the gate holds this suite takes.
@@ -287,7 +292,8 @@ fn request_meta() -> serde_json::Value {
 
 #[tokio::test]
 async fn mcp_full_flow() {
-    // This flow runs memory_query, which admits through the shared gate.
+    // This flow runs memory_query (the zero-LLM hits default); it holds
+    // the lock alongside the gate-sensitive tests.
     let _lock = TEST_LOCK.lock().await;
     let _defaults = GateDefaults;
     let (base, shutdown, dir, pool) = boot().await;
@@ -837,7 +843,12 @@ async fn mcp_full_flow() {
         "bob must see zero concepts (isolation): {text}"
     );
 
-    // Bob's query must not find the admin's concept.
+    // Bob's query must not find the admin's concept. Since the hits
+    // default spans global scopes (spec §3.3 — the global skill above is
+    // shared by design), an empty-hit error is no longer the probe: the
+    // response may legitimately list the global skill, but it must NOT
+    // carry the admin's concept's text or path (and must not carry the
+    // admin's PRIVATE skill variant either).
     let (status, body) = rpc(
         &client,
         &base,
@@ -852,10 +863,49 @@ async fn mcp_full_flow() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(
-        body["result"]["isError"], true,
-        "bob's query must not return admin's concept"
+    let bob_text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert!(
+        !bob_text.contains("tokio::select") && !bob_text.contains("async-basics"),
+        "bob's hit list must not carry the admin's concept: {bob_text}"
     );
+    assert!(
+        !bob_text.contains("Private variant"),
+        "bob's hit list must not carry the admin's private skill: {bob_text}"
+    );
+    assert!(
+        bob_text.contains("## Deploy Rust Service"),
+        "the global skill stays visible across scopes (the hits default spans skills): {bob_text}"
+    );
+
+    // Spec §3.2a-12: the hits arm's schema-facing delivery is
+    // structuredContent = {"hits": [...]} — the wire test reads IT (the
+    // serialized CallToolResult), not just the text template.
+    if let Some(wire_hits) = body["result"]["structuredContent"]["hits"].as_array() {
+        assert!(
+            !wire_hits.is_empty(),
+            "structuredContent carries the hits array: {:#?}",
+            body["result"]["structuredContent"]
+        );
+        assert!(
+            !wire_hits
+                .iter()
+                .any(|hit| hit["path"] == "/rust/async-basics.md"),
+            "structuredContent must not carry the admin's concept either: {:#?}",
+            wire_hits
+        );
+        for hit in wire_hits {
+            for key in HIT_KEYS {
+                assert!(hit.get(key).is_some(), "wire hit must carry {key}: {hit}");
+            }
+        }
+    } else {
+        panic!(
+            "the hits arm must set structuredContent = {{\"hits\": [...]}}; got: {:#?}",
+            body["result"]
+        );
+    }
 
     // Bob adds his own concept; admin's query must not see it.
     let (status, _body) = rpc(
@@ -1288,6 +1338,19 @@ struct QueryHarness {
     _dir: tempfile::TempDir,
     state: mycelium_mcp::McpState,
     user: mycelium_mcp::auth::McpUser,
+    /// The harness user's master key, held so tests can seed further
+    /// private concepts through the same encrypted scope the tool reads.
+    master: mycelium_crypto::keys::MasterKey,
+}
+
+/// A user-scoped ConceptStore over the harness's bundle (for seeding
+/// fixtures with the same keys the tool's own handle derives).
+async fn harness_user_cs(h: &QueryHarness) -> mycelium_store::concept_store::ConceptStore<'_> {
+    mycelium_store::concept_store::ConceptStore::for_user(
+        &h.state.store,
+        h.user.user_id,
+        h.master.clone(),
+    )
 }
 
 /// Build a harness whose sealed "llm" config points at `llm_url` with
@@ -1331,7 +1394,7 @@ async fn query_harness(llm_url: &str, max_parallel: u32, query_wait_secs: u32) -
     // The master key is primed in the cache, so no user row (and no
     // service seal) is needed for the tool's key lookup.
     let master_keys = Arc::new(mycelium_mcp::MasterKeyCache::default());
-    master_keys.insert(user_id, master);
+    master_keys.insert(user_id, master.clone());
     let state = mycelium_mcp::McpState {
         store: Arc::new(store),
         service_key: Arc::new(service_key),
@@ -1350,6 +1413,7 @@ async fn query_harness(llm_url: &str, max_parallel: u32, query_wait_secs: u32) -
         _dir: dir,
         state,
         user,
+        master,
     }
 }
 
@@ -1357,6 +1421,21 @@ fn query_args(question: &str) -> mycelium_mcp::tools::MemoryQueryArgs {
     mycelium_mcp::tools::MemoryQueryArgs {
         question: question.to_string(),
         limit: None,
+        synthesize: None,
+        include_inactive: None,
+    }
+}
+
+/// Query args for the agent path (`synthesize: true`). The three gate
+/// tests keep pinning gate/cache behavior on THE SYNTHESIS FLOW after
+/// the hits-default switch — it is the only gate-entrant memory_query
+/// path (spec §3.3), so a gate test without it would prove nothing.
+fn synth_args(question: &str) -> mycelium_mcp::tools::MemoryQueryArgs {
+    mycelium_mcp::tools::MemoryQueryArgs {
+        question: question.to_string(),
+        limit: None,
+        synthesize: Some(true),
+        include_inactive: None,
     }
 }
 
@@ -1380,11 +1459,13 @@ async fn poll_gate_until<F: FnMut() -> bool>(mut want: F, what: &str) {
 /// Spec §3.3: with every slot taken, the query waits its bound and then
 /// the deterministic keyword fallback answers. The mock LLM proves the
 /// fallback came from the gate and not from an unreachable backend: it
-/// is reachable and sees ZERO requests.
+/// is reachable and sees ZERO requests. (`synthesize: true` is what
+/// still enters the gate — the hits default skips it entirely.)
 #[tokio::test]
 async fn memory_query_falls_back_when_gate_saturated() {
     let _lock = TEST_LOCK.lock().await;
     let _defaults = GateDefaults;
+    let _health = HealthDefaults;
     let (llm_url, mock) = mock_llm(vec![text_response("the agent would have answered")]).await;
     let h = query_harness(&llm_url, DEFAULT_CAPACITY as u32, 1).await;
 
@@ -1396,7 +1477,7 @@ async fn memory_query_falls_back_when_gate_saturated() {
     let out = mycelium_mcp::tools::memory_query(
         &h.state,
         &h.user,
-        &query_args("zebra stripes under a saturated gate"),
+        &synth_args("zebra stripes under a saturated gate"),
     )
     .await
     .expect("a saturated gate never errors the tool");
@@ -1437,6 +1518,7 @@ async fn memory_query_falls_back_when_gate_saturated() {
 async fn memory_query_admits_when_slot_frees() {
     let _lock = TEST_LOCK.lock().await;
     let _defaults = GateDefaults;
+    let _health = HealthDefaults;
     let (llm_url, mock) = mock_llm(vec![text_response(
         "Zebras are striped.\n\nSources:\n- /notes/zebras.md",
     )])
@@ -1452,7 +1534,7 @@ async fn memory_query_admits_when_slot_frees() {
         mycelium_mcp::tools::memory_query(
             &state,
             &user,
-            &query_args("what do you know about zebras while a slot is busy"),
+            &synth_args("what do you know about zebras while a slot is busy"),
         )
         .await
     });
@@ -1500,7 +1582,7 @@ async fn memory_query_cache_hit_never_waits() {
     let h = query_harness(&llm_url, DEFAULT_CAPACITY as u32, 60).await;
 
     // Prime the exact cache with one successful agent answer.
-    let primed = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args(question))
+    let primed = mycelium_mcp::tools::memory_query(&h.state, &h.user, &synth_args(question))
         .await
         .expect("priming query must succeed");
     let primed = match primed {
@@ -1518,7 +1600,7 @@ async fn memory_query_cache_hit_never_waits() {
     assert_eq!(LLM_GATE.stats().active, DEFAULT_CAPACITY);
 
     let started = Instant::now();
-    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args(question))
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &synth_args(question))
         .await
         .expect("a cache hit must answer");
     let elapsed = started.elapsed();
@@ -1545,4 +1627,622 @@ async fn memory_query_cache_hit_never_waits() {
 
     drop(hold1);
     drop(hold2);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 (memory-lifecycle): memory_query's DEFAULT is the zero-LLM
+// ranked-hits path (spec §3.3), with `synthesize` as the opt-in for the
+// agent loop and `include_inactive` as the opt-in for history queries.
+// Direct-invocation tests (the Task-7 gate harness shape).
+// ---------------------------------------------------------------------------
+
+/// Fixed-Green health hygiene (the 2026-10-31 note): `memory_query` is
+/// a passive FEEDER of the process-global `LLM_HEALTH` — its LlmClient
+/// observes backend failures even along this tool's paths — so dead-LLM
+/// fixture runs must not leak Red/Yellow state into the next test in
+/// this binary. `QueueWorker::set_health_source` is the queue's READ
+/// pin; this side has no reader-facing seam, so the reset guard is the
+/// feed-side hygiene: on drop the static re-inits to its fresh default
+/// (Green, configured) — held AFTER the lock guard, like GateDefaults.
+struct HealthDefaults;
+
+impl Drop for HealthDefaults {
+    fn drop(&mut self) {
+        let _ = mycelium_librarian::llm_health::LLM_HEALTH.reset_for_test();
+    }
+}
+
+/// Restores the process-global `query_top_k` on drop, so a failing
+/// assertion cannot leak a sealed row's value into the next test (the
+/// [`GateDefaults`] shape — the store-side counterpart lives in
+/// `revisions_store_integration.rs`).
+struct TopKDefaults;
+
+impl Drop for TopKDefaults {
+    fn drop(&mut self) {
+        mycelium_store::revisions::set_query_top_k(mycelium_store::revisions::DEFAULT_QUERY_TOP_K);
+    }
+}
+
+/// The ten §3.2a-6 hit keys, pinned as key PRESENCE (the store-side
+/// values are exercised by the lifecycle tests); `query_top_k` tests
+/// size the set.
+const HIT_KEYS: [&str; 10] = [
+    "scope",
+    "path",
+    "title",
+    "description",
+    "snippet",
+    "score",
+    "timestamp",
+    "confirmed_at",
+    "status",
+    "superseded_by",
+];
+
+/// Unwrap the hits variant, phrased for the default-path tests: a
+/// `memory_query` that returns the agent's Answer instead of hits
+/// violates the zero-LLM default (or proves the fallthrough broke).
+fn hits_or_panic(
+    out: mycelium_mcp::tools::QueryOutput,
+    what: &str,
+) -> Vec<mycelium_librarian::agent::QueryHit> {
+    match out {
+        mycelium_mcp::tools::QueryOutput::Hits(hits) => hits,
+        other => panic!("{what} must return enriched hits, got: {other:?}"),
+    }
+}
+
+/// Spec §3.3 + §3.2a-6 + §3.2a-12: DEFAULT memory_query is the zero-LLM
+/// ranked hits — no gate slot, no LLM contact, even with the llm row
+/// pointing at an unreachable backend. The pin reads the WIRE delivery
+/// (`handler::query_hits_result` serialized to JSON — the
+/// `structuredContent` the tools/call response actually carries), not
+/// the live Rust value: every wire hit carries the ten §3.2a-6 keys, and
+/// one seeded lifecycle concept pins its `status`/`confirmed_at`/
+/// `superseded_by` VALUES end-to-end (default-path visible because its
+/// status is explicitly "active"; the pointer contradiction is the
+/// fixture's point — the wire reports what the store carries).
+/// `description`/`timestamp` stay presence-only.
+#[tokio::test]
+async fn memory_query_default_returns_hits_no_llm() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    let h = query_harness("http://127.0.0.1:1/v1", DEFAULT_CAPACITY as u32, 1).await;
+    // A lifecycle-marked concept: explicitly active, confirmed at a
+    // fixed instant, carrying a replacement pointer.
+    harness_user_cs(&h)
+        .await
+        .put(
+            &mycelium_core::concept::Concept::parse(
+                "/notes/lifecycle-zebra.md",
+                "---\ntype: Note\ntitle: Lifecycle Zebra\nstatus: active\nconfirmed_at: 2026-03-03T03:03:03Z\nsuperseded_by: /notes/zebras.md\n---\n\nThe lifecycle zebra has distinctive stripes.\n",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args("zebra stripes"))
+        .await
+        .expect("the hits default must answer without an LLM");
+    let hits = hits_or_panic(out, "the default memory_query");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path == "/notes/lifecycle-zebra.md"),
+        "the explicitly-active lifecycle concept must surface by default: {hits:?}"
+    );
+
+    // confirmed_at is a SYSTEM field the store re-stamps at record time
+    // (provenance_stamp_on_put_overwrites_spoofed_source_and_sets_confirmed_at)
+    // — its fixture frontmatter cannot govern the value, so both the
+    // wire and the text pins below assert FIDELITY against the store's
+    // actual stamp.
+    let stored = harness_user_cs(&h)
+        .await
+        .get("/notes/lifecycle-zebra.md")
+        .await
+        .unwrap_or_else(|e| panic!("the seeded concept must read back: {e}"));
+    let confirmed = stored.frontmatter.confirmed_at.as_deref().unwrap();
+
+    // Wire delivery (§3.2a-12): serialize the handler result as the
+    // tools/call response carries it, then read structuredContent.
+    let wire = mycelium_mcp::handler::query_hits_result(&hits)
+        .expect("the handler serializes the hits wire result");
+    let result = serde_json::to_value(&wire).unwrap();
+    let wire_hits = result["structuredContent"]["hits"]
+        .as_array()
+        .expect("structuredContent = {{\"hits\": [...]}} (§3.2a-12): {result:#?}");
+    assert!(
+        !wire_hits.is_empty(),
+        "structuredContent carries the hits: {result:#?}"
+    );
+    for wire_hit in wire_hits {
+        for key in HIT_KEYS {
+            assert!(
+                wire_hit.get(key).is_some(),
+                "wire hit must carry {key}: {wire_hit}"
+            );
+        }
+    }
+    let lifecycle = wire_hits
+        .iter()
+        .find(|hit| hit["path"] == "/notes/lifecycle-zebra.md")
+        .expect("the lifecycle concept is a wire hit");
+    assert_eq!(lifecycle["scope"], "user", "the private bundle's scope");
+    assert_eq!(
+        lifecycle["status"], "active",
+        "the lifecycle concept's status rides the wire end-to-end"
+    );
+    // confirmed_at is a SYSTEM field the store re-stamps at record time
+    // (provenance_stamp_on_put_overwrites_spoofed_source_and_sets_confirmed_at)
+    // — its fixture frontmatter cannot govern the value. The end-to-end
+    // pin is fidelity: the wire value EQUALS the store's stamped value.
+    assert_eq!(
+        lifecycle["confirmed_at"], confirmed,
+        "the wire's confirmed_at equals the store's stamp"
+    );
+    assert_eq!(
+        lifecycle["superseded_by"], "/notes/zebras.md",
+        "the lifecycle concept's superseded_by rides the wire end-to-end"
+    );
+
+    // (a) The extended text template: the scope and lifecycle lines sit
+    // compactly after the snippet.
+    let wire_text = result["content"][0]["text"].as_str().expect("text content");
+    for line in [
+        "scope: user".to_string(),
+        "status: active".to_string(),
+        format!("confirmed_at: {confirmed}"),
+        "superseded_by: /notes/zebras.md".to_string(),
+    ] {
+        assert!(
+            wire_text.contains(line.as_str()),
+            "the extended text template carries {line:?}: {wire_text}"
+        );
+    }
+}
+
+/// Spec §3.3 regression pin: the DEFAULT path is zero-LLM even when the
+/// backend IS reachable. The pre-step-3 shape (agent first, degrade on
+/// failure or absence) passed a dead-LLM fixture indistinguishably —
+/// `memory_query_default_returns_hits_no_llm`'s unreachable backend
+/// answers for both shapes — but on a reachable backend it burned an LLM
+/// call on every default query. Reachable mock + default args → hits,
+/// ZERO LLM requests, gate stats untouched.
+#[tokio::test]
+async fn memory_query_default_is_zero_llm() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    // REACHABLE: if the default path ever attempted the agent, this mock
+    // would serve it and the zero-request pin below would fire.
+    let (llm_url, mock) = mock_llm(vec![text_response("the agent must never be asked this")]).await;
+    let h = query_harness(&llm_url, DEFAULT_CAPACITY as u32, 60).await;
+
+    let before = LLM_GATE.stats();
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args("zebra stripes"))
+        .await
+        .expect("the default path must answer");
+    let hits = hits_or_panic(out, "the default memory_query (reachable LLM)");
+    assert!(!hits.is_empty(), "the seeded bundle must rank: {hits:?}");
+    assert_eq!(
+        llm_requests(&mock).await,
+        0,
+        "the default path must make ZERO LLM calls even with a reachable backend"
+    );
+    assert_eq!(
+        LLM_GATE.stats().active,
+        before.active,
+        "the default path never takes gate capacity"
+    );
+    assert_eq!(
+        LLM_GATE.stats().queued,
+        before.queued,
+        "the default path never queues (admission is the synthesis path's alone)"
+    );
+    assert_eq!(
+        LLM_GATE.stats().timeouts_total,
+        before.timeouts_total,
+        "the default path never waits on the gate"
+    );
+}
+
+/// Spec §3.3: the hits path spans the SAME scopes as the synthesis path
+/// — the caller's bundle, global skills, and the library catalog — with
+/// the same bookshelf visibility: a private-shelf chapter is ABSENT for
+/// the non-admin caller and PRESENT for an admin (agent_integration's
+/// library_with_books arrangement, rebuilt over real bookshelf rows so
+/// `agent_scopes` derives the visible slugs).
+#[tokio::test]
+async fn memory_query_hits_span_scopes_with_visibility() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    // The llm row is present but unreachable — irrelevant to the
+    // default path, which by construction makes zero LLM calls.
+    let h = query_harness("http://127.0.0.1:1/v1", DEFAULT_CAPACITY as u32, 1).await;
+
+    // A global skill whose body matches the query term.
+    seed_global_skills(
+        h._dir.path(),
+        &[(
+            "/deploy-rust-service.md",
+            "---\ntype: Skill\ntitle: Deploy Rust Service\n---\n\nZebras of deployment: the runbook body.\n",
+        )],
+    )
+    .await;
+
+    // The library catalog: real bookshelf rows (agent_scopes derives
+    // visible_slugs from them) + chapter concepts keyed by book slug.
+    let store = Store::open(h._dir.path()).await.unwrap();
+    let public_shelf = store.create_bookshelf("Public Shelf", true).await.unwrap();
+    store
+        .create_book(
+            public_shelf,
+            "public-book",
+            "A Public Book",
+            "/library/public-book/book.md",
+        )
+        .await
+        .unwrap();
+    let secret_shelf = store.create_bookshelf("Secret Shelf", false).await.unwrap();
+    store
+        .create_book(
+            secret_shelf,
+            "secret-book",
+            "A Secret Book",
+            "/library/secret-book/book.md",
+        )
+        .await
+        .unwrap();
+    let service_key =
+        mycelium_crypto::load_or_create_service_key_with(h._dir.path(), None).unwrap();
+    let library = mycelium_store::concept_store::ConceptStore::for_service(
+        &store,
+        service_key,
+        &store.library_dir(),
+        "library",
+    );
+    // Both chapters carry the query's terms ("zebras graze"): the
+    // non-admin's ABSENCE below is then the visibility gate, not a
+    // no-match.
+    library
+        .put(
+            &mycelium_core::concept::Concept::parse(
+                "/public-book/ch-1-zebras.md",
+                "---\ntype: Chapter\nbook: public-book\nchapter_index: 1\ntitle: Zebra Chapter\n---\n\nZebras graze on the plain.\n",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    library
+        .put(
+            &mycelium_core::concept::Concept::parse(
+                "/secret-book/ch-1-zebras.md",
+                "---\ntype: Chapter\nbook: secret-book\nchapter_index: 1\ntitle: Secret Zebra Chapter\n---\n\nThe private shelf's zebras graze hidden from plain readers.\n",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Non-admin caller: all three scopes span the results, but the
+    // secret-book chapter is filtered out by shelf visibility.
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args("zebras graze"))
+        .await
+        .expect("the hits path must answer the non-admin caller");
+    let user_hits = hits_or_panic(out, "the non-admin hits path");
+    let scopes_seen: std::collections::HashSet<&str> =
+        user_hits.iter().map(|hit| hit.scope.as_str()).collect();
+    for scope in ["user", "skills", "library"] {
+        assert!(
+            scopes_seen.contains(scope),
+            "hits must span the {scope} scope: {scopes_seen:?}"
+        );
+    }
+    assert!(
+        !user_hits
+            .iter()
+            .any(|hit| hit.path.starts_with("/secret-book/")),
+        "a private-shelf chapter must be absent for a non-admin: {user_hits:?}"
+    );
+    assert!(
+        user_hits
+            .iter()
+            .any(|hit| hit.path == "/public-book/ch-1-zebras.md"),
+        "the global-read chapter must be present for a non-admin"
+    );
+
+    // Same state, admin caller: unrestricted visibility, the secret
+    // chapter surfaces.
+    let admin = mycelium_mcp::auth::McpUser {
+        role: mycelium_auth::rbac::Role::Admin,
+        ..h.user.clone()
+    };
+    let out = mycelium_mcp::tools::memory_query(&h.state, &admin, &query_args("zebras graze"))
+        .await
+        .expect("the hits path must answer the admin caller");
+    let admin_hits = hits_or_panic(out, "the admin hits path");
+    assert!(
+        admin_hits
+            .iter()
+            .any(|hit| hit.path == "/secret-book/ch-1-zebras.md"),
+        "a private-shelf chapter must be present for an admin: {admin_hits:?}"
+    );
+}
+
+/// Spec §3.2a-8: `include_inactive` widens the hits path over retired
+/// (and superseded) concepts — default searches hide them.
+#[tokio::test]
+async fn memory_query_include_inactive_surfaces_retired() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    let h = query_harness("http://127.0.0.1:1/v1", DEFAULT_CAPACITY as u32, 1).await;
+    harness_user_cs(&h)
+        .await
+        .put(
+            &mycelium_core::concept::Concept::parse(
+                "/notes/retired-zebra.md",
+                "---\ntype: Note\ntitle: Retired Zebra Doctrine\nstatus: retired\n---\n\nThe retired zebra doctrine predates the current one.\n",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // A second lifecycle mark: superseded WITH its replacement pointer —
+    // the superseded_by end-to-end pin.
+    harness_user_cs(&h)
+        .await
+        .put(
+            &mycelium_core::concept::Concept::parse(
+                "/notes/old-zebra-doctrine.md",
+                "---\ntype: Note\ntitle: Old Zebra Doctrine\nstatus: superseded\nsuperseded_by: /notes/zebras.md\n---\n\nAn even older retired zebra doctrine, superseded by the current one.\n",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Default: the inactive concepts are invisible.
+    let out =
+        mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args("retired zebra doctrine"))
+            .await
+            .expect("the default hits path must answer");
+    let hits = hits_or_panic(out, "the default hits path");
+    assert!(
+        !hits.iter().any(|hit| hit.path == "/notes/retired-zebra.md"),
+        "a retired concept must not surface by default: {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.path == "/notes/old-zebra-doctrine.md"),
+        "a superseded concept must not surface by default: {hits:?}"
+    );
+
+    // include_inactive: they surface, and the lifecycle fields ride the
+    // hits all the way to the WIRE (§3.2a-12: structuredContent).
+    let out = mycelium_mcp::tools::memory_query(
+        &h.state,
+        &h.user,
+        &mycelium_mcp::tools::MemoryQueryArgs {
+            question: "retired zebra doctrine".to_string(),
+            limit: None,
+            synthesize: None,
+            include_inactive: Some(true),
+        },
+    )
+    .await
+    .expect("the include_inactive hits path must answer");
+    let hits = hits_or_panic(out, "the include_inactive hits path");
+    let hit = hits
+        .iter()
+        .find(|hit| hit.path == "/notes/retired-zebra.md")
+        .expect("the retired concept must surface with include_inactive");
+    assert_eq!(
+        hit.status.as_deref(),
+        Some("retired"),
+        "the hit carries the concept's status"
+    );
+    let sup = hits
+        .iter()
+        .find(|hit| hit.path == "/notes/old-zebra-doctrine.md")
+        .expect("the superseded concept must surface with include_inactive");
+    assert_eq!(
+        sup.superseded_by.as_deref(),
+        Some("/notes/zebras.md"),
+        "the hit carries the concept's superseded_by pointer"
+    );
+
+    // The same values on the WIRE (§3.2a-12(b)).
+    let wire = mycelium_mcp::handler::query_hits_result(&hits)
+        .expect("the handler serializes the hits wire result");
+    let result = serde_json::to_value(&wire).unwrap();
+    let sup_wire = result["structuredContent"]["hits"]
+        .as_array()
+        .expect("structuredContent = {{\"hits\": [...]}}")
+        .iter()
+        .find(|hit| hit["path"] == "/notes/old-zebra-doctrine.md")
+        .expect("the superseded concept is a wire hit");
+    assert_eq!(
+        sup_wire["status"], "superseded",
+        "the superseded status rides the wire"
+    );
+    assert_eq!(
+        sup_wire["superseded_by"], "/notes/zebras.md",
+        "the superseded_by pointer rides the wire"
+    );
+}
+
+/// Spec §3.3: `synthesize: true` keeps the exact agent path — cache →
+/// gate → run — and on an unreachable backend the failed agent run
+/// degrades into the SAME enriched hits (one shared hits constructor;
+/// the old keyword fallback body is gone).
+#[tokio::test]
+async fn memory_query_synthesize_true_keeps_agent_path() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    let h = query_harness("http://127.0.0.1:1/v1", DEFAULT_CAPACITY as u32, 1).await;
+
+    let out = mycelium_mcp::tools::memory_query(
+        &h.state,
+        &h.user,
+        &synth_args("zebra stripes under synthesis"),
+    )
+    .await
+    .expect("a failed agent run must degrade to hits, not error");
+    let hits = hits_or_panic(out, "the failed synthesis");
+    assert!(!hits.is_empty(), "the degraded hits must rank the bundle");
+    let first = serde_json::to_value(hits.first().unwrap()).unwrap();
+    for key in HIT_KEYS {
+        assert!(first.get(key).is_some(), "hit must carry {key}: {first}");
+    }
+}
+
+/// Spec §3.2a-7 + §3.3: the caller-absent default comes from the sealed
+/// lifecycle row's `query_top_k` (admin-tunable, 1–64), the hard
+/// ceiling is 64 irrespective of the row, and a literal 0 stays zero.
+/// ~70 matching concepts prove all three cuts.
+#[tokio::test]
+async fn memory_query_top_k_default_and_ceiling() {
+    let _lock = TEST_LOCK.lock().await;
+    let _defaults = GateDefaults;
+    let _health = HealthDefaults;
+    // Restores the process-global on drop (success or failure) — a
+    // sealed row's value must not outlive this test.
+    let _topk = TopKDefaults;
+    let h = query_harness("http://127.0.0.1:1/v1", DEFAULT_CAPACITY as u32, 1).await;
+
+    // A sealed lifecycle row with query_top_k = 2 (the mutation-queue
+    // tests' sealed-row pattern), applied through the boot-time sync.
+    let lifecycle = mycelium_store::revisions::LifecycleConfig {
+        revision_retention: mycelium_store::revisions::DEFAULT_REVISION_RETENTION,
+        query_top_k: 2,
+    };
+    h.state
+        .config
+        .set(
+            "lifecycle",
+            &mycelium_store::config::seal_config(&h.state.service_key, "lifecycle", &lifecycle),
+        )
+        .await
+        .unwrap();
+    mycelium_store::revisions::sync_lifecycle_from_store(&h.state.config, &h.state.service_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        mycelium_store::revisions::query_top_k(),
+        2,
+        "the row must drive the process-global through the sync"
+    );
+
+    // ~70 matching concepts in the caller's bundle.
+    let cs = harness_user_cs(&h).await;
+    for n in 1..=70 {
+        let md =
+            format!("---\ntype: Note\ntitle: Zebra Herd {n}\n---\n\nZebras of herd {n} graze.\n");
+        cs.put(
+            &mycelium_core::concept::Concept::parse(&format!("/notes/herd-{n}.md"), &md).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Caller absent: the row's default (2) governs the cut.
+    let out = mycelium_mcp::tools::memory_query(&h.state, &h.user, &query_args("zebras graze"))
+        .await
+        .expect("the hits default must answer");
+    let hits = hits_or_panic(out, "the absent-limit query");
+    assert_eq!(
+        hits.len(),
+        2,
+        "absent limit follows the sealed query_top_k: {hits:?}"
+    );
+
+    // Explicit 64: more candidates than the cap, so the ceiling binds.
+    let out = mycelium_mcp::tools::memory_query(
+        &h.state,
+        &h.user,
+        &mycelium_mcp::tools::MemoryQueryArgs {
+            question: "zebras graze".to_string(),
+            limit: Some(64),
+            synthesize: None,
+            include_inactive: None,
+        },
+    )
+    .await
+    .expect("the capped query must answer");
+    let hits = hits_or_panic(out, "the 64-cap query");
+    assert_eq!(hits.len(), 64, "the hard ceiling is 64: {hits:?}");
+
+    // Literal zero stays zero (§3.2a-7) — the caller asked for nothing.
+    let out = mycelium_mcp::tools::memory_query(
+        &h.state,
+        &h.user,
+        &mycelium_mcp::tools::MemoryQueryArgs {
+            question: "zebras graze".to_string(),
+            limit: Some(0),
+            synthesize: None,
+            include_inactive: None,
+        },
+    )
+    .await
+    .expect("the zero query must answer");
+    let hits = hits_or_panic(out, "the zero query");
+    assert!(hits.is_empty(), "a literal zero returns no hits: {hits:?}");
+}
+
+/// Spec §3.2a-8 schema posture: the new opt-ins are described booleans
+/// defaulting to false, `limit` advertises the hits default, and none
+/// of the optional args enters `required` (only the question does).
+/// Raw `schema_for!` types an Option<bool> as `["boolean","null"]` —
+/// the pin is "a boolean arg (nullability aside)".
+#[test]
+fn include_inactive_schema_defaults_false() {
+    let schema = schemars::schema_for!(mycelium_mcp::tools::MemoryQueryArgs);
+    let json = serde_json::to_value(&schema).unwrap();
+
+    let is_boolean = |prop: &serde_json::Value| match &prop["type"] {
+        serde_json::Value::String(t) => t == "boolean",
+        serde_json::Value::Array(t) => t.iter().any(|t| t == "boolean"),
+        _ => false,
+    };
+
+    let syn = &json["properties"]["synthesize"];
+    assert!(is_boolean(syn), "synthesize must be a boolean arg: {syn}");
+    assert_eq!(
+        syn["description"],
+        "Full agent synthesis (LLM tool-call loop: search, read, synthesize). Default false: top-k ranked hits with zero LLM calls."
+    );
+
+    let inc = &json["properties"]["include_inactive"];
+    assert!(
+        is_boolean(inc),
+        "include_inactive must be a boolean arg: {inc}"
+    );
+    assert_eq!(
+        inc["description"],
+        "Include retired/superseded concepts (history queries). Default false."
+    );
+
+    let limit = &json["properties"]["limit"];
+    assert_eq!(
+        limit["description"], "Maximum hits; default = admin-tunable top_k (8), hard ceiling 64",
+        "limit description must advertise the hits default: {limit}"
+    );
+
+    let required = json["required"].as_array().unwrap();
+    assert_eq!(required.len(), 1, "only the question is required");
+    assert_eq!(required[0], "question");
+    assert!(
+        !required
+            .iter()
+            .any(|r| r == "synthesize" || r == "include_inactive" || r == "limit"),
+        "no opt-in arg is required: {required:?}"
+    );
 }

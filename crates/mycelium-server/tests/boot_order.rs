@@ -76,3 +76,31 @@ fn lifecycle_retention_is_synced_before_the_packaged_skill_seed() {
          (sync at {sync}, seed at {seed})"
     );
 }
+
+/// The length-backfill sweep (memory-lifecycle spec §3.2a-4, Task 5)
+/// sits in the same lifecycle-sweep block as the deprecated-tag sweep:
+/// after the retention sync (the uniform boot discipline — every
+/// post-sync boot step sees live config) and after the deprecated-tag
+/// sweep (main.rs orders the two lifecycle sweeps back-to-back; the
+/// backfill is index-only, so it neither writes revisions nor needs to
+/// precede anything, but it must not drift ahead of its block).
+#[test]
+fn backfill_sweep_follows_retention_sync_and_the_deprecated_tag_sweep() {
+    let src = main_rs();
+    let sync = only_at(&src, "sync_lifecycle_from_store(");
+    // The deprecated-tag sweep (the first lifecycle sweep).
+    let deprecated = only_at(&src, "migrate_deprecated_tags(&state)");
+    // The length backfill sweep (the second lifecycle sweep).
+    let backfill = only_at(&src, "backfill_index_lengths(&state)");
+
+    assert!(
+        sync < backfill,
+        "the backfill sweep must come after the lifecycle retention sync in main.rs \
+         (sync at {sync}, backfill at {backfill})"
+    );
+    assert!(
+        deprecated < backfill,
+        "the backfill sweep must come after the deprecated-tag sweep in main.rs \
+         (deprecated at {deprecated}, backfill at {backfill})"
+    );
+}

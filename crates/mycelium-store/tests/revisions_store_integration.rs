@@ -11,8 +11,9 @@ use mycelium_crypto::keys::{ServiceKey, generate_master_key};
 use mycelium_crypto::store_keys::IndexKeys;
 use mycelium_crypto::{aead_open, aead_seal};
 use mycelium_store::revisions::{
-    DEFAULT_REVISION_RETENTION, LifecycleConfig, RevisionStore, RevisionsError, op_summary,
-    revision_retention, set_revision_retention, sync_lifecycle_from_store,
+    DEFAULT_QUERY_TOP_K, DEFAULT_REVISION_RETENTION, LifecycleConfig, RevisionStore,
+    RevisionsError, op_summary, query_top_k, revision_retention, set_query_top_k,
+    set_revision_retention, sync_lifecycle_from_store,
 };
 use mycelium_store::{ConceptStore, ConfigStore, Store, config};
 use uuid::Uuid;
@@ -26,6 +27,19 @@ static RETENTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 
 async fn retention_lock() -> tokio::sync::MutexGuard<'static, ()> {
     RETENTION_LOCK.lock().await
+}
+
+/// Restores the process-global `query_top_k` on drop, so a failing
+/// assertion cannot leak a set value into the next test (the store-side
+/// counterpart of the MCP suite's guard; the retention tests keep their
+/// literal end-of-test resets — pre-existing idiom, out of this branch's
+/// churn).
+struct TopKDefaults;
+
+impl Drop for TopKDefaults {
+    fn drop(&mut self) {
+        set_query_top_k(DEFAULT_QUERY_TOP_K);
+    }
 }
 
 async fn store() -> (tempfile::TempDir, Store) {
@@ -427,6 +441,7 @@ async fn sync_lifecycle_row_reads_clamped_value() {
         "lifecycle",
         &LifecycleConfig {
             revision_retention: 9,
+            ..Default::default()
         },
     );
     config.set("lifecycle", &sealed).await.unwrap();
@@ -436,6 +451,119 @@ async fn sync_lifecycle_row_reads_clamped_value() {
     assert_eq!(revision_retention(), 25, "stored value clamps on load");
 
     set_revision_retention(DEFAULT_REVISION_RETENTION);
+}
+
+#[tokio::test]
+async fn query_top_k_clamps_everywhere() {
+    let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
+    // Below the floor → the floor: zero stays meaningful only as an
+    // explicit CALLER request (spec §3.2a-7), never as a stored/static
+    // value.
+    set_query_top_k(0);
+    assert_eq!(query_top_k(), 1);
+    // Above the ceiling → the ceiling.
+    set_query_top_k(100);
+    assert_eq!(query_top_k(), 64);
+    // In-range passes through untouched.
+    set_query_top_k(2);
+    assert_eq!(query_top_k(), 2);
+    // The "never set" default is the constant this process-global is
+    // initialized from (the retention pin's shape, mirrored); the
+    // TopKDefaults guard restores the default on exit).
+    assert_eq!(DEFAULT_QUERY_TOP_K, 8);
+}
+
+#[tokio::test]
+async fn sync_lifecycle_row_reads_clamped_query_top_k() {
+    let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
+    // Deliberately NOT the default: an absent row must RESET the global
+    // to the default, not leave whatever was live before the sync (the
+    // retention sync test's reasoning, mirrored).
+    set_query_top_k(16);
+    let (_dir, store) = store().await;
+    let config = ConfigStore::new(store.pool().clone());
+    let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
+
+    // Absent row → the defaults (spec §3.3: "default 8 when the row is
+    // absent"; the llm-row pattern — missing/blank keeps defaults).
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        query_top_k(),
+        8,
+        "absent lifecycle row resets the top-k global to the default"
+    );
+
+    // Persisted values clamp ON LOAD: 0 → the floor (an unbounded query
+    // can never leave the static), 200 → the ceiling (clamp on load
+    // mirrors the clamp on save, as with retention).
+    let sealed = config::seal_config(
+        &service_key,
+        "lifecycle",
+        &serde_json::json!({
+            "revision_retention": DEFAULT_REVISION_RETENTION,
+            "query_top_k": 0
+        }),
+    );
+    config.set("lifecycle", &sealed).await.unwrap();
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(query_top_k(), 1, "stored zero clamps to the floor on load");
+
+    let sealed = config::seal_config(
+        &service_key,
+        "lifecycle",
+        &serde_json::json!({
+            "revision_retention": DEFAULT_REVISION_RETENTION,
+            "query_top_k": 200
+        }),
+    );
+    config.set("lifecycle", &sealed).await.unwrap();
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        query_top_k(),
+        64,
+        "stored 200 clamps to the ceiling on load"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_old_row_defaults_query_top_k() {
+    let _retention = retention_lock().await;
+    let _topk = TopKDefaults;
+    // Deliberately NOT the default: a sync over the old row would
+    // otherwise look like a no-op.
+    set_query_top_k(2);
+    let (_dir, store) = store().await;
+    let config = ConfigStore::new(store.pool().clone());
+    let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
+
+    // An older build's row — its JSON predates the field. serde's
+    // `#[serde(default = ...)]` keeps it valid: the field reads as the
+    // default 8, both through a direct parse and through the sync.
+    let sealed = config::seal_config(
+        &service_key,
+        "lifecycle",
+        &serde_json::json!({ "revision_retention": 200 }),
+    );
+    config.set("lifecycle", &sealed).await.unwrap();
+    let parsed = config::get_sealed::<LifecycleConfig>(&config, &service_key, "lifecycle")
+        .await
+        .unwrap();
+    assert_eq!(
+        parsed.query_top_k, 8,
+        "an old row (no query_top_k in its JSON) keeps the serde default"
+    );
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(query_top_k(), 8, "the sync applies the defaulted field");
 }
 
 #[test]

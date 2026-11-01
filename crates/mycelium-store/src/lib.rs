@@ -33,9 +33,10 @@ pub use mutation_queue::{
     read_payload, write_payload,
 };
 pub use revisions::{
-    DEFAULT_REVISION_RETENTION, LIFECYCLE_CONFIG_KEY, LifecycleConfig, REVISION_OPS,
-    REVISION_RETENTION_RANGE, RevisionEntry, RevisionPathEntry, RevisionStore, RevisionsError,
-    op_summary, revision_retention, set_revision_retention, sync_lifecycle_from_store,
+    DEFAULT_QUERY_TOP_K, DEFAULT_REVISION_RETENTION, LIFECYCLE_CONFIG_KEY, LifecycleConfig,
+    QUERY_TOP_K_RANGE, REVISION_OPS, REVISION_RETENTION_RANGE, RevisionEntry, RevisionPathEntry,
+    RevisionStore, RevisionsError, op_summary, query_top_k, revision_retention, set_query_top_k,
+    set_revision_retention, sync_lifecycle_from_store,
 };
 pub use search_index::{EncryptedIndex, IndexError};
 pub use skill_bundle::{SkillBundleError, SkillBundleFile, bundle_skill_files};

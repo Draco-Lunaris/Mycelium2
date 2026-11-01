@@ -1,6 +1,6 @@
 //! Search index abstractions and an in-memory reference implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::concept::Concept;
 
@@ -111,14 +111,93 @@ pub fn searchable_text(concept: &Concept) -> String {
     text
 }
 
-/// In-memory reference index: tokenizes title + description + tags + body,
-/// scores by term frequency. Serves as the test oracle for the Phase 3
-/// encrypted SQLite index.
+/// Shared BM25 parameters and scorer.
+///
+/// Both indexes (the in-memory oracle below and the encrypted SQLite index
+/// in `mycelium-store`) score through [`bm25_score`] with the same inputs
+/// so their result ordering agrees (oracle equivalence).
+pub mod bm25 {
+    /// Scoring parameters. `k1` controls term-frequency saturation, `b`
+    /// controls how strongly document length is normalized.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Params {
+        pub k1: f32,
+        pub b: f32,
+    }
+
+    impl Default for Params {
+        fn default() -> Self {
+            Self { k1: 1.2, b: 0.75 }
+        }
+    }
+}
+
+/// BM25 contribution of one (term, document) pair.
+///
+/// Argument order is fixed — `n_docs`, `df`, `tf`, `doc_len`, `avgdl` — so
+/// callers cannot transpose the count-like arguments. Semantics:
+///
+/// - idf uses the non-negative Lucene form
+///   `ln(1 + (n_docs − df + 0.5) / (df + 0.5))` (§3.2a-1). Plain Robertson
+///   idf turns negative once `df > n_docs / 2` and, because query scores
+///   are a sum over terms, a corpus-common term would then *subtract* from
+///   every multi-term hit.
+/// - `df == 0` contributes `0.0` (callers normally skip such terms).
+/// - `avgdl == 0.0` leaves only the tf-saturation term: the length ratio is
+///   treated as `1.0` rather than dividing by zero (§3.2a-5).
+///
+/// Callers must dedup query terms before summing over them (§3.2a-2), or a
+/// repeated term would double its weight. `df` must not exceed `n_docs` (a
+/// posting list is a subset of the corpus); both indexes get that from
+/// counting the same doc set they score against.
+pub fn bm25_score(
+    params: &bm25::Params,
+    n_docs: usize,
+    df: usize,
+    tf: u32,
+    doc_len: u32,
+    avgdl: f32,
+) -> f32 {
+    if df == 0 {
+        return 0.0;
+    }
+    let n_docs = n_docs as f32;
+    let df = df as f32;
+    let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+    let length_ratio = if avgdl == 0.0 {
+        1.0
+    } else {
+        doc_len as f32 / avgdl
+    };
+    let tf = tf as f32;
+    let tf_term =
+        tf * (params.k1 + 1.0) / (tf + params.k1 * (1.0 - params.b + params.b * length_ratio));
+    idf * tf_term
+}
+
+/// One indexed document: the fields a search result needs plus the token
+/// count BM25 normalizes against.
+#[derive(Debug)]
+struct DocMeta {
+    title: String,
+    body: String,
+    status: Option<String>,
+    /// Token count of the document's [`searchable_text`] (repeats
+    /// included, i.e. equal to the sum of tf over its distinct tokens).
+    /// Tracked at `add` so scoring never re-tokenizes.
+    length: u32,
+}
+
+/// In-memory reference index: tokenizes title + description + tags + body
+/// and scores with [`bm25_score`]. Serves as the test oracle for the Phase
+/// 3 encrypted SQLite index, so it must agree with it on the three things
+/// that decide ordering: deduped query terms, the BM25 formula, and the
+/// pre-scoring lifecycle skip.
 #[derive(Debug, Default)]
 pub struct InMemoryIndex {
     /// term -> (concept_path -> tf)
     postings: HashMap<String, HashMap<String, u32>>,
-    docs: HashMap<String, (String, String, Option<String>)>, // path -> (title, body, status)
+    docs: HashMap<String, DocMeta>, // path -> metadata
 }
 
 impl InMemoryIndex {
@@ -137,49 +216,85 @@ impl SearchIndex for InMemoryIndex {
             .clone()
             .unwrap_or_else(|| concept.source_path.clone());
         let text = searchable_text(concept);
+        let tokens = tokenize(&text);
 
-        for token in tokenize(&text) {
-            self.postings
-                .entry(token)
+        // A re-add REPLACES the path's postings (§3.2a-9): strip it from
+        // every posting list first, then drop lists left empty. Accumulating
+        // instead would keep superseded content searchable, resurrect terms
+        // the new version dropped, and inflate df — which BM25 makes
+        // load-bearing. The store index behaves the same way (its `add` is
+        // DELETE-then-INSERT).
+        for posting in self.postings.values_mut() {
+            posting.remove(&concept.source_path);
+        }
+        self.postings.retain(|_, posting| !posting.is_empty());
+
+        for token in tokens.iter() {
+            *self
+                .postings
+                .entry(token.clone())
                 .or_default()
                 .entry(concept.source_path.clone())
-                .and_modify(|tf| *tf += 1)
-                .or_insert(1);
+                .or_insert(0) += 1;
         }
         self.docs.insert(
             concept.source_path.clone(),
-            (
+            DocMeta {
                 title,
-                concept.body.clone(),
-                concept.frontmatter.status.clone(),
-            ),
+                body: concept.body.clone(),
+                status: concept.frontmatter.status.clone(),
+                length: tokens.len() as u32,
+            },
         );
         Ok(())
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, Self::Error> {
+        // Corpus statistics cover every doc regardless of lifecycle status:
+        // the filter is a per-result skip, not an index cut.
+        let n_docs = self.docs.len();
+        let avgdl = if n_docs == 0 {
+            0.0
+        } else {
+            let total_len: u64 = self.docs.values().map(|doc| doc.length as u64).sum();
+            total_len as f32 / n_docs as f32
+        };
+        let params = bm25::Params::default();
+
         let mut scores: HashMap<&str, f32> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for term in &query.terms {
+            // Query terms are deduped before scoring (§3.2a-2): under BM25
+            // a repeated term must not double its weight, and the store
+            // index dedups the same way. Dedup on the lowercased token —
+            // the same form the posting lookup uses.
             let token = term.to_lowercase();
+            if !seen.insert(token.clone()) {
+                continue;
+            }
             if let Some(docs) = self.postings.get(&token) {
+                let df = docs.len();
                 for (path, tf) in docs {
                     // Lifecycle filter is a skip BEFORE scoring: scoring,
                     // ordering and snippets are untouched by it.
                     if query.status_filter == StatusFilter::ActiveOnly {
-                        let (_, _, status) = &self.docs[path];
+                        let status = &self.docs[path].status;
                         if !is_active_status(status.as_deref()) {
                             continue;
                         }
                     }
-                    *scores.entry(path.as_str()).or_insert(0.0) += *tf as f32;
+                    let doc_len = self.docs[path].length;
+                    *scores.entry(path.as_str()).or_insert(0.0) +=
+                        bm25_score(&params, n_docs, df, *tf, doc_len, avgdl);
                 }
             }
         }
         let mut results: Vec<SearchResult> = scores
             .into_iter()
             .map(|(path, score)| {
-                let (title, body, _) = &self.docs[path];
-                let snippet = body
+                let doc = &self.docs[path];
+                let snippet = doc
+                    .body
                     .chars()
                     .take(200)
                     .collect::<String>()
@@ -187,7 +302,7 @@ impl SearchIndex for InMemoryIndex {
                     .to_string();
                 SearchResult {
                     concept_path: path.to_string(),
-                    title: title.clone(),
+                    title: doc.title.clone(),
                     snippet,
                     score,
                 }
@@ -365,5 +480,157 @@ mod tests {
         assert!(is_active_status(Some("archive"))); // unknown ⇒ active
         assert!(!is_active_status(Some("superseded")));
         assert!(!is_active_status(Some("retired")));
+    }
+
+    #[test]
+    fn bm25_score_exact_value_pins() {
+        let p = bm25::Params::default();
+        assert!((p.k1 - 1.2).abs() < 1e-9 && (p.b - 0.75).abs() < 1e-9);
+
+        // (a) n 4, df 2, tf 3, doc_len 4, avgdl 4.0 — right side computed
+        // as an independent expression: idf ln(1 + 2.5/2.5) = ln(2) times
+        // the tf term 3·2.2 / (3 + 1.2·(1 − 0.75 + 0.75·4/4)) = 6.6 / 4.2.
+        let got = bm25_score(&p, 4, 2, 3, 4, 4.0);
+        let want = ((4.0f32 - 2.0 + 0.5) / (2.0 + 0.5)).ln_1p() * 6.6 / 4.2;
+        assert!((got - want).abs() < 1e-4, "(a) {got} vs {want}");
+
+        // (b) df 0 contributes nothing.
+        assert_eq!(bm25_score(&p, 4, 0, 3, 4, 4.0), 0.0);
+
+        // (c) avgdl 0.0 ⇒ the length ratio is treated as 1.0 (pure
+        // tf-saturation, no NaN): score = idf · tf·(k1+1)/(tf+k1).
+        // At the pinned n 1, df 1 the Lucene-form idf is ln(1 + 0.5/1.5).
+        let got = bm25_score(&p, 1, 1, 1, 5, 0.0);
+        let want = ((1.0f32 - 1.0 + 0.5) / (1.0 + 0.5)).ln_1p() * (2.2 / (1.0 + 1.2));
+        assert!((got - want).abs() < 1e-4, "(c) {got} vs {want}");
+        // doc_len never leaks through when avgdl is 0: at df 1 of n 2 the
+        // idf is ln(2), so the whole score is the pinned pure-tf form
+        // ln(2.0) · (2.2 / (1.0 + 1.2)) — identical for any doc_len.
+        let got = bm25_score(&p, 2, 1, 1, 5, 0.0);
+        let want = 2.0f32.ln() * (2.2 / (1.0 + 1.2));
+        assert!((got - want).abs() < 1e-4, "(c') {got} vs {want}");
+        let got4 = bm25_score(&p, 2, 1, 1, 4, 0.0);
+        assert!((got - got4).abs() < 1e-9, "doc_len leaked: {got} vs {got4}");
+    }
+
+    /// Long/short corpus for the length-normalization tests: `/a.md` =
+    /// title "Alpha Note" (tokens `alpha`, `note`) plus body `rust rust
+    /// rust` and the 197 filler tokens `n001..n197` = 202 tokens; `/b.md`
+    /// = title "Beta Note" plus body `rust` = 3 tokens. Both match `rust`;
+    /// corpus avgdl is (202 + 3) / 2 = 102.5.
+    fn long_short_index() -> InMemoryIndex {
+        let fillers: String = (1..=197).map(|i| format!(" n{i:03}")).collect();
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept(
+            "/a.md",
+            "Alpha Note",
+            &format!("rust rust rust{fillers}"),
+        ))
+        .unwrap();
+        idx.add(&concept("/b.md", "Beta Note", "rust")).unwrap();
+        idx
+    }
+
+    #[test]
+    fn bm25_length_normalization_long_doc_loses() {
+        // Acceptance #3's in-memory analog: on equal term matches, the
+        // short focused concept must outrank the long enriched one.
+        let idx = long_short_index();
+        let hits = idx.search(&SearchQuery::new(vec!["rust".into()])).unwrap();
+        assert_eq!(paths(&hits), ["/b.md", "/a.md"]);
+
+        // Scores computed independently from the BM25 formula: corpus
+        // lengths 202 and 3 → avgdl 102.5; df 2 of n 2 →
+        // idf = ln(1 + 0.5/2.5) = ln(1.2); k1 1.2, b 0.75.
+        let idf = 1.2f32.ln();
+        let want_a = idf * 6.6 / (3.0 + 1.2 * (1.0 - 0.75 + 0.75 * 202.0 / 102.5));
+        let want_b = idf * 2.2 / (1.0 + 1.2 * (1.0 - 0.75 + 0.75 * 3.0 / 102.5));
+        assert!(
+            (hits[0].score - want_b).abs() < 1e-6,
+            "short doc: {} vs {want_b}",
+            hits[0].score
+        );
+        assert!(
+            (hits[1].score - want_a).abs() < 1e-6,
+            "long doc: {} vs {want_a}",
+            hits[1].score
+        );
+        // Pinned magnitudes: the index's exact f32 scores for this corpus
+        // (the plan's literals 0.23712/0.30243 were approximations, ~5e-5
+        // off the exact 202/102.5-corpus values).
+        assert!(
+            (hits[1].score - 0.23717058).abs() < 1e-6,
+            "long doc: {}",
+            hits[1].score
+        );
+        assert!(
+            (hits[0].score - 0.30241647).abs() < 1e-6,
+            "short doc: {}",
+            hits[0].score
+        );
+    }
+
+    #[test]
+    fn duplicate_query_terms_do_not_double_count() {
+        let idx = long_short_index();
+        let once = idx.search(&SearchQuery::new(vec!["rust".into()])).unwrap();
+        let twice = idx
+            .search(&SearchQuery::new(vec!["rust".into(), "rust".into()]))
+            .unwrap();
+        assert_eq!(paths(&twice), paths(&once));
+        for (dup, single) in twice.iter().zip(&once) {
+            assert!(
+                (dup.score - single.score).abs() < 1e-6,
+                "{}: {} vs {}",
+                dup.concept_path,
+                dup.score,
+                single.score
+            );
+        }
+    }
+
+    #[test]
+    fn readd_replaces_postings_in_memory_oracle() {
+        let mut idx = InMemoryIndex::new();
+        idx.add(&concept("/v.md", "V1", "alpha zebra")).unwrap();
+        idx.add(&concept("/v.md", "V2", "gamma delta")).unwrap();
+
+        // v1's postings are stripped, not accumulated: no resurrection of
+        // dropped terms.
+        assert!(
+            idx.search(&SearchQuery::new(vec!["alpha".into()]))
+                .unwrap()
+                .is_empty(),
+            "superseded content must not stay searchable"
+        );
+        assert!(
+            idx.search(&SearchQuery::new(vec!["zebra".into()]))
+                .unwrap()
+                .is_empty(),
+            "superseded content must not stay searchable"
+        );
+        assert_eq!(
+            paths(&idx.search(&SearchQuery::new(vec!["gamma".into()])).unwrap()),
+            ["/v.md"]
+        );
+
+        // df stays sane: "zebra" matches only /c3.md (df 1). With the old
+        // accumulating add the stale /v.md posting still matched "zebra",
+        // so the resurrected doc would fail the paths assertion below
+        // before any score is compared.
+        idx.add(&concept("/c3.md", "C3", "zebra shared")).unwrap();
+        let hits = idx.search(&SearchQuery::new(vec!["zebra".into()])).unwrap();
+        assert_eq!(paths(&hits), ["/c3.md"]);
+        // Both docs tokenize to 3 tokens → avgdl 3, ratio 1; df 1 of n 2
+        // → idf ln(1 + 1.5/1.5) = ln(2); tf term 1·2.2/(1 + 1.2). Had the
+        // stale posting been scored instead: the docs map is path-keyed, so
+        // n stays 2 while df would rise to 2, idf ln(1 + 0.5/2.5) = ln(1.2)
+        // ≈ 0.18 — visibly below ln(2) ≈ 0.69.
+        let want = 2.0f32.ln() * (2.2 / (1.0 + 1.2));
+        assert!(
+            (hits[0].score - want).abs() < 1e-4,
+            "{} vs {want}",
+            hits[0].score
+        );
     }
 }
