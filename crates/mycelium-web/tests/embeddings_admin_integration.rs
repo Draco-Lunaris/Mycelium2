@@ -8,15 +8,25 @@
 //! in this binary serializes on [`TEST_LOCK`] and restores the machine
 //! through [`EmbDefaults`] (the chat-LLM file's pattern — integration
 //! binaries cannot link the crate's `#[cfg(test)]` guard).
+//!
+//! The memory-lifecycle tests at the bottom add the probe task
+//! ([`mycelium_web::server::spawn_embedding_probe`]) and the /health +
+//! /metrics embedding fields; the same [`TEST_LOCK`] discipline covers
+//! them, and every spawned tick-loop task is cancelled and JOINED
+//! before the lock is released.
 
 use std::net::SocketAddr;
+use std::ops::AsyncFnMut;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::response::IntoResponse;
 
 use mycelium_auth::login::LoginService;
-use mycelium_librarian::llm_health::{EMB_LAST_SUCCESS, EMBEDDING_DIMS, EMBEDDING_HEALTH};
+use mycelium_librarian::llm_health::{
+    BackendState, EMB_LAST_SUCCESS, EMBEDDING_DIMS, EMBEDDING_HEALTH,
+};
 use mycelium_store::Store;
 use mycelium_web::AppState;
 
@@ -758,4 +768,285 @@ async fn embeddings_admin_surfaces_require_admin() {
         .await
         .unwrap();
     assert_eq!(post.status(), 403, "a non-admin probe must be refused");
+}
+
+// ---- probe task + observability (memory-lifecycle spec §3.3) ----
+//
+// `spawn_embedding_probe` mirrors `spawn_backend_probe` above: the
+// machine is process-global and the task feeds it from a spawned tick
+// loop, so each test here holds TEST_LOCK for its whole body and joins
+// its task before releasing the lock (token cancel + await unwrap);
+// EmbDefaults re-zeroes the machine on drop (the ok probes stamp
+// EMB_LAST_SUCCESS + EMBEDDING_DIMS, which reset_for_test does not).
+
+/// A live-swappable probe mock: POST /v1/embeddings answers with the
+/// CURRENT atomic status and a per-request rebuilt body of `dims`
+/// coordinates, so a successful RE-stamp is observable as a dims change
+/// (a restamp-always pin cannot ride a fixed body, where a stamp-once
+/// implementation would look identical).
+async fn embeddings_mock_live(status: Arc<AtomicU16>, dims: Arc<AtomicU16>) -> String {
+    let app = axum::Router::new().route(
+        "/v1/embeddings",
+        axum::routing::post(move || {
+            let status = Arc::clone(&status);
+            let dims = Arc::clone(&dims);
+            async move {
+                let n = dims.load(Ordering::SeqCst) as usize;
+                let vec = vec![1.5f64; n]
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let body = format!(r#"{{"data":[{{"index":0,"embedding":[{vec}]}}]}}"#);
+                (
+                    axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap(),
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    // The embeddings row's shape: server root WITHOUT /v1 — the client
+    // POSTs {base_url}/v1/embeddings.
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+/// A bare `AppState` over a fresh store (no HTTP listener): the probe
+/// task needs the config store + service key, nothing else.
+async fn state_only() -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let service_key = mycelium_crypto::load_or_create_service_key_with(dir.path(), None).unwrap();
+    let users = mycelium_auth::UserStore::new(store.pool().clone());
+    users
+        .create_local(
+            "admin",
+            "admin@localhost.local",
+            ADMIN_PASSWORD,
+            mycelium_auth::Role::Admin,
+        )
+        .await
+        .unwrap();
+    let login = LoginService::new(store.pool().clone());
+    let state = AppState::new(
+        store,
+        service_key,
+        login,
+        dir.path().join("assets"),
+        dir.path().to_path_buf(),
+        None,
+    );
+    (state, dir)
+}
+
+/// Sealed-`embeddings`-row writer (the admin page's own storage shape).
+async fn write_embeddings_row(state: &AppState, base_url: String) {
+    let sealed = mycelium_web::state::seal_config(
+        &state.service_key,
+        "embeddings",
+        &mycelium_librarian::embeddings::EmbeddingsConfig {
+            base_url,
+            model: "mymodel".into(),
+            ..Default::default()
+        },
+    );
+    state.config.set("embeddings", &sealed).await.unwrap();
+}
+
+/// Poll until `cond` holds, with a deadline (never a bare sleep); the
+/// failure reports the machine snapshot.
+async fn poll_until(what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(cond().await) {
+        assert!(
+            Instant::now() < deadline,
+            "never reached: {what} (snapshot {:?})",
+            EMBEDDING_HEALTH.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll until the machine itself reaches `want`.
+async fn poll_state_until(want: BackendState, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while EMBEDDING_HEALTH.state() != want {
+        assert!(
+            Instant::now() < deadline,
+            "never saw {what}: {:?}",
+            EMBEDDING_HEALTH.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn fetch_health(cl: &reqwest::Client, base: &str) -> serde_json::Value {
+    cl.get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()
+}
+
+/// The probe task mirrors the LLM probe loop: row absent → Disabled;
+/// row present + reachable → Green (dims stamped); 503 → Red at the
+/// 3-failure threshold; recovery → Green with the dims RE-stamped
+/// (restamp-always on every ok probe); row deleted → Disabled.
+#[tokio::test]
+async fn embedding_probe_task_reaches_green_then_red_then_disabled() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    reset_emb_sentinels();
+    // Pin Disabled first (the production boot seed): the reset state is
+    // trivially Green, so without the pin the first Green assertion
+    // could not tell a fed machine from an un-started task. Reaching
+    // Green from here requires note_configured AND note_ok — exactly
+    // what the first tick does against a reachable row.
+    EMBEDDING_HEALTH.reset_for_test();
+    EMBEDDING_HEALTH.set_disabled();
+
+    let status = Arc::new(AtomicU16::new(200));
+    let dims = Arc::new(AtomicU16::new(3));
+    let url = embeddings_mock_live(Arc::clone(&status), Arc::clone(&dims)).await;
+    let (state, _dir) = state_only().await;
+    write_embeddings_row(&state, url).await;
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probe = mycelium_web::server::spawn_embedding_probe(
+        state.clone(),
+        shutdown.clone(),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    // Reachable → Green AND the dims stamped: the FIRST Green alone is
+    // the note_configured lift (a present row lifts the Disabled pin to
+    // a fresh Green BEFORE the probe's outcome applies), so the DIMS
+    // condition must ride in the poll — the ok probe stamps the body's
+    // 3 coordinates with note_ok. (The probe does NOT stamp
+    // EMB_LAST_SUCCESS — that sentinel is the model-call hook's "last
+    // successful completion"; the raw probe feeds only machine + dims.)
+    poll_until("Green with the ok probe's dims stamped", || async {
+        EMBEDDING_HEALTH.state() == BackendState::Green
+            && EMBEDDING_DIMS.load(Ordering::Relaxed) == 3
+    })
+    .await;
+
+    // Backend 503 → Yellow after 1 failure, Red at the 3-probe
+    // threshold. A 503 answers instantly, so the 10 s bound is generous
+    // headroom over 3×100 ms ticks.
+    status.store(503, Ordering::SeqCst);
+    poll_state_until(BackendState::Red, "Red after 3 failed probes").await;
+
+    // Backend recovers → Green AND a re-stamp: the mock now answers 5
+    // dims, so a stamp-once implementation would still read 3 here.
+    status.store(200, Ordering::SeqCst);
+    dims.store(5, Ordering::SeqCst);
+    poll_state_until(BackendState::Green, "Green after the backend recovers").await;
+    poll_until("the ok dims were re-stamped", || async {
+        EMBEDDING_DIMS.load(Ordering::Relaxed) == 5
+    })
+    .await;
+
+    // Row deleted → Disabled within two ticks.
+    state.config.delete("embeddings").await.unwrap();
+    poll_state_until(BackendState::Disabled, "Disabled after the row is deleted").await;
+
+    // Join before releasing the lock (select! may pick a due tick over
+    // the cancellation, so a late note_* could otherwise land after the
+    // test releases TEST_LOCK and perturb a sibling's window); the
+    // unwrap keeps a panicking probe a visible failure.
+    shutdown.cancel();
+    probe.await.unwrap();
+}
+
+/// /health carries the embedding fields (state word + optional outage
+/// windows, deliberately outside the degraded rule) and /metrics
+/// carries the embedding gauge and the vector counters — read through
+/// the live server's real surfaces. The machine is pinned Disabled (the
+/// boot seed's posture for an absent row), then driven Red through the
+/// admin test-connection probes — the real passive-hook surface, never
+/// a direct note call.
+#[tokio::test]
+async fn health_and_metrics_carry_the_embedding_fields() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    reset_emb_sentinels();
+    EMBEDDING_HEALTH.reset_for_test();
+    EMBEDDING_HEALTH.set_disabled();
+
+    let (emb_url, _captured) = embeddings_mock(503, "still down").await;
+    let (base, shutdown, _dir, state) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    // No row anywhere (the seed saw an absent embeddings row): Disabled
+    // posture, no outage windows, and the degraded rule stays "ok" —
+    // the embedding fields are observability, not part of the gate.
+    let json = fetch_health(&cl, &base).await;
+    assert_eq!(
+        json["status"], "ok",
+        "the degraded rule stays intact: {json}"
+    );
+    assert_eq!(json["embedding_state"], "disabled", "{json}");
+    assert!(json["embedding_down_seconds"].is_null(), "{json}");
+    assert!(json["embedding_checked_seconds_ago"].is_null(), "{json}");
+
+    // A configured row lifts the posture: the machine stays Disabled
+    // for the passive failure hooks (they ignore notes while pinned),
+    // so the row is written and the REAL boot seed runs — present row →
+    // configured postured machine.
+    write_embeddings_row(&state, emb_url.clone()).await;
+    mycelium_web::server::sync_embedding_from_store(&state).await;
+
+    // Three failed probes through the real admin surface → Red.
+    for _ in 0..3 {
+        let resp = admin_test_embeddings(&cl, &base, &cookie, &csrf, &emb_url, None).await;
+        let loc = location_of(resp).await;
+        assert!(loc.contains("error="), "each failing probe flashes: {loc}");
+    }
+    poll_state_until(BackendState::Red, "Red through the passive hooks").await;
+
+    let json = fetch_health(&cl, &base).await;
+    assert_eq!(
+        json["status"], "ok",
+        "a red backend is weather, not this service's illness: {json}"
+    );
+    assert_eq!(json["embedding_state"], "red", "{json}");
+    let down = json["embedding_down_seconds"]
+        .as_i64()
+        .expect("outage window");
+    assert!(
+        (0..=10).contains(&down),
+        "the outage window is live: {down}"
+    );
+    let checked = json["embedding_checked_seconds_ago"]
+        .as_i64()
+        .expect("checked");
+    assert!((0..=10).contains(&checked), "just checked: {checked}");
+
+    let metrics = cl.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(metrics.status(), 200);
+    let text = metrics.text().await.unwrap();
+    for line in [
+        "# TYPE mycelium2_embedding_up gauge",
+        "# TYPE mycelium2_vector_queue_depth gauge",
+        "# TYPE mycelium2_vector_processed_total counter",
+    ] {
+        assert!(text.contains(line), "{line} present: {text}");
+    }
+    assert!(
+        text.contains("mycelium2_embedding_up 1"),
+        "red maps to 1: {text}"
+    );
+
+    shutdown.cancel();
 }

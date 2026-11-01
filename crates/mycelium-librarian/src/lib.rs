@@ -13,6 +13,7 @@ pub mod llm_health;
 pub mod query_cache;
 pub mod queue_worker;
 pub mod trace;
+pub mod vector_worker;
 pub mod worker;
 
 pub use embeddings::{EmbeddingError, EmbeddingsClient, EmbeddingsConfig};

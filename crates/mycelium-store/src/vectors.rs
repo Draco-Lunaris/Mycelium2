@@ -257,6 +257,20 @@ impl<'a> VectorStore<'a> {
         Ok(())
     }
 
+    /// Remove the row BY TOKEN (the belt for a drained queue item whose
+    /// concept no longer exists: the item carries only the one-way
+    /// token, which no longer resolves through any path). A miss is
+    /// still success — the belt's outcome does not depend on whether a
+    /// row was there.
+    pub async fn remove_row_by_token(&self, token: &str) -> Result<(), VectorError> {
+        sqlx::query("DELETE FROM search_vectors WHERE scope_id = ? AND path_token = ?")
+            .bind(&self.scope_id)
+            .bind(token)
+            .execute(self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Mark every row of the scope stale (corpus-wide invalidation
     /// marker; rows return to fresh only via re-upsert).
     pub async fn mark_scope_stale(&self) -> Result<u64, VectorError> {
@@ -264,6 +278,26 @@ impl<'a> VectorStore<'a> {
             .bind(&self.scope_id)
             .execute(self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Mark EVERY mismatching row across ALL scopes stale (the worker
+    /// tick's prologue — the config's model vs the learned dims): one
+    /// statement, no per-scope loops. A learned mismatch is the ONLY
+    /// thing this statement keys on, so an already-matching row is
+    /// untouched regardless of scope. Caller guarantees `learned_dims
+    /// != 0`.
+    pub async fn mark_corpus_stale(
+        pool: &sqlx::SqlitePool,
+        model: &str,
+        learned_dims: u32,
+    ) -> Result<u64, VectorError> {
+        let result =
+            sqlx::query("UPDATE search_vectors SET stale = 1 WHERE model <> ? OR dims <> ?")
+                .bind(model)
+                .bind(learned_dims)
+                .execute(pool)
+                .await?;
         Ok(result.rows_affected())
     }
 

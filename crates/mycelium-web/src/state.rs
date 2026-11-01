@@ -163,6 +163,11 @@ pub struct AppState {
     pub librarian: Arc<mycelium_librarian::LibrarianWorker>,
     /// The mutation-queue drain worker (Phase 11).
     pub queue_worker: Arc<mycelium_librarian::queue_worker::QueueWorker>,
+    /// The vector maintenance worker (memory-lifecycle §3.3): drains
+    /// the bounded write-hook queue into `search_vectors` and handles
+    /// the stale-corpus rebuilds. Spawned at boot AFTER the embeddings
+    /// posture sync.
+    pub vector_worker: Arc<mycelium_librarian::vector_worker::VectorWorker>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
     /// The server's data directory — the root that holds `config/tls/`
@@ -229,9 +234,17 @@ impl AppState {
         let queue_worker = Arc::new(mycelium_librarian::queue_worker::QueueWorker::new(
             Arc::clone(&store),
             Arc::clone(&config),
-            recovery,
+            Arc::clone(&recovery),
             Arc::clone(&service_key),
             mycelium_librarian::queue_worker::QueueLimits::default(),
+        ));
+        // The vector worker shares the drain worker's recovery seam
+        // (one cache, one service key — no divergent unwrapping).
+        let vector_worker = Arc::new(mycelium_librarian::vector_worker::VectorWorker::new(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            Arc::clone(&service_key),
+            recovery,
         ));
         // TOTP secrets encrypt at rest under the service key: attach it to
         // the login service before it is shared out.
@@ -263,6 +276,7 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             librarian,
             queue_worker,
+            vector_worker,
             assets_dir,
             data_dir,
             webauthn,

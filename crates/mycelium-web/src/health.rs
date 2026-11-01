@@ -57,6 +57,11 @@ pub(crate) fn oldest_degraded_at_secs() -> i64 {
 /// gate fields they are observability only: no degraded rule consults
 /// them — an unhealthy backend is weather the queue and chat surfaces
 /// absorb, not illness of THIS service.
+///
+/// The embedding fields (`embedding_*`, memory-lifecycle §3.3) mirror
+/// that posture exactly — one embeddings-snapshot read per request,
+/// and again observability only: a red embeddings backend is the same
+/// weather, and the vector queue's depth rides `/metrics` alone.
 pub struct SystemStats {
     pub user_count: i64,
     pub queue_depth: i64,
@@ -81,6 +86,17 @@ pub struct SystemStats {
     /// actually checked" is a fact, not an outage claim, so a renderer
     /// must not read it as a live liveness tick.
     pub backend_checked_seconds_ago: Option<i64>,
+    /// The reported EMBEDDINGS state name (same mapping as
+    /// `backend_state`; memory-lifecycle §3.3's `/health` fields).
+    pub embedding_state: &'static str,
+    /// Seconds since the embeddings outage opened; `None` while not
+    /// down (the same Disabled-frozen-clock rule as
+    /// `backend_down_seconds`).
+    pub embedding_down_seconds: Option<i64>,
+    /// Seconds since the last embeddings observation; `None` when none
+    /// was ever made (the same not-gated rule as
+    /// `backend_checked_seconds_ago`).
+    pub embedding_checked_seconds_ago: Option<i64>,
     /// Turns parked `waiting_backend` or crash-interrupted and never
     /// claimed (`ChatStore::waiting_turn_count`; zeroed on read failure
     /// like the queue fields).
@@ -131,6 +147,18 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
             health.down_since.map(|ts| now - ts as i64)
         };
     let backend_checked_seconds_ago = health.checked_at.map(|ts| now - ts as i64);
+    // Embeddings health (memory-lifecycle §3.3): the same pattern, off
+    // the ONE snapshot function for the embeddings machine, sharing the
+    // same `now`.
+    let emb = mycelium_librarian::llm_health::embedding_snapshot();
+    let embedding_state = emb.state.as_str();
+    let embedding_down_seconds =
+        if emb.state == mycelium_librarian::llm_health::BackendState::Disabled {
+            None
+        } else {
+            emb.down_since.map(|ts| now - ts as i64)
+        };
+    let embedding_checked_seconds_ago = emb.checked_at.map(|ts| now - ts as i64);
     // Chat waiting turns (same zero-on-failure convention as the queue
     // fields: db_ok already reports an unreachable store).
     let chat_waiting_count = state.chat_sessions.waiting_turn_count().await.unwrap_or(0);
@@ -147,6 +175,9 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
         backend_state: health.state.as_str(),
         backend_down_seconds,
         backend_checked_seconds_ago,
+        embedding_state,
+        embedding_down_seconds,
+        embedding_checked_seconds_ago,
         chat_waiting_count,
         db_ok,
     }
@@ -162,7 +193,11 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
 /// The gate fields (`llm_active`/`llm_queued`/`llm_capacity`) are
 /// reported beside the write-queue fields but are DELIBERATELY absent
 /// from the degraded rule below (spec §3.6): a saturated or queued gate
-/// is load, not ill health.
+/// is load, not ill health. The backend-health and embedding fields
+/// (the `embedding_state`/`embedding_down_seconds`/
+/// `embedding_checked_seconds_ago` keys) are the same exclusion by
+/// design: backend weather is observability, and an unhealthy backend
+/// 503s nothing.
 async fn health(State(state): State<AppState>) -> Response {
     let stats = system_stats(&state).await;
     let degraded = !stats.db_ok
@@ -193,6 +228,9 @@ async fn health(State(state): State<AppState>) -> Response {
             "backend_state": stats.backend_state,
             "backend_down_seconds": stats.backend_down_seconds,
             "backend_checked_seconds_ago": stats.backend_checked_seconds_ago,
+            "embedding_state": stats.embedding_state,
+            "embedding_down_seconds": stats.embedding_down_seconds,
+            "embedding_checked_seconds_ago": stats.embedding_checked_seconds_ago,
             "chat_waiting_count": stats.chat_waiting_count,
         })),
     )
@@ -369,6 +407,31 @@ async fn metrics(State(state): State<AppState>) -> Response {
     let _ = writeln!(
         out,
         "# TYPE mycelium2_backend_down_seconds gauge\nmycelium2_backend_down_seconds {down_seconds}"
+    );
+    // Embeddings health + the vector drain surfaces (memory-lifecycle
+    // §3.3). Same four-state mapping as `backend_up`; the vector
+    // queue's own drop reasons are log-only (the queue and the drop
+    // warns, not metrics).
+    let emb = mycelium_librarian::llm_health::embedding_snapshot();
+    let emb_up = match emb.state {
+        mycelium_librarian::llm_health::BackendState::Disabled => 0,
+        mycelium_librarian::llm_health::BackendState::Red => 1,
+        mycelium_librarian::llm_health::BackendState::Yellow => 2,
+        mycelium_librarian::llm_health::BackendState::Green => 3,
+    };
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_embedding_up gauge\nmycelium2_embedding_up {emb_up}"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_vector_queue_depth gauge\nmycelium2_vector_queue_depth {}",
+        mycelium_store::vector_queue_depth()
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_vector_processed_total counter\nmycelium2_vector_processed_total {}",
+        mycelium_store::VECTOR_PROCESSED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
     );
     // Chat turns owed an answer (weather-parked + unclaimed crash),
     // zeroed on read failure like the queue surfaces beside it.
