@@ -538,8 +538,14 @@ impl<'a> ConceptStore<'a> {
     /// regeneration. Because it never writes a concept, the deprecated-tag
     /// sweep's `global:library` exclusion does not apply — library index rows
     /// are swept too. A missing concept fails `NotFound` (the caller's sweep
-    /// skips dead rows); no index rows are written for it.
+    /// skips dead rows); no index rows are written for it. Like every other
+    /// ConceptStore write entry point, it refuses the mutation queue's
+    /// reserved `/mutation-queue/` prefix (staging notes are queue-internal
+    /// scaffolding — the sweep never reindexes them).
     pub async fn reindex(&self, path: &str) -> Result<(), ConceptStoreError> {
+        if path.starts_with("/mutation-queue/") {
+            return Err(ConceptStoreError::QueuePath(path.to_string()));
+        }
         let concept = self.get(path).await?;
         self.index.add_async(&concept).await?;
         Ok(())
@@ -1120,5 +1126,25 @@ mod tests {
         assert_eq!(got_after.frontmatter.confirmed_at, confirmed_before);
         assert_eq!(got_after.frontmatter.source, source_before);
         assert_eq!(got_after.body, got_before.body);
+    }
+
+    #[tokio::test]
+    async fn reindex_refuses_mutation_queue_prefix() {
+        // §3.2a reserved-prefix guard, same posture as put/restore/delete:
+        // reindex refuses staging-note paths before any read/write. Task 5's
+        // sweep skips `/mutation-queue/` paths, so this breaks no sweep.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let user = Uuid::new_v4();
+        let master = mycelium_crypto::generate_master_key();
+        let cs = ConceptStore::for_user(&store, user, master);
+        let err = cs
+            .reindex("/mutation-queue/staging/note.md")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ConceptStoreError::QueuePath(_)),
+            "reindex must refuse the queue prefix, got {err}"
+        );
     }
 }

@@ -110,13 +110,15 @@ impl EncryptedIndex {
         let tokens: Vec<String> = distinct.iter().map(|t| self.keys.token(t)).collect();
         let active_only = query.status_filter == StatusFilter::ActiveOnly;
 
-        // Corpus statistics (§3.3, §3.2a-5): `N = COUNT(length)`, `avgdl =
-        // SUM(length) / N` over the WHOLE scope. The lifecycle filter is a
-        // per-result skip, never an index cut — the in-memory oracle counts
-        // every doc (active or not) in N and avgdl too. NULL lengths (rows
-        // awaiting the §3.2a-4 sweep) are excluded from BOTH by COUNT/SUM.
+        // Corpus statistics (§3.3, §3.2a-11): `N = COUNT(*)`, `avgdl =
+        // COALESCE(SUM(length), 0) / N` over the WHOLE scope. N counts EVERY
+        // scoped row — a NULL-length row still owns postings, so it must be
+        // in N or `df` can exceed N and drive idf negative (§3.2a-11). This
+        // is exactly the oracle's `docs.len()` (it counts every doc, active
+        // or not, in both N and avgdl). NULL lengths add 0 to the sum but
+        // count in N; `avgdl == 0` is still guarded below (no NaN).
         let (n_docs, sum_len): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(length), COALESCE(SUM(length), 0) FROM search_docs WHERE scope = ?",
+            "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM search_docs WHERE scope = ?",
         )
         .bind(&self.scope_id)
         .fetch_one(&self.pool)
@@ -166,13 +168,17 @@ impl EncryptedIndex {
 
         // Batch doc load for scored paths (one round-trip per chunk of 64),
         // now carrying `length` (COALESCE 0 for the transient NULL case —
-        // §3.2a-5: over-boosted but still returned). Under ActiveOnly the
+        // §3.2a-11: over-boosted but still returned). Under ActiveOnly the
         // lifecycle cut is a SQL predicate on the plaintext status column —
         // hidden docs are absent from the RESULTS, not from df/avgdl above.
         // A path whose doc row vanished mid-scan is simply not returned (skip,
-        // not error).
+        // not error). Keys are sorted so the `IN (…)` batch sequence is
+        // deterministic run-to-run (not HashMap-order), per the determinism
+        // convention.
         let mut results = Vec::with_capacity(tf_by_path.len());
-        for chunk in tf_by_path.keys().collect::<Vec<_>>().chunks(64) {
+        let mut scored_paths: Vec<&String> = tf_by_path.keys().collect();
+        scored_paths.sort();
+        for chunk in scored_paths.chunks(64) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = if active_only {
                 let status_holders = vec!["?"; NON_ACTIVE_STATUSES.len()].join(",");
@@ -211,7 +217,13 @@ impl EncryptedIndex {
                 // contribution to THIS doc, summed in the sorted `tokens`
                 // order (deterministic across re-runs). A term this doc lacks
                 // (tf 0) or the corpus has never seen (df 0) contributes 0 —
-                // matching the oracle's per-doc sum.
+                // matching the oracle's per-doc sum. `n` is clamped to `df`
+                // (§3.2a-11): the callee documents `df ≤ n_docs`, and `search`
+                // reads N and the postings as separate autocommit queries, so
+                // a concurrent `add_async` commit between them can transiently
+                // raise a token's df above the N already captured — the clamp
+                // keeps idf non-negative for that transient (NULL-length rows
+                // no longer trip it, since N is now COUNT(*)).
                 let path_tfs = tf_by_path.get(&path);
                 let mut score = 0.0f32;
                 for token in &tokens {
@@ -223,7 +235,8 @@ impl EncryptedIndex {
                     if tf == 0 {
                         continue;
                     }
-                    score += bm25_score(&params, n_docs_u, term_df, tf, doc_len as u32, avgdl);
+                    let term_n = n_docs_u.max(term_df);
+                    score += bm25_score(&params, term_n, term_df, tf, doc_len as u32, avgdl);
                 }
                 results.push(SearchResult {
                     concept_path: path,
@@ -657,9 +670,18 @@ mod tests {
 
     #[tokio::test]
     async fn null_length_scoring_guard() {
-        // §3.2a-5: a scored doc with `length = NULL` counts as length 0 —
-        // still returned (transiently over-boosted), no error; n_docs/avgdl
-        // come from the OTHER (length-bearing) doc.
+        // §3.2a-11 (supersedes the amendment-5 wording): a scored doc with
+        // `length = NULL` scores as length 0 — still returned, OVER-boosted,
+        // never an error. The corpus-stat universe is EVERY scoped row, so
+        // `n_docs = COUNT(*)` counts BOTH docs here (a NULL-length row still
+        // owns postings, so it contributes to `df` and must be in `N` — that
+        // is exactly the oracle's `docs.len()`); `avgdl = COALESCE(SUM,0)/N`
+        // counts the NULL row in N but adds 0 to the sum. With /a (NULL) +
+        // /b (length 3) sharing "zebra": N = 2, Σ = 3, avgdl = 3/2 = 1.5.
+        // The over-boost (doc_len 0 → smallest length penalty) must RANK the
+        // NULL-length doc first with non-negative scores — the old
+        // `COUNT(length)` N (1 here) made df (2) exceed N and drove idf
+        // negative, turning the over-boost into a demotion.
         let (_dir, store) = test_store().await;
         let master = mycelium_crypto::generate_master_key();
         let index = EncryptedIndex::for_user(store.pool().clone(), "user-1", &master);
@@ -680,14 +702,26 @@ mod tests {
             .search(&SearchQuery::new(vec!["zebra".into()]))
             .await
             .unwrap();
-        // Both present (the NULL-length doc is NOT dropped), no error.
-        assert!(
-            hits.iter().any(|h| h.concept_path == "/a.md"),
-            "NULL-length doc must still be returned: {hits:?}"
+        // Both present, over-boosted doc first: NULL-length /a.md ranks ABOVE
+        // /b.md (§3.2a-11's over-boost intent, not the amendment-5 demotion).
+        assert_eq!(
+            paths(&hits),
+            vec!["/a.md".to_string(), "/b.md".to_string()],
+            "NULL-length doc must be over-boosted to first, both present: {hits:?}"
         );
+        // Non-negative idf: N ≥ df, so no term's idf goes negative and drags
+        // the sum below 0.
+        for h in &hits {
+            assert!(
+                h.score >= 0.0,
+                "BM25 idf must stay non-negative (df ≤ N): {} score {}",
+                h.concept_path,
+                h.score
+            );
+        }
         assert!(
-            hits.iter().any(|h| h.concept_path == "/b.md"),
-            "the length-bearing doc must still be returned: {hits:?}"
+            hits[0].score >= hits[1].score,
+            "over-boosted NULL-length doc must outrank the length-bearing doc"
         );
     }
 
