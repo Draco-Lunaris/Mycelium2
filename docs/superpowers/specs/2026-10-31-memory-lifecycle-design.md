@@ -347,6 +347,67 @@ the step-2 block binds step 2.
     (documented; §3.2a-7's zero-honoring lives at the function boundary;
     the isolation probes key on isError-on-none).
 
+### 2026-11-01 — step 4 (embeddings + hybrid search)
+
+Rulings recorded during step-4 planning; they bind the step-4 plan the way
+the earlier blocks bind their plans.
+
+13. **Vector access is reached through `ConceptStore`, not around it**:
+    `ConceptStore` gains a `vectors: VectorStore<'a>` field built alongside
+    its existing repo/index/revisions siblings (both constructors), with a
+    `pub fn vectors(&self) -> &VectorStore<'a>` accessor — every consumer
+    (agent / MCP hits path / web search) already holds a `ConceptStore` per
+    scope, so no new state plumbing is added to surfaces. The shared fusion
+    helper is `cross_scope_hits` (librarian agent.rs — the one function all
+    three consumers already call), extended with a trailing
+    `embeddings: Option<&EmbeddingsClient>` parameter;
+    per-surface callers build the one-shot client from the decrypted
+    `embeddings` config row (absent row ⇒ `None` ⇒ lexical-only).
+14. **RRF is per-scope fusion, then a cross-scope merge of fused scores**:
+    each scope's lexical top-50 and vector top-50 are fused with RRF *within
+    that scope* (lexical pools are corpus-relative; BM25 ranks only compare
+    within one scope — §3.3), and the per-scope fused lists are then merged
+    across scopes by fused score desc, path-asc ties, followed by the
+    library-visibility post-filter and the caller's cap. Fused scores are
+    rank-based, so they ARE comparable across scopes; raw BM25 never was.
+    Cost if wrong: cross-scope ordering slightly off in multi-scope
+    deployments — observable only with a populated multi-scope corpus.
+15. **The embeddings health REUSES `LlmHealth` by instantiation** — no
+    rename, no trait, no second state machine: `LlmHealth` is cheap to
+    construct, so `pub static EMBEDDING_HEALTH: LazyLock<LlmHealth>` is a
+    second process-global of the same type; the four `#[doc(hidden)]
+    *_at` fns are un-hidden as the documented per-instance seam (the
+    production `LLM_HEALTH` reads the chat-LLM inputs inside `state()`/
+    `snapshot()`; every other instance feeds its own inputs via the `_at`
+    fns). The embeddings instance always passes `busy: false` to the
+    staleness rule (that rule exists for queue waiters; embeddings has no
+    wait queue) — its `wired` free fns are `embedding_state()` /
+    `embedding_snapshot()`, reading `EMB_LAST_SUCCESS` (0 ⇒ None).
+16. **Deletes remove their vector row DIRECTLY at the `ConceptStore::delete`
+    tail** (`remove_row` + cache eviction; NO enqueue — a deleted concept
+    has nothing to embed, and an enqueue would re-create the classic
+    delete-then-rebuild race). put/patch/restore enqueue once per call
+    (dedup-on-push, cap 512, back-drop) AND evict the decoded cache;
+    `reindex` (index-only, content unchanged) does neither. Stale-scope
+    rebuild therefore resurrects no row a delete already removed.
+17. **The admin-form rrf tuning fields ride step 5's dream admin section**
+    (they live on the same `lifecycle` config row and the same admin page
+    region); step 4 ships the `lifecycle` row EXTENSION structurally —
+    serde(default) fields (rrf_k, rrf_weight_lex, rrf_weight_vec,
+    dedup_cosine) with clamps and process-global statics — with no form
+    UI yet; the form fields are added in step 5 with the other lifecycle
+    controls. Config-level embedding settings DO get their admin section
+    in step 4 (`/admin/embeddings` — new row, not the lifecycle row).
+18. **Boot posture for the embeddings health mirrors the LLM seed**: main.rs
+    calls `EMBEDDING_HEALTH.set_disabled()` BEFORE anything can observe it
+    (a just-constructed `LlmHealth` reads Green — never trust the trivial
+    default), then `sync_embedding_from_store(&state)` lifts the posture
+    exactly like `sync_llm_gate_from_store` (absent row ⇒ stays disabled;
+    present ⇒ `note_configured()`; undecryptable = warn + still
+    configured — the observation belongs to the 30s probe worker). Boot
+    order pin: sync_embedding_from_store < vector-worker spawn <
+    embedding-probe spawn < serve.
+
 ## 4. Crypto model (unchanged invariants)
 
 - No new key hierarchy. Existing `MasterKey`/KEK/DEK layering untouched.
