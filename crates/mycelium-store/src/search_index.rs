@@ -5,8 +5,9 @@
 //! Results are ranked by BM25 through the shared `mycelium_core::search`
 //! scorer, matching the in-memory reference index in mycelium-core (oracle
 //! equivalence via `searchable_text`): `df` is the scoped posting-list size
-//! per token, `N`/`avgdl` come from `search_docs.length`, and each doc's
-//! length is that column, captured at `add`.
+//! per token, `N` is the scope's row count (`COUNT(*)`) and `avgdl` its mean
+//! length over `search_docs.length` (§3.2a-11), and each doc's length is
+//! that column, captured at `add`.
 
 use mycelium_core::search::{
     NON_ACTIVE_STATUSES, SearchIndex, SearchQuery, SearchResult, StatusFilter, bm25, bm25_score,

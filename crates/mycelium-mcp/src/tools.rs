@@ -296,6 +296,10 @@ pub async fn memory_query(
         .limit
         .unwrap_or_else(|| mycelium_store::revisions::query_top_k() as usize)
         .min(HARD_HIT_CEILING);
+    // zero stays zero — skip the searches (§3.2a-7)
+    if k == 0 {
+        return Ok(QueryOutput::Hits(vec![]));
+    }
     let scoped = mycelium_librarian::agent::cross_scope_hits(&cs, &scopes, &query, k).await;
     let mut out = Vec::with_capacity(scoped.len());
     for (scope, hit) in &scoped {

@@ -1,15 +1,22 @@
 -- 0011_search_length.sql
--- BM25 length column (spec: docs/superpowers/specs/2026-10-31-memory-lifecycle-design.md §3.3; §3.2a-3/4/5).
+-- BM25 length column (spec: docs/superpowers/specs/2026-10-31-memory-lifecycle-design.md §3.3; §3.2a-3/4; scoring §3.2a-11).
 --
 -- search_docs.length: the token count of a concept's searchable_text
 -- (title + description + tags + the `# History`-cut body), stored at `put`
 -- so BM25 length normalization reads it without re-tokenizing (spec §3.3).
 -- NULL for rows written before this migration — §3.2a-4's index-only
 -- `ConceptStore::reindex` boot sweep backfills them (no concept write, no
--- registry touch, NO revision row). §3.2a-5: scoring treats a NULL length as
--- 0 (still returned, transiently over-boosted) and derives n_docs/avgdl from
--- COUNT(length)/SUM(length), so NULL rows are excluded from the corpus
--- statistics until the sweep lands.
+-- registry touch, NO revision row). §3.2a-11 is the SHIPPED scoring posture
+-- (landed in `search_index.rs`, commit d04440d; it REVOKES §3.2a-5's
+-- COUNT(length)-excludes-NULLs draft): corpus statistics read the WHOLE
+-- scope — n_docs = COUNT(*) (every scoped row, NULL-length or not, is the
+-- oracle's docs.len()), avgdl = COALESCE(SUM(length), 0) / n_docs (a NULL
+-- row adds 0 to the sum but still counts in N); a NULL length scores as
+-- length 0 (COALESCE at the doc-load — still returned, transiently
+-- over-boosted). The call-site clamp `term_n = n_docs.max(term_df)` guards
+-- the concurrent-add transient: between two autocommit reads a later df
+-- read can exceed the N already captured — the clamp keeps idf
+-- non-negative.
 --
 -- A NEW migration, not an amendment to 0010 (§3.2a-3): 0010 is merged,
 -- shipped history and cannot be amended; `search_vectors` already exists
