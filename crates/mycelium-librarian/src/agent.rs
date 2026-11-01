@@ -131,6 +131,117 @@ fn library_path_visible(scopes: &AgentScopes<'_>, path: &str) -> bool {
     }
 }
 
+/// A cross-scope hit before lifecycle enrichment: the scope tag and the
+/// search result (spec §3.2a-6).
+pub type ScopedHit = (String, mycelium_core::search::SearchResult);
+
+/// The shared cross-scope hit helper behind BOTH the MCP `memory_query`
+/// hits default (cap = the caller's `limit`, `query_top_k` when absent,
+/// ≤ 64) and the agent's `search_knowledge` tool (cap 10, §3.2a-10):
+/// the user's private bundle first, then the global skills shelf, then
+/// the library catalog filtered by bookshelf visibility — exactly as
+/// the agent arm collected before this consolidation. Sort: score
+/// descending, ties broken by concept path ascending (deterministic),
+/// truncation LAST. BM25 scores are corpus-relative (the scope tag is
+/// provenance), so scoring is per-corpus and the tag carries which.
+pub async fn cross_scope_hits(
+    store: &ConceptStore<'_>,
+    scopes: &AgentScopes<'_>,
+    query: &SearchQuery,
+    cap: usize,
+) -> Vec<ScopedHit> {
+    let mut all_hits: Vec<ScopedHit> = Vec::new();
+
+    // 1. User's private bundle (always searched).
+    for h in store.search(query).await.unwrap_or_default() {
+        all_hits.push(("user".to_string(), h));
+    }
+
+    // 2. Global skills shelf (if available).
+    if let Some(ref skills) = scopes.skills {
+        for h in skills.search(query).await.unwrap_or_default() {
+            all_hits.push(("skills".to_string(), h));
+        }
+    }
+
+    // 3. Global library catalog (if available), filtered by the caller's
+    //    bookshelf visibility.
+    if let Some(ref library) = scopes.library {
+        for h in library.search(query).await.unwrap_or_default() {
+            if !library_path_visible(scopes, &h.concept_path) {
+                continue;
+            }
+            all_hits.push(("library".to_string(), h));
+        }
+    }
+
+    // Sort by score descending, then path ascending for determinism.
+    // Cap the result set AFTER the sort: truncation must not change the
+    // ordering rule.
+    all_hits.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.concept_path.cmp(&b.1.concept_path))
+    });
+    all_hits.truncate(cap);
+    all_hits
+}
+
+/// The lifecycle/provenance fields of a hit's underlying concept (spec
+/// §3.2a-6: the ten-field hit carries them beside the snippet). The
+/// `description` is the FRONTMATTER's (never the snippet's text).
+pub struct HitFields {
+    pub description: Option<String>,
+    pub timestamp: Option<String>,
+    pub confirmed_at: Option<String>,
+    pub status: Option<String>,
+    pub superseded_by: Option<String>,
+}
+
+/// Read [`HitFields`] for `path` from `cs` (`cs.get` → frontmatter). A
+/// read or parse FAULT does not drop the hit — every field reads as
+/// `None` and the fault logs (muted, as a warning) — the
+/// revisions-browser `(no title)` precedent: search results stay honest
+/// about what matched even when a file is corrupt.
+pub async fn hit_fields(cs: &ConceptStore<'_>, path: &str) -> HitFields {
+    match cs.get(path).await {
+        Ok(c) => HitFields {
+            description: c.frontmatter.description.clone(),
+            timestamp: c.frontmatter.timestamp.clone(),
+            confirmed_at: c.frontmatter.confirmed_at.clone(),
+            status: c.frontmatter.status.clone(),
+            superseded_by: c.frontmatter.superseded_by.clone(),
+        },
+        Err(e) => {
+            tracing::warn!(path, error = %e, "hit fields unavailable: hit kept, fields None");
+            HitFields {
+                description: None,
+                timestamp: None,
+                confirmed_at: None,
+                status: None,
+                superseded_by: None,
+            }
+        }
+    }
+}
+
+/// The ten-field enriched hit the MCP `memory_query` hits default
+/// returns (spec §3.2a-6); the field order is the serde output order.
+#[derive(Debug, serde::Serialize)]
+pub struct QueryHit {
+    pub scope: String,
+    pub path: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub snippet: String,
+    pub score: f32,
+    pub timestamp: Option<String>,
+    pub confirmed_at: Option<String>,
+    pub status: Option<String>,
+    pub superseded_by: Option<String>,
+}
+
 /// Where agent-run traces are persisted (DB-backed; v1 .traces/ parity).
 #[derive(Clone)]
 pub struct TraceSink {
@@ -565,42 +676,13 @@ async fn execute_tool_tracked(
                 q.status_filter = mycelium_core::search::StatusFilter::All;
             }
 
-            // Collect hits from all available scopes, tagging each with its scope.
-            let mut all_hits: Vec<(String, mycelium_core::search::SearchResult)> = Vec::new();
-
-            // 1. User's private bundle (always searched).
-            for h in store.search(&q).await.unwrap_or_default() {
-                all_hits.push(("user".to_string(), h));
-            }
-
-            // 2. Global skills shelf (if available).
-            if let Some(ref skills) = scopes.skills {
-                for h in skills.search(&q).await.unwrap_or_default() {
-                    all_hits.push(("skills".to_string(), h));
-                }
-            }
-
-            // 3. Global library catalog (if available), filtered by the
-            // caller's bookshelf visibility.
-            if let Some(ref library) = scopes.library {
-                for h in library.search(&q).await.unwrap_or_default() {
-                    if !library_path_visible(scopes, &h.concept_path) {
-                        continue;
-                    }
-                    all_hits.push(("library".to_string(), h));
-                }
-            }
-
-            // Sort by score descending, then path ascending for determinism.
-            // Cap the result set: hundreds of catalog concepts would drown
-            // the model and burn its step budget reading them one by one.
-            all_hits.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.concept_path.cmp(&b.1.concept_path))
-            });
-            all_hits.truncate(10);
+            // Cross-scope collection via the shared helper — the MCP
+            // hits default runs the same code with the caller's cap
+            // (§3.2a-6/§3.3). Cap 10 is this tool's own (§3.2a-10: it
+            // does NOT use the admin-tunable query_top_k): hundreds of
+            // catalog concepts would drown the model and burn its step
+            // budget reading them one by one.
+            let all_hits = cross_scope_hits(store, scopes, &q, 10).await;
 
             let hits_json: Vec<serde_json::Value> = all_hits
                 .iter()

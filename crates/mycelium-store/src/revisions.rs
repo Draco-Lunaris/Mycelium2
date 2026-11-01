@@ -76,6 +76,39 @@ pub fn revision_retention() -> u32 {
     clamp_retention(REVISION_RETENTION.load(Ordering::Relaxed))
 }
 
+/// Default hits returned by a zero-LLM `memory_query` (spec §3.3: 8,
+/// admin-tunable, range 1–64).
+pub const DEFAULT_QUERY_TOP_K: u32 = 8;
+
+/// Accepted range for `query_top_k` (spec §3.2a-7), clamped on EVERY
+/// set, get, save and load. Zero is meaningful only as an EXPLICIT
+/// caller request; it never lives in the row or the static.
+pub const QUERY_TOP_K_RANGE: (u32, u32) = (1, 64);
+
+/// Process-global zero-LLM query top-k, the [`REVISION_RETENTION`]
+/// pattern: initialized to the default and clamped on every set and get.
+/// Set at boot by [`sync_lifecycle_from_store`] and live by step 5's
+/// admin section; read by the MCP hits path (spec §3.3).
+static QUERY_TOP_K: AtomicU32 = AtomicU32::new(DEFAULT_QUERY_TOP_K);
+
+fn clamp_query_top_k(v: u32) -> u32 {
+    v.clamp(QUERY_TOP_K_RANGE.0, QUERY_TOP_K_RANGE.1)
+}
+
+/// Set the process-global query top-k. Clamp 1–64 on EVERY set — an
+/// out-of-range caller (a hand-edited row, an older build, step 5's
+/// form) can never make a default query return zero hits or an
+/// unbounded tail.
+pub fn set_query_top_k(k: u32) {
+    QUERY_TOP_K.store(clamp_query_top_k(k), Ordering::Relaxed);
+}
+
+/// The process-global query top-k (clamped — get applies the range, so a
+/// value that entered through any path reads as documented).
+pub fn query_top_k() -> u32 {
+    clamp_query_top_k(QUERY_TOP_K.load(Ordering::Relaxed))
+}
+
 /// Deterministic per-op summaries (byte-safe bounded, the queue
 /// receipts' `short_detail` discipline): create→"concept created",
 /// update→"concept updated", delete→"concept deleted", restore→
@@ -102,43 +135,54 @@ pub fn op_summary(op: &str, n: Option<u64>) -> Result<String, RevisionsError> {
 
 /// Sealed `lifecycle` config row (key [`LIFECYCLE_CONFIG_KEY`]), the
 /// llm-row pattern: a blank/missing row keeps the defaults, and the
-/// retention clamps on BOTH save and load, so a row written by an older
-/// (or hand-edited) build can never widen the log. Step 2 carries ONE
-/// field; later steps extend the struct — `serde(default)` keeps old
-/// rows valid through that growth.
+/// values clamp on BOTH save and load, so a row written by an older
+/// (or hand-edited) build can never widen the log or change the query
+/// defaults. Step 2 carries ONE field; later steps extend the struct —
+/// `serde(default)` keeps old rows valid through that growth (step 3's
+/// `query_top_k` rides exactly that promise).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct LifecycleConfig {
     #[serde(default = "default_retention")]
     pub revision_retention: u32,
+    /// Hits a zero-LLM `memory_query` returns when the caller sends no
+    /// `limit` (spec §3.3); 1–64, clamped on save and load.
+    #[serde(default = "default_query_top_k")]
+    pub query_top_k: u32,
 }
 
 fn default_retention() -> u32 {
     DEFAULT_REVISION_RETENTION
 }
 
+fn default_query_top_k() -> u32 {
+    DEFAULT_QUERY_TOP_K
+}
+
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
             revision_retention: DEFAULT_REVISION_RETENTION,
+            query_top_k: DEFAULT_QUERY_TOP_K,
         }
     }
 }
 
 impl LifecycleConfig {
-    /// A copy with the retention forced into [`REVISION_RETENTION_RANGE`]
-    /// — the SAVE-side clamp (step 5's admin surface applies it before
-    /// sealing the row); the load side clamps through
-    /// [`set_revision_retention`].
+    /// A copy with every field forced into its accepted range — the
+    /// SAVE-side clamp (step 5's admin surface applies it before sealing
+    /// the row); the load side clamps through [`set_revision_retention`]
+    /// and [`set_query_top_k`].
     #[must_use]
     pub fn clamp(&self) -> LifecycleConfig {
         LifecycleConfig {
             revision_retention: clamp_retention(self.revision_retention),
+            query_top_k: clamp_query_top_k(self.query_top_k),
         }
     }
 }
 
 /// Read the sealed `lifecycle` row and push it onto the process-global
-/// retention. Boot-order contract: `main` syncs before
+/// retention and query top-k. Boot-order contract: `main` syncs before
 /// `seed_packaged_skills` and before every boot sweep — the seed and the
 /// sweeps write concepts, so retention must be live before them (the
 /// same reason `sync_llm_gate_from_store` precedes the workers).
@@ -154,6 +198,7 @@ pub async fn sync_lifecycle_from_store(
         .await
         .unwrap_or_default();
     set_revision_retention(cfg.revision_retention);
+    set_query_top_k(cfg.query_top_k);
     Ok(())
 }
 

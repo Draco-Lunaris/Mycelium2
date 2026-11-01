@@ -158,9 +158,20 @@ pub struct MemoryQueryArgs {
     /// The natural-language question to answer from the knowledge base.
     #[schemars(description = "Natural-language question to answer from the knowledge base")]
     pub question: String,
-    /// Maximum number of results to return (default 10).
-    #[schemars(description = "Maximum number of results to return (default 10)")]
+    /// Maximum hits; default = admin-tunable top_k (8), hard ceiling 64
+    #[schemars(description = "Maximum hits; default = admin-tunable top_k (8), hard ceiling 64")]
     pub limit: Option<usize>,
+    /// Full agent synthesis (LLM tool-call loop: search → read →
+    /// synthesize). Default false: top-k ranked hits with zero LLM calls.
+    #[schemars(
+        description = "Full agent synthesis (LLM tool-call loop: search, read, synthesize). Default false: top-k ranked hits with zero LLM calls."
+    )]
+    pub synthesize: Option<bool>,
+    /// Include retired/superseded concepts (history queries). Default false.
+    #[schemars(
+        description = "Include retired/superseded concepts (history queries). Default false."
+    )]
+    pub include_inactive: Option<bool>,
 }
 
 /// Cap on search terms per query — the encrypted index issues one lookup
@@ -179,16 +190,19 @@ fn search_terms(question: &str) -> Vec<String> {
 
 /// The agent's answer to a query: grounded text (the agent embeds a
 /// "Sources:" line per the system prompt).
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct AgentAnswer {
     pub answer: String,
 }
 
-/// Answer a question from the caller's private bundle. The librarian
-/// agent (LLM tool-call loop: search → read → synthesize, citing
-/// paths) handles the query; when no LLM backend is reachable the
-/// deterministic keyword search is the fallback (ranked hits, no
-/// synthesis) — the tool never hard-fails on a missing LLM.
+/// Answer a question from the knowledge base. Default path (spec §3.3):
+/// zero-LLM ranked hits across the caller's bundle, the global skills
+/// shelf, and the visible library catalog — the same visibility the
+/// synthesis path has. `synthesize: true` keeps the v1 architecture
+/// (the librarian agent's search → read → synthesize loop, citing
+/// paths); when no LLM backend is reachable, or the gate is saturated,
+/// or the agent run fails, that path DEGRADES into the same shared hits
+/// constructor — the tool never hard-fails on a missing LLM.
 pub async fn memory_query(
     state: &McpState,
     user: &McpUser,
@@ -199,10 +213,14 @@ pub async fn memory_query(
         .await
         .map_err(ConceptStoreError::Db)?;
     let cs = user_store(state, user.user_id, master);
+    // Cross-scope capabilities: the agent run consumes them via the
+    // query cache, the hits path reads them directly.
+    let scopes = agent_scopes(state, user).await;
 
-    // Agent path: the v1 architecture — all queries flow through the
-    // librarian. Unreachable LLM → deterministic fallback below.
-    if let Some((client, llm_cfg)) = agent_client(state).await {
+    // Agent path (spec §3.3): `synthesize: true` is the exact agent flow.
+    if args.synthesize == Some(true)
+        && let Some((client, llm_cfg)) = agent_client(state).await
+    {
         // The cached wrapper's layer 1 (v1 parity) answers identical
         // repeats from the fingerprint-invalidated cache — no agent
         // run, no tokens. It costs no LLM time, so it is served before
@@ -230,7 +248,7 @@ pub async fn memory_query(
                 match mycelium_librarian::query_cache::run_query_cached(
                     &client,
                     &cs,
-                    &agent_scopes(state, user).await,
+                    &scopes,
                     &args.question,
                 )
                 .await
@@ -255,23 +273,73 @@ pub async fn memory_query(
         }
     }
 
-    // Deterministic fallback: ranked keyword hits (pre-agent behavior).
-    let query = SearchQuery::new(search_terms(&args.question));
-    // MCP query stays private by default (DESIGN: web search spans
-    // user + global; MCP queries the user bundle only).
-    let mut results = cs.search(&query).await?;
-    let limit = args.limit.unwrap_or(10).min(100);
-    results.truncate(limit);
-    Ok(QueryOutput::Hits(results))
+    // Zero-LLM ranked hits (spec §3.3, shared by the synthesize path's
+    // fallthrough): spanning the caller's bundle + global skills + the
+    // visible library catalog — the SAME visibility as the synthesis
+    // path, which is why the cross-scope constructor is shared.
+    let mut query = SearchQuery::new(search_terms(&args.question));
+    // History queries are opt-in (§3.2a-8): without the flag the search
+    // keeps the default active-only filter, so retired and superseded
+    // concepts stay out of ordinary retrieval.
+    if args.include_inactive == Some(true) {
+        query.status_filter = mycelium_core::search::StatusFilter::All;
+    }
+    // §3.2a-7: the caller's limit, defaulting to the admin-tunable
+    // query_top_k and hard-capped at 64. A literal 0 stays zero. (The
+    // u32→usize widening is lossless: the clamp bounds the value 1..=64
+    // and usize is at least 32 bits.)
+    let k = args
+        .limit
+        .unwrap_or_else(|| mycelium_store::revisions::query_top_k() as usize)
+        .min(64);
+    let scoped = mycelium_librarian::agent::cross_scope_hits(&cs, &scopes, &query, k).await;
+    let mut out = Vec::with_capacity(scoped.len());
+    for (scope, hit) in &scoped {
+        // The lifecycle fields come from the hit's own scope's store;
+        // a read/parse fault keeps the hit with None fields (§3.2a-6).
+        let scope_cs: Option<&ConceptStore<'_>> = match scope.as_str() {
+            "user" => Some(&cs),
+            "skills" => scopes.skills.as_ref(),
+            "library" => scopes.library.as_ref(),
+            // Unreachable: cross_scope_hits produces exactly these tags,
+            // and a scope with no store produces no hits.
+            _ => None,
+        };
+        let fields = match scope_cs {
+            Some(scope_cs) => {
+                mycelium_librarian::agent::hit_fields(scope_cs, &hit.concept_path).await
+            }
+            None => mycelium_librarian::agent::HitFields {
+                description: None,
+                timestamp: None,
+                confirmed_at: None,
+                status: None,
+                superseded_by: None,
+            },
+        };
+        out.push(mycelium_librarian::agent::QueryHit {
+            scope: scope.clone(),
+            path: hit.concept_path.clone(),
+            title: hit.title.clone(),
+            description: fields.description,
+            snippet: hit.snippet.clone(),
+            score: hit.score,
+            timestamp: fields.timestamp,
+            confirmed_at: fields.confirmed_at,
+            status: fields.status,
+            superseded_by: fields.superseded_by,
+        });
+    }
+    Ok(QueryOutput::Hits(out))
 }
 
 /// The query tool's output: either the agent's grounded answer or the
-/// deterministic search fallback.
-#[derive(serde::Serialize)]
+/// zero-LLM ranked hits (each hit ten fields, spec §3.2a-6).
+#[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
 pub enum QueryOutput {
     Answer(AgentAnswer),
-    Hits(Vec<mycelium_core::search::SearchResult>),
+    Hits(Vec<mycelium_librarian::agent::QueryHit>),
 }
 
 // ---------------------------------------------------------------------------

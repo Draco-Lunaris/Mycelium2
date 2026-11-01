@@ -69,7 +69,7 @@ impl MyceliumMcpServer {
                     .map(|r| {
                         format!(
                             "## {}\npath: {}\nscore: {:.2}\n{}\n",
-                            r.title, r.concept_path, r.score, r.snippet
+                            r.title, r.path, r.score, r.snippet
                         )
                     })
                     .collect::<Vec<_>>()
