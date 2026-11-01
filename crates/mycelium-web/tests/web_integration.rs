@@ -2263,13 +2263,18 @@ async fn admin_split_pages() {
         .to_string();
     let csrf = csrf_from_page(&client, &format!("{base}/"), &cookie).await;
 
-    // 1. All five pages render 200 for the admin, each carrying the
-    //    TabBar's five labels (spec §6) and its own markers.
+    // 1. All six pages render 200 for the admin, each carrying the
+    //    TabBar's labels (spec §6's five plus the Embeddings entry)
+    //    and its own markers.
     let pages: &[(&str, &[&str])] = &[
         ("/admin/users", &["Username", "Create user"]),
         // The en-dash range hint is the current form label's exact text.
         ("/admin/sign-in", &["Session TTL", "15–10080", "OIDC"]),
         ("/admin/llm", &["LLM backend"]),
+        (
+            "/admin/embeddings",
+            &["Embedding dimensions", "Save embeddings config"],
+        ),
         (
             "/admin/library",
             &["Bookshelves", "Upload", "Global skills"],
@@ -2287,7 +2292,14 @@ async fn admin_split_pages() {
             .unwrap();
         assert_eq!(resp.status(), 200, "{route} must render for the admin");
         let html = resp.text().await.unwrap();
-        for label in ["Users", "Sign-in", "LLM backend", "Library", "System"] {
+        for label in [
+            "Users",
+            "Sign-in",
+            "LLM backend",
+            "Embeddings",
+            "Library",
+            "System",
+        ] {
             assert!(
                 html.contains(label),
                 "{route}: TabBar label {label} missing: {html}"

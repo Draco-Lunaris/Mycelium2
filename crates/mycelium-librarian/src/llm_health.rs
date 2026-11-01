@@ -443,9 +443,10 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
     format!("{}… [truncated]", &s[..end])
 }
 
-/// Serializes the tests that *feed or read the global* `LLM_HEALTH`
-/// against every test whose client drives a passive health note:
-/// `llm_health::tests::public_wrappers_stamp_the_real_clock` and
+/// Serializes the tests that *feed or read the global* health
+/// machines — `LLM_HEALTH` and its embeddings instance
+/// [`EMBEDDING_HEALTH`] — against every test whose client drives a
+/// passive health note: `llm_health::tests::public_wrappers_stamp_the_real_clock` and
 /// `probe_refused_is_unhealthy_and_never_feeds_the_machine`,
 /// `llm.rs::passive_hooks_feed_health`, `unreachable_endpoint_errors`,
 /// `bearer_header_sent_when_key_configured`, `no_header_without_key`,
@@ -455,8 +456,28 @@ pub fn short_detail(e: impl std::fmt::Display) -> String {
 /// `concurrent_runners_cannot_double_run`, `pending_job_runs_on_later_tick`,
 /// `spawn_wakes_on_notify` — `run_pending` → `ingest_one` hits the
 /// default URL and notes backend-down, or ok on a host with Ollama).
-/// Success-path tests only note ok, which no health test's assertion
-/// depends on. An async mutex because the guarded tests hold it
+/// Success-path tests only note ok on the chat machine, which none of
+/// the enumerated health tests' assertions depend on.
+///
+/// The embeddings client takes the same guard — every mock-driven test
+/// in `embeddings.rs::tests`:
+/// `embed_batch_preserves_input_order_by_index`,
+/// `embed_batch_rejects_an_index_gap`,
+/// `embed_batch_rejects_an_out_of_range_index`,
+/// `embed_batch_rejects_a_duplicate_index`,
+/// `embed_batch_rejects_an_empty_vector`,
+/// `embed_batch_rejects_a_non_finite_value`,
+/// `embed_batch_sends_bearer_only_when_key_configured`,
+/// `embed_batch_truncates_input_at_the_char_cap`,
+/// `backend_down_class_pins`,
+/// `probe_once_returns_dims_and_rejects_over_4096`, and
+/// `a_healthy_embed_success_stamps_only_the_embeddings_machine` (which
+/// pins both machines' isolation). Their driver, `embed_batch`, feeds
+/// ONLY `EMBEDDING_HEALTH` through the passive hooks — but it is the
+/// same lock the llm-side tests hold, so a machine-feed can never race
+/// another machine's pinned snapshot. The five config-row pins
+/// (defaults/clamp/roundtrip/redaction) drive no client and take no
+/// guard. An async mutex because the guarded tests hold it
 /// across awaits; tokio's mutex never poisons, so one failed test cannot
 /// wedge the rest.
 #[cfg(test)]

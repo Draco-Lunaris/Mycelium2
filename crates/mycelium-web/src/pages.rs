@@ -2124,14 +2124,20 @@ pub fn account_page(
 
 // ---------- Admin pages (PR 3: the five-page split) ----------
 
-/// The admin section's TabBar (spec §6's exact labels) with the
-/// current page's tab active — rendered under the page header on
-/// every admin page.
+/// The admin section's TabBar (the Phase-5 spec's five labels plus the
+/// memory-lifecycle stream's Embeddings entry, adjacent to the LLM
+/// one) with the current page's tab active — rendered under the page
+/// header on every admin page.
 fn admin_tabs(active: &str) -> String {
     mycelium_ui::render::render(mycelium_ui::tab_bar(&[
         ("Users", "/admin/users", active == "/admin/users"),
         ("Sign-in", "/admin/sign-in", active == "/admin/sign-in"),
         ("LLM backend", "/admin/llm", active == "/admin/llm"),
+        (
+            "Embeddings",
+            "/admin/embeddings",
+            active == "/admin/embeddings",
+        ),
         ("Library", "/admin/library", active == "/admin/library"),
         ("System", "/admin/system", active == "/admin/system"),
     ]))
