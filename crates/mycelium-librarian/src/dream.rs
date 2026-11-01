@@ -8,10 +8,15 @@
 //! action (v1 ran it on a cron-like schedule; the trigger wiring is
 //! the caller's choice).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use mycelium_store::ConceptStore;
+use mycelium_store::revisions::dedup_cosine;
+use mycelium_store::vectors::VectorStore;
 
 use crate::agent::{self, AgentScopes};
 use crate::llm::LlmClient;
+use crate::llm_health::{BackendState, embedding_state};
 
 /// What a dream pass found and did.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -35,13 +40,25 @@ struct DuplicateCandidate {
 
 const OVERSIZED_CHARS: usize = 20_000;
 const DUPLICATE_SIMILARITY: f64 = 0.8;
+/// Nearest neighbors drawn per concept by the cosine duplicate signal
+/// (spec §3.4): a pair is a candidate only if it appears in at least
+/// one endpoint's top-K list — unbounded all-pairs would nominate
+/// every above-threshold pair in a large corpus.
+const NEIGHBORS_PER_CONCEPT: usize = 2;
 
 /// Run one dream pass over the caller's bundle. Deterministic signals
 /// first; the agent runs only when there is something to do.
+///
+/// `vectors` is the caller scope's vector-row store: `Some` enables
+/// the cosine duplicate signal whenever the embeddings backend is
+/// healthy or the scope holds fresh current-model rows (the jaccard
+/// title signal stays the fallback — and with `None` the branch is
+/// absent entirely, dream behaving byte-identically to v1).
 pub async fn run_dream(
     client: &LlmClient,
     store: &ConceptStore<'_>,
     scopes: &AgentScopes<'_>,
+    vectors: Option<&VectorStore<'_>>,
 ) -> Result<DreamReport, agent::AgentError> {
     // Gather the deterministic signals (no LLM).
     let entries = store.list().await?;
@@ -60,7 +77,7 @@ pub async fn run_dream(
     };
     let graph = mycelium_core::graph::build_graph(&bundle);
     let _health = graph.health();
-    let dupes = duplicate_candidates(&concepts);
+    let dupes = duplicate_candidates(&concepts, vectors).await;
     let fat = oversized_concepts(&concepts);
 
     let mut signals: Vec<String> = Vec::new();
@@ -90,7 +107,8 @@ pub async fn run_dream(
     }
     if !dupes.is_empty() {
         signals.push(format!(
-            "LIKELY DUPLICATES (title similarity). Read each pair; if they cover the same thing, \
+            "LIKELY DUPLICATES (title or embedding similarity). Read each pair; if they cover the \
+             same thing, \
              merge the content into the better-placed concept, update anything that linked to \
              the removed one, and delete the duplicate (deletion IS authorized for true \
              duplicates after merging). If they are genuinely distinct, cross-link them instead:\n{}",
@@ -142,10 +160,162 @@ pub async fn run_dream(
     })
 }
 
-/// Title-similarity duplicate candidates (v1's deterministic signal:
-/// token-set Jaccard over titles, threshold 0.8).
-fn duplicate_candidates(concepts: &[mycelium_core::Concept]) -> Vec<DuplicateCandidate> {
-    let mut out = Vec::new();
+/// Duplicate candidates: v1's title signal (token-set Jaccard over
+/// titles, threshold 0.8) upgraded with the embedding-cosine signal
+/// (spec §3.4's dream bullet). Concepts holding a fresh vector row
+/// belong to the cosine branch; every other concept rides the jaccard
+/// path, which stays byte-identical to v1 — and when the cosine
+/// branch is absent the two-branch split is invisible: every concept
+/// is "every other concept".
+async fn duplicate_candidates(
+    concepts: &[mycelium_core::Concept],
+    vectors: Option<&VectorStore<'_>>,
+) -> Vec<DuplicateCandidate> {
+    let (mut pairs, embedded) = cosine_candidates(concepts, vectors).await;
+    let scan: Vec<&mycelium_core::Concept> = if embedded.is_empty() {
+        concepts.iter().collect()
+    } else {
+        concepts
+            .iter()
+            .filter(|c| !embedded.contains(c.source_path.as_str()))
+            .collect()
+    };
+    pairs.extend(jaccard_pairs(&scan));
+    pairs
+        .into_iter()
+        .map(|(a, b)| DuplicateCandidate { a, b })
+        .collect()
+}
+
+/// The embedding-cosine duplicate signal over the scope's vector rows:
+/// a pair is a candidate iff cosine ≥ [`dedup_cosine`] AND it sits in
+/// at least one endpoint's top-[`NEIGHBORS_PER_CONCEPT`] nearest list
+/// (union-of-drawings — one side suffices). Returns the candidate
+/// pairs plus the paths holding a fresh row (the concepts the branch
+/// owns); both empty when the branch is ABSENT: no store, an
+/// unhealthy backend over an unpopulated scope, or unreadable rows
+/// (a degraded embedding layer degrades dream to v1 — it never fails
+/// the dream).
+///
+/// Population: ≥2 fresh rows under one current model. Stale rows —
+/// written under a different model, the corpus invalidation's marker —
+/// count for neither population nor scoring, and rows only score
+/// against rows of the same model and dimensionality.
+async fn cosine_candidates(
+    concepts: &[mycelium_core::Concept],
+    vectors: Option<&VectorStore<'_>>,
+) -> (BTreeSet<(String, String)>, HashSet<String>) {
+    let Some(vectors) = vectors else {
+        return (BTreeSet::new(), HashSet::new());
+    };
+    let rows = match vectors.load_rows().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                scope = %vectors.scope_id(),
+                error = %e,
+                "dream: vector rows unreadable — duplicate signal is jaccard-only"
+            );
+            return (BTreeSet::new(), HashSet::new());
+        }
+    };
+    let fresh: Vec<_> = rows.into_iter().filter(|r| !r.stale).collect();
+    let mut per_model: HashMap<&str, usize> = HashMap::new();
+    for row in &fresh {
+        *per_model.entry(row.model.as_str()).or_default() += 1;
+    }
+    let populated = per_model.values().any(|n| *n >= 2);
+    // The same gate set the fusion composer uses (Task 5): Green and
+    // Yellow proceed, Red/Disabled fall back — unless the scope's own
+    // fresh rows speak for the signal regardless of the backend.
+    let healthy = matches!(
+        embedding_state(),
+        BackendState::Green | BackendState::Yellow
+    );
+    if !healthy && !populated {
+        return (BTreeSet::new(), HashSet::new());
+    }
+    // Row token → live concept path (rows are keyed by the same
+    // one-way HMAC token; a row whose concept is gone falls away).
+    let by_token: HashMap<String, &str> = concepts
+        .iter()
+        .map(|c| {
+            (
+                vectors.path_token_of(&c.source_path),
+                c.source_path.as_str(),
+            )
+        })
+        .collect();
+    let live: Vec<(&str, &str, u32, &Vec<f32>)> = fresh
+        .iter()
+        .filter_map(|r| {
+            by_token
+                .get(&r.path_token)
+                .map(|path| (*path, r.model.as_str(), r.dims, &r.vec_f32))
+        })
+        .collect();
+    let embedded: HashSet<String> = live.iter().map(|(path, ..)| (*path).to_string()).collect();
+    let mut groups: HashMap<(&str, u32), Vec<usize>> = HashMap::new();
+    for (i, (_, model, dims, _)) in live.iter().enumerate() {
+        groups.entry((model, *dims)).or_default().push(i);
+    }
+    let threshold = dedup_cosine();
+    let mut out = BTreeSet::new();
+    for idxs in groups.values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Each concept draws its NEIGHBORS_PER_CONCEPT nearest (cosine
+        // desc, path asc on ties — deterministic).
+        let mut drawn: BTreeSet<(String, String)> = BTreeSet::new();
+        for &i in idxs {
+            let mut others: Vec<(f32, &str)> = idxs
+                .iter()
+                .filter(|&&j| j != i)
+                .map(|&j| {
+                    (
+                        mycelium_core::search::cosine(live[i].3, live[j].3),
+                        live[j].0,
+                    )
+                })
+                .collect();
+            others.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(b.1))
+            });
+            for (_, path) in others.into_iter().take(NEIGHBORS_PER_CONCEPT) {
+                drawn.insert(canonical_pair(live[i].0, path));
+            }
+        }
+        for (x, &i) in idxs.iter().enumerate() {
+            for &j in &idxs[x + 1..] {
+                let pair = canonical_pair(live[i].0, live[j].0);
+                if drawn.contains(&pair)
+                    && mycelium_core::search::cosine(live[i].3, live[j].3) >= threshold
+                {
+                    out.insert(pair);
+                }
+            }
+        }
+    }
+    (out, embedded)
+}
+
+/// The canonical form of an unordered pair: (min, max) by path.
+fn canonical_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
+/// v1's title scan over one set of concepts: token-set Jaccard ≥
+/// DUPLICATE_SIMILARITY, pairs canonicalized and deduped (the
+/// BTreeSet is also the deterministic output order).
+fn jaccard_pairs(concepts: &[&mycelium_core::Concept]) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
     for i in 0..concepts.len() {
         for j in (i + 1)..concepts.len() {
             let a = concepts[i].frontmatter.title.clone().unwrap_or_default();
@@ -154,10 +324,10 @@ fn duplicate_candidates(concepts: &[mycelium_core::Concept]) -> Vec<DuplicateCan
                 continue;
             }
             if jaccard(&a, &b) >= DUPLICATE_SIMILARITY {
-                out.push(DuplicateCandidate {
-                    a: concepts[i].source_path.clone(),
-                    b: concepts[j].source_path.clone(),
-                });
+                out.insert(canonical_pair(
+                    &concepts[i].source_path,
+                    &concepts[j].source_path,
+                ));
             }
         }
     }

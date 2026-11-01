@@ -5095,6 +5095,11 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         Ok(m) => m,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
     };
+    // The cosine duplicate signal reads the caller scope's vector
+    // rows — built under the same master key the ConceptStore below
+    // takes (the same HMAC path tokens bind the two views together).
+    let user_vectors =
+        mycelium_store::vectors::VectorStore::for_user(state.store.pool(), user.user_id, &master);
     let cs = ConceptStore::for_user(&state.store, user.user_id, master)
         // The dream agent may write concepts: label its store (spec
         // §3.1 `dream` — system provenance; nothing model-authored
@@ -5138,7 +5143,8 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
             return llm_capacity_response();
         }
     };
-    let outcome = mycelium_librarian::dream::run_dream(&client, &cs, &scopes).await;
+    let outcome =
+        mycelium_librarian::dream::run_dream(&client, &cs, &scopes, Some(&user_vectors)).await;
     // The slot is free the moment the run is: the response body is
     // built after the release, not under the permit.
     drop(permit);
