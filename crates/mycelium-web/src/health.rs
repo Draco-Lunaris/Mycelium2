@@ -101,10 +101,13 @@ pub struct SystemStats {
     /// claimed (`ChatStore::waiting_turn_count`; zeroed on read failure
     /// like the queue fields).
     pub chat_waiting_count: i64,
-    /// Whether a corpus backfill has COMPLETED at some point (Ruling
+    /// Whether the MOST RECENT corpus backfill run completed (Ruling
     /// 7: keyed off the plain `dream_backfill_at` marker's presence —
-    /// deleted at click time, rewritten at completion). NOT in the
-    /// degraded rule — an absent marker is an un-run backfill, not an
+    /// deleted at click time, rewritten at completion, so a new click
+    /// makes this false until that run finishes; latest-attempt, not
+    /// ever-completed, because ruling-mandated click-time delete
+    /// erases the historical marker). NOT in the degraded rule — an
+    /// absent marker is an un-run or in-flight backfill, not an
     /// illness.
     pub dream_backfill_complete: bool,
     pub db_ok: bool,

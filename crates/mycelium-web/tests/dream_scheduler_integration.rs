@@ -1173,7 +1173,7 @@ async fn backfill_walks_every_scope_and_writes_marker() {
     assert_eq!(
         reqs.len(),
         3,
-        "one request per signal-carrying scope: two users + skills (the admin scope is empty)"
+        "one request per signal-carrying scope: two users + skills (the admin scope is unresolvable — no service seal)"
     );
     let bodies: Vec<String> = reqs
         .iter()
@@ -1538,4 +1538,130 @@ async fn backfill_shutdown_dies_silently_without_marker() {
         backfill_marker(&env.state.config).await.is_none(),
         "a shutdown walk writes NO marker"
     );
+}
+
+/// Ruling 8's explicit-intent clause: a backfill is the admin's own
+/// action, so `dream_enabled` gates NOTHING about it — with a lifecycle
+/// row that would stop every scheduler wake cold, the walk still runs
+/// the scopes and writes THE marker.
+#[tokio::test]
+async fn dream_enabled_false_does_not_gate_backfill() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let (llm_url, requests) =
+        capturing_mock_llm(vec![text_response("disabled-row summary text")]).await;
+    let env = boot_web().await;
+    // A lifecycle row that DISABLES dreams (the scheduler's own short
+    // circuit). Admin intent is NOT the scheduler's: the row does not
+    // consult it.
+    write_lifecycle(
+        &env.state.config,
+        &env.state.service_key,
+        TEST_INTERVAL,
+        false,
+    )
+    .await;
+    let (uid, master) = real_user(&env, "backfill-disabled-row").await;
+    put_orphan(
+        &ConceptStore::for_user(env.state.store.as_ref(), uid, master),
+        REAL_PATH,
+        "Disabled Row Note",
+        "nobody links to the disabled row",
+    )
+    .await;
+    write_llm(&env.state.config, &env.state.service_key, &llm_url).await;
+    let (cookie, csrf) = login_admin(&env.client, &env.base).await;
+
+    let resp = post_backfill(&env.client, &env.base, &cookie, &csrf).await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(location_of(resp).await, "/admin/dream?ok=Backfill started");
+
+    // The walk RUNS anyway: the marker appears, the real scope makes
+    // its request, /health flips.
+    wait_until("the marker written despite the disabled row", async || {
+        backfill_marker(&env.state.config).await.is_some()
+    })
+    .await;
+    assert!(
+        backfill_flag(&env.client, &env.base).await,
+        "the walk completed behind the disabled lifecycle row"
+    );
+    assert_eq!(
+        requests.lock().await.len(),
+        1,
+        "the orphaned user scope ran (the admin scope is unresolvable, the skills shelf has no signals)"
+    );
+    assert!(
+        env.state
+            .config
+            .get::<serde_json::Value>(DREAM_LAST_RUN_KEY)
+            .await
+            .unwrap()
+            .is_none(),
+        "the backfill still writes no scheduler readout"
+    );
+
+    env.shutdown.cancel();
+}
+
+/// The no-backend posture (the tick's step-4 shape): a walk without a
+/// usable llm row abandons BEFORE the rotation — warned, guard
+/// released by the RAII drop, NO marker — and a re-click after the
+/// admin configures a backend restarts the walk cleanly (the guard
+/// never wedged the button).
+#[tokio::test]
+async fn backfill_without_usable_llm_row_abandons_silently() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    // Deliberately NO llm row and NO mock server yet: the first walk
+    // must abandon at resolve_llm_client, having touched nothing.
+    let env = boot_web().await;
+    let (uid, master) = real_user(&env, "backfill-nollm").await;
+    put_orphan(
+        &ConceptStore::for_user(env.state.store.as_ref(), uid, master),
+        REAL_PATH,
+        "No LLM Note",
+        "nobody links to the no-llm orphan",
+    )
+    .await;
+    let (cookie, csrf) = login_admin(&env.client, &env.base).await;
+
+    let resp = post_backfill(&env.client, &env.base, &cookie, &csrf).await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(location_of(resp).await, "/admin/dream?ok=Backfill started");
+
+    // The walk abandoned: the guard is back (RAII), nothing completed.
+    wait_until("the guard released after the abandon", async || {
+        backfill_gauge(&env.client, &env.base).await == 0
+    })
+    .await;
+    assert!(
+        backfill_marker(&env.state.config).await.is_none(),
+        "no usable llm row — NO marker"
+    );
+    assert!(
+        !backfill_flag(&env.client, &env.base).await,
+        "/health stays false: nothing ran"
+    );
+
+    // Re-click after the backend exists: the SAME click flow works
+    // (a wedged guard would return the already-running flash), the
+    // walk runs the real scope, the marker appears.
+    let (llm_url, requests) = capturing_mock_llm(vec![text_response("late summary text")]).await;
+    write_llm(&env.state.config, &env.state.service_key, &llm_url).await;
+    let r2 = post_backfill(&env.client, &env.base, &cookie, &csrf).await;
+    assert_eq!(r2.status(), 303);
+    assert_eq!(location_of(r2).await, "/admin/dream?ok=Backfill started");
+    wait_until("the marker written by the restarted walk", async || {
+        backfill_marker(&env.state.config).await.is_some()
+    })
+    .await;
+    assert_eq!(
+        requests.lock().await.len(),
+        1,
+        "the restarted walk ran its pass (and nothing ran in the first, aborted one)"
+    );
+    assert!(backfill_flag(&env.client, &env.base).await);
+
+    env.shutdown.cancel();
 }
