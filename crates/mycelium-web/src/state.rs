@@ -1,7 +1,7 @@
 //! Shared application state: store, auth services, key caches, metrics.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mycelium_auth::login::LoginService;
 use mycelium_auth::session::SessionManager;
@@ -173,6 +173,20 @@ pub struct AppState {
     /// the skills shelf), try-class gate admission. Spawned at boot
     /// after the gate sync and the boot sweeps.
     pub dream_scheduler: Arc<crate::dream_scheduler::DreamScheduler>,
+    /// The corpus-backfill running-guard (Ruling 8): claimed by the
+    /// `/admin/dream/backfill` handler (CAS false→true) before it
+    /// spawns the worker, released by the worker's RAII guard on every
+    /// exit. The /metrics `mycelium2_dream_backfill_active` gauge and
+    /// the handler's reject path read this same flag.
+    pub dream_backfill_running: Arc<AtomicBool>,
+    /// The app's shutdown token, installed by `main` before any worker
+    /// spawn: handler-spawned workers (the corpus backfill) select on
+    /// the same cancellation the boot-spawned ones do. An `Arc<
+    /// OnceLock<…>>` because a request can only construct state AFTER
+    /// `AppState::new` — the lock keeps the 24-call-site constructor
+    /// signature untouched; unset (tests) means a detached,
+    /// never-cancelled default.
+    pub shutdown: Arc<std::sync::OnceLock<tokio_util::sync::CancellationToken>>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
     /// The server's data directory — the root that holds `config/tls/`
@@ -292,6 +306,8 @@ impl AppState {
             queue_worker,
             vector_worker,
             dream_scheduler,
+            dream_backfill_running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(std::sync::OnceLock::new()),
             assets_dir,
             data_dir,
             webauthn,
@@ -306,6 +322,15 @@ impl AppState {
         self.master_keys
             .for_user(&self.store, &self.service_key, user_id)
             .await
+    }
+
+    /// The app shutdown token for handler-spawned workers: the token
+    /// `main` installs (the root's child) once state is built; before
+    /// that install — and in tests that never install one — a detached
+    /// default that is never cancelled, so a worker spawned from this
+    /// state behaves like a daemon.
+    pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown.get().cloned().unwrap_or_default()
     }
 
     /// Seal a user's master key under the service key and persist it

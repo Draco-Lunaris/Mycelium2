@@ -5173,6 +5173,62 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
     }
 }
 
+/// POST /admin/dream/backfill (memory-lifecycle Ruling 8): the admin
+/// click that launches ONE detached corpus-backfill worker. Its order
+/// is the contract (design note 1):
+///
+///   1. the running-guard claim — FIRST, before anything else: a
+///      second click while a walk runs is rejected with the running
+///      flash and touches NOTHING (the compare-and-swap is the single
+///      synchronization between racing clicks);
+///   2. the previous completion marker (`dream_backfill_at`) is
+///      DELETED — the walk is re-clickable the moment it is launched
+///      (a stale "complete" must not outlive a fresh trigger); the
+///      worker rewrites it at completion;
+///   3. the worker spawns on the app's shutdown token (detached; the
+///      guard stays claimed while it walks and is released by its
+///      RAII drop — a dead worker never wedges the button).
+///
+/// The flash redirects target the Dream admin page; session-only
+/// (browser-flow admin action, CSRF'd by the middleware like every
+/// other admin POST).
+pub async fn post_admin_dream_backfill(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    // 1. Claim the guard — exactly one racer wins.
+    if state
+        .dream_backfill_running
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Redirect::to("/admin/dream?error=Backfill%20already%20running").into_response();
+    }
+    // 2. Kill the stale marker (re-clickable from the launch instant).
+    if let Err(e) = state
+        .config
+        .delete(crate::dream_scheduler::DREAM_BACKFILL_AT_KEY)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            "dream backfill: stale marker delete failed (the walk still runs)"
+        );
+    }
+    // 3. Spawn the walk.
+    crate::dream_scheduler::DreamScheduler::spawn_backfill(
+        state.dream_scheduler.clone(),
+        state.dream_backfill_running.clone(),
+        state.shutdown_token(),
+    );
+    Redirect::to("/admin/dream?ok=Backfill%20started").into_response()
+}
+
 /// POST /api/v1/chat — the stateless single-turn endpoint (spec D9):
 /// one message in, one reply out, no cross-call memory (the
 /// session-scoped endpoints under /chat/sessions own multi-turn

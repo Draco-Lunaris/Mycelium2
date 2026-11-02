@@ -23,29 +23,38 @@
 //!   5. resolve the rotation: users (`SELECT id, role FROM users ORDER
 //!      BY id`) then the `global:skills` shelf; a failed enumeration
 //!      defers the wake.
-//!   6. admit through [`LLM_GATE.try_enter`] — try class, NEVER waits
-//!      (the stream's global constraint): a busy gate defers the wake
-//!      with the cursor untouched. A RED backend (the drain's Red-halt,
-//!      2026-10-31: a doomed run would hold a max_parallel slot up to
-//!      the LLM timeout) defers too; Disabled is step 4's no-op, NOT
-//!      weather, and Yellow still runs.
-//!   7. resolve the scope (stores, agent scopes, vectors — the
-//!      `api_dream` construction, built fresh per attempt). An
-//!      unrecoverable user master key is still an ATTEMPTED pass:
-//!      warned, recorded `ran: false`, cursor advances.
-//!   8. [`mycelium_librarian::dream::run_dream`] under the permit —
-//!      dropped the moment the run ends; every completed attempt (ran,
-//!      no-signal, or failure) writes the plain-JSON `dream_last_run`
-//!      record (Ruling 7: summary bounded at the byte-safe cap) and
-//!      advances the cursor. A PANICKING pass is caught (the queue
-//!      worker's 2026-10-31 panic net) and takes the same attempted-
-//!      failure shape — recorded `ran: false`, cursor advances, loop
-//!      continues on the next tick.
+//!   6. the shared per-scope pass ([`DreamScheduler::run_scope_pass`],
+//!      Task 4's ONE source of truth for resolve+admit+dream): the
+//!      backend-Red gate (the drain's Red-halt, 2026-10-31: a doomed
+//!      run would hold a max_parallel slot up to the LLM timeout;
+//!      Disabled is step 4's no-op, NOT weather, Yellow still runs) →
+//!      scope resolution (the `api_dream` construction, built fresh
+//!      per attempt — BEFORE admission, so an unrecoverable user
+//!      master key never holds a queue slot) → [`LLM_GATE.try_enter`]
+//!      admission (try class, NEVER waits — the stream's global
+//!      constraint: a busy gate never does) →
+//!      [`mycelium_librarian::dream::run_dream`] under the permit,
+//!      dropped the moment the run ends.
+//!   7. the CALLER's recording — the shared fn returns an outcome
+//!      shape both callers account from: the tick counts the pass and
+//!      writes the plain-JSON `dream_last_run` record for every
+//!      Attempted outcome (ran, no-signal, failure — Ruling 7:
+//!      summary bounded at the byte-safe cap) and advances the
+//!      cursor. A PANICKING pass is caught (the queue worker's
+//!      2026-10-31 panic net) and takes the same attempted-failure
+//!      shape; an unrecoverable key is likewise an ATTEMPTED pass
+//!      (recorded `ran: false`, cursor advances).
 //!
-//! The backfill worker (Task 4) shares the per-scope pass code through
-//! [`DreamScheduler::resolve_scope`] / [`DreamScheduler::finish_pass`]
-//! but resolves keys BEFORE admission and records no last-run readout —
-//! `dream_last_run` is the scheduler's own.
+//! The backfill worker (Task 4, Ruling 8) drives the SAME
+//! [`DreamScheduler::run_scope_pass`] for every maintenance scope —
+//! users `ORDER BY id` then the `global:skills` shelf — but records
+//! nothing: no `dream_last_run` write, no cursor (the scheduler's
+//! readout stays its own). On completion it leaves THE
+//! [`DREAM_BACKFILL_AT_KEY`] marker (a plain RFC3339 row — the /health
+//! `dream_backfill_complete` flag keys off its presence); the admin
+//! click deletes the marker before spawning. Its shutdown-token select
+//! arm kills a mid-walk silently — no marker — and the running-guard
+//! is released on every exit (panic included) regardless.
 //!
 //! /metrics exposes three counters (health.rs writes the lines): every
 //! wake is a tick; every wake that ran a pass — ran, no-signal, or
@@ -55,7 +64,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use mycelium_auth::rbac::Role;
@@ -63,7 +72,7 @@ use mycelium_crypto::keys::ServiceKey;
 use mycelium_librarian::agent::{AgentError, AgentScopes};
 use mycelium_librarian::dream::DreamReport;
 use mycelium_librarian::llm::{LlmClient, LlmConfig};
-use mycelium_librarian::llm_gate::{GatePermit, LLM_GATE};
+use mycelium_librarian::llm_gate::LLM_GATE;
 use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH, short_detail};
 use mycelium_librarian::queue_worker::MasterKeyRecovery;
 use mycelium_store::config::get_sealed;
@@ -79,6 +88,14 @@ use uuid::Uuid;
 /// the admin readout (Task 5). Scheduler-writes-only; the backfill
 /// passes record nothing, and no boot sweep prunes it.
 pub const DREAM_LAST_RUN_KEY: &str = "dream_last_run";
+
+/// The `dream_backfill_at` completion marker (Ruling 7): a plain
+/// (UNsealed) ConfigStore RFC3339 string row — THE evidence a corpus
+/// backfill completed (the /health `dream_backfill_complete` flag
+/// keys off its presence). The admin click DELETES it (the walk is
+/// re-clickable the moment it is launched) and the backfill worker
+/// rewrites it on completion.
+pub const DREAM_BACKFILL_AT_KEY: &str = "dream_backfill_at";
 
 /// /metrics counters (health.rs writes the lines): every wake is a
 /// tick; every wake that ran a pass — ran, no-signal, or resolve-
@@ -207,57 +224,59 @@ impl DreamScheduler {
             return;
         };
 
-        // 6. One scope per wake, at the cursor; try class — a busy gate
-        //    defers the wake with the cursor untouched (never waits).
-        //    Backend weather first (the drain's Red-halt, 2026-10-31): a
-        //    Red backend is a doomed run that would hold a max_parallel
-        //    slot for up to the LLM timeout, recorded as a failure
-        //    anyway — the wake defers instead. Disabled is deliberately
-        //    NOT gated here (no llm row is step 4's no-op, not weather)
-        //    and Yellow still runs (1-2 failures do not make every pass
-        //    doomed).
+        // 6. One scope per wake, at the cursor — the SHARED per-scope
+        //    pass (the ONE source of truth for resolve+admit+dream;
+        //    the backfill worker drives the same fn). The tick owns
+        //    the recording off the returned outcome: every Attempted
+        //    outcome — ran, no-signal, pass failure, resolve-failure —
+        //    is a pass recorded to `dream_last_run` (Ruling 7) and
+        //    advanced (Ruling 6); BackendRed / GateBusy defer the wake
+        //    with the cursor untouched.
         let target = &rotation[*cursor % rotation.len()];
         let scope_id = target.scope_id();
-        if LLM_HEALTH.state() == BackendState::Red {
-            tracing::warn!(
-                scope = %scope_id,
-                "dream scheduler: backend Red — the wake defers"
-            );
-            DREAM_PASSES_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return;
+        match self.run_scope_pass(target, &client).await {
+            ScopePassOutcome::Attempted(Ok(report)) => {
+                // Ruling 9: the record serializes the report fields it
+                // got — the agent's summary when it ran, the
+                // deterministic skip reason otherwise (a `ran: false`
+                // no-signal pass is still an honest record).
+                let summary = report.summary.clone().or_else(|| report.reason.clone());
+                self.record_last_run(&scope_id, report.ran, summary).await;
+                DREAM_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                advance_cursor(cursor, rotation.len());
+            }
+            ScopePassOutcome::Attempted(Err(detail)) => {
+                tracing::warn!(scope = %scope_id, error = %detail, "scheduled dream pass failed");
+                self.record_last_run(&scope_id, false, Some(detail)).await;
+                DREAM_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                advance_cursor(cursor, rotation.len());
+            }
+            ScopePassOutcome::Unresolvable => {
+                // The resolve-failure ruling: an unrecoverable user
+                // master key is still an ATTEMPTED pass (resolve_scope
+                // already warned per scope).
+                tracing::warn!(
+                    scope = %scope_id,
+                    "dream scheduler: scope unresolvable — counted as an attempted pass"
+                );
+                self.record_last_run(
+                    &scope_id,
+                    false,
+                    Some("scope skipped: master key unrecoverable".to_string()),
+                )
+                .await;
+                DREAM_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                advance_cursor(cursor, rotation.len());
+            }
+            ScopePassOutcome::BackendRed | ScopePassOutcome::GateBusy => {
+                // Red warns inside run_scope_pass (the drain's
+                // Red-halt — a doomed run would hold a max_parallel
+                // slot for up to the LLM timeout); the gate-busy skip
+                // keeps the tick's try-class silence. Either way: a
+                // skip, the cursor untouched.
+                DREAM_PASSES_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        let Some(permit) = LLM_GATE.try_enter() else {
-            DREAM_PASSES_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-
-        // 7. Resolve the scope's stores/scopes/vectors. An unresolvable
-        //    user key is still an ATTEMPTED pass (the resolve-failure
-        //    ruling): warn, record `ran: false`, advance.
-        let Some(scope) = self.resolve_scope(target).await else {
-            drop(permit);
-            tracing::warn!(
-                scope = %scope_id,
-                "dream scheduler: scope unresolvable — counted as an attempted pass"
-            );
-            self.record_last_run(
-                &scope_id,
-                false,
-                Some("scope skipped: master key unrecoverable".to_string()),
-            )
-            .await;
-            DREAM_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            advance_cursor(cursor, rotation.len());
-            return;
-        };
-
-        // 8. The pass — the permit rides along and is dropped the
-        //    moment the run ends. Every completed attempt (Ok including
-        //    the `ran: false` no-signal report, Err) is recorded and
-        //    advances the cursor (Ruling 6).
-        self.finish_pass(&client, scope, permit, true).await;
-        DREAM_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        advance_cursor(cursor, rotation.len());
     }
 
     /// The sealed `lifecycle` row, always clamped. `Some` = the tick
@@ -379,9 +398,9 @@ impl DreamScheduler {
     /// The `api_dream` scope construction for one rotation entry — the
     /// same stores, agent scopes, and vectors the REST endpoint builds,
     /// per attempt. `pub(crate)` + fallible ONLY on the user branch's
-    /// master-key recovery (the skills branch is always resolvable):
-    /// the backfill worker (Task 4) resolves its scopes through this fn
-    /// too.
+    /// master-key recovery (the skills branch is always resolvable);
+    /// called by [`DreamScheduler::run_scope_pass`], which both
+    /// callers (the tick and the Task-4 backfill worker) drive.
     pub(crate) async fn resolve_scope<'a>(
         &'a self,
         target: &RotationTarget,
@@ -410,7 +429,6 @@ impl DreamScheduler {
                     &scope_id,
                 );
                 Some(DreamScope {
-                    scope_id,
                     cs,
                     cons_cs,
                     scopes,
@@ -445,7 +463,6 @@ impl DreamScheduler {
                     &scope_id,
                 );
                 Some(DreamScope {
-                    scope_id,
                     cs,
                     cons_cs,
                     scopes,
@@ -455,22 +472,47 @@ impl DreamScheduler {
         }
     }
 
-    /// One already-admitted dream pass — the tick's per-scope body, and
-    /// the backfill worker's (Task 4). `run_dream` runs under the
-    /// caller's permit and under [`catch_pass_panic`]'s net; the permit
-    /// is dropped the MOMENT the run ends (nothing between the run and
-    /// the release). `write_readout`: the scheduler tick writes
-    /// `dream_last_run` (Ruling 7); the backfill passes record nothing
-    /// (Ruling 8). Every failure shape — a real `Err` and a caught
-    /// panic alike — is the same ATTEMPTED outcome: recorded `ran:
-    /// false` with the bounded detail; the loop continues.
-    pub(crate) async fn finish_pass(
+    /// The per-scope dream pass — the ONE source of truth for
+    /// resolve+admit+dream (Task 4's refactor ruling). Both callers —
+    /// the tick and the backfill worker — drive this fn; the CALLER
+    /// owns the recording off the returned [`ScopePassOutcome`] (the
+    /// tick records `dream_last_run` + counts the pass + advances the
+    /// rotation, Ruling 7; the backfill records nothing, Ruling 8).
+    ///
+    /// Order: the backend-Red gate (the drain's Red-halt, 2026-10-31 —
+    /// a doomed run would hold a max_parallel slot for up to the LLM
+    /// timeout; Disabled is deliberately NOT gated — no llm row is the
+    /// no-backend case, not weather — and Yellow still runs) → scope
+    /// resolution BEFORE admission (an unrecoverable user master key
+    /// never holds a queue slot) → [`LLM_GATE.try_enter`] (try class,
+    /// never waits) → the panic-netted [`mycelium_librarian::dream::
+    /// run_dream`] under the permit, dropped the MOMENT the run ends
+    /// (nothing between the run and the release). Every failure shape —
+    /// a real `Err` and a caught panic alike — is the same ATTEMPTED
+    /// outcome for the caller's accounting.
+    pub(crate) async fn run_scope_pass(
         &self,
+        target: &RotationTarget,
         client: &LlmClient,
-        scope: DreamScope<'_>,
-        permit: GatePermit<'_>,
-        write_readout: bool,
-    ) {
+    ) -> ScopePassOutcome {
+        let scope_id = target.scope_id();
+        if LLM_HEALTH.state() == BackendState::Red {
+            tracing::warn!(scope = %scope_id, "dream pass: backend Red — the pass defers");
+            return ScopePassOutcome::BackendRed;
+        }
+        // Resolve the scope's stores/scopes/vectors (the `api_dream`
+        // construction, fresh per attempt) BEFORE admission — an
+        // unloadable key never burns a try-class slot.
+        let Some(scope) = self.resolve_scope(target).await else {
+            return ScopePassOutcome::Unresolvable;
+        };
+        // Try class — a busy gate never waits; the caller decides the
+        // skip accounting (the tick defers its wake, the backfill
+        // skips the scope but still finishes its walk).
+        let permit = match LLM_GATE.try_enter() {
+            Some(permit) => permit,
+            None => return ScopePassOutcome::GateBusy,
+        };
         let report = catch_pass_panic(mycelium_librarian::dream::run_dream(
             client,
             &scope.cs,
@@ -480,25 +522,7 @@ impl DreamScheduler {
         ))
         .await;
         drop(permit);
-        if !write_readout {
-            return;
-        }
-        match report {
-            Ok(report) => {
-                // Ruling 9: the record serializes the report fields it
-                // got — the agent's summary when it ran, the
-                // deterministic skip reason otherwise (a `ran: false`
-                // no-signal pass is still an honest record).
-                let summary = report.summary.clone().or_else(|| report.reason.clone());
-                self.record_last_run(&scope.scope_id, report.ran, summary)
-                    .await;
-            }
-            Err(detail) => {
-                tracing::warn!(scope = %scope.scope_id, error = %detail, "scheduled dream pass failed");
-                self.record_last_run(&scope.scope_id, false, Some(detail))
-                    .await;
-            }
-        }
+        ScopePassOutcome::Attempted(report)
     }
 
     /// The last-run record write (plain JSON, summary bounded at the
@@ -519,6 +543,147 @@ impl DreamScheduler {
             );
         }
     }
+
+    /// Launch the admin-triggered corpus backfill (Ruling 8): ONE
+    /// detached worker over [`run_backfill`]. The handler claims the
+    /// running-guard BEFORE calling this (the CAS is the only
+    /// single-run synchronization) and passes the app's shutdown token
+    /// — the walk selects on it like every boot-spawned worker and
+    /// dies silently when the process shuts down.
+    pub(crate) fn spawn_backfill(
+        sched: Arc<DreamScheduler>,
+        running: Arc<AtomicBool>,
+        shutdown: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move { run_backfill(sched, running, shutdown).await })
+    }
+}
+
+/// RAII release of the backfill running-guard: every exit path —
+/// completion, unusable config, enumeration failure, shutdown, panic
+/// unwind — hands the admin button back (deliberate: a dead worker
+/// must never wedge it; the next click restarts the walk). The marker
+/// is NOT part of the release — only a completed walk writes one.
+struct BackfillGuard(Arc<AtomicBool>);
+
+impl Drop for BackfillGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The admin-triggered corpus backfill walk (Ruling 8): every
+/// maintenance scope ONCE — the users `ORDER BY id` first, the
+/// `global:skills` shelf strictly last (the one rotation builder) —
+/// through the SAME per-scope pass the tick drives. `dream_enabled`
+/// gates nothing here; `dream_last_run` is never written (the
+/// scheduler's readout stays its own). A gate-busy scope is skipped
+/// (warned; its signals persist for the scheduler's rotation or the
+/// next walk) and the walk still completes; a Red backend defers
+/// scope-by-scope through the same shared gate.
+async fn run_backfill(
+    sched: Arc<DreamScheduler>,
+    running: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    // Deliberate: the guard release rides the RAII guard, so a panic
+    // in this walk's own body still hands the button back (the pass
+    // net is inside run_scope_pass; this is the outer net).
+    let _guard = BackfillGuard(running);
+
+    // The client resolves ONCE, before the walk (the tick's step-4
+    // posture): an absent/undecryptable/unreadable `llm` row is a
+    // guaranteed-fail walk — warn and leave NO marker (nothing ran).
+    let Some(client) = sched.resolve_llm_client().await else {
+        tracing::warn!("dream backfill: no usable llm row — the walk is abandoned, no marker left");
+        return;
+    };
+
+    // The walk's targets: every user scope, then the skills shelf (the
+    // ONE rotation builder — never a third literal). An enumeration
+    // failure leaves no marker either: nothing walked.
+    let Some(rotation) = sched.rotation().await else {
+        tracing::warn!(
+            "dream backfill: user enumeration failed — the walk is abandoned, no marker left"
+        );
+        return;
+    };
+    let total = rotation.len();
+
+    // One pass per scope; the shutdown select arm kills a mid-walk
+    // silently — no marker (Ruling 8); the guard releases via the
+    // RAII drop regardless.
+    let mut attempted = 0usize;
+    let mut skipped = 0usize;
+    for target in &rotation {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            outcome = sched.run_scope_pass(target, &client) => match outcome {
+                ScopePassOutcome::Attempted(Ok(_)) => attempted += 1,
+                ScopePassOutcome::Attempted(Err(detail)) => {
+                    attempted += 1;
+                    tracing::warn!(
+                        scope = %target.scope_id(),
+                        error = %detail,
+                        "dream backfill pass failed"
+                    );
+                }
+                // The unloadable-key skip (Review Focus 4): warned
+                // inside resolve_scope; the walk reaches the remaining
+                // scopes and finishes.
+                ScopePassOutcome::Unresolvable => skipped += 1,
+                ScopePassOutcome::BackendRed => skipped += 1,
+                ScopePassOutcome::GateBusy => {
+                    skipped += 1;
+                    tracing::warn!(
+                        scope = %target.scope_id(),
+                        "dream backfill: gate busy — scope skipped, its signals persist"
+                    );
+                }
+            },
+        }
+    }
+
+    // Completion: THE marker (Ruling 7 — a plain RFC3339 row; /health
+    // keys `dream_backfill_complete` off its presence). A failed write
+    // warns but never wedges the worker (the walk happened; the
+    // marker is observability).
+    if let Err(e) = sched
+        .config
+        .set(DREAM_BACKFILL_AT_KEY, &chrono::Utc::now().to_rfc3339())
+        .await
+    {
+        tracing::warn!(error = %e, "dream backfill: marker write failed");
+    }
+    tracing::info!(
+        attempted,
+        skipped,
+        total,
+        "dream backfill complete — the corpus marker is set"
+    );
+}
+
+/// What one per-scope pass produced — the shape BOTH callers (the
+/// tick, the Task-4 backfill worker) account from off the shared
+/// [`DreamScheduler::run_scope_pass`]. Attempted outcomes are the
+/// caller's recording decision; the last two are honest skips.
+/// `pub(crate)`: the fn returning it is.
+pub(crate) enum ScopePassOutcome {
+    /// An admitted pass ran to completion: a real report (ran or the
+    /// `ran: false` no-signal posture) on Ok; a pass failure on Err —
+    /// a real error or a caught panic's detail alike.
+    Attempted(Result<DreamReport, String>),
+    /// The backend is Red — the drain's Red-halt (a doomed run would
+    /// hold a max_parallel slot for up to the LLM timeout). Warned in
+    /// the shared fn; Disabled is NOT weather and Yellow still runs.
+    BackendRed,
+    /// The gate was busy — try class never waits.
+    GateBusy,
+    /// The user scope's master key could not be recovered (warned in
+    /// `resolve_scope`). For the tick this is still an ATTEMPTED pass
+    /// (the resolve-failure ruling); for the backfill it is the
+    /// unloadable-key skip (Review Focus 4).
+    Unresolvable,
 }
 
 /// What a wake knows about the lifecycle row: `cfg` is ALWAYS clamped
@@ -555,10 +720,11 @@ impl RotationTarget {
 }
 
 /// One resolved dream target — everything [`run_dream`] needs for the
-/// scope, plus the scope id the record carries. The borrows are the
-/// tick's own `&self` borrow of the scheduler's store.
+/// scope. The borrows are the tick's own `&self` borrow of the
+/// scheduler's store; the scope id for records/warns stays with the
+/// caller (a cheap `RotationTarget::scope_id` recompute), the struct
+/// itself never carried it.
 pub(crate) struct DreamScope<'a> {
-    pub scope_id: String,
     pub cs: ConceptStore<'a>,
     pub cons_cs: ConceptStore<'a>,
     pub scopes: AgentScopes<'a>,
