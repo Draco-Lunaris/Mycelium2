@@ -733,21 +733,24 @@ pub(crate) struct DreamScope<'a> {
 
 /// The `dream_last_run` readout record (Ruling 7): `{at, scope, ran,
 /// summary}` as plain (unsealed) ConfigStore JSON. Task 5's admin
-/// readout renders it as-is.
-#[derive(Debug, serde::Serialize)]
-struct DreamLastRunRecord {
+/// readout renders it as-is — public with `Deserialize` so the GET
+/// page reads the SAME shape the scheduler writes (a missing summary
+/// deserializes as `None`; `skip_serializing_if` is serialize-side
+/// only).
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct DreamLastRunRecord {
     /// The write time (RFC 3339).
-    at: String,
+    pub at: String,
     /// The scope the attempt ran for (`user:<uuid>` / `global:skills`).
-    scope: String,
+    pub scope: String,
     /// Whether the agent actually ran (`run_dream`'s report) — false
     /// also marks skill-less no-signal passes, resolve-failures, and
     /// pass failures.
-    ran: bool,
+    pub ran: bool,
     /// The agent summary / the skip reason / the bounded failure
     /// detail, when anything readable came out.
     #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
+    pub summary: Option<String>,
 }
 
 /// Re-arm the wake interval at `period` (the live re-tune): a rebuilt

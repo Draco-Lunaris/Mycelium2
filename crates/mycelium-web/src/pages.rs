@@ -2125,9 +2125,9 @@ pub fn account_page(
 // ---------- Admin pages (PR 3: the five-page split) ----------
 
 /// The admin section's TabBar (the Phase-5 spec's five labels plus the
-/// memory-lifecycle stream's Embeddings entry, adjacent to the LLM
-/// one) with the current page's tab active — rendered under the page
-/// header on every admin page.
+/// memory-lifecycle stream's Embeddings and Dream entries, adjacent to
+/// the LLM one) with the current page's tab active — rendered under the
+/// page header on every admin page.
 fn admin_tabs(active: &str) -> String {
     mycelium_ui::render::render(mycelium_ui::tab_bar(&[
         ("Users", "/admin/users", active == "/admin/users"),
@@ -2138,6 +2138,7 @@ fn admin_tabs(active: &str) -> String {
             "/admin/embeddings",
             active == "/admin/embeddings",
         ),
+        ("Dream", "/admin/dream", active == "/admin/dream"),
         ("Library", "/admin/library", active == "/admin/library"),
         ("System", "/admin/system", active == "/admin/system"),
     ]))
@@ -2574,6 +2575,226 @@ pub fn admin_embeddings_page(
     )
 }
 
+/// Admin: Dream (memory-lifecycle Task 5) — one page hosts BOTH the
+/// dream scheduler section (the `dream_last_run` / `dream_backfill_at`
+/// readouts over Ruling 7's plain rows, the running guard, the backfill
+/// button) and the whole `lifecycle` row's form (plan Ruling 1 — never
+/// a row-per-item page).
+///
+/// Escaping: every free-text readout (the run timestamp, scope, agent
+/// summary, the backfill marker) goes through `html_escape` before its
+/// TrustedHtml slot — the summary is agent-produced text. The state
+/// words and field names are code constants. `cfg` is rendered CLAMPED
+/// — the caller hands in the clamped config (`get_sealed` deserializes
+/// unclamped; the api-side view applies `clamp()` after decode), so
+/// the boxes always show a value a save would accept.
+///
+/// The checkbox POST contract (the controller ruling): the hidden
+/// `dream_enabled_present` marker is ALWAYS rendered; the checkbox is
+/// present in a submit only when checked — the save handler reads
+/// marker-absent as "no page form drove this POST" (unreachable from
+/// this page's one form encoding).
+pub fn admin_dream_page(
+    user: &SessionUser,
+    csrf: &str,
+    cfg: &mycelium_store::revisions::LifecycleConfig,
+    readouts: &crate::api::DreamPageReadouts,
+    ok: Option<&str>,
+    err: Option<&str>,
+) -> Html<String> {
+    use mycelium_store::revisions::{
+        CONSOLIDATION_PATCHES_RANGE, DEDUP_COSINE_RANGE, DREAM_INTERVAL_S_RANGE, QUERY_TOP_K_RANGE,
+        RECENT_WINDOW_RANGE, REVISION_RETENTION_RANGE, RRF_K_RANGE, RRF_WEIGHT_RANGE,
+        STALE_DAYS_RANGE,
+    };
+
+    // ---- the scheduler section ----
+    // The last scheduled run: "none yet" before the first scheduled
+    // attempt (the plain row simply does not exist yet).
+    let last_run = match &readouts.last_run {
+        None => r#"<p class="muted">Last scheduled run: none yet.</p>"#.to_string(),
+        Some(r) => {
+            let mut line = format!(
+                r#"<p>Last scheduled run: <span>{at}</span> for <span>{scope}</span> &mdash; <span>{outcome}</span></p>"#,
+                at = html_escape(&r.at),
+                scope = html_escape(&r.scope),
+                outcome = if r.ran { "ran" } else { "did not run" },
+            );
+            if let Some(summary) = r.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+                line.push_str(&format!(
+                    r#"<p class="muted">{summary}</p>"#,
+                    summary = html_escape(summary)
+                ));
+            }
+            line
+        }
+    };
+    // The backfill state's dispatch precedence: a PRESENT marker is a
+    // completed walk (Task 4's launch deletes the marker and the worker
+    // rewrites it), so it renders even while a re-run is in flight;
+    // "in flight" requires the marker gone AND the running guard
+    // claimed; otherwise it has never run.
+    let backfill_state = if let Some(ts) = readouts
+        .backfill_at
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+    {
+        format!(
+            r#"<p>Corpus backfill: <strong>complete</strong> <span>(run {ts})</span></p>"#,
+            ts = html_escape(ts)
+        )
+    } else if readouts.backfill_running {
+        r#"<p>Corpus backfill: <strong>in flight</strong>.</p>"#.to_string()
+    } else {
+        r#"<p class="muted">Corpus backfill: never run.</p>"#.to_string()
+    };
+    // The backfill button: Task 4's POST route, session CSRF by the
+    // middleware — the hidden csrf_token field keeps the form working
+    // without JS (the shared no-JS discipline; app.js skips forms that
+    // already carry one).
+    let scheduler_body = format!(
+        r#"{last_run}{backfill_state}
+<form method="post" action="/admin/dream/backfill">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button type="submit">Run corpus backfill</button>
+</form>"#,
+        last_run = last_run,
+        backfill_state = backfill_state,
+        csrf = html_escape(csrf),
+    );
+
+    // ---- the lifecycle form ----
+    // One labelled number input per field (the admin page's closure
+    // shape): the range is both a browser-enforced min/max and a
+    // visible hint — server-side the value is clamped on save, never
+    // rejected. The f32 fields add `step="any"` (the browser default
+    // step of 1 would block decimal submissions).
+    let u32_field = |label: &str, name: &str, value: u32, range: (u32, u32)| {
+        format!(
+            r#"  <label>{label} ({lo}&ndash;{hi})</label><input name="{name}" type="number" min="{lo}" max="{hi}" value="{value}">
+"#,
+            label = html_escape(label),
+            name = html_escape(name),
+            lo = range.0,
+            hi = range.1,
+            value = html_escape(&value.to_string()),
+        )
+    };
+    let f32_field = |label: &str, name: &str, value: f32, range: (f32, f32)| {
+        format!(
+            r#"  <label>{label} ({lo}&ndash;{hi})</label><input name="{name}" type="number" step="any" min="{lo}" max="{hi}" value="{value}">
+"#,
+            label = html_escape(label),
+            name = html_escape(name),
+            lo = range.0,
+            hi = range.1,
+            value = html_escape(&value.to_string()),
+        )
+    };
+    // Field order follows the row's fixed sync order (the retention →
+    // query → fusion → dedup → dream-signal sequence
+    // `sync_lifecycle_from_store` stamps), dream fields last.
+    let fields = [
+        u32_field(
+            "Revision retention (revisions kept per concept)",
+            "revision_retention",
+            cfg.revision_retention,
+            REVISION_RETENTION_RANGE,
+        ),
+        u32_field(
+            "Query top-K (candidates per query)",
+            "query_top_k",
+            cfg.query_top_k,
+            QUERY_TOP_K_RANGE,
+        ),
+        u32_field("Fusion rank constant k", "rrf_k", cfg.rrf_k, RRF_K_RANGE),
+        f32_field(
+            "Fusion lexical weight",
+            "rrf_weight_lex",
+            cfg.rrf_weight_lex,
+            RRF_WEIGHT_RANGE,
+        ),
+        f32_field(
+            "Fusion vector weight",
+            "rrf_weight_vec",
+            cfg.rrf_weight_vec,
+            RRF_WEIGHT_RANGE,
+        ),
+        f32_field(
+            "Dream consolidation dedup threshold (cosine)",
+            "dedup_cosine",
+            cfg.dedup_cosine,
+            DEDUP_COSINE_RANGE,
+        ),
+        u32_field(
+            "Stale days (stale threshold)",
+            "stale_days",
+            cfg.stale_days,
+            STALE_DAYS_RANGE,
+        ),
+        u32_field(
+            "Recent window (days)",
+            "recent_window",
+            cfg.recent_window,
+            RECENT_WINDOW_RANGE,
+        ),
+        u32_field(
+            "Consolidation patches per pass",
+            "consolidation_patches",
+            cfg.consolidation_patches,
+            CONSOLIDATION_PATCHES_RANGE,
+        ),
+        u32_field(
+            "Dream interval (seconds)",
+            "dream_interval_s",
+            cfg.dream_interval_s,
+            DREAM_INTERVAL_S_RANGE,
+        ),
+    ]
+    .concat();
+    // The checkbox POST contract's markup: the hidden marker ALWAYS
+    // rides; the checkbox is present in a submit only when checked.
+    let checkbox = format!(
+        r#"  <input type="hidden" name="dream_enabled_present" value="1">
+  <label for="dream-enabled">Scheduled dream runs enabled</label><input id="dream-enabled" name="dream_enabled" type="checkbox"{checked}>
+"#,
+        checked = if cfg.dream_enabled { " checked" } else { "" },
+    );
+    let form_body = format!(
+        r#"{checkbox}  <p class="muted">Blank fields keep their stored value; out-of-range values are clamped to the range shown. The query/fusion/retention/dream-signal settings apply live &mdash; no restart.</p>
+{fields}  <button type="submit">Save lifecycle config</button>
+</form>"#,
+        checkbox = checkbox,
+        fields = fields,
+    );
+    let lifecycle_body = format!(
+        r#"<form method="post" action="/admin/dream">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+{form_body}"#,
+        csrf = html_escape(csrf),
+        form_body = form_body,
+    );
+
+    let header = mycelium_ui::render::render(mycelium_ui::page_header(
+        "Dream",
+        TrustedHtml::from_markup(""),
+    ));
+    let body = format!(
+        "{header}{tabs}{flash}{}{}",
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Dream scheduler",
+            TrustedHtml::from_markup(scheduler_body),
+        )),
+        mycelium_ui::render::render(mycelium_ui::card(
+            "Lifecycle configuration",
+            TrustedHtml::from_markup(lifecycle_body),
+        )),
+        tabs = admin_tabs("/admin/dream"),
+        flash = admin_flash(ok, err),
+    );
+    layout("Dream", Some(user), csrf, "/admin/dream", body)
+}
+
 /// Admin: Library (mockup 12) — the stack of section cards:
 /// bookshelves (create form + table with the books-count column, the
 /// PR-2 books page's derived-count pattern), the upload card (the
@@ -2852,6 +3073,48 @@ pub fn llm_card(stats: &crate::api::SystemPageStats) -> String {
     ))
 }
 
+/// The embeddings-backend indicator card on the admin System page
+/// (memory-lifecycle Task 5): `embedding_state` + the last-checked
+/// clock from the ONE `EMBEDDING_HEALTH.embedding_snapshot()` read in
+/// `health::system_stats`, same ONE-snapshot-read discipline as the
+/// backend block — the card cannot disagree with /health or /metrics.
+///
+/// Deliberately NO outage clause: `SystemPageStats` maps only the state
+/// and the checked-at clock (the outage timeline
+/// `embedding_down_seconds` stays where /health derives it — the card's
+/// job is the indicator beside the LLM card, not a second timeline), so
+/// there is nothing to double-report here.
+///
+/// The dot is never the only signal: `aria-label` AND a visible state
+/// word beside it (WCAG — color alone must not encode state), the
+/// backend block's exact shape copy. Disabled reports no outage clause
+/// by construction (the frozen-down rule never renders here).
+///
+/// Escaping: the state word is `BackendState::as_str()` (a constant —
+/// "green"/"yellow"/"red"/"disabled"), the age is an `i64` — nothing
+/// attacker-controlled reaches the markup.
+pub fn embedding_card(stats: &crate::api::SystemPageStats) -> String {
+    let state = stats.embedding_state;
+    let mut line = format!(
+        r#"<p><span class="health-dot health-dot--{state}" role="img" aria-label="Embeddings backend health: {state}"></span><strong>Embeddings backend {state}</strong>"#
+    );
+    match stats.embedding_checked_seconds_ago {
+        Some(ago) => line.push_str(&format!(
+            " <span>last checked {} ago</span>",
+            fmt_waited(ago)
+        )),
+        None => line.push_str(" <span>never checked</span>"),
+    }
+    line.push_str("</p>");
+    line.push_str(
+        r#"<p class="muted">The embeddings backend powers hybrid search and the dream consolidation. Outage clocks live on /health and /metrics; this card is the indicator.</p>"#,
+    );
+    mycelium_ui::render::render(mycelium_ui::card(
+        "Embeddings backend",
+        TrustedHtml::from_markup(line),
+    ))
+}
+
 /// Format an age in seconds the way the System page reads durations:
 /// under a minute "45s", under an hour "5m", hours-and-minutes "1h 0m".
 /// Deterministic, integer-only (no clock reads here — callers pass the
@@ -2972,7 +3235,8 @@ fn waiting_items_card(stats: &crate::api::SystemPageStats) -> String {
 /// Admin: System — the operational view: the backend-health indicator,
 /// waiting summary and per-item waiting table above the StatTiles
 /// (outage-recovery spec §3.5), then /health's fields as StatTiles (a
-/// tile per value), the LLM-gate readout card, the TLS card, and the
+/// tile per value), the LLM-gate readout card + the embeddings-backend
+/// indicator card (memory-lifecycle Task 5), the TLS card, and the
 /// backup download (the existing POST /admin/backup button with its
 /// no-store rationale). The ingest-jobs table moved to /status (spec
 /// §8's PR-4 ruling — /status is the jobs-table home; the PR-3
@@ -3033,11 +3297,13 @@ pub fn admin_system_page(
     );
     let waiting_html = waiting_items_card(stats);
     // The LLM card sits directly under the queue/health tiles (spec
-    // §3.6: "next to the existing queue table"), ahead of the TLS and
-    // maintenance cards.
+    // §3.6: "next to the existing queue table"), with the embeddings
+    // indicator card beside it (Task 5's mapped state), ahead of the
+    // TLS and maintenance cards.
     let body = format!(
-        "{header}{tabs}{flash}{backend_html}{waiting_html}{stats_html}{}{}{}",
+        "{header}{tabs}{flash}{backend_html}{waiting_html}{stats_html}{}{}{}{}",
         llm_card(stats),
+        embedding_card(stats),
         tls_card(cert, pending, csrf),
         mycelium_ui::render::render(mycelium_ui::card(
             "Maintenance",

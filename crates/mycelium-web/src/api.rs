@@ -3447,6 +3447,17 @@ pub struct SystemPageStats {
     pub backend_state: &'static str,
     pub backend_down_seconds: Option<i64>,
     pub backend_checked_seconds_ago: Option<i64>,
+    /// The embeddings backend's reported state (`EMBEDDING_HEALTH` —
+    /// llm-health spec §3.5): the System page's embeddings card rides
+    /// the same ONE-snapshot-read discipline as `backend_state` — the
+    /// card cannot disagree with /health or /metrics.
+    pub embedding_state: &'static str,
+    /// Seconds since the last embeddings observation (`None` = never
+    /// observed). Mapping ONLY `state` + `checked` keeps the card
+    /// metadata-honest: the outage clock (`embedding_down_seconds`)
+    /// stays where /health computes it, because the card's job is the
+    /// indicator, not the outage timeline.
+    pub embedding_checked_seconds_ago: Option<i64>,
     pub chat_waiting_count: i64,
     /// The per-item waiting table's rows (chat turns + queued writes +
     /// pending ingest jobs, oldest first). The summary line's per-kind
@@ -3665,6 +3676,8 @@ pub async fn admin_system_view(
         backend_state: s.backend_state,
         backend_down_seconds: s.backend_down_seconds,
         backend_checked_seconds_ago: s.backend_checked_seconds_ago,
+        embedding_state: s.embedding_state,
+        embedding_checked_seconds_ago: s.embedding_checked_seconds_ago,
         chat_waiting_count: s.chat_waiting_count,
         waiting_items,
     };
@@ -4044,6 +4057,231 @@ pub async fn admin_save_embeddings(
         .into_response();
     }
     Redirect::to("/admin/embeddings?ok=Embeddings%20config%20saved").into_response()
+}
+
+/// GET /admin/dream — the Dream admin page (memory-lifecycle Task 5):
+/// one page hosts BOTH the scheduler section (the last scheduled run,
+/// the backfill button + state — Ruling 7's plain keys) and the whole
+/// `lifecycle` row's form (plan Ruling 1 — never a row-per-item page).
+///
+/// Rendered clamped: `get_sealed`/`decrypt_config` deserializes the
+/// sealed row UNclamped (mycelium-store applies the range rules on the
+/// SAVE side only), so this read path applies `clamp()` after decode —
+/// a stale or hand-edited out-of-range row must not put an
+/// unenforceable value back in the box.
+pub async fn admin_dream_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let lifecycle = crate::state::decrypt_config::<mycelium_store::revisions::LifecycleConfig>(
+        &state.config,
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+    )
+    .await
+    .unwrap_or_default()
+    .clamp();
+    let readouts = dream_readouts(&state).await;
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_dream_page(
+        &admin,
+        &csrf,
+        &lifecycle,
+        &readouts,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// The Dream page's scheduler readouts (Ruling 7): the last scheduled
+/// run record, the backfill completion marker (the plain RFC3339 row
+/// the worker rewrites), and the running guard (the same
+/// [`AppState::dream_backfill_running`] Task 4's launch races on). The
+/// reads fail open — a missing or unreadable plain row is
+/// "none yet"/"never run" on the page, never a 500.
+pub struct DreamPageReadouts {
+    /// The `dream_last_run` record (plain JSON row); `None` before the
+    /// first scheduled attempt.
+    pub last_run: Option<crate::dream_scheduler::DreamLastRunRecord>,
+    /// The `dream_backfill_at` marker — the last COMPLETION's RFC3339
+    /// timestamp (Task 4's launch deletes it; the worker rewrites it).
+    pub backfill_at: Option<String>,
+    /// The backfill walk's running guard — "in flight" only when the
+    /// marker is GONE (dispatch precedence lives on the page: a
+    /// present marker is a completed walk even mid-re-run).
+    pub backfill_running: bool,
+}
+
+/// The readouts' plain reads: `dream_last_run` as the scheduler's own
+/// [`crate::dream_scheduler::DreamLastRunRecord`] (serialize-side
+/// `skip_serializing_if` deserializes a missing summary as `None`), the
+/// marker as the plain RFC3339 string it is stored as, the guard as an
+/// atomic load.
+async fn dream_readouts(state: &AppState) -> DreamPageReadouts {
+    let last_run = state
+        .config
+        .get::<crate::dream_scheduler::DreamLastRunRecord>(
+            crate::dream_scheduler::DREAM_LAST_RUN_KEY,
+        )
+        .await
+        .ok()
+        .flatten();
+    let backfill_at = state
+        .config
+        .get::<String>(crate::dream_scheduler::DREAM_BACKFILL_AT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| raw.trim().to_string())
+        .filter(|t| !t.is_empty());
+    DreamPageReadouts {
+        last_run,
+        backfill_at,
+        backfill_running: state
+            .dream_backfill_running
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The `lifecycle` row's form (memory-lifecycle Task 5). The number
+/// fields ride raw strings (the [`embeddings_field`] doctrine — a
+/// missing, blank, or non-numeric field all mean "keep the stored
+/// value"; out of range clamps, never rejects). `dream_enabled` is
+/// POST-encoded per the controller ruling: the ALWAYS-rendered hidden
+/// `dream_enabled_present` marker records that a Dream-page form
+/// submitted; the checkbox's presence (checked browsers submit it as
+/// "on", unchecked do not submit it) is then the value. The marker
+/// ABSENT means no page form drove this POST: the stored flag is
+/// untouched.
+#[derive(Deserialize)]
+pub struct LifecycleForm {
+    /// The always-rendered hidden marker: `Some` ⇒ a Dream-page form
+    /// submitted, so the checkbox's presence IS the flag.
+    pub dream_enabled_present: Option<String>,
+    /// The checkbox itself ("on") — absent from an unchecked submit.
+    pub dream_enabled: Option<String>,
+    pub dream_interval_s: Option<String>,
+    pub stale_days: Option<String>,
+    pub recent_window: Option<String>,
+    pub consolidation_patches: Option<String>,
+    pub query_top_k: Option<String>,
+    pub revision_retention: Option<String>,
+    pub rrf_k: Option<String>,
+    pub rrf_weight_lex: Option<String>,
+    pub rrf_weight_vec: Option<String>,
+    pub dedup_cosine: Option<String>,
+}
+
+/// A submitted lifecycle number, or `stored` when the field is absent,
+/// blank, or not a number (the [`embeddings_field`] twin). Range
+/// enforcement is `LifecycleConfig::clamp`'s job.
+fn lifecycle_u32_field(submitted: Option<&String>, stored: u32) -> u32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(stored)
+}
+
+/// The f32 twin ([`lifecycle_u32_field`]) — same blank-keeps doctrine;
+/// a NaN parse (`"NaN"` parses as f32) is clamped away by the seal-side
+/// `LifecycleConfig::clamp` (NaN folds to the default, not NaN).
+fn lifecycle_f32_field(submitted: Option<&String>, stored: f32) -> f32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .unwrap_or(stored)
+}
+
+/// POST /admin/dream — save the `lifecycle` row (admin only; the
+/// [`admin_save_embeddings`] shape): blank-keeps-stored per field →
+/// `clamp()` → seal under the service key → re-run
+/// [`mycelium_store::revisions::sync_lifecycle_from_store`] so the nine
+/// static-bearing fields re-stamp live (plan Ruling 5 — the composer,
+/// retention and dream filters read process-global statics, so "saved"
+/// must mean live without a restart; `dream_enabled`/`dream_interval_s`
+/// carry no statics — the scheduler reads the sealed row per tick).
+pub async fn admin_save_lifecycle(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<LifecycleForm>,
+) -> Response {
+    // The existing row (both checkbox directions read through it) or
+    // the default (a first save on a keyless store seeds the row).
+    let existing = crate::state::decrypt_config::<mycelium_store::revisions::LifecycleConfig>(
+        &state.config,
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+    )
+    .await
+    .unwrap_or_default();
+    let dream_enabled = match form.dream_enabled_present {
+        // No marker ⇒ no page form drove this POST: the stored flag is
+        // untouched (a synthetic client cannot toggle the scheduler by
+        // merely omitting the checkbox).
+        None => existing.dream_enabled,
+        // The page's own encoding: the marker is always rendered; the
+        // checkbox is submitted only when checked.
+        Some(_) => form.dream_enabled.is_some(),
+    };
+    let cfg = mycelium_store::revisions::LifecycleConfig {
+        dream_enabled,
+        dream_interval_s: lifecycle_u32_field(
+            form.dream_interval_s.as_ref(),
+            existing.dream_interval_s,
+        ),
+        stale_days: lifecycle_u32_field(form.stale_days.as_ref(), existing.stale_days),
+        recent_window: lifecycle_u32_field(form.recent_window.as_ref(), existing.recent_window),
+        consolidation_patches: lifecycle_u32_field(
+            form.consolidation_patches.as_ref(),
+            existing.consolidation_patches,
+        ),
+        query_top_k: lifecycle_u32_field(form.query_top_k.as_ref(), existing.query_top_k),
+        revision_retention: lifecycle_u32_field(
+            form.revision_retention.as_ref(),
+            existing.revision_retention,
+        ),
+        rrf_k: lifecycle_u32_field(form.rrf_k.as_ref(), existing.rrf_k),
+        rrf_weight_lex: lifecycle_f32_field(form.rrf_weight_lex.as_ref(), existing.rrf_weight_lex),
+        rrf_weight_vec: lifecycle_f32_field(form.rrf_weight_vec.as_ref(), existing.rrf_weight_vec),
+        dedup_cosine: lifecycle_f32_field(form.dedup_cosine.as_ref(), existing.dedup_cosine),
+    }
+    // Clamp before sealing: the row at rest is always in range.
+    .clamp();
+    // Seal (serialize + AEAD); a failure must not land plaintext.
+    let sealed = crate::state::seal_config(
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+        &cfg,
+    );
+    if let Err(e) = state
+        .config
+        .set(mycelium_store::revisions::LIFECYCLE_CONFIG_KEY, &sealed)
+        .await
+    {
+        return Redirect::to(&format!(
+            "/admin/dream?error={}",
+            pages::urlencoding_encode(&e.to_string())
+        ))
+        .into_response();
+    }
+    // Re-stamp the nine static-bearing fields from the row we just
+    // sealed (the boot sync also runs this same fn, so a failure here
+    // is not a lost save — the row is at rest and the next boot applies
+    // it) — but the admin must know the live statics did NOT move.
+    if (mycelium_store::revisions::sync_lifecycle_from_store(&state.config, &state.service_key))
+        .await
+        .is_err()
+    {
+        tracing::warn!("lifecycle save: live re-stamp failed (row stored; a restart applies it)");
+        return Redirect::to(&format!(
+            "/admin/dream?error={}",
+            pages::urlencoding_encode("saved, but the live re-stamp failed - a restart applies it")
+        ))
+        .into_response();
+    }
+    Redirect::to("/admin/dream?ok=Lifecycle%20config%20saved").into_response()
 }
 
 /// POST /admin/embeddings/test — probe the embeddings backend with one

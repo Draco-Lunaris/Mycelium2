@@ -169,14 +169,18 @@ async fn csp_sweep_no_inline_style_or_script() {
         // HTML to sweep; full_web_flow pins that redirect, and this
         // /account sweep covers the card the redirect leads to.)
         "/account",
-        // The admin split (PR 3; six pages once the memory-lifecycle
-        // stream added Embeddings): all 200 for the swept admin
-        // session. (/admin itself is a 307 now — its redirect is
-        // pinned by admin_split_pages, not swept here.)
+        // The admin split (PR 3; seven pages once the memory-lifecycle
+        // stream added Embeddings and the Dream page): all 200 for the
+        // swept admin session. (/admin itself is a 307 now — its
+        // redirect is pinned by admin_split_pages, not swept here.)
         "/admin/users",
         "/admin/sign-in",
         "/admin/llm",
         "/admin/embeddings",
+        // Dream/lifecycle admin page (memory-lifecycle Task 5):
+        // scheduler readouts + backfill button + the lifecycle form,
+        // swept like its admin siblings.
+        "/admin/dream",
         "/admin/library",
         "/admin/system",
         // Librarian status (PR 4): admin-only page, same swept session.

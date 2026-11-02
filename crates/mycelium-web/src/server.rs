@@ -140,6 +140,13 @@ pub fn build_router_with_shutdown(
             get(api::admin_embeddings_view).post(api::admin_save_embeddings),
         )
         .route("/admin/embeddings/test", post(api::admin_test_embeddings))
+        // Dream/lifecycle admin page (memory-lifecycle Task 5): the
+        // scheduler readouts + backfill button + the whole lifecycle
+        // row's form on one page.
+        .route(
+            "/admin/dream",
+            get(api::admin_dream_view).post(api::admin_save_lifecycle),
+        )
         .route("/admin/library", get(api::admin_library_view))
         .route("/admin/system", get(api::admin_system_view))
         .route("/admin/oidc", post(api::admin_save_oidc))
