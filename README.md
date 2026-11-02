@@ -11,15 +11,16 @@ It is a ground-up rewrite of [Mycelium](https://github.com/Draco-Lunaris/Myceliu
 
 ## Status
 
-In active development. The crypto, storage, authentication, MCP, and librarian layers are implemented and covered by 250+ tests. The web interface works and is being improved; expect it to change.
+In active development. Crypto, storage, authentication, MCP, the librarian, and the full memory lifecycle (status-aware reads, BM25 + hybrid retrieval, revision history, scheduled dream maintenance) are implemented and covered by 860+ tests. The web interface works and is being improved; expect it to change.
 
 ## What it does
 
 - **Agent memory.** Agents store and query knowledge as markdown concepts with YAML frontmatter, cross-linked into a graph. Each user has a private, encrypted bundle.
+- **Memory lifecycle.** Concepts carry frontmatter status (`active`, `superseded`, `retired`) with `superseded_by` and `valid_to`, so stale knowledge stops contaminating search. Retrieval uses BM25 scoring with optional hybrid vector fusion; a scheduled dream job flags duplicates, drift, and broken links for consolidation; every write records a per-concept revision with one-click restore.
 - **Bookshelves.** An administrator uploads books; a librarian catalogs them into chapters and sections that agents can search and read by passage.
 - **Skills store.** Agents fetch skills (SKILL.md-style markdown) by name: private skills per user and administrator-managed global skills, with installable bundles (zip download / CLI export).
 - **MCP server.** Seven tools over Streamable HTTP at `/mcp`, authenticated per user.
-- **Web interface.** Bundle browser, concept editor, search, graph view, chat, and an admin portal.
+- **Web interface.** Bundle browser, concept editor, search, graph view, chat, per-concept revision history, and an admin portal (including retrieval tuning and the dream maintenance page).
 
 ## Security model
 
@@ -168,7 +169,7 @@ Then open `https://127.0.0.1:8443/setup`.
 
 ## Architecture
 
-One Rust binary, nine crates, SQLite for metadata, and encrypted files on disk. No external services are required; the LLM backend is optional.
+One Rust binary, ten crates, SQLite for metadata, and encrypted files on disk. No external services are required; the LLM backend is optional.
 
 | Crate | Responsibility |
 |---|---|
@@ -177,6 +178,7 @@ One Rust binary, nine crates, SQLite for metadata, and encrypted files on disk. 
 | `mycelium-store` | SQLite metadata, encrypted file repository, encrypted search index |
 | `mycelium-auth` | Accounts, sessions, TOTP, WebAuthn, OIDC, API keys, roles |
 | `mycelium-web` | HTTPS server, REST API, web interface, admin portal |
+| `mycelium-ui` | SSR islands and shell, hydrate wasm bundle |
 | `mycelium-mcp` | MCP server and tools |
 | `mycelium-librarian` | Librarian agent and book ingest |
 | `mycelium-server` | The `mycelium2` binary |

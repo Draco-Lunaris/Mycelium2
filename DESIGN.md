@@ -1,6 +1,6 @@
 # Mycelium2 — Design Plan
 
-> Status: design decisions captured. Ready to move to architecture and implementation planning.
+> Status: all planned phases shipped (per-phase and per-stream records live in AGENTS.md). This document is the original design plus later decision amendments; the memory-lifecycle subsystem is specified in `docs/superpowers/specs/2026-10-31-memory-lifecycle-design.md`.
 
 ## 1. Goals
 
@@ -171,7 +171,8 @@ Pattern alignment: reuse the LPM/LHFM `*-auth` crate pattern (JWT EdDSA/Ed25519,
 
 ## 11. Data model
 
-- **OKF concept**: markdown file with YAML frontmatter (`type`, `title`, `description`, `resource`, `tags`).
+- **OKF concept**: markdown file with YAML frontmatter (`type`, `title`, `description`, `resource`, `tags`), with lifecycle fields — `status` (`active`/`superseded`/`retired`, validated at write time), `superseded_by` (absolute `.md` path), `valid_to` (RFC 3339), `confirmed_at` — and provenance in `source`. Every write records a per-concept revision (restorable; `consolidate` is one of the revision ops).
+- **Memory lifecycle (added 2026-11, spec `docs/superpowers/specs/2026-10-31-memory-lifecycle-design.md`)**: search ranks BM25 with optional hybrid RRF over per-scope embedding vectors (active-only by default); dream maintenance — scheduled per-user passes plus a corpus backfill — detects duplicates, staleness, and broken supersessions and consolidates through `patch_concept` with provenance `dream`; all thresholds live in one sealed config row editable on `/admin/dream`.
 - **User private bundle**: per-user encrypted OKF store for notes, concepts, and private skills.
 - **Bookshelves**:
   - Admin-created.
@@ -354,3 +355,8 @@ Anyone with read access to the data directory (host shell, stolen backup,
 | Skills model | OKF concepts with `type: Skill`; private in user bundle, global in service-key shelf |
 | Skills MCP tools | `mycelium2_skill_get`, `mycelium2_skill_list` |
 | Global skills management | Admin-only writes; all users read |
+| Concept lifecycle state | Frontmatter `status` (`active`/`superseded`/`retired`) + `superseded_by`/`valid_to`; provenance in `source` |
+| Search scoring | BM25 (k1 1.2, b 0.75) with hybrid RRF over per-scope embedding vectors |
+| Retrieval visibility | Active-only by default; `superseded`/`retired` stay readable but out of search |
+| Memory maintenance | Scheduled dream per user + corpus backfill; consolidation via revision ops, provenance `dream` |
+| Revision history | Per-concept revisions, restorable; retention-pruned on the next write |
