@@ -62,6 +62,10 @@ Graph edges are absolute leading-slash `.md` links; links inside code
 spans/fenced blocks are skipped (a deliberate divergence from the
 original Mycelium — it fixes false-edge bugs). `index.md`, `log.md`,
 and `info.md` are reserved. Skills are concepts with `type: Skill`.
+Concepts also carry lifecycle frontmatter — `status`
+(`active`/`superseded`/`retired`, validated at write time),
+`superseded_by`, `valid_to` — with provenance in `source`, and every
+write records a reviewable revision.
 
 ## Book ingest flow
 
@@ -83,6 +87,31 @@ identity comes from the bearer API key (rmcp injects the request parts
 into each call). Tools: `mycelium2_memory_query/add/update/status/
 maintain`, `mycelium2_skill_get/list`. MCP queries stay private to the
 caller's bundle by default (web search spans user + global scopes).
+
+## Memory lifecycle
+
+Concepts move through lifecycle states (`active`/`superseded`/`retired`)
+so stale knowledge stops contaminating reads and search:
+
+- **Scoring.** Lexical search ranks with BM25 (`k1` 1.2, `b` 0.75). A
+  per-scope embedding worker keeps vector entries beside the encrypted
+  index; where they exist, retrieval fuses both pools by reciprocal-rank
+  fusion — `weight / (rrf_k + rank)` — with defaults from the sealed
+  lifecycle row (`rrf_k` 60, lexical 1.0, vector 1.0). Retrieval is
+  active-only by default: `superseded`/`retired` concepts never enter
+  the index, the pools, or the cached snapshot.
+- **Dream maintenance.** A per-user scheduler wakes every
+  `dream_interval_s` (default 86400) and runs signal passes through the
+  LLM gate's try class only — orphans, broken links, duplicate
+  candidates (cosine at `dedup_cosine` 0.92), oversized documents,
+  stale pairs, expired `valid_to`, broken supersessions, and
+  disorganized concepts. Two-phase consolidation applies fixes through
+  the revision ops with provenance `dream`. Operators trigger a
+  full-corpus walk via `POST /admin/dream/backfill` (one-walk CAS
+  guard) and tune every threshold on `/admin/dream`.
+- **Revisions.** Every mutation — agent write, dream pass,
+  consolidation — records a per-concept revision (restorable from the
+  web UI); retention prunes on the next write.
 
 ## Frontend (mycelium-ui)
 

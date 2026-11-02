@@ -43,11 +43,16 @@ mycelium2 --data-dir ./data --https-addr 127.0.0.1:8443 --http-addr 127.0.0.1:80
   total heuristic fallback; read passages via `book://` anchors.
 - **MCP server** — stateless MCP 2026-07-28 over Streamable HTTP at
   `/mcp`; per-user API keys as bearer tokens; 7 memory/skill tools.
+- **Memory lifecycle** — frontmatter status (`active`/`superseded`/
+  `retired`) with `superseded_by` and `valid_to`; BM25 scoring with
+  hybrid RRF over per-scope embeddings; scheduled dream consolidation;
+  per-concept revision history with restore.
 - **Skills store** — private per-user skills and admin-managed global
   skills, both stored as OKF concepts (`type: Skill`).
 - **Web UI** — login, bundle browser, concept editor, cross-scope
-  search, graph view, admin portal (users, OIDC, LLM, bookshelves,
-  book upload, backups).
+  search, graph view, revision history, admin portal (users, OIDC,
+  LLM, embeddings, bookshelves, book upload, dream maintenance,
+  backups).
 
 ## Security properties
 

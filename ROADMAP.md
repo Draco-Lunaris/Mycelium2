@@ -2,6 +2,8 @@
 
 > This roadmap breaks the design into implementation phases. Each phase produces a working milestone that can be built, tested, and reviewed independently.
 
+> **Status (2026-11-02): every phase below is complete** — per-phase and later-stream records live in AGENTS.md ("Current state"). The roadmap was not extended past Phase 9; subsequent streams (librarian agent, mutation queue, chat session history, LLM concurrency, outage recovery, memory lifecycle) were specified as issue-attached designs in `docs/superpowers/specs/` and tracked through AGENTS.md and GitHub issues instead.
+
 ## Phase 0: Foundation
 
 **Goal**: a compiling Cargo workspace with crate skeletons and shared infrastructure.
