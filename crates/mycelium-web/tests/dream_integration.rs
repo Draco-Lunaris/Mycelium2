@@ -772,3 +772,108 @@ async fn consolidation_signal_writes_op_consolidate_revision() {
         "frontmatter survives the consolidate rewrite"
     );
 }
+
+/// The consolidation-only dream (the controller's adjudication, Task 3's
+/// scheduler rides it): a scope with NO main-signal family but an
+/// over-threshold trailing-update chain runs exactly ONE pass — the
+/// consolidation pass — never an empty main pass under the main
+/// preamble. The two-pass test above saw 4 requests because both
+/// families fired; here the sequence is only the consolidation pass's
+/// own (instruction + tool call, then the closing text — one
+/// run_mutation with a tool call is exactly two LLM requests): the
+/// instruction opens with the consolidation preamble (not the main
+/// "This is a scheduled maintenance pass" one), and the revision tail
+/// records op `consolidate` with the count reset — the two-pass test's
+/// assertions minus any main-pass request.
+#[tokio::test]
+async fn consolidation_only_dream_runs_single_consolidation_pass() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+
+    const TARGET: &str = "/consolidation-only/disorganized.md";
+    let summary = "Current state only.\n\n# History\n\nolder notes";
+
+    // Exactly ONE concept, self-linked (the orphan rule counts incoming
+    // edges, and a self-link is one) with a 9-update trailing chain
+    // over the 8 default — the run's ONLY signal family. No other
+    // concept exists, so orphans/broken links/duplicates/oversized/
+    // stale/expired/broken supersedes are all empty (every put stamps a
+    // fresh confirmed_at).
+    const MD: &str = "---\ntype: note\ntitle: Disorganized Storage Layout\n---\n\nworking notes, see [self](/consolidation-only/disorganized.md)\n";
+    let (llm_url, requests) = capturing_mock_llm(vec![
+        text_response("Consolidation pass complete."),
+        tool_call_response(
+            "call-cons",
+            "patch_concept",
+            serde_json::json!({ "path": TARGET, "body": summary }),
+        ),
+    ])
+    .await;
+    let (base, _shutdown, _dir, state) = boot(&llm_url).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    seed_with_updates(&state, TARGET, MD, 9).await;
+
+    let report = post_dream(&cl, &base, &cookie, &csrf).await;
+    assert_eq!(
+        report["ran"], true,
+        "the consolidation signal runs the dream: {report}"
+    );
+    assert_eq!(
+        report["summary"], "Consolidation pass complete.",
+        "one pass: the report aggregates only the consolidation summary"
+    );
+
+    let reqs = requests.lock().await;
+    assert_eq!(
+        reqs.len(),
+        2,
+        "exactly the consolidation pass's two steps, no empty main pass: {reqs:?}"
+    );
+
+    // Its instruction IS the consolidation preamble — and nothing rides
+    // the main one (the prefixes are the two distinct preambles; the
+    // consolidation one embeds the main wording AFTER "pass of").
+    let instruction = instruction_of(&reqs[0]);
+    assert!(
+        instruction.starts_with("This is the consolidation pass of a scheduled maintenance pass"),
+        "the cons-only instruction opens with the consolidation preamble: {instruction}"
+    );
+    assert!(
+        !instruction.starts_with("This is a scheduled maintenance pass"),
+        "no empty main pass rides the main preamble: {instruction}"
+    );
+    let cons_section = section_of(&instruction, "DISORGANIZED CONCEPTS")
+        .expect("the over-threshold chain fires the consolidation signal");
+    assert!(
+        cons_section.contains(TARGET) && cons_section.contains("9 consecutive patch revisions"),
+        "the over-threshold chain is named: {cons_section}"
+    );
+    assert!(
+        instruction.contains("`body`"),
+        "the consolidation pass names the body argument: {instruction}"
+    );
+
+    // The one patch records exactly one `consolidate` row atop the
+    // seeded chain (create + 9 updates), resetting the trailing count.
+    let target_ops = op_chain(&state, TARGET).await;
+    let target_ops: Vec<&str> = target_ops.iter().map(|(op,)| op.as_str()).collect();
+    let mut expected = vec!["create"];
+    expected.extend(std::iter::repeat_n("update", 9));
+    expected.push("consolidate");
+    assert_eq!(
+        target_ops, expected,
+        "create + 9 updates + exactly one consolidate: {target_ops:?}"
+    );
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+    let master = admin_master();
+    let revisions =
+        mycelium_store::revisions::RevisionStore::for_user(state.store.pool(), admin, &master);
+    let count_after = revisions
+        .consecutive_update_count(&revisions.path_token_of(TARGET))
+        .await
+        .unwrap();
+    assert_eq!(count_after, 0, "the consolidate row breaks the chain");
+}
