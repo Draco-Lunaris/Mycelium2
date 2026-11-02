@@ -4270,11 +4270,13 @@ pub async fn admin_save_lifecycle(
     // sealed (the boot sync also runs this same fn, so a failure here
     // is not a lost save — the row is at rest and the next boot applies
     // it) — but the admin must know the live statics did NOT move.
-    if (mycelium_store::revisions::sync_lifecycle_from_store(&state.config, &state.service_key))
-        .await
-        .is_err()
+    if let Err(e) =
+        mycelium_store::revisions::sync_lifecycle_from_store(&state.config, &state.service_key)
+            .await
     {
-        tracing::warn!("lifecycle save: live re-stamp failed (row stored; a restart applies it)");
+        tracing::warn!(
+            "lifecycle save: live re-stamp failed (row stored; a restart applies it): {e}"
+        );
         return Redirect::to(&format!(
             "/admin/dream?error={}",
             pages::urlencoding_encode("saved, but the live re-stamp failed - a restart applies it")
