@@ -885,6 +885,11 @@ async fn consolidation_only_dream_runs_single_consolidation_pass() {
 /// is the generic `{"error":"internal error"}` every other api.rs 500
 /// carries — never the old `{"error":"key unavailable"}`, which told a
 /// caller nothing it could act on and named a subsystem for no benefit.
+/// The broken-key state is driven across ALL TEN converted handlers —
+/// every api.rs route whose key fetch answers this way: graph, concept
+/// get/put/delete, the revisions index store, the revisions read gate
+/// (via both of its routes), the restore, the revisions browser page,
+/// dream, and stateless chat.
 #[tokio::test]
 async fn key_unavailable_endpoints_return_internal_error() {
     let _lock = TEST_LOCK.lock().await;
@@ -906,22 +911,112 @@ async fn key_unavailable_endpoints_return_internal_error() {
         .unwrap();
     state.master_keys.remove(admin);
 
-    let resp = cl
-        .post(format!("{base}/api/v1/dream"))
-        .header("cookie", &cookie)
-        .header("x-csrf-token", &csrf)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        500,
-        "an unrecoverable key is a server failure"
-    );
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        body,
-        serde_json::json!({ "error": "internal error" }),
-        "the body carries no key detail"
-    );
+    // Every converted handler, driven to its `master_key_for` fetch.
+    // The two body-carrying routes carry the minimal VALID body: a bad
+    // one 400s before the route reaches its fetch (api_put_concept
+    // parses first, api_chat refuses an empty message first); the key
+    // failure itself needs nothing else to fire.
+    enum Body {
+        None,
+        Json(serde_json::Value),
+        Form(&'static str, &'static str),
+    }
+    impl Body {
+        fn attach(self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            match self {
+                Body::None => req,
+                Body::Json(v) => req.json(&v),
+                Body::Form(k, v) => req.form(&[(k, v)]),
+            }
+        }
+    }
+
+    let cases: Vec<(&'static str, reqwest::Method, String, Body)> = vec![
+        (
+            "GET /api/v1/graph",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/graph"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/concepts/{path}",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::None,
+        ),
+        (
+            "DELETE /api/v1/concepts/{path}",
+            reqwest::Method::DELETE,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::None,
+        ),
+        (
+            "PUT /api/v1/concepts/{path}",
+            reqwest::Method::PUT,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::Json(serde_json::json!({
+                "markdown": "---\ntype: note\n---\nrevision pin body\n"
+            })),
+        ),
+        (
+            "GET /api/v1/revisions",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/revisions/list",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions/list?path=pin.md"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/revisions/snapshot",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions/snapshot?path=pin.md&n=1"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/revisions/restore",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/revisions/restore?path=pin.md&n=1"),
+            Body::None,
+        ),
+        (
+            "GET /revisions (page)",
+            reqwest::Method::GET,
+            format!("{base}/revisions"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/dream",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/dream"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/chat",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/chat"),
+            Body::Form("message", "hello"),
+        ),
+    ];
+    for (name, method, url, body) in cases {
+        let req = cl
+            .request(method, &url)
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf);
+        let resp = body.attach(req).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            500,
+            "{name}: an unrecoverable key is a server failure"
+        );
+        let payload: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "error": "internal error" }),
+            "{name}: the body carries no key detail"
+        );
+    }
 }

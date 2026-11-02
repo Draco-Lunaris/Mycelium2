@@ -553,5 +553,5 @@ attached (`… master key unavailable`), so the operator sees it in
 `docker logs` while the wire stays free of crypto and storage detail.
 Capacity is deliberately a different class: `429` with
 `Retry-After: 5` means "ask again", `503` on the stateless chat path
-means "a configured backend refused the run" and carries that bounded
-reason.
+means the run failed for backend reasons — a refusal when a backend
+is configured, the configure-me wording when not.

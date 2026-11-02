@@ -30,9 +30,10 @@
 //! installs — a fetch that raced an invalidation rebuilds (bounded
 //! retries; beyond the bound the snapshot is served transiently, never
 //! installed). That discipline is exactly as wide as invalidation itself:
-//! bump and removal both happen under the cache mutex, so a scope's
-//! invalidation either refuses the install or erases what the install
-//! wrote. What it cannot see is the change that never invalidates — the
+//! the bump is ordered before the removal, and the removal contends on
+//! the cache mutex, so a scope's invalidation either refuses the
+//! install or erases what the install wrote. What it cannot see is the
+//! change that never invalidates — the
 //! worker upsert above — so an installed snapshot is a fetch-instant
 //! observation until the next invalidation or rebuild.
 
@@ -448,8 +449,9 @@ impl<'a> VectorStore<'a> {
     /// install mutex. A build whose fetch raced an [`invalidate_scope`]
     /// rebuilds — retried to [`CACHE_BUILD_PASSES`] passes total, every
     /// pass installing ONLY on an epoch match. The match is sufficient
-    /// because of how the pair is ordered: an invalidation bumps and
-    /// removes under THIS mutex (bump first, then removal), so for any
+    /// because of how the pair is ordered: an invalidation's bump is
+    /// ordered before its removal (bump first, then removal), and the
+    /// removal contends on THIS mutex, so for any
     /// invalidation of this scope exactly one of two things holds — its
     /// bump is visible to the install's re-check (which refuses the pass
     /// and rebuilds), or its removal is ordered after this pass's insert

@@ -128,7 +128,7 @@ corpus without a restart.
 
 | Field | Default | Range | Meaning |
 |---|---|---|---|
-| `base_url` | — (required) | non-empty after trim | Endpoint base URL, e.g. `http://localhost:11434/v1`. An empty or whitespace-only value is refused with a flash and nothing is written: such a row would fail every embed at request time and read to the operator as an outage |
+| `base_url` | — (required) | non-empty after trim | Endpoint base URL, e.g. `http://localhost:11434` (no `/v1` suffix — the client appends the path). An empty or whitespace-only value is refused with a flash and nothing is written: such a row would fail every embed at request time and read to the operator as an outage |
 | `model` | — (required) | non-empty after trim | Model name sent in each request. Refused when empty for the same reason |
 | `api_key` | none | — | Optional bearer token (`Authorization: Bearer …`), sealed at rest, never rendered back; a blank save keeps the stored key |
 | `timeout_secs` | 30 | 5–300 | Per-request timeout |

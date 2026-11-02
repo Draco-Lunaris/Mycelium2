@@ -319,13 +319,13 @@ async fn duplicate_candidates(
 /// pairs plus the paths holding a non-stale row of a concept that still
 /// exists — the concepts this branch owns, i.e. the set the jaccard scan
 /// skips. Ownership is model-blind while scoring is not: only rows
-/// sharing one model and dimensionality pair, so a row the corpus
-/// invalidation marked stale (or a lone row of a model nobody else in
-/// the scope has) contributes ownership and never a pair — see
-/// Population below. Both empty when the branch is ABSENT: no store, an
-/// unhealthy backend over an unpopulated scope, or unreadable rows
-/// (a degraded embedding layer degrades dream to v1 — it never fails
-/// the dream).
+/// sharing one model and dimensionality pair, so a lone fresh row of a
+/// model nobody else in the scope has contributes ownership and never
+/// a pair, while a row the corpus invalidation marked stale contributes
+/// neither — see Population below. Both empty when the branch is ABSENT:
+/// no store, an unhealthy backend over an unpopulated scope, or
+/// unreadable rows (a degraded embedding layer degrades dream to v1 —
+/// it never fails the dream).
 ///
 /// Population: ≥2 LIVE fresh rows under one current model — rows of
 /// deleted concepts are orphaned and count for nothing. Stale rows —
