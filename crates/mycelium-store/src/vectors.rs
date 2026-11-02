@@ -29,7 +29,13 @@
 //! also bumps an in-process epoch, and a build re-checks it before it
 //! installs — a fetch that raced an invalidation rebuilds (bounded
 //! retries; beyond the bound the snapshot is served transiently, never
-//! installed).
+//! installed). That discipline is exactly as wide as invalidation itself:
+//! the bump is ordered before the removal, and the removal contends on
+//! the cache mutex, so a scope's invalidation either refuses the
+//! install or erases what the install wrote. What it cannot see is the
+//! change that never invalidates — the
+//! worker upsert above — so an installed snapshot is a fetch-instant
+//! observation until the next invalidation or rebuild.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -442,18 +448,28 @@ impl<'a> VectorStore<'a> {
     /// invalidation epoch BEFORE its fetch and re-checks it inside the
     /// install mutex. A build whose fetch raced an [`invalidate_scope`]
     /// rebuilds — retried to [`CACHE_BUILD_PASSES`] passes total, every
-    /// pass installing ONLY on an epoch match. A second invalidation
-    /// landing during a retry-pass's fetch is thus also caught (its
-    /// bump+remove complete before that install; the match check
-    /// refuses it) — the stale snapshot can never outlive the
-    /// invalidation that removed it. Exhausting the bound (an
-    /// invalidation storm racing every pass) serves the last computed
-    /// snapshot for THIS call only, transiently — never installed, so
-    /// the next `cache_scope` rebuilds from scratch. That residual
-    /// freshness class: the served snapshot is the rows as of one
-    /// pass's fetch instant (at most one pending invalidation behind —
-    /// each failed re-check proved a newer bump before that fetch), a
-    /// transient observation, never a persistent stale entry.
+    /// pass installing ONLY on an epoch match. The match is sufficient
+    /// because of how the pair is ordered: an invalidation's bump is
+    /// ordered before its removal (bump first, then removal), and the
+    /// removal contends on THIS mutex, so for any
+    /// invalidation of this scope exactly one of two things holds — its
+    /// bump is visible to the install's re-check (which refuses the pass
+    /// and rebuilds), or its removal is ordered after this pass's insert
+    /// (which erases what was installed). Either way a scope's snapshot
+    /// never outlives the invalidation aimed at it. The epoch has no
+    /// visibility into a change that never invalidates (the worker's
+    /// vector-only upsert — module docs), and rows this pass skipped as
+    /// `stale` stay skipped until the next rebuild: the installed
+    /// snapshot is a fetch-instant observation, not a live view.
+    /// Exhausting the bound (an invalidation storm racing every pass)
+    /// serves the last computed snapshot for THIS call only, transiently
+    /// — never installed, so the next `cache_scope` rebuilds from
+    /// scratch. That residual freshness class: the served snapshot is
+    /// the rows as of one pass's fetch instant — each failed re-check
+    /// provably caught a newer bump before its own fetch, and a racing
+    /// storm bumps once per pass, so how many invalidations it sits
+    /// behind is unbounded; a transient observation either way, never a
+    /// persistent stale entry.
     pub async fn cache_scope(&self) -> Result<Arc<ScopeVectors>, VectorError> {
         {
             let guard = SCOPE_VECTORS.lock().unwrap();

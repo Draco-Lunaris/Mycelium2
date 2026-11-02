@@ -535,11 +535,15 @@ pub enum ConversationTurn {
     },
 }
 
-/// Per-tool-result output cap, in chars (24,000 ≈ 6,000 tokens): a run
+/// Per-tool-result output cap, in BYTES (24,000 ≈ 6,000 tokens): a run
 /// reading full-size concepts must not let one `read_concept` result
-/// alone crowd the context window. Applied in `chat_with_tools_impl`
-/// when the model's messages are built — the run loop's own
-/// conversation keeps the full text (the cap is per-model-call).
+/// alone crowd the context window. Multibyte output therefore cuts
+/// harder than the byte count reads like — a CJK concept loses a third
+/// of what an ASCII one keeps (the marker literal below is pinned, so
+/// the wording there stays "chars" while the cut is byte-wise). Applied
+/// in `chat_with_tools_impl` when the model's messages are built — the
+/// run loop's own conversation keeps the full text (the cap is
+/// per-model-call).
 pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 
 /// Token budget for one `chat/completions` call (estimator: bytes / 4 —

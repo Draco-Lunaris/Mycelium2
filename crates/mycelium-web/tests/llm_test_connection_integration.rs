@@ -2,8 +2,8 @@
 //! backend with one minimal completion using the submitted form values
 //! (blank api_key = the stored key) and redirects back with a verdict
 //! flash. Success → `?ok=connected…`; backend errors → `?error=…`
-//! carrying the backend's status and body so a mis-pasted key or wrong
-//! URL is visible in seconds.
+//! carrying a BOUNDED reason — the backend's status code, never its body
+//! (the flash text rides a URL; the full error goes to the server log).
 //!
 //! The file also hosts the background backend-probe loop tests (outage
 //! recovery spec §3.1: `spawn_backend_probe` keeps the process-global
@@ -292,8 +292,14 @@ async fn test_connection_success_reports_connected() {
     );
 }
 
+/// A backend failure reports a BOUNDED, non-leaking error: the status
+/// surfaces (the operator's question — wrong URL or refused key — is
+/// answered by it), the upstream body does not, and the flash stays
+/// short. `admin_test_embeddings`'s twin
+/// `test_connection_failure_reports_a_bounded_backend_error` pins the
+/// same posture on the embeddings endpoint.
 #[tokio::test]
-async fn test_connection_failure_carries_backend_status_and_body() {
+async fn test_connection_failure_reports_a_bounded_backend_error() {
     let _lock = TEST_LOCK.lock().await;
     let _health = HealthDefaults;
     let (llm_url, _captured) =
@@ -313,8 +319,13 @@ async fn test_connection_failure_carries_backend_status_and_body() {
         "the backend status must surface: {loc}"
     );
     assert!(
-        loc.contains("API key is missing"),
-        "the backend body must surface: {loc}"
+        !loc.contains("API key is missing"),
+        "the upstream body must never ride the redirect: {loc}"
+    );
+    assert!(
+        loc.len() < 300,
+        "the flash reason is bounded, got {} chars: {loc}",
+        loc.len()
     );
 }
 

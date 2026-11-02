@@ -41,12 +41,17 @@ pub(crate) fn parse_mode_param(
 /// Construct the librarian agent's cross-scope capabilities from a store
 /// and service key (global skills + library + full-text book search).
 /// `visible_slugs` filters library access by bookshelf visibility
-/// (None = unrestricted, i.e. admin).
+/// (None = unrestricted, i.e. admin). `scope_id` is the agent-trace id
+/// for the scope: `user:<uuid>` for per-user surfaces (chat runner,
+/// dream/api_dream, stateless chat), `global:skills` for the scheduler's
+/// system-side skills scope (memory-lifecycle §3.4) — shared so the
+/// dream scheduler's per-attempt construction stays the same shape the
+/// REST endpoints build.
 pub(crate) fn build_agent_scopes<'a>(
     store: &'a mycelium_store::Store,
-    service_key: &'a mycelium_crypto::keys::ServiceKey,
+    service_key: &mycelium_crypto::keys::ServiceKey,
     visible_slugs: Option<std::collections::HashSet<String>>,
-    user_id: uuid::Uuid,
+    scope_id: &str,
 ) -> mycelium_librarian::agent::AgentScopes<'a> {
     let store_arc = store.clone();
     let sk = service_key.clone();
@@ -86,33 +91,31 @@ pub(crate) fn build_agent_scopes<'a>(
         visible_slugs,
         trace: Some(mycelium_librarian::agent::TraceSink {
             pool: store.pool().clone(),
-            scope_id: format!("user:{user_id}"),
+            scope_id: scope_id.to_string(),
         }),
     }
 }
 
-/// The set of book slugs the user may see in the library: books on
-/// global-read shelves. Admins get None (unrestricted). `pub(crate)`:
-/// the chat submit endpoints resolve it once at submit time for the
-/// detached runner's context.
+/// The set of book slugs a scope's user may see in the library: books on
+/// global-read shelves. Admins (admin=true) get None (unrestricted).
+/// `pub(crate)` + store/role-shaped (not AppState/SessionUser): the chat
+/// submit endpoints resolve it once at submit time for the detached
+/// runner's context, and the dream scheduler calls it per attempt below
+/// the session layer (memory-lifecycle §3.4) — one walk, three users.
 pub(crate) async fn visible_library_slugs(
-    state: &AppState,
-    user: &SessionUser,
+    store: &mycelium_store::Store,
+    admin: bool,
 ) -> Option<std::collections::HashSet<String>> {
-    if user.role == Role::Admin {
+    if admin {
         return None;
     }
-    let shelves = state
-        .store
-        .list_bookshelves_detailed()
-        .await
-        .unwrap_or_default();
+    let shelves = store.list_bookshelves_detailed().await.unwrap_or_default();
     let mut out = std::collections::HashSet::new();
     for (id, _name, global_read) in shelves {
         if !global_read {
             continue;
         }
-        for (slug, _title) in state.store.books_on_shelf(id).await.unwrap_or_default() {
+        for (slug, _title) in store.books_on_shelf(id).await.unwrap_or_default() {
             out.insert(slug);
         }
     }
@@ -219,7 +222,10 @@ struct GraphEdge {
 async fn graph_data(State(state): State<AppState>, user: SessionUser) -> Response {
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "graph: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     let mut nodes = Vec::new();
@@ -336,7 +342,7 @@ async fn search_all_scopes(
         // Bookshelf visibility, precomputed as a slug set (the same
         // tables book_by_slug consulted per hit before) — None for
         // admins (the option IS the allowlist-or-unrestricted shape).
-        visible_slugs: visible_library_slugs(state, user).await,
+        visible_slugs: visible_library_slugs(&state.store, user.role == Role::Admin).await,
         trace: None,
     };
     mycelium_librarian::agent::cross_scope_hits(
@@ -408,7 +414,10 @@ async fn api_put_concept(
     };
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept put: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master)
         .with_provenance(format!("web:{}", user.username));
@@ -445,7 +454,10 @@ async fn api_get_concept(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept read: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.get(&canonical).await {
@@ -487,7 +499,10 @@ async fn api_delete_concept(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept delete: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.delete(&canonical).await {
@@ -670,10 +685,10 @@ async fn revisions_index_store<'a>(
 ) -> Result<RevisionStore<'a>, RevRejection> {
     match scope {
         RevScope::User => {
-            let master = state
-                .master_key_for(user.user_id)
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            let master = state.master_key_for(user.user_id).await.map_err(|e| {
+                tracing::warn!(error = %e, "revisions index: master key unavailable");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
             Ok(RevisionStore::for_user(
                 state.store.pool(),
                 user.user_id,
@@ -770,10 +785,10 @@ async fn read_gate_store_scope<'a>(
     let scope = RevScope::parse(scope_raw)?;
     match scope {
         RevScope::User => {
-            let master = state
-                .master_key_for(user.user_id)
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            let master = state.master_key_for(user.user_id).await.map_err(|e| {
+                tracing::warn!(error = %e, "revision read gate: master key unavailable");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
             Ok(RevisionStore::for_user(
                 state.store.pool(),
                 user.user_id,
@@ -835,8 +850,9 @@ async fn api_revisions_restore(
         RevScope::User => {
             let master = match state.master_key_for(user.user_id).await {
                 Ok(m) => m,
-                Err(_) => {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                Err(e) => {
+                    tracing::warn!(error = %e, "revision restore: master key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             };
             ConceptStore::for_user(&state.store, user.user_id, master)
@@ -929,7 +945,7 @@ pub async fn revisions_view(
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "revisions browser: master key unavailable");
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             };
             ConceptStore::for_user(&state.store, user.user_id, master)
@@ -3444,6 +3460,17 @@ pub struct SystemPageStats {
     pub backend_state: &'static str,
     pub backend_down_seconds: Option<i64>,
     pub backend_checked_seconds_ago: Option<i64>,
+    /// The embeddings backend's reported state (`EMBEDDING_HEALTH` —
+    /// llm-health spec §3.5): the System page's embeddings card rides
+    /// the same ONE-snapshot-read discipline as `backend_state` — the
+    /// card cannot disagree with /health or /metrics.
+    pub embedding_state: &'static str,
+    /// Seconds since the last embeddings observation (`None` = never
+    /// observed). Mapping ONLY `state` + `checked` keeps the card
+    /// metadata-honest: the outage clock (`embedding_down_seconds`)
+    /// stays where /health computes it, because the card's job is the
+    /// indicator, not the outage timeline.
+    pub embedding_checked_seconds_ago: Option<i64>,
     pub chat_waiting_count: i64,
     /// The per-item waiting table's rows (chat turns + queued writes +
     /// pending ingest jobs, oldest first). The summary line's per-kind
@@ -3662,6 +3689,8 @@ pub async fn admin_system_view(
         backend_state: s.backend_state,
         backend_down_seconds: s.backend_down_seconds,
         backend_checked_seconds_ago: s.backend_checked_seconds_ago,
+        embedding_state: s.embedding_state,
+        embedding_checked_seconds_ago: s.embedding_checked_seconds_ago,
         chat_waiting_count: s.chat_waiting_count,
         waiting_items,
     };
@@ -3894,9 +3923,18 @@ pub async fn admin_save_llm(
 /// POST /admin/llm/test — probe the LLM backend with one minimal
 /// completion using the submitted form values (blank api_key = the
 /// stored key, mirroring the save semantics). Nothing is persisted.
-/// The redirect verdict carries the backend's status + body on failure
-/// so a mis-pasted key or wrong URL is visible in seconds — the chat
-/// path only says "librarian unavailable", never why.
+/// The redirect verdict is BOUNDED on failure — [`admin_test_embeddings`]
+/// is the twin this mirrors: [`llm_test_reason`] keeps the backend's HTTP
+/// status (a wrong URL answers "did not answer", a refused key answers
+/// "HTTP 401", which is what the operator is actually asking — the chat
+/// path only says "librarian unavailable", never why) and drops the
+/// upstream BODY, because the flash text rides a URL: it lands in browser
+/// history, proxies' access logs and the Referer chain, and an upstream
+/// error body can carry anything — including the key it just refused.
+/// The full error (status + body) is logged server-side, where the
+/// operator's `docker logs` shows it. The success flash carries the
+/// backend's reply encoded and byte-capped for the same reason: it is
+/// upstream-controlled text going into a query string.
 pub async fn admin_test_llm(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -3926,16 +3964,43 @@ pub async fn admin_test_llm(
         .chat_system(Some("You are a connectivity probe."), "Reply with OK", 0.0)
         .await
     {
-        Ok(reply) => format!("ok=connected%20%E2%80%94%20backend%20responded:{reply}",),
+        Ok(reply) => format!(
+            "ok={}",
+            pages::urlencoding_encode(&format!(
+                "connected — backend responded: {}",
+                mycelium_librarian::llm_health::short_detail(reply),
+            ))
+        ),
         Err(e) => {
+            let reason = llm_test_reason(&e);
             tracing::warn!(error = %e, "LLM test connection failed");
             format!(
                 "error={}",
-                pages::urlencoding_encode(&format!("test connection failed: {e}"))
+                pages::urlencoding_encode(&format!(
+                    "test connection failed: {}",
+                    mycelium_librarian::llm_health::short_detail(reason),
+                ))
             )
         }
     };
     Redirect::to(&format!("/admin/llm?{verdict}")).into_response()
+}
+
+/// The bounded, non-leaking LLM test-connection failure reason —
+/// [`embedding_test_reason`]'s twin for the chat backend: the upstream
+/// STATUS surfaces (a mis-pasted URL or a refused key is visible in
+/// seconds) but never its body. A transport failure never arrived, so it
+/// "did not answer"; an empty completion means the backend answered and
+/// had nothing to say (a wrong MODEL, which no status code would show).
+/// The caller bounds the composed string through `llm_health::short_detail`.
+fn llm_test_reason(e: &mycelium_librarian::llm::LlmError) -> String {
+    match e {
+        mycelium_librarian::llm::LlmError::Status { status, .. } => format!("HTTP {status}"),
+        mycelium_librarian::llm::LlmError::Request(_) => "the backend did not answer".to_string(),
+        mycelium_librarian::llm::LlmError::EmptyResponse => {
+            "the backend returned no content".to_string()
+        }
+    }
 }
 
 /// GET /admin/embeddings — the embeddings-backend card on its own
@@ -4000,11 +4065,36 @@ fn embeddings_field(submitted: Option<&String>, stored: u32) -> u32 {
 /// blank api_key keeps the stored key; the key is never rendered back
 /// to the browser. The tunables are clamped BEFORE sealing (the row at
 /// rest is always in range). No gate call: embeddings has none.
+///
+/// An empty-after-trim `base_url` or `model` is REFUSED with a flash,
+/// before anything is sealed or written: such a row is not a
+/// half-configured backend but a broken one — every embed call would
+/// fail at request time (an empty URL is a transport error, an empty
+/// model is a 4xx), the probe would answer "did not answer", and the
+/// vector worker would silently keep every scope stale. The refusal
+/// says which field, because that is the field to fix.
+///
+/// A failed store write flashes a CONSTANT, never the error: the detail
+/// is logged, and the redirect query is not a log sink.
 pub async fn admin_save_embeddings(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
     axum::Form(form): axum::Form<EmbeddingsForm>,
 ) -> Response {
+    if form.base_url.trim().is_empty() {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode("base_url must not be empty")
+        ))
+        .into_response();
+    }
+    if form.model.trim().is_empty() {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode("model must not be empty")
+        ))
+        .into_response();
+    }
     // The existing config (blank-key keep reads through it) or the
     // default (a first save from a keyless store keeps no key).
     let existing =
@@ -4034,13 +4124,246 @@ pub async fn admin_save_embeddings(
     // Seal (serialize + AEAD); a failure must not land plaintext.
     let sealed = crate::state::seal_config(&state.service_key, "embeddings", &cfg);
     if let Err(e) = state.config.set("embeddings", &sealed).await {
+        tracing::warn!(error = %e, "embeddings config save failed");
         return Redirect::to(&format!(
             "/admin/embeddings?error={}",
-            pages::urlencoding_encode(&e.to_string())
+            pages::urlencoding_encode("config not saved - check the server logs")
         ))
         .into_response();
     }
     Redirect::to("/admin/embeddings?ok=Embeddings%20config%20saved").into_response()
+}
+
+/// GET /admin/dream — the Dream admin page (memory-lifecycle Task 5):
+/// one page hosts BOTH the scheduler section (the last scheduled run,
+/// the backfill button + state — Ruling 7's plain keys) and the whole
+/// `lifecycle` row's form (plan Ruling 1 — never a row-per-item page).
+///
+/// Rendered clamped: `get_sealed`/`decrypt_config` deserializes the
+/// sealed row UNclamped (mycelium-store applies the range rules on the
+/// SAVE side only), so this read path applies `clamp()` after decode —
+/// a stale or hand-edited out-of-range row must not put an
+/// unenforceable value back in the box.
+pub async fn admin_dream_view(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    session: SessionId,
+    Query(params): Query<AdminParams>,
+) -> Response {
+    let csrf = pages::current_csrf(&state, &session).await;
+    let lifecycle = crate::state::decrypt_config::<mycelium_store::revisions::LifecycleConfig>(
+        &state.config,
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+    )
+    .await
+    .unwrap_or_default()
+    .clamp();
+    let readouts = dream_readouts(&state).await;
+    let admin = request_admin_user(&state, &session).await;
+    pages::admin_dream_page(
+        &admin,
+        &csrf,
+        &lifecycle,
+        &readouts,
+        params.ok.as_deref(),
+        params.error.as_deref(),
+    )
+    .into_response()
+}
+
+/// The Dream page's scheduler readouts (Ruling 7): the last scheduled
+/// run record, the backfill completion marker (the plain RFC3339 row
+/// the worker rewrites), and the running guard (the same
+/// [`AppState::dream_backfill_running`] Task 4's launch races on). The
+/// reads fail open — a missing or unreadable plain row is
+/// "none yet"/"never run" on the page, never a 500.
+pub struct DreamPageReadouts {
+    /// The `dream_last_run` record (plain JSON row); `None` before the
+    /// first scheduled attempt.
+    pub last_run: Option<crate::dream_scheduler::DreamLastRunRecord>,
+    /// The `dream_backfill_at` marker — the last COMPLETION's RFC3339
+    /// timestamp (Task 4's launch deletes it; the worker rewrites it).
+    pub backfill_at: Option<String>,
+    /// The backfill walk's running guard — "in flight" only when the
+    /// marker is GONE (dispatch precedence lives on the page: a
+    /// present marker is a completed walk even mid-re-run).
+    pub backfill_running: bool,
+}
+
+/// The readouts' plain reads: `dream_last_run` as the scheduler's own
+/// [`crate::dream_scheduler::DreamLastRunRecord`] (serialize-side
+/// `skip_serializing_if` deserializes a missing summary as `None`), the
+/// marker as the plain RFC3339 string it is stored as, the guard as an
+/// atomic load.
+async fn dream_readouts(state: &AppState) -> DreamPageReadouts {
+    let last_run = state
+        .config
+        .get::<crate::dream_scheduler::DreamLastRunRecord>(
+            crate::dream_scheduler::DREAM_LAST_RUN_KEY,
+        )
+        .await
+        .ok()
+        .flatten();
+    let backfill_at = state
+        .config
+        .get::<String>(crate::dream_scheduler::DREAM_BACKFILL_AT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| raw.trim().to_string())
+        .filter(|t| !t.is_empty());
+    DreamPageReadouts {
+        last_run,
+        backfill_at,
+        backfill_running: state
+            .dream_backfill_running
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The `lifecycle` row's form (memory-lifecycle Task 5). The number
+/// fields ride raw strings (the [`embeddings_field`] doctrine — a
+/// missing, blank, or non-numeric field all mean "keep the stored
+/// value"; out of range clamps, never rejects). `dream_enabled` is
+/// POST-encoded per the controller ruling: the ALWAYS-rendered hidden
+/// `dream_enabled_present` marker records that a Dream-page form
+/// submitted; the checkbox's presence (checked browsers submit it as
+/// "on", unchecked do not submit it) is then the value. The marker
+/// ABSENT means no page form drove this POST: the stored flag is
+/// untouched.
+#[derive(Deserialize)]
+pub struct LifecycleForm {
+    /// The always-rendered hidden marker: `Some` ⇒ a Dream-page form
+    /// submitted, so the checkbox's presence IS the flag.
+    pub dream_enabled_present: Option<String>,
+    /// The checkbox itself ("on") — absent from an unchecked submit.
+    pub dream_enabled: Option<String>,
+    pub dream_interval_s: Option<String>,
+    pub stale_days: Option<String>,
+    pub recent_window: Option<String>,
+    pub consolidation_patches: Option<String>,
+    pub query_top_k: Option<String>,
+    pub revision_retention: Option<String>,
+    pub rrf_k: Option<String>,
+    pub rrf_weight_lex: Option<String>,
+    pub rrf_weight_vec: Option<String>,
+    pub dedup_cosine: Option<String>,
+}
+
+/// A submitted lifecycle number, or `stored` when the field is absent,
+/// blank, or not a number (the [`embeddings_field`] twin). Range
+/// enforcement is `LifecycleConfig::clamp`'s job.
+fn lifecycle_u32_field(submitted: Option<&String>, stored: u32) -> u32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(stored)
+}
+
+/// The f32 twin ([`lifecycle_u32_field`]) — same blank-keeps doctrine;
+/// a NaN parse (`"NaN"` parses as f32) is clamped away by the seal-side
+/// `LifecycleConfig::clamp` (NaN folds to the default, not NaN).
+fn lifecycle_f32_field(submitted: Option<&String>, stored: f32) -> f32 {
+    submitted
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .unwrap_or(stored)
+}
+
+/// POST /admin/dream — save the `lifecycle` row (admin only; the
+/// [`admin_save_embeddings`] shape): blank-keeps-stored per field →
+/// `clamp()` → seal under the service key → re-run
+/// [`mycelium_store::revisions::sync_lifecycle_from_store`] so the nine
+/// static-bearing fields re-stamp live (plan Ruling 5 — the composer,
+/// retention and dream filters read process-global statics, so "saved"
+/// must mean live without a restart; `dream_enabled`/`dream_interval_s`
+/// carry no statics — the scheduler reads the sealed row per tick).
+pub async fn admin_save_lifecycle(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+    axum::Form(form): axum::Form<LifecycleForm>,
+) -> Response {
+    // The existing row (both checkbox directions read through it) or
+    // the default (a first save on a keyless store seeds the row).
+    let existing = crate::state::decrypt_config::<mycelium_store::revisions::LifecycleConfig>(
+        &state.config,
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+    )
+    .await
+    .unwrap_or_default();
+    let dream_enabled = match form.dream_enabled_present {
+        // No marker ⇒ no page form drove this POST: the stored flag is
+        // untouched (a synthetic client cannot toggle the scheduler by
+        // merely omitting the checkbox).
+        None => existing.dream_enabled,
+        // The page's own encoding: the marker is always rendered; the
+        // checkbox is submitted only when checked.
+        Some(_) => form.dream_enabled.is_some(),
+    };
+    let cfg = mycelium_store::revisions::LifecycleConfig {
+        dream_enabled,
+        dream_interval_s: lifecycle_u32_field(
+            form.dream_interval_s.as_ref(),
+            existing.dream_interval_s,
+        ),
+        stale_days: lifecycle_u32_field(form.stale_days.as_ref(), existing.stale_days),
+        recent_window: lifecycle_u32_field(form.recent_window.as_ref(), existing.recent_window),
+        consolidation_patches: lifecycle_u32_field(
+            form.consolidation_patches.as_ref(),
+            existing.consolidation_patches,
+        ),
+        query_top_k: lifecycle_u32_field(form.query_top_k.as_ref(), existing.query_top_k),
+        revision_retention: lifecycle_u32_field(
+            form.revision_retention.as_ref(),
+            existing.revision_retention,
+        ),
+        rrf_k: lifecycle_u32_field(form.rrf_k.as_ref(), existing.rrf_k),
+        rrf_weight_lex: lifecycle_f32_field(form.rrf_weight_lex.as_ref(), existing.rrf_weight_lex),
+        rrf_weight_vec: lifecycle_f32_field(form.rrf_weight_vec.as_ref(), existing.rrf_weight_vec),
+        dedup_cosine: lifecycle_f32_field(form.dedup_cosine.as_ref(), existing.dedup_cosine),
+    }
+    // Clamp before sealing: the row at rest is always in range.
+    .clamp();
+    // Seal (serialize + AEAD); a failure must not land plaintext.
+    let sealed = crate::state::seal_config(
+        &state.service_key,
+        mycelium_store::revisions::LIFECYCLE_CONFIG_KEY,
+        &cfg,
+    );
+    if let Err(e) = state
+        .config
+        .set(mycelium_store::revisions::LIFECYCLE_CONFIG_KEY, &sealed)
+        .await
+    {
+        return Redirect::to(&format!(
+            "/admin/dream?error={}",
+            pages::urlencoding_encode(&e.to_string())
+        ))
+        .into_response();
+    }
+    // Re-stamp the nine static-bearing fields from the row we just
+    // sealed (the boot sync also runs this same fn, so a failure here
+    // is not a lost save — the row is at rest and the next boot applies
+    // it) — but the admin must know the live statics did NOT move.
+    // Defensive shape, not an expected path: `sync_lifecycle_from_store`
+    // reads with the lenient `get_sealed(..).unwrap_or_default()` (its own
+    // doc) and only stamps statics, so today it cannot fail — the arm is
+    // kept for the signature. Any read failure upstream had already left
+    // THIS handler's baseline (`existing` above) as defaults.
+    if let Err(e) =
+        mycelium_store::revisions::sync_lifecycle_from_store(&state.config, &state.service_key)
+            .await
+    {
+        tracing::warn!(
+            "lifecycle save: live re-stamp failed (row stored; a restart applies it): {e}"
+        );
+        return Redirect::to(&format!(
+            "/admin/dream?error={}",
+            pages::urlencoding_encode("saved, but the live re-stamp failed - a restart applies it")
+        ))
+        .into_response();
+    }
+    Redirect::to("/admin/dream?ok=Lifecycle%20config%20saved").into_response()
 }
 
 /// POST /admin/embeddings/test — probe the embeddings backend with one
@@ -5087,24 +5410,39 @@ fn llm_capacity_response() -> Response {
 
 /// POST /api/v1/dream — run a maintenance/consolidation pass over the
 /// caller's private bundle (v1 parity: orphans, broken links, likely
-/// duplicates, oversized concepts). Deterministic signals decide
-/// whether the agent runs at all; no signals → no tokens. CSRF is
-/// enforced by the /api/v1 middleware layer.
+/// duplicates, oversized concepts; plus the lifecycle signals — stale
+/// pairings, expired valid_to, broken supersedes, disorganized patch
+/// chains). Deterministic signals decide whether the agent runs at
+/// all; no signals → no tokens. When consolidation signals exist a
+/// second pass runs through a `consolidate`-tagged store view (Ruling
+/// 3), both passes under the one gate permit below. CSRF is enforced
+/// by the /api/v1 middleware layer.
 pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Response {
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "dream: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     // The cosine duplicate signal reads the caller scope's vector
     // rows — built under the same master key the ConceptStore below
     // takes (the same HMAC path tokens bind the two views together).
     let user_vectors =
         mycelium_store::vectors::VectorStore::for_user(state.store.pool(), user.user_id, &master);
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master.clone())
         // The dream agent may write concepts: label its store (spec
         // §3.1 `dream` — system provenance; nothing model-authored
         // survives the put).
         .with_provenance("dream");
+    // The consolidation pass (memory-lifecycle Ruling 3) writes through
+    // a SECOND view of the same scope, tagged with the explicit
+    // `consolidate` revision op: its body rewrites record "consolidated
+    // body history" while the main store's writes stay mechanically
+    // derived (create/update).
+    let cons_cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        .with_provenance("dream")
+        .with_revision_op("consolidate");
     // The config load is also the gate's sync point (spec §3.2): the
     // clamped row is the single source of both the gate's limits and
     // this surface's wait bound — no separate plumbing.
@@ -5118,8 +5456,8 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
     let scopes = build_agent_scopes(
         &state.store,
         &state.service_key,
-        visible_library_slugs(&state, &user).await,
-        user.user_id,
+        visible_library_slugs(&state.store, user.role == Role::Admin).await,
+        &format!("user:{}", user.user_id),
     );
     // Dream is wait class with the CHAT bound (spec §5): admin-triggered
     // and rare, so it may wait for a slot — but it never jumps the
@@ -5144,7 +5482,8 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         }
     };
     let outcome =
-        mycelium_librarian::dream::run_dream(&client, &cs, &scopes, Some(&user_vectors)).await;
+        mycelium_librarian::dream::run_dream(&client, &cs, &cons_cs, &scopes, Some(&user_vectors))
+            .await;
     // The slot is free the moment the run is: the response body is
     // built after the release, not under the permit.
     drop(permit);
@@ -5155,6 +5494,62 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
+}
+
+/// POST /admin/dream/backfill (memory-lifecycle Ruling 8): the admin
+/// click that launches ONE detached corpus-backfill worker. Its order
+/// is the contract (design note 1):
+///
+///   1. the running-guard claim — FIRST, before anything else: a
+///      second click while a walk runs is rejected with the running
+///      flash and touches NOTHING (the compare-and-swap is the single
+///      synchronization between racing clicks);
+///   2. the previous completion marker (`dream_backfill_at`) is
+///      DELETED — the walk is re-clickable the moment it is launched
+///      (a stale "complete" must not outlive a fresh trigger); the
+///      worker rewrites it at completion;
+///   3. the worker spawns on the app's shutdown token (detached; the
+///      guard stays claimed while it walks and is released by its
+///      RAII drop — a dead worker never wedges the button).
+///
+/// The flash redirects target the Dream admin page; session-only
+/// (browser-flow admin action, CSRF'd by the middleware like every
+/// other admin POST).
+pub async fn post_admin_dream_backfill(
+    State(state): State<AppState>,
+    _admin: mycelium_auth::rbac::RequireAdmin,
+) -> Response {
+    // 1. Claim the guard — exactly one racer wins.
+    if state
+        .dream_backfill_running
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Redirect::to("/admin/dream?error=Backfill%20already%20running").into_response();
+    }
+    // 2. Kill the stale marker (re-clickable from the launch instant).
+    if let Err(e) = state
+        .config
+        .delete(crate::dream_scheduler::DREAM_BACKFILL_AT_KEY)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            "dream backfill: stale marker delete failed (the walk still runs)"
+        );
+    }
+    // 3. Spawn the walk.
+    crate::dream_scheduler::DreamScheduler::spawn_backfill(
+        state.dream_scheduler.clone(),
+        state.dream_backfill_running.clone(),
+        state.shutdown_token(),
+    );
+    Redirect::to("/admin/dream?ok=Backfill%20started").into_response()
 }
 
 /// POST /api/v1/chat — the stateless single-turn endpoint (spec D9):
@@ -5175,7 +5570,10 @@ pub async fn api_chat(
     }
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "stateless chat: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master)
         // The chat-mode agent may write concepts: label its store (spec
@@ -5197,13 +5595,16 @@ pub async fn api_chat(
     let scopes = build_agent_scopes(
         &state.store,
         &state.service_key,
-        visible_library_slugs(&state, &user).await,
-        user.user_id,
+        visible_library_slugs(&state.store, user.role == Role::Admin).await,
+        &format!("user:{}", user.user_id),
     );
     // Wait class, bounded by `query_wait_secs` (spec §3.3): this
     // endpoint holds an HTTP request open, so its bound is the short
     // one. No slot in time → 429 + Retry-After, which the caller can
-    // tell apart from the 503 below (nothing reachable to ask).
+    // tell apart from the 503 below, which means a slot WAS granted and
+    // the run still failed — either nothing was reachable to ask, or a
+    // configured backend was reachable and REFUSED the request (401/403
+    // route here too; `llm_failure_detail` says which).
     let permit = match mycelium_librarian::llm_gate::LLM_GATE
         .enter(
             Some(user.user_id),

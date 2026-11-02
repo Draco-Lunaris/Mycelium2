@@ -110,6 +110,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
     );
 
+    // The app shutdown token, BEFORE any worker spawn: the handler-
+    // spawned corpus-backfill worker takes the token installed in the
+    // state (the root's child — the same cancellation the boot-spawned
+    // workers get from the root below, and the same one the signal
+    // handler fires).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let _ = state.shutdown.set(shutdown.child_token());
+
     // LLM admission gate first (LLM concurrency spec §3.2): every boot
     // sweep and worker below admits on the process-global gate — the
     // mutation-queue drain pass runs inline right here, and both
@@ -191,7 +199,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let https_addr: SocketAddr = args.https_addr.parse()?;
     let http_addr: SocketAddr = args.http_addr.parse()?;
-    let shutdown = tokio_util::sync::CancellationToken::new();
 
     // Graceful shutdown on SIGTERM (docker stop) and SIGINT (ctrl-c).
     let token = shutdown.clone();
@@ -267,6 +274,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::time::Duration::from_secs(mycelium_librarian::llm_health::PROBE_INTERVAL_SECS),
     )
     .await;
+
+    // The dream scheduler (memory-lifecycle spec §3.4): one dream pass
+    // per wake, round-robin over the maintenance scopes (users then the
+    // skills shelf), try-class gate admission — a busy gate defers a
+    // wake, never waits. Spawned with the other long-lived workers,
+    // after the gate sync and the boot sweeps: its immediate first tick
+    // reads the stored cadence and applies it live if it differs.
+    state.dream_scheduler.clone().spawn(shutdown.clone());
 
     mycelium_web::serve(
         state,

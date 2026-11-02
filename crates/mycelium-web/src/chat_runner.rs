@@ -82,7 +82,7 @@ const LLM_UNAVAILABLE: &str =
 /// the configure-me wording would send them to the admin portal to fix
 /// something that is already configured. Only [`BackendState::Disabled`]
 /// (no `llm` row to decrypt) makes "configure one" the honest answer.
-/// Byte-safety and the 512-char bound come from [`short_detail`]; the
+/// Byte-safety and the 512-byte bound come from [`short_detail`]; the
 /// transcript path renders the row escaped like every other row.
 ///
 /// The backend-down class on a *configured* backend never reaches here —
@@ -272,7 +272,8 @@ pub struct ChatRunContext {
     pub llm: LlmConfig,
     /// Bookshelf-visibility slug set for the agent's library scope
     /// (None = unrestricted, i.e. admin) — computed before the spawn
-    /// (`visible_library_slugs` is async and borrows `AppState`).
+    /// (`visible_library_slugs` is async and borrows the metadata
+    /// `Store`, taking the admin flag directly).
     pub scopes_visible: Option<HashSet<String>>,
 }
 
@@ -497,7 +498,7 @@ async fn run_chat_turn(
         &ctx.store,
         &ctx.service_key,
         ctx.scopes_visible.clone(),
-        user_id,
+        &format!("user:{user_id}"),
     );
 
     // The agent emits progress on an unbounded channel (sends never

@@ -413,7 +413,9 @@ async fn decoded_cache_excludes_non_active_concepts() {
 
     // (review ruling) Dead rows drop BEFORE the truncate: query the
     // axis where the (dead) c row ranks clearly above the live a row
-    // (0.9/0.9055 vs 0.1/0.9055) and take top=1 — the dead row still
+    // (c = (0.1+0.9)/(|q|·√2) ≈ 0.781 vs a = 0.1/|q| ≈ 0.110, |q| =
+    // 0.9055 — the √2 is c's own length, so the raw-dot reading of
+    // 0.9/0.9055 overstates it) and take top=1 — the dead row still
     // gives up its slot, so a LIVE entry fills the top-1 (take-then-map
     // arithmetic would return an empty list here).
     let hits = f.vs.top_cosine(&[0.1f32, 0.9], "m-x", 1).await.unwrap();

@@ -575,3 +575,448 @@ fn all_titles(i: usize) -> &'static str {
         "Tidal Gate Registers",
     ][i]
 }
+
+/// One assistant tool-call turn in the OpenAI wire shape the agent's
+/// parser expects (chat_sessions_integration.rs's helper).
+fn tool_call_response(id: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args.to_string() }
+                }]
+            }
+        }]
+    })
+}
+
+/// The full op chain of one concept's revision rows (ascending), and
+/// its provenance labels with them — the deterministic shape of the
+/// dream's two-store write history.
+async fn op_chain(state: &AppState, path: &str) -> Vec<(String,)> {
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+    sqlx::query_as(
+        "SELECT op FROM concept_revisions WHERE scope_id = ? AND path = ? ORDER BY revision_no",
+    )
+    .bind(format!("user:{admin}"))
+    .bind(path)
+    .fetch_all(state.store.pool())
+    .await
+    .unwrap()
+}
+
+/// Seed `path` with an initial put plus `updates` identical rewrites —
+/// each re-put is a mechanically derived `update` revision (the
+/// trailing-update chain the consolidation signal counts).
+async fn seed_with_updates(state: &AppState, path: &str, md: &str, updates: usize) {
+    let cs = concept_store(state).await;
+    let concept = mycelium_core::Concept::parse(path, md).unwrap();
+    cs.put(&concept).await.unwrap();
+    for _ in 0..updates {
+        cs.put(&concept).await.unwrap();
+    }
+}
+
+/// The two-phase dream (Ruling 3) on its only pinned surface —
+/// POST /api/v1/dream, whose handler builds BOTH stores: a concept
+/// whose trailing-update chain exceeds `consolidation_patches()` fires
+/// the consolidation signal, the dream runs TWO passes under the one
+/// gate permit (a main-signal pass through `store`, then a
+/// consolidation-only pass through the `consolidate`-tagged store), the
+/// scripted agent patches the body via patch_concept's new `body`
+/// argument, and the revision log ends up mixed: the consolidation
+/// concept's tail row is `consolidate` (count reset to 0 — the op row
+/// breaks the trailing-update chain) while the main pass's own write in
+/// the same run stays mechanically tagged (`create`, never
+/// `consolidate`).
+#[tokio::test]
+async fn consolidation_signal_writes_op_consolidate_revision() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+
+    const ORPHAN: &str = "/consolidated-run/orphan.md";
+    const TARGET: &str = "/consolidated-run/disorganized.md";
+    const MAIN_WRITE: &str = "/consolidated-run/main-write.md";
+    let summary = "Current state of the layout.\n\n# History\n\nolder notes";
+
+    // LIFO script. The main pass runs first: one write_concept (its own
+    // store, mechanically tagged), then its closing text. The
+    // consolidation pass follows: one patch_concept with the new `body`
+    // argument (the consolidate-tagged store), then its closing text.
+    let (llm_url, requests) = capturing_mock_llm(vec![
+        text_response("Consolidation pass complete."),
+        tool_call_response(
+            "call-cons",
+            "patch_concept",
+            serde_json::json!({ "path": TARGET, "body": summary }),
+        ),
+        text_response("Main pass complete."),
+        tool_call_response(
+            "call-main",
+            "write_concept",
+            serde_json::json!({
+                "path": MAIN_WRITE,
+                "frontmatter": { "type": "Note", "title": "Main Written" },
+                "body": "written by the main pass",
+            }),
+        ),
+    ])
+    .await;
+    let (base, _shutdown, _dir, state) = boot(&llm_url).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    // The main signal (a lone unlinked concept) sends the main pass;
+    // the 9-update chain on TARGET (> consolidation_patches() = 8 by
+    // default) sends the consolidation pass. Every put stamps a fresh
+    // confirmed_at, so nothing else is stale/expired here — the run's
+    // signals are exactly the two families.
+    seed(&state, ORPHAN, "Lonely Main Note", &[]).await;
+    seed_with_updates(
+        &state,
+        TARGET,
+        "---\ntype: note\ntitle: Disorganized Storage Layout\n---\n\nworking notes\n",
+        9,
+    )
+    .await;
+
+    let report = post_dream(&cl, &base, &cookie, &csrf).await;
+    assert_eq!(report["ran"], true, "two signals, one dream: {report}");
+    assert_eq!(
+        report["summary"], "Main pass complete.\n\nConsolidation pass complete.",
+        "both passes' summaries aggregate into the one report"
+    );
+
+    let reqs = requests.lock().await;
+    assert_eq!(reqs.len(), 4, "two passes, two steps each: {reqs:?}");
+
+    // The MAIN instruction carries the graph signal only — the
+    // consolidation family never leaks into the untagged pass.
+    let main_instruction = instruction_of(&reqs[0]);
+    assert!(
+        main_instruction.contains("ORPHANED"),
+        "the orphan seeds the main pass: {main_instruction}"
+    );
+    assert!(
+        !main_instruction.contains("DISORGANIZED") && !main_instruction.contains("consolidation"),
+        "no consolidation work in the main pass: {main_instruction}"
+    );
+
+    // The CONSOLIDATION instruction carries the disorganized concept
+    // and steers the agent at patch_concept's `body` argument.
+    let cons_instruction = instruction_of(&reqs[2]);
+    let cons_section = section_of(&cons_instruction, "DISORGANIZED CONCEPTS")
+        .expect("the over-threshold chain fires the consolidation signal");
+    assert!(
+        cons_section.contains(TARGET) && cons_section.contains("9 consecutive patch revisions"),
+        "the over-threshold chain is named: {cons_section}"
+    );
+    assert!(
+        cons_instruction.contains("`body`"),
+        "the consolidation pass names the body argument: {cons_instruction}"
+    );
+    assert!(
+        !cons_instruction.contains("ORPHANED"),
+        "main-signal work never reappears in the consolidation pass: {cons_instruction}"
+    );
+
+    // The revision log carries the MIXED tags: the main pass's own
+    // write is a mechanically derived `create`, while the seeded chain
+    // (create + 9 updates) ends in exactly one `consolidate` row.
+    let main_ops = op_chain(&state, MAIN_WRITE).await;
+    assert_eq!(
+        main_ops.iter().map(|(op,)| op.as_str()).collect::<Vec<_>>(),
+        vec!["create"],
+        "the main store's write is never consolidate-tagged: {main_ops:?}"
+    );
+    let target_ops = op_chain(&state, TARGET).await;
+    let target_ops: Vec<&str> = target_ops.iter().map(|(op,)| op.as_str()).collect();
+    let mut expected = vec!["create"];
+    expected.extend(std::iter::repeat_n("update", 9));
+    expected.push("consolidate");
+    assert_eq!(
+        target_ops, expected,
+        "create + 9 updates + exactly one consolidate on top: {target_ops:?}"
+    );
+
+    // The consolidate row RESETS the trailing-update count (Ruling 2).
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+    let master = admin_master();
+    let revisions =
+        mycelium_store::revisions::RevisionStore::for_user(state.store.pool(), admin, &master);
+    let count_after = revisions
+        .consecutive_update_count(&revisions.path_token_of(TARGET))
+        .await
+        .unwrap();
+    assert_eq!(count_after, 0, "the consolidate row breaks the chain");
+
+    // The scripted `body` patch landed as a whole-body replace with the
+    // frontmatter untouched.
+    let got = cl
+        .get(format!("{base}/api/v1/concepts{TARGET}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200, "the consolidation patch landed");
+    let stored = mycelium_core::Concept::parse(TARGET, &got.text().await.unwrap()).unwrap();
+    assert_eq!(stored.body, summary, "the body argument replaced the body");
+    assert_eq!(
+        stored.frontmatter.title.as_deref(),
+        Some("Disorganized Storage Layout"),
+        "frontmatter survives the consolidate rewrite"
+    );
+}
+
+/// The consolidation-only dream (the controller's adjudication, Task 3's
+/// scheduler rides it): a scope with NO main-signal family but an
+/// over-threshold trailing-update chain runs exactly ONE pass — the
+/// consolidation pass — never an empty main pass under the main
+/// preamble. The two-pass test above saw 4 requests because both
+/// families fired; here the sequence is only the consolidation pass's
+/// own (instruction + tool call, then the closing text — one
+/// run_mutation with a tool call is exactly two LLM requests): the
+/// instruction opens with the consolidation preamble (not the main
+/// "This is a scheduled maintenance pass" one), and the revision tail
+/// records op `consolidate` with the count reset — the two-pass test's
+/// assertions minus any main-pass request.
+#[tokio::test]
+async fn consolidation_only_dream_runs_single_consolidation_pass() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+
+    const TARGET: &str = "/consolidation-only/disorganized.md";
+    let summary = "Current state only.\n\n# History\n\nolder notes";
+
+    // Exactly ONE concept, self-linked (the orphan rule counts incoming
+    // edges, and a self-link is one) with a 9-update trailing chain
+    // over the 8 default — the run's ONLY signal family. No other
+    // concept exists, so orphans/broken links/duplicates/oversized/
+    // stale/expired/broken supersedes are all empty (every put stamps a
+    // fresh confirmed_at).
+    const MD: &str = "---\ntype: note\ntitle: Disorganized Storage Layout\n---\n\nworking notes, see [self](/consolidation-only/disorganized.md)\n";
+    let (llm_url, requests) = capturing_mock_llm(vec![
+        text_response("Consolidation pass complete."),
+        tool_call_response(
+            "call-cons",
+            "patch_concept",
+            serde_json::json!({ "path": TARGET, "body": summary }),
+        ),
+    ])
+    .await;
+    let (base, _shutdown, _dir, state) = boot(&llm_url).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    seed_with_updates(&state, TARGET, MD, 9).await;
+
+    let report = post_dream(&cl, &base, &cookie, &csrf).await;
+    assert_eq!(
+        report["ran"], true,
+        "the consolidation signal runs the dream: {report}"
+    );
+    assert_eq!(
+        report["summary"], "Consolidation pass complete.",
+        "one pass: the report aggregates only the consolidation summary"
+    );
+
+    let reqs = requests.lock().await;
+    assert_eq!(
+        reqs.len(),
+        2,
+        "exactly the consolidation pass's two steps, no empty main pass: {reqs:?}"
+    );
+
+    // Its instruction IS the consolidation preamble — and nothing rides
+    // the main one (the prefixes are the two distinct preambles; the
+    // consolidation one embeds the main wording AFTER "pass of").
+    let instruction = instruction_of(&reqs[0]);
+    assert!(
+        instruction.starts_with("This is the consolidation pass of a scheduled maintenance pass"),
+        "the cons-only instruction opens with the consolidation preamble: {instruction}"
+    );
+    assert!(
+        !instruction.starts_with("This is a scheduled maintenance pass"),
+        "no empty main pass rides the main preamble: {instruction}"
+    );
+    let cons_section = section_of(&instruction, "DISORGANIZED CONCEPTS")
+        .expect("the over-threshold chain fires the consolidation signal");
+    assert!(
+        cons_section.contains(TARGET) && cons_section.contains("9 consecutive patch revisions"),
+        "the over-threshold chain is named: {cons_section}"
+    );
+    assert!(
+        instruction.contains("`body`"),
+        "the consolidation pass names the body argument: {instruction}"
+    );
+
+    // The one patch records exactly one `consolidate` row atop the
+    // seeded chain (create + 9 updates), resetting the trailing count.
+    let target_ops = op_chain(&state, TARGET).await;
+    let target_ops: Vec<&str> = target_ops.iter().map(|(op,)| op.as_str()).collect();
+    let mut expected = vec!["create"];
+    expected.extend(std::iter::repeat_n("update", 9));
+    expected.push("consolidate");
+    assert_eq!(
+        target_ops, expected,
+        "create + 9 updates + exactly one consolidate: {target_ops:?}"
+    );
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+    let master = admin_master();
+    let revisions =
+        mycelium_store::revisions::RevisionStore::for_user(state.store.pool(), admin, &master);
+    let count_after = revisions
+        .consecutive_update_count(&revisions.path_token_of(TARGET))
+        .await
+        .unwrap();
+    assert_eq!(count_after, 0, "the consolidate row breaks the chain");
+}
+
+// ---- endpoint-wide 500 body (Task 6 parked cleanup) ----
+
+/// The endpoint-wide 500 convention: an unrecoverable master key is a
+/// server-side failure, so its detail goes to the log and the JSON body
+/// is the generic `{"error":"internal error"}` every other api.rs 500
+/// carries — never the old `{"error":"key unavailable"}`, which told a
+/// caller nothing it could act on and named a subsystem for no benefit.
+/// The broken-key state is driven across ALL TEN converted handlers —
+/// every api.rs route whose key fetch answers this way: graph, concept
+/// get/put/delete, the revisions index store, the revisions read gate
+/// (via both of its routes), the restore, the revisions browser page,
+/// dream, and stateless chat.
+#[tokio::test]
+async fn key_unavailable_endpoints_return_internal_error() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    let (mock, _requests) = capturing_mock_llm(vec![]).await;
+    let (base, _shutdown, _dir, state) = boot(&mock).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+
+    // Break the RECOVERY path: the service seal no longer decodes, and
+    // the cached entry is dropped, so the endpoint's `master_key_for`
+    // read fails. (Login seeds the cache, so removing the entry is what
+    // makes the route take the failing branch.)
+    sqlx::query("UPDATE users SET master_key_service_sealed = 'not-hex' WHERE id = ?")
+        .bind(admin.to_string())
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    state.master_keys.remove(admin);
+
+    // Every converted handler, driven to its `master_key_for` fetch.
+    // The two body-carrying routes carry the minimal VALID body: a bad
+    // one 400s before the route reaches its fetch (api_put_concept
+    // parses first, api_chat refuses an empty message first); the key
+    // failure itself needs nothing else to fire.
+    enum Body {
+        None,
+        Json(serde_json::Value),
+        Form(&'static str, &'static str),
+    }
+    impl Body {
+        fn attach(self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            match self {
+                Body::None => req,
+                Body::Json(v) => req.json(&v),
+                Body::Form(k, v) => req.form(&[(k, v)]),
+            }
+        }
+    }
+
+    let cases: Vec<(&'static str, reqwest::Method, String, Body)> = vec![
+        (
+            "GET /api/v1/graph",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/graph"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/concepts/{path}",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::None,
+        ),
+        (
+            "DELETE /api/v1/concepts/{path}",
+            reqwest::Method::DELETE,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::None,
+        ),
+        (
+            "PUT /api/v1/concepts/{path}",
+            reqwest::Method::PUT,
+            format!("{base}/api/v1/concepts/pin.md"),
+            Body::Json(serde_json::json!({
+                "markdown": "---\ntype: note\n---\nrevision pin body\n"
+            })),
+        ),
+        (
+            "GET /api/v1/revisions",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/revisions/list",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions/list?path=pin.md"),
+            Body::None,
+        ),
+        (
+            "GET /api/v1/revisions/snapshot",
+            reqwest::Method::GET,
+            format!("{base}/api/v1/revisions/snapshot?path=pin.md&n=1"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/revisions/restore",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/revisions/restore?path=pin.md&n=1"),
+            Body::None,
+        ),
+        (
+            "GET /revisions (page)",
+            reqwest::Method::GET,
+            format!("{base}/revisions"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/dream",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/dream"),
+            Body::None,
+        ),
+        (
+            "POST /api/v1/chat",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/chat"),
+            Body::Form("message", "hello"),
+        ),
+    ];
+    for (name, method, url, body) in cases {
+        let req = cl
+            .request(method, &url)
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf);
+        let resp = body.attach(req).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            500,
+            "{name}: an unrecoverable key is a server failure"
+        );
+        let payload: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "error": "internal error" }),
+            "{name}: the body carries no key detail"
+        );
+    }
+}

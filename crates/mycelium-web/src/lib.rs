@@ -6,6 +6,7 @@ pub mod cert;
 pub mod chat_api;
 pub mod chat_resume;
 pub mod chat_runner;
+pub mod dream_scheduler;
 pub mod health;
 pub mod lifecycle;
 pub mod middleware;

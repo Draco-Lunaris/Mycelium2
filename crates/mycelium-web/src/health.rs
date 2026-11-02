@@ -101,6 +101,15 @@ pub struct SystemStats {
     /// claimed (`ChatStore::waiting_turn_count`; zeroed on read failure
     /// like the queue fields).
     pub chat_waiting_count: i64,
+    /// Whether the MOST RECENT corpus backfill run completed (Ruling
+    /// 7: keyed off the plain `dream_backfill_at` marker's presence —
+    /// deleted at click time, rewritten at completion, so a new click
+    /// makes this false until that run finishes; latest-attempt, not
+    /// ever-completed, because ruling-mandated click-time delete
+    /// erases the historical marker). NOT in the degraded rule — an
+    /// absent marker is an un-run or in-flight backfill, not an
+    /// illness.
+    pub dream_backfill_complete: bool,
     pub db_ok: bool,
 }
 
@@ -162,6 +171,16 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
     // Chat waiting turns (same zero-on-failure convention as the queue
     // fields: db_ok already reports an unreachable store).
     let chat_waiting_count = state.chat_sessions.waiting_turn_count().await.unwrap_or(0);
+    // The corpus-backfill completion flag (Ruling 7): the plain
+    // marker's presence; a failed read reports "no marker" (zeroed,
+    // like the queue fields beside it).
+    let dream_backfill_complete = state
+        .config
+        .get::<String>(crate::dream_scheduler::DREAM_BACKFILL_AT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
     SystemStats {
         user_count,
         queue_depth,
@@ -179,6 +198,7 @@ pub(crate) async fn system_stats(state: &AppState) -> SystemStats {
         embedding_down_seconds,
         embedding_checked_seconds_ago,
         chat_waiting_count,
+        dream_backfill_complete,
         db_ok,
     }
 }
@@ -232,6 +252,7 @@ async fn health(State(state): State<AppState>) -> Response {
             "embedding_down_seconds": stats.embedding_down_seconds,
             "embedding_checked_seconds_ago": stats.embedding_checked_seconds_ago,
             "chat_waiting_count": stats.chat_waiting_count,
+            "dream_backfill_complete": stats.dream_backfill_complete,
         })),
     )
         .into_response()
@@ -432,6 +453,39 @@ async fn metrics(State(state): State<AppState>) -> Response {
         out,
         "# TYPE mycelium2_vector_processed_total counter\nmycelium2_vector_processed_total {}",
         mycelium_store::VECTOR_PROCESSED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // Dream scheduler surfaces (memory-lifecycle §3.4): every wake of
+    // the scheduler's tick loop; passes are attempted wakes (a run, a
+    // no-signal pass, or a resolve-failure); skips are the gated and
+    // disabled wakes plus ticks without a usable config.
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_ticks_total counter\nmycelium2_dream_ticks_total {}",
+        crate::dream_scheduler::DREAM_TICKS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_passes_total counter\nmycelium2_dream_passes_total {}",
+        crate::dream_scheduler::DREAM_PASSES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_passes_skipped_total counter\nmycelium2_dream_passes_skipped_total {}",
+        crate::dream_scheduler::DREAM_PASSES_SKIPPED_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // The corpus-backfill worker's live gauge (Ruling 8): 1 while a
+    // walk runs, 0 otherwise — the SAME running-guard the handler
+    // claims and the worker's RAII guard releases (a dying worker can
+    // never leave a stale 1 behind).
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_backfill_active gauge\nmycelium2_dream_backfill_active {}",
+        u8::from(
+            state
+                .dream_backfill_running
+                .load(std::sync::atomic::Ordering::Relaxed)
+        )
     );
     // Chat turns owed an answer (weather-parked + unclaimed crash),
     // zeroed on read failure like the queue surfaces beside it.

@@ -1325,8 +1325,25 @@ async fn execute_tool_tracked(
                     }
                 }
             }
-            // Section replace or full body replace.
-            if let Some(section) = args.get("replace_section").and_then(|v| v.as_object()) {
+            // Whole-body replace first (the dream consolidation pass
+            // composes its current-state summary + `# History` through
+            // patch_concept's `body` argument): a present, non-null,
+            // NON-EMPTY string replaces the body verbatim — an empty
+            // string omits (Ruling 4: `body` never wipes a concept), and
+            // `body` outranks the legacy `replace_body`/`replace_section`
+            // spellings when several arrive in one call. When `body` is
+            // absent the tool behaves exactly as before. The two spellings
+            // are deliberately NOT symmetric on empty: `body: ""` changes
+            // nothing (Ruling 4 again), while `replace_body: ""` — the
+            // older spelling, kept as-is for callers written before the
+            // ruling — does wipe the body.
+            if let Some(body) = args
+                .get("body")
+                .and_then(|v| v.as_str())
+                .filter(|b| !b.is_empty())
+            {
+                concept.body = body.to_string();
+            } else if let Some(section) = args.get("replace_section").and_then(|v| v.as_object()) {
                 // Missing keys resolve to empty strings (the Value-miss
                 // semantics these `unwrap_or_default()`s were written for)
                 // — a lenient no-op-ish patch, never a Map-index panic.
@@ -1711,7 +1728,8 @@ pub fn all_tool_specs() -> Vec<crate::llm::ToolSpec<'static>> {
                                 "content": { "type": "string", "description": "New content for that section" }
                             }
                         },
-                        "replace_body": { "type": "string", "description": "Replace the entire markdown body (frontmatter untouched)" }
+                        "replace_body": { "type": "string", "description": "Replace the entire markdown body (frontmatter untouched)" },
+                        "body": { "type": "string", "description": "Whole-body replace verbatim (frontmatter untouched); an empty string changes nothing. Outranks replace_section/replace_body when several are sent." }
                     },
                     "required": ["path"]
                 })),
@@ -1997,9 +2015,12 @@ mod tests {
 
     /// Patch tool call in wire shape (`ToolCall`'s private serde
     /// defaults reconstruct it), executed through the real dispatch.
+    /// `allow_writes` selects the mode: Mutate (`true`) or read-only
+    /// Query (`false` — the write gate must reject before any parsing).
     async fn run_patch(
         cs: &ConceptStore<'_>,
         args: serde_json::Value,
+        allow_writes: bool,
     ) -> Result<(String, Option<String>), AgentError> {
         let call: crate::llm::ToolCall = serde_json::from_value(serde_json::json!({
             "id": "call-patch-test",
@@ -2018,7 +2039,7 @@ mod tests {
             trace: None,
         };
         let mut recorder = crate::trace::TraceRecorder::new();
-        execute_tool_tracked(cs, &scopes, &call, true, &mut recorder).await
+        execute_tool_tracked(cs, &scopes, &call, allow_writes, &mut recorder).await
     }
 
     /// Same store setup as the prompt test below, plus a `/old.md` note.
@@ -2051,6 +2072,7 @@ mod tests {
                 "path": "/old.md",
                 "frontmatter": { "status": "superseded", "superseded_by": "/new.md" },
             }),
+            true,
         )
         .await
         .expect("patch with lifecycle fields must succeed");
@@ -2082,6 +2104,7 @@ mod tests {
         run_patch(
             &cs,
             serde_json::json!({ "path": "/old.md", "frontmatter": { "status": null } }),
+            true,
         )
         .await
         .expect("null status merge must succeed");
@@ -2097,6 +2120,7 @@ mod tests {
         let err = run_patch(
             &cs,
             serde_json::json!({ "path": "/old.md", "frontmatter": { "status": "Bogus" } }),
+            true,
         )
         .await
         .expect_err("bad status must fail the put, not merge to a success reply");
@@ -2120,6 +2144,7 @@ mod tests {
                 "path": "/old.md",
                 "frontmatter": { "superseded_by": "not-a-valid-shape" },
             }),
+            true,
         )
         .await
         .expect_err("bad superseded_by shape must fail the put");
@@ -2129,6 +2154,106 @@ mod tests {
             )) => assert_eq!(value, "not-a-valid-shape"),
             other => panic!("expected Put(Parse(InvalidSupersededBy)), got {other:?}"),
         }
+    }
+
+    /// The optional `body` argument (Ruling 4): a present, non-empty
+    /// string replaces the whole body verbatim while the frontmatter —
+    /// including the lifecycle fields consolidations must keep — is
+    /// untouched. An empty string omits (never wipes), `body` outranks
+    /// the legacy spellings, and Query mode rejects the write like any
+    /// other write tool.
+    #[tokio::test]
+    async fn patch_body_replaces_body_keeps_frontmatter() {
+        let cs = patch_store_setup().await;
+        // Seed the lifecycle fields a body patch must NOT drop.
+        let seeded = Concept::new(
+            mycelium_core::concept::Frontmatter {
+                concept_type: "Note".into(),
+                title: Some("Keeper Title".into()),
+                tags: vec!["keeper".into()],
+                status: Some("superseded".into()),
+                superseded_by: Some("/new/fact.md".into()),
+                valid_to: Some("2027-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            "old body".into(),
+            "/old.md".into(),
+        );
+        cs.put(&seeded).await.unwrap();
+
+        let summary = "Current state summary\n\n# History\n\nold bits";
+        run_patch(
+            &cs,
+            serde_json::json!({ "path": "/old.md", "body": summary }),
+            true,
+        )
+        .await
+        .expect("a body patch in Mutate mode succeeds");
+        let stored = cs.get("/old.md").await.unwrap();
+        assert_eq!(stored.body, summary, "whole-body replace verbatim");
+        assert_eq!(
+            stored.frontmatter.title.as_deref(),
+            Some("Keeper Title"),
+            "frontmatter untouched by the body replace"
+        );
+        assert_eq!(stored.frontmatter.tags, vec!["keeper".to_string()]);
+        assert_eq!(
+            stored.frontmatter.status.as_deref(),
+            Some("superseded"),
+            "status survives the body patch"
+        );
+        assert_eq!(
+            stored.frontmatter.superseded_by.as_deref(),
+            Some("/new/fact.md"),
+            "superseded_by survives the body patch"
+        );
+        assert_eq!(
+            stored.frontmatter.valid_to.as_deref(),
+            Some("2027-01-01T00:00:00Z"),
+            "valid_to survives the body patch"
+        );
+
+        // Empty body = omit (Ruling 4): the body never wipes.
+        run_patch(
+            &cs,
+            serde_json::json!({ "path": "/old.md", "body": "" }),
+            true,
+        )
+        .await
+        .expect("an empty body is a no-op, not a wipe");
+        assert_eq!(cs.get("/old.md").await.unwrap().body, summary);
+
+        // `body` outranks the legacy replace spellings when several are
+        // sent — one deterministic winner.
+        run_patch(
+            &cs,
+            serde_json::json!({
+                "path": "/old.md",
+                "body": "body wins",
+                "replace_body": "legacy spelling",
+            }),
+            true,
+        )
+        .await
+        .expect("the body argument wins the precedence race");
+        assert_eq!(cs.get("/old.md").await.unwrap().body, "body wins");
+
+        // Query mode rejects the write before any parsing.
+        let err = run_patch(
+            &cs,
+            serde_json::json!({ "path": "/old.md", "body": "x" }),
+            false,
+        )
+        .await
+        .expect_err("write tool in read-only mode");
+        match &err {
+            AgentError::BadToolArgs { reason, .. } => {
+                assert!(reason.contains("read-only"), "{reason}");
+            }
+            other => panic!("expected BadToolArgs, got {other:?}"),
+        }
+        // The rejected run changed nothing.
+        assert_eq!(cs.get("/old.md").await.unwrap().body, "body wins");
     }
 
     /// The assembled prompt (not just its building blocks) carries the
