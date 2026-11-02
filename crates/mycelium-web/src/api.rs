@@ -5087,9 +5087,13 @@ fn llm_capacity_response() -> Response {
 
 /// POST /api/v1/dream — run a maintenance/consolidation pass over the
 /// caller's private bundle (v1 parity: orphans, broken links, likely
-/// duplicates, oversized concepts). Deterministic signals decide
-/// whether the agent runs at all; no signals → no tokens. CSRF is
-/// enforced by the /api/v1 middleware layer.
+/// duplicates, oversized concepts; plus the lifecycle signals — stale
+/// pairings, expired valid_to, broken supersedes, disorganized patch
+/// chains). Deterministic signals decide whether the agent runs at
+/// all; no signals → no tokens. When consolidation signals exist a
+/// second pass runs through a `consolidate`-tagged store view (Ruling
+/// 3), both passes under the one gate permit below. CSRF is enforced
+/// by the /api/v1 middleware layer.
 pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Response {
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
@@ -5100,11 +5104,19 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
     // takes (the same HMAC path tokens bind the two views together).
     let user_vectors =
         mycelium_store::vectors::VectorStore::for_user(state.store.pool(), user.user_id, &master);
-    let cs = ConceptStore::for_user(&state.store, user.user_id, master)
+    let cs = ConceptStore::for_user(&state.store, user.user_id, master.clone())
         // The dream agent may write concepts: label its store (spec
         // §3.1 `dream` — system provenance; nothing model-authored
         // survives the put).
         .with_provenance("dream");
+    // The consolidation pass (memory-lifecycle Ruling 3) writes through
+    // a SECOND view of the same scope, tagged with the explicit
+    // `consolidate` revision op: its body rewrites record "consolidated
+    // body history" while the main store's writes stay mechanically
+    // derived (create/update).
+    let cons_cs = ConceptStore::for_user(&state.store, user.user_id, master)
+        .with_provenance("dream")
+        .with_revision_op("consolidate");
     // The config load is also the gate's sync point (spec §3.2): the
     // clamped row is the single source of both the gate's limits and
     // this surface's wait bound — no separate plumbing.
@@ -5144,7 +5156,8 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
         }
     };
     let outcome =
-        mycelium_librarian::dream::run_dream(&client, &cs, &scopes, Some(&user_vectors)).await;
+        mycelium_librarian::dream::run_dream(&client, &cs, &cons_cs, &scopes, Some(&user_vectors))
+            .await;
     // The slot is free the moment the run is: the response body is
     // built after the release, not under the permit.
     drop(permit);

@@ -116,6 +116,14 @@ impl<'a> ConceptStore<'a> {
         &self.vectors
     }
 
+    /// The scope's revision chain (the undo log's read side): the dream
+    /// consolidation signal reads `consecutive_update_count`/`path_token_of`
+    /// through the store it is handed (it receives `ConceptStore`s, not
+    /// a pool + key pair).
+    pub fn revisions(&self) -> &RevisionStore<'a> {
+        &self.revisions
+    }
+
     /// Label this store's writes with a provenance source (system
     /// provenance — the write-time stamp overwrites whatever the
     /// caller's frontmatter carries in `source`). Consuming builder;
