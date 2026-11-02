@@ -111,7 +111,9 @@ WantedBy=multi-user.target
   three are
   observability only — a saturated or queued gate is load, not ill
   health, and never makes the status `degraded`.
-- `GET /api/v1/health` — detailed JSON status (authenticated).
+- `GET /api/v1/health` — the minimal authenticated document
+  (`status`, `database`, `users`, `version`). The rich posture document
+  is the public `/health` above.
 - `GET /metrics` — Prometheus counters (logins, searches, ingests,
   backups, mutation-queue totals, ...) plus gauges for the mutation
   queue depth, the oldest pending item's age, and
@@ -143,6 +145,25 @@ WantedBy=multi-user.target
   unhealthy backend never makes `/health` `degraded` — the LLM backend
   being down is weather these services wait out, not illness of this
   container; degraded still means MY database or write queue is ill.
+- Embeddings / vector-index metric lines: `mycelium2_embedding_up`
+  (gauge; the same `0`/`1`/`2`/`3` four-state encoding as
+  `mycelium2_backend_up`, its own machine — `0` means no stored
+  `embeddings` row, i.e. vector retrieval is off),
+  `mycelium2_vector_queue_depth` (gauge; write-hook items waiting to be
+  embedded) and `mycelium2_vector_processed_total` (counter; concepts
+  embedded). `/health` mirrors the state as `embedding_state`,
+  `embedding_down_seconds`, `embedding_checked_seconds_ago`. A red
+  embeddings backend never makes `/health` degraded either: retrieval
+  falls back to lexical and the rows catch up when the model returns.
+- Dream metric lines: `mycelium2_dream_ticks_total` (counter; every
+  scheduler wake), `mycelium2_dream_passes_total` (counter; wakes that
+  ran a pass — the agent ran, found nothing, or failed),
+  `mycelium2_dream_passes_skipped_total` (counter; wakes that ended
+  without a pass: gate busy, backend red, dreaming disabled, config
+  unreadable) and `mycelium2_dream_backfill_active` (gauge; a corpus
+  backfill is walking now). `/health` reports the backfill's RESULT as
+  `dream_backfill_complete` — the marker's presence, meaning "the most
+  recent walk finished" (a fresh click clears it until that walk ends).
 - Container healthcheck: the HTTP redirect listener answers on port
   80 (`curl http://127.0.0.1:80/`).
 
@@ -190,6 +211,149 @@ opportunities. A corrupt or foreign-sealed `llm` config row is a
 config problem, not backend weather: the probe logs a warning each
 tick and reports **no** observation (the last real state stays), so a
 bad row never drives the dot red.
+
+### Embeddings and the vector index
+
+Two independent background tasks keep the vector half of retrieval
+current. Neither one touches the LLM admission gate — embedding traffic
+is not an agent run, so it neither occupies nor waits behind a chat
+slot.
+
+- **The probe** (30 s cadence, immediate first tick) posts a
+  one-element `["probe"]` input to `{base_url}/v1/embeddings` with a
+  5 s timeout. Any error counts as one failure — transport, HTTP
+  status, an unparseable body, or a vector wider than the 4096-dim
+  sanity cap. One or two consecutive failures read **yellow**, three
+  or more **red**, and no stored `embeddings` row reads **disabled**
+  (grey: nothing to probe, not an outage). Every successful probe also
+  re-stamps the model's learned dimensionality, so a model that
+  silently changes width is caught within one interval rather than
+  cached from first boot.
+- **The vector worker** (5 s tick) re-reads the row every tick (absent
+  ⇒ the machine goes Disabled and the tick ends), marks every row whose
+  model or dims no longer matches the config stale — once, and only
+  after a probe has learned a width — skips its embedding phases
+  entirely while the backend is red, then drains the **whole**
+  write-hook queue and re-embeds those concepts in `batch`-sized
+  batches with three attempts per batch. A batch that still fails drops
+  with a bounded warning: nothing errors upward, nothing wedges. Finally
+  it re-embeds up to 256 stale rows per scope, resuming the rest next
+  tick — so a model swap re-embeds a corpus gradually instead of in one
+  enormous request.
+
+What that means at the console:
+
+- **Turning embeddings on mid-life needs no restart.** Concept writes
+  enqueue their path as they happen and the worker drains only when it
+  can read a row, so an operator who saves the config after boot gets
+  the pre-existing corpus anyway: the first tick of the process that
+  actually sees a row re-enqueues every path lacking a vector row
+  (per scope, users included, and a user whose master key is
+  temporarily unrecoverable is skipped and resumes at the next boot).
+- **The queue is bounded at 512 and drops its newest item at
+  capacity.** A full drain runs every tick, so overflow takes a burst of
+  more than 512 unserved writes; a dropped concept simply keeps the
+  vector it already had until it is written again or the corpus
+  re-embeds. Search reads a slightly older vector, never an error, and
+  `mycelium2_vector_queue_depth` is where the pressure shows.
+- **A red embeddings backend is invisible to users.** Retrieval answers
+  lexically, `mycelium2_embedding_up` drops to 1 or 2, and the rows
+  catch up on their own when the model returns. After a config save or a
+  model change, watch `mycelium2_vector_processed_total` climb and
+  `mycelium2_vector_queue_depth` fall back toward zero.
+- An **undecryptable or foreign-sealed `embeddings` row is a config
+  problem, not weather** — the probe warns each tick and feeds no
+  observation, so the dot keeps its last real state (same rule as the
+  `llm` row).
+
+### Scheduled dreaming
+
+One worker wakes on the stored `dream_interval_s` (default 86400 s =
+daily; 3600–2592000, clamped on save and on read) and runs **one dream
+pass per wake**, over a rotation of the maintenance scopes: every user
+(`ORDER BY id`) then the `global:skills` shelf, one scope per wake at a
+cursor that advances on each attempted pass. A deployment with N users
+therefore revisits any given scope roughly every N intervals. The
+library is never dreamed — book stacks are ingest output, not knowledge
+to consolidate.
+
+- **Admission is try-class, never waiting.** A gate that is busy or
+  queued defers the wake: the wake counts as a skip
+  (`mycelium2_dream_passes_skipped_total`), the cursor stays, and the
+  scope's signals persist for the next wake. Dreaming never takes a slot
+  from an interactive chat or query.
+- **A red backend defers the wake too** (same accounting — no pass, no
+  record, cursor untouched); a yellow one still runs, because a flap is
+  not an outage. No usable `llm` row is a guaranteed-fail pass, so the
+  wake is skipped before admission rather than burning a slot on it.
+- **Unticking `dream_enabled`** on `/admin/dream` stops everything: each
+  wake counts a skip, admits nothing, records nothing, and leaves the
+  cursor where it was.
+- **Cadence changes apply on the next wake** — the scheduler re-reads
+  the sealed row each time and re-tunes itself when the value differs. A
+  deployment that has never saved the row (no `lifecycle` row at all)
+  keeps the built-in daily cadence forever.
+- **Each attempted pass writes a `dream_last_run` record** — the scope,
+  whether the agent actually ran, and a bounded summary (the agent's own
+  summary, the "nothing to do" reason, or the failure detail) — shown on
+  `/admin/dream`. An attempted pass is recorded even when it failed,
+  including the case where a user's master key was unrecoverable, so the
+  readout never silently goes stale.
+
+### Corpus backfill (the `/admin/dream` button)
+
+**Backfill corpus** (`POST /admin/dream/backfill`, admin) walks every
+maintenance scope **once** through the same per-scope pass the scheduler
+uses, and is how a bundle that has been accumulating signals for months
+gets its first consolidation.
+
+- The click deletes the `dream_backfill_at` marker before spawning, so
+  `/health` reports `dream_backfill_complete: false` from the instant it
+  is launched, and `mycelium2_dream_backfill_active` reads 1 while it
+  walks. Exactly one walk runs at a time — a second click flashes
+  `Backfill already running`.
+- Each scope is admitted try-class, so a busy gate or a red backend
+  **skips that scope** and the walk continues to the rest. The marker is
+  written when the walk finishes either way, so the flag means "the most
+  recent walk completed", not "every scope was consolidated"; a skipped
+  scope keeps its signals for the scheduler's rotation or the next walk.
+- `dream_enabled` gates nothing here (an explicit admin click is not the
+  scheduler), and `dream_last_run` is never written by a backfill — the
+  scheduled readout stays the scheduled readout.
+- A walk killed by shutdown leaves **no** marker; a walk that finds no
+  usable `llm` row, or cannot enumerate users, is abandoned and leaves
+  no marker either (nothing ran).
+
+### Revisions: storage and retention
+
+Every concept write appends one row to `concept_revisions` in the same
+SQLite database as everything else — no separate directory, nothing new
+to mount. Each row carries the **full pre-mutation bytes** of the
+concept (`create` rows carry what was created; restoring a path that was
+deleted carries no payload), sealed with the scope's index key and bound
+by an AAD of `(scope, path token, revision number)`, so a row cannot be
+moved between concepts or renumbered without failing decryption.
+
+- **Retention is `revision_retention`** (default 200, 25–2000) and prunes
+  in the **same transaction as the insert**: the newest N rows per
+  concept survive, the rest are deleted immediately and irreversibly.
+  Lowering the setting therefore removes nothing until each concept is
+  written again; raising it does not bring pruned rows back.
+- **Budget disk accordingly**: rows are full snapshots, not diffs, so a
+  concept's history costs roughly `retention × concept size`. Editing
+  many large concepts under a high retention is the case that moves the
+  database's size.
+- **Backups cover history** because it rides the database — see
+  [Backup and restore](backup.md); a full restore brings revision
+  chains with it.
+- **Reading history decrypts nothing.** The listing is metadata only
+  (number, op, source, summary, timestamp, and whether the payload is
+  empty, judged from the stored envelope's length); viewing a snapshot
+  and restoring are the decrypting paths, and a restore writes a **new**
+  revision (`restored to revision n`) rather than erasing the chain.
+- **Boot order is enforced**: retention is synced from the stored row
+  before the packaged-skill seed and every boot sweep, because those
+  write revisions that the retention rule must already govern.
 
 ### Sizing `max_parallel`
 

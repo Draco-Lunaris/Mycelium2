@@ -125,7 +125,7 @@ impl ChatResumeWorker {
     /// One pass: health gate (Red/Disabled: skip everything, Ok) →
     /// merged supplies (crash + weather) oldest-first → grouped by
     /// user → per user recover the key (error: skip the user) → per
-    /// turn try_acquire a permit (None: skip unclaimed) → atomic
+    /// turn `llm_gate::try_enter` a permit (None: skip unclaimed) → atomic
     /// status-dispatched claim (false: raced/skipped) → spawn the
     /// resumed run. Returns when every eligible turn this pass decided
     /// on is dispatched or deliberately skipped.

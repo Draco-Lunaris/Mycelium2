@@ -877,3 +877,51 @@ async fn consolidation_only_dream_runs_single_consolidation_pass() {
         .unwrap();
     assert_eq!(count_after, 0, "the consolidate row breaks the chain");
 }
+
+// ---- endpoint-wide 500 body (Task 6 parked cleanup) ----
+
+/// The endpoint-wide 500 convention: an unrecoverable master key is a
+/// server-side failure, so its detail goes to the log and the JSON body
+/// is the generic `{"error":"internal error"}` every other api.rs 500
+/// carries — never the old `{"error":"key unavailable"}`, which told a
+/// caller nothing it could act on and named a subsystem for no benefit.
+#[tokio::test]
+async fn key_unavailable_endpoints_return_internal_error() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    let (mock, _requests) = capturing_mock_llm(vec![]).await;
+    let (base, _shutdown, _dir, state) = boot(&mock).await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+    let admin = state.users.get_by_username("admin").await.unwrap().id;
+
+    // Break the RECOVERY path: the service seal no longer decodes, and
+    // the cached entry is dropped, so the endpoint's `master_key_for`
+    // read fails. (Login seeds the cache, so removing the entry is what
+    // makes the route take the failing branch.)
+    sqlx::query("UPDATE users SET master_key_service_sealed = 'not-hex' WHERE id = ?")
+        .bind(admin.to_string())
+        .execute(state.store.pool())
+        .await
+        .unwrap();
+    state.master_keys.remove(admin);
+
+    let resp = cl
+        .post(format!("{base}/api/v1/dream"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        500,
+        "an unrecoverable key is a server failure"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "internal error" }),
+        "the body carries no key detail"
+    );
+}

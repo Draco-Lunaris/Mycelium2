@@ -222,7 +222,10 @@ struct GraphEdge {
 async fn graph_data(State(state): State<AppState>, user: SessionUser) -> Response {
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "graph: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     let mut nodes = Vec::new();
@@ -411,7 +414,10 @@ async fn api_put_concept(
     };
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept put: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master)
         .with_provenance(format!("web:{}", user.username));
@@ -448,7 +454,10 @@ async fn api_get_concept(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept read: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.get(&canonical).await {
@@ -490,7 +499,10 @@ async fn api_delete_concept(
     let canonical = format!("/{}", path.trim_start_matches('/'));
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "concept delete: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master);
     match cs.delete(&canonical).await {
@@ -673,10 +685,10 @@ async fn revisions_index_store<'a>(
 ) -> Result<RevisionStore<'a>, RevRejection> {
     match scope {
         RevScope::User => {
-            let master = state
-                .master_key_for(user.user_id)
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            let master = state.master_key_for(user.user_id).await.map_err(|e| {
+                tracing::warn!(error = %e, "revisions index: master key unavailable");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
             Ok(RevisionStore::for_user(
                 state.store.pool(),
                 user.user_id,
@@ -773,10 +785,10 @@ async fn read_gate_store_scope<'a>(
     let scope = RevScope::parse(scope_raw)?;
     match scope {
         RevScope::User => {
-            let master = state
-                .master_key_for(user.user_id)
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"))?;
+            let master = state.master_key_for(user.user_id).await.map_err(|e| {
+                tracing::warn!(error = %e, "revision read gate: master key unavailable");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
             Ok(RevisionStore::for_user(
                 state.store.pool(),
                 user.user_id,
@@ -838,8 +850,9 @@ async fn api_revisions_restore(
         RevScope::User => {
             let master = match state.master_key_for(user.user_id).await {
                 Ok(m) => m,
-                Err(_) => {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                Err(e) => {
+                    tracing::warn!(error = %e, "revision restore: master key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             };
             ConceptStore::for_user(&state.store, user.user_id, master)
@@ -932,7 +945,7 @@ pub async fn revisions_view(
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "revisions browser: master key unavailable");
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             };
             ConceptStore::for_user(&state.store, user.user_id, master)
@@ -3910,9 +3923,18 @@ pub async fn admin_save_llm(
 /// POST /admin/llm/test — probe the LLM backend with one minimal
 /// completion using the submitted form values (blank api_key = the
 /// stored key, mirroring the save semantics). Nothing is persisted.
-/// The redirect verdict carries the backend's status + body on failure
-/// so a mis-pasted key or wrong URL is visible in seconds — the chat
-/// path only says "librarian unavailable", never why.
+/// The redirect verdict is BOUNDED on failure — [`admin_test_embeddings`]
+/// is the twin this mirrors: [`llm_test_reason`] keeps the backend's HTTP
+/// status (a wrong URL answers "did not answer", a refused key answers
+/// "HTTP 401", which is what the operator is actually asking — the chat
+/// path only says "librarian unavailable", never why) and drops the
+/// upstream BODY, because the flash text rides a URL: it lands in browser
+/// history, proxies' access logs and the Referer chain, and an upstream
+/// error body can carry anything — including the key it just refused.
+/// The full error (status + body) is logged server-side, where the
+/// operator's `docker logs` shows it. The success flash carries the
+/// backend's reply encoded and byte-capped for the same reason: it is
+/// upstream-controlled text going into a query string.
 pub async fn admin_test_llm(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
@@ -3942,16 +3964,43 @@ pub async fn admin_test_llm(
         .chat_system(Some("You are a connectivity probe."), "Reply with OK", 0.0)
         .await
     {
-        Ok(reply) => format!("ok=connected%20%E2%80%94%20backend%20responded:{reply}",),
+        Ok(reply) => format!(
+            "ok={}",
+            pages::urlencoding_encode(&format!(
+                "connected — backend responded: {}",
+                mycelium_librarian::llm_health::short_detail(reply),
+            ))
+        ),
         Err(e) => {
+            let reason = llm_test_reason(&e);
             tracing::warn!(error = %e, "LLM test connection failed");
             format!(
                 "error={}",
-                pages::urlencoding_encode(&format!("test connection failed: {e}"))
+                pages::urlencoding_encode(&format!(
+                    "test connection failed: {}",
+                    mycelium_librarian::llm_health::short_detail(reason),
+                ))
             )
         }
     };
     Redirect::to(&format!("/admin/llm?{verdict}")).into_response()
+}
+
+/// The bounded, non-leaking LLM test-connection failure reason —
+/// [`embedding_test_reason`]'s twin for the chat backend: the upstream
+/// STATUS surfaces (a mis-pasted URL or a refused key is visible in
+/// seconds) but never its body. A transport failure never arrived, so it
+/// "did not answer"; an empty completion means the backend answered and
+/// had nothing to say (a wrong MODEL, which no status code would show).
+/// The caller bounds the composed string through `llm_health::short_detail`.
+fn llm_test_reason(e: &mycelium_librarian::llm::LlmError) -> String {
+    match e {
+        mycelium_librarian::llm::LlmError::Status { status, .. } => format!("HTTP {status}"),
+        mycelium_librarian::llm::LlmError::Request(_) => "the backend did not answer".to_string(),
+        mycelium_librarian::llm::LlmError::EmptyResponse => {
+            "the backend returned no content".to_string()
+        }
+    }
 }
 
 /// GET /admin/embeddings — the embeddings-backend card on its own
@@ -4016,11 +4065,36 @@ fn embeddings_field(submitted: Option<&String>, stored: u32) -> u32 {
 /// blank api_key keeps the stored key; the key is never rendered back
 /// to the browser. The tunables are clamped BEFORE sealing (the row at
 /// rest is always in range). No gate call: embeddings has none.
+///
+/// An empty-after-trim `base_url` or `model` is REFUSED with a flash,
+/// before anything is sealed or written: such a row is not a
+/// half-configured backend but a broken one — every embed call would
+/// fail at request time (an empty URL is a transport error, an empty
+/// model is a 4xx), the probe would answer "did not answer", and the
+/// vector worker would silently keep every scope stale. The refusal
+/// says which field, because that is the field to fix.
+///
+/// A failed store write flashes a CONSTANT, never the error: the detail
+/// is logged, and the redirect query is not a log sink.
 pub async fn admin_save_embeddings(
     State(state): State<AppState>,
     _admin: mycelium_auth::rbac::RequireAdmin,
     axum::Form(form): axum::Form<EmbeddingsForm>,
 ) -> Response {
+    if form.base_url.trim().is_empty() {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode("base_url must not be empty")
+        ))
+        .into_response();
+    }
+    if form.model.trim().is_empty() {
+        return Redirect::to(&format!(
+            "/admin/embeddings?error={}",
+            pages::urlencoding_encode("model must not be empty")
+        ))
+        .into_response();
+    }
     // The existing config (blank-key keep reads through it) or the
     // default (a first save from a keyless store keeps no key).
     let existing =
@@ -4050,9 +4124,10 @@ pub async fn admin_save_embeddings(
     // Seal (serialize + AEAD); a failure must not land plaintext.
     let sealed = crate::state::seal_config(&state.service_key, "embeddings", &cfg);
     if let Err(e) = state.config.set("embeddings", &sealed).await {
+        tracing::warn!(error = %e, "embeddings config save failed");
         return Redirect::to(&format!(
             "/admin/embeddings?error={}",
-            pages::urlencoding_encode(&e.to_string())
+            pages::urlencoding_encode("config not saved - check the server logs")
         ))
         .into_response();
     }
@@ -4270,6 +4345,11 @@ pub async fn admin_save_lifecycle(
     // sealed (the boot sync also runs this same fn, so a failure here
     // is not a lost save — the row is at rest and the next boot applies
     // it) — but the admin must know the live statics did NOT move.
+    // Defensive shape, not an expected path: `sync_lifecycle_from_store`
+    // reads with the lenient `get_sealed(..).unwrap_or_default()` (its own
+    // doc) and only stamps statics, so today it cannot fail — the arm is
+    // kept for the signature. Any read failure upstream had already left
+    // THIS handler's baseline (`existing` above) as defaults.
     if let Err(e) =
         mycelium_store::revisions::sync_lifecycle_from_store(&state.config, &state.service_key)
             .await
@@ -5340,7 +5420,10 @@ fn llm_capacity_response() -> Response {
 pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Response {
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "dream: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     // The cosine duplicate signal reads the caller scope's vector
     // rows — built under the same master key the ConceptStore below
@@ -5487,7 +5570,10 @@ pub async fn api_chat(
     }
     let master = match state.master_key_for(user.user_id).await {
         Ok(m) => m,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "key unavailable"),
+        Err(e) => {
+            tracing::warn!(error = %e, "stateless chat: master key unavailable");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
     };
     let cs = ConceptStore::for_user(&state.store, user.user_id, master)
         // The chat-mode agent may write concepts: label its store (spec
@@ -5515,7 +5601,10 @@ pub async fn api_chat(
     // Wait class, bounded by `query_wait_secs` (spec §3.3): this
     // endpoint holds an HTTP request open, so its bound is the short
     // one. No slot in time → 429 + Retry-After, which the caller can
-    // tell apart from the 503 below (nothing reachable to ask).
+    // tell apart from the 503 below, which means a slot WAS granted and
+    // the run still failed — either nothing was reachable to ask, or a
+    // configured backend was reachable and REFUSED the request (401/403
+    // route here too; `llm_failure_detail` says which).
     let permit = match mycelium_librarian::llm_gate::LLM_GATE
         .enter(
             Some(user.user_id),

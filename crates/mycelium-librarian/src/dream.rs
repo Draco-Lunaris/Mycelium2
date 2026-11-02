@@ -316,8 +316,13 @@ async fn duplicate_candidates(
 /// a pair is a candidate iff cosine ≥ [`dedup_cosine`] AND it sits in
 /// at least one endpoint's top-[`NEIGHBORS_PER_CONCEPT`] nearest list
 /// (union-of-drawings — one side suffices). Returns the candidate
-/// pairs plus the paths holding a fresh row (the concepts the branch
-/// owns); both empty when the branch is ABSENT: no store, an
+/// pairs plus the paths holding a non-stale row of a concept that still
+/// exists — the concepts this branch owns, i.e. the set the jaccard scan
+/// skips. Ownership is model-blind while scoring is not: only rows
+/// sharing one model and dimensionality pair, so a row the corpus
+/// invalidation marked stale (or a lone row of a model nobody else in
+/// the scope has) contributes ownership and never a pair — see
+/// Population below. Both empty when the branch is ABSENT: no store, an
 /// unhealthy backend over an unpopulated scope, or unreadable rows
 /// (a degraded embedding layer degrades dream to v1 — it never fails
 /// the dream).

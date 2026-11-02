@@ -82,7 +82,7 @@ const LLM_UNAVAILABLE: &str =
 /// the configure-me wording would send them to the admin portal to fix
 /// something that is already configured. Only [`BackendState::Disabled`]
 /// (no `llm` row to decrypt) makes "configure one" the honest answer.
-/// Byte-safety and the 512-char bound come from [`short_detail`]; the
+/// Byte-safety and the 512-byte bound come from [`short_detail`]; the
 /// transcript path renders the row escaped like every other row.
 ///
 /// The backend-down class on a *configured* backend never reaches here —

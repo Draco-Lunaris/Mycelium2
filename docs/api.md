@@ -110,17 +110,55 @@ empty-payload rows). The library scope refuses restores outright.
 The caller's private-bundle graph: `{"nodes": [...], "edges": [...]}`.
 (Global scopes are never included — graph view is private by design.)
 
-### `GET /api/v1/search?q=...&global=1`
-Search the caller's bundle; `global=1` adds the global skills shelf
-and library catalogs. Results are scope-tagged:
+### `GET /api/v1/search?q=...&global=1&mode=auto`
+Search the caller's bundle; `global=1` (the default — anything but
+`global=0`) adds the global skills shelf and the library catalogs.
+Results are scope-tagged:
 
 ```json
 [{"concept_path": "/my-book/book.md", "title": "My Book",
-  "snippet": "...", "score": 3.0, "scope": "library"}]
+  "snippet": "...", "score": 0.0328, "scope": "library"}]
 ```
 
 `scope` is `"user"`, `"skills"`, or `"library"`. Library hits from
 admin-private bookshelves are filtered out for non-admin callers.
+
+**`mode`** selects which pools the composer combines, not how they are
+scored: `auto` (default), `lexical`, or `vector_only`. An unknown value
+answers `400 {"error": "invalid mode (auto | lexical | vector_only)"}`.
+
+- `auto` — per scope, the lexical top-50 fuses with the vector top-50 by
+  reciprocal-rank fusion whenever an embeddings row is configured AND
+  the embeddings backend is Green or Yellow; otherwise the lexical
+  result stands (a degraded vector layer is a debug log, never an
+  error).
+- `lexical` — the pre-vector behavior, byte-for-byte: BM25 only.
+- `vector_only` — vector pools only, with no lexical fallback and the
+  raw cosine as the score. An empty pool stays empty; that is the
+  honest answer, not a failure.
+
+**Scoring.** Fusion consumes each pool's RANK, never its raw score: a
+candidate's score is `w_lex/(rrf_k + rank)` from the lexical pool plus
+`w_vec/(rrf_k + rank)` from the vector pool (rank is 1-based; an absent
+pool contributes 0). Because only ranks drive the arithmetic, fused
+scores are comparable across scopes, which is why the composer fuses
+per scope and merges afterwards; the list sorts by fused score
+descending, ties by path ascending. All three constants are
+admin-tunable on `/admin/dream` (`rrf_k` default 60, both weights
+default 1.0 — see [Configuration](configuration.md)). So `score` is a
+fusion value in a small range, not a BM25 magnitude: with the defaults
+the lexical pool's rank 1 alone scores `1/61 ≈ 0.0164`.
+
+**Lifecycle filter.** Retrieval is active-only by default: a concept
+whose frontmatter `status` is `superseded` or `retired` never appears —
+in the lexical index, in the vector pools, or in the cached snapshot.
+A missing or unrecognized `status` is active. This route has no
+parameter to widen that (history queries are an MCP-tool option, see
+[mcp.md](mcp.md)); the vector rows follow the same rule.
+
+The web surface passes no per-hit cap (it renders everything the
+scopes produced); the MCP hit path caps at the caller's `limit`,
+defaulting to the admin-tunable `query_top_k` and hard-capped at 64.
 
 ## Books and passages
 
@@ -318,30 +356,129 @@ wording only when no backend is configured at all.
 
 ## Dream
 
+A dream is a maintenance/consolidation pass over one scope:
+deterministic signals decide whether there is anything to do, and only
+then does the agent run — no signals, no tokens.
+
+**The signals** (a pass runs when any one of them has candidates):
+
+- `orphans` — concepts with no inbound or outbound graph edge.
+- `broken links` — absolute `.md` links pointing at a path no concept
+  occupies.
+- `duplicates` — two families, one nomination set: v1's title Jaccard
+  (threshold 0.8) and, when the embeddings layer is usable, the
+  embedding cosine at `dedup_cosine` (default 0.92) restricted to pairs
+  that appear in at least one endpoint's top-2 nearest list.
+- `oversized concepts` — a body over 20,000 characters.
+- `stale pairs` — an active concept untouched for `stale_days` whose
+  tokens an active concept created or confirmed inside `recent_window`
+  now covers (the newer one is the candidate replacement).
+- `expired concepts` — active concepts whose `valid_to` lies in the
+  past.
+- `broken supersedes` — an active concept pointing `superseded_by` at a
+  path that does not exist, is itself superseded, or is retired.
+- `disorganized concepts` — a concept whose trailing run of `update`
+  revisions strictly exceeds `consolidation_patches`.
+
+The last family (and only that one) runs in a **separate consolidation
+pass** through a store view that tags its writes with the revision op
+`consolidate`, so a body rewrite that folds `# History` forward reads
+differently in the log from a mechanically derived edit. Every other
+signal runs in the main pass. A dream with only consolidation
+candidates skips the main pass entirely.
+
 ### `POST /api/v1/dream`
-Run a maintenance pass over the caller's private bundle (orphans,
-broken links, likely duplicates, oversized concepts). Deterministic
-signals decide whether the agent runs at all. Returns
-`{"ran": true, "summary": "...", "files_changed": [...]}`, or
-`{"ran": false, "reason": "..."}` when nothing needed doing. It is
-wait-class on the LLM gate with the chat bound (`chat_wait_secs`); no
-slot within it answers
-`429 {"error": "LLM at capacity — try again shortly"}` with
-`Retry-After: 5`.
+Run one pass over the **caller's own private bundle** — any
+authenticated user, not only admins (the route is under the `/api/v1`
+session/bearer + CSRF gates like every other write). The caller's
+scope is the one that gets vector rows, revisions and the `consolidate`
+view; global shelves are readable context for the agent, never a dream
+target from this route.
+
+```json
+{"ran": true, "summary": "...", "files_changed": ["/notes/a.md"]}
+{"ran": false, "reason": "no signals: no orphans, broken links, duplicates, …"}
+```
+
+`summary` / `files_changed` are absent when `ran` is false, and
+`reason` is absent when it ran. It is **wait class** on the LLM gate
+with the chat bound (`chat_wait_secs`) — admin/user-triggered and rare,
+so it may queue, but never jumps the queue and never hangs: no slot in
+time answers `429 {"error": "LLM at capacity — try again shortly"}`
+with `Retry-After: 5`. A run that fails (no configured backend, a
+refusing backend, an agent error) answers
+`500 {"error": "internal error"}` — the real reason, including the
+backend's status and message, is logged server-side and never put on
+the wire.
+
+**The scheduled dream.** A background scheduler runs the same pass
+without anyone asking (`/admin/dream` shows its last result, and
+`mycelium2_dream_*` metrics count it). Per wake, in order: read the
+sealed `lifecycle` row (clamped; absent means defaults, unreadable
+defers the wake) → re-tune the wake interval when a present row's
+`dream_interval_s` differs (the next wake is one full new period away)
+→ skip when `dream_enabled` is false (nothing admitted, nothing
+recorded) → resolve the LLM client (an absent/unreadable row defers the
+wake rather than burning a slot) → walk the rotation **users by id,
+then the `global:skills` shelf** (the library is never dreamed: its
+stacks are ingest output, not the user's memory) → for the one scope
+this wake owns: skip if the LLM backend is Red, resolve the scope's
+stores (a user whose master key is unrecoverable records an attempted
+no-op and moves on), then take a **try-class** gate slot
+(`try_enter`: it never waits — a busy gate means this wake is simply
+skipped, which is how background maintenance stays behind every
+interactive waiter) → run the pass → record it.
+
+`dream_last_run` (plain JSON, on `/admin/dream`) carries the last
+attempt: `at` (RFC 3339), `scope` (`user:<uuid>` or `global:skills`),
+`ran`, and a bounded `summary` (the agent summary, the skip reason, or
+the failure detail — the byte-capped `short_detail` convention). A
+panicking pass is caught and recorded as a failed attempt; the
+scheduler never dies on one scope.
+
+### `POST /admin/dream/backfill` *(admin)*
+The corpus backfill: one dream pass per maintenance scope (the same
+users-then-skills rotation), driven once by an operator so a bundle
+that accumulated history before dreaming existed gets consolidated. It
+records nothing in `dream_last_run` (that readout stays the
+scheduler's). Clicking it deletes the completion marker and spawns the
+walk; a second click while one is running redirects
+`?error=Backfill%20already%20running`. On completion it writes the
+`dream_backfill_at` marker (plain RFC 3339), which is exactly what
+`/health`'s `dream_backfill_complete` reads. The walk obeys the
+shutdown token: a mid-walk shutdown leaves no marker.
 
 ## Health
 
 ### `GET /api/v1/health`
-Detailed JSON health (authenticated). `GET /health` (public coarse
-status plus the mutation-queue fields `queue_depth`,
-`oldest_pending_age_seconds`, `queue_dead_count`,
-`llm_last_success_seconds`, and the LLM-gate fields `llm_active`,
-`llm_queued`, `llm_capacity`; it answers 503 `degraded` when the
-database is unreachable, any queued item is dead, or a pending item
-has waited past twice the integration deadline — the gate fields are
-observability only and never make it degraded) and `GET /metrics`
-(Prometheus text) live outside `/api/v1` and are public by design —
-for container orchestration and scrape endpoints.
+The minimal authenticated liveness document:
+`{"status": "ok" | "degraded", "database": true, "users": 3, "version": "…"}`
+(`users` is `-1` when the user store itself failed to answer). The rich
+health document — the one worth scraping — is the **public** `GET /health`
+below; this route exists so an authenticated probe can distinguish "my
+database is reachable" from the whole system's posture without
+exposing the internals to an unauthenticated caller.
+
+### `GET /health` and `GET /metrics` (public by design)
+`GET /health` answers the full posture for container orchestration and
+`GET /metrics` the Prometheus text for scrape endpoints; both live
+outside `/api/v1` and are deliberately unauthenticated (they carry
+counts and states, never content or identifiers). `/health` answers
+**503 `degraded`** when the database is unreachable, any queued
+mutation is `dead`, or a pending item has waited past twice the
+integration deadline — nothing else moves it, and every field below is
+observability.
+
+| Field | Meaning |
+|---|---|
+| `status`, `database`, `users`, `version` | as above |
+| `queue_depth` / `oldest_pending_age_seconds` / `queue_dead_count` | the mutation queue: items waiting, the oldest pending item's age, dead items (any one of which is the degraded trigger) |
+| `llm_last_success_seconds` | seconds since the last real LLM **completion**. The health probe never feeds it, so a reachable-but-completion-less backend never looks "recently successful" here |
+| `llm_active` / `llm_queued` / `llm_capacity` | the LLM admission gate right now: admitted runs, waiters in the FIFO, and the configured slot count |
+| `backend_state` / `backend_down_seconds` / `backend_checked_seconds_ago` | the chat LLM backend — see below |
+| `embedding_state` / `embedding_down_seconds` / `embedding_checked_seconds_ago` | the embeddings backend, same four states and the same rules: `green`/`yellow`/`red`/`disabled`, down-seconds absent while green or disabled, checked-seconds-ago absent only if never observed |
+| `chat_waiting_count` | chat turns owed an answer (parked for a backend outage plus crash-interrupted turns, all users) |
+| `dream_backfill_complete` | whether the **most recent** corpus-backfill walk finished — the `dream_backfill_at` marker's presence. Latest-attempt, not ever-completed: clicking backfill deletes the marker, so this reads `false` again until that walk completes. Never part of the degraded rule (an un-run backfill is not an illness) |
 
 **Backend-health fields** (outage recovery spec §3.6, on `/health`):
 
@@ -357,9 +494,11 @@ for container orchestration and scrape endpoints.
   observation (probe or model-call note); absent if never observed.
   Unlike `backend_down_seconds` this is NOT gated on disabled: when
   health was last actually checked is a fact, not an outage claim.
-- `chat_waiting_count` — chat turns owed an answer: parked
-  `waiting_backend` during an outage plus crash-interrupted turns not
-  yet claimed (all users).
+The three `embedding_*` fields mirror these three exactly, one state
+machine per backend (the embeddings machine has its own 30 s probe and
+its own passively-fed observations), with `disabled` meaning no stored
+`embeddings` row. A vector call's failure therefore never changes the
+chat backend's colour, or vice versa.
 
 **Backend-health metric lines** (`/metrics`):
 
@@ -369,6 +508,25 @@ for container orchestration and scrape endpoints.
   outage has been open; `0` when not down (green or disabled).
 - `mycelium2_chat_waiting_turns` (gauge) — the same turns as
   `chat_waiting_count`.
+- `mycelium2_embedding_up` (gauge) — the embeddings backend, same
+  four-state encoding (`0` disabled, `1` red, `2` yellow, `3` green).
+- `mycelium2_vector_queue_depth` (gauge) / `mycelium2_vector_processed_total`
+  (counter) — the write-hook queue the vector worker drains, and the
+  concepts it has embedded.
+- `mycelium2_dream_ticks_total` (counter) — scheduler wakes.
+- `mycelium2_dream_passes_total` (counter) — wakes that ran a pass (the
+  agent ran, found no signals, or failed).
+- `mycelium2_dream_passes_skipped_total` (counter) — wakes that ended
+  without a pass (gate busy, backend Red, dreaming disabled, config
+  unreadable).
+- `mycelium2_dream_backfill_active` (gauge) — a corpus backfill is
+  walking right now.
+
+The full `/metrics` vocabulary also carries the request/login/concept/
+search/ingest counters, the mutation-queue family
+(`mycelium2_mutation_*`), the gate family (`mycelium2_llm_gate_*`), and
+`mycelium2_backups_total`; every line is a plain counter or gauge named
+`mycelium2_<name>`.
 
 The `/health` **degraded posture is deliberately unaffected by backend
 state**: the LLM backend being red is weather the queue and chat
@@ -385,3 +543,15 @@ successful" there.
 
 Errors are `{"error": "..."}` with an appropriate status code.
 Internal details (SQL, paths, crypto errors) are never included.
+
+A `500` answers `{"error": "internal error"}` — including the routes
+that cannot proceed because a user's master key could not be recovered
+(a locked store, a rotated service key). The one route with its own
+`500` wording is the admin backup download (`backup failed`). The
+reason is logged server-side at `warn`/`error` with the real error
+attached (`… master key unavailable`), so the operator sees it in
+`docker logs` while the wire stays free of crypto and storage detail.
+Capacity is deliberately a different class: `429` with
+`Retry-After: 5` means "ask again", `503` on the stateless chat path
+means "a configured backend refused the run" and carries that bounded
+reason.

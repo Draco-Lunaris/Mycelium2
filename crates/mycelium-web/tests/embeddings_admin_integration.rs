@@ -1057,3 +1057,83 @@ async fn health_and_metrics_carry_the_embedding_fields() {
 
     shutdown.cancel();
 }
+
+/// `base_url` and `model` are the two fields the client cannot work
+/// without: an empty (or whitespace-only, after trim) one is refused
+/// with an `?error=` flash and the stored row stays exactly as it was —
+/// the number fields' clamp/hint discipline, applied to the strings
+/// (a silently-stored empty base_url would leave a config that probes
+/// red forever with no reason on screen).
+#[tokio::test]
+async fn embeddings_save_rejects_empty_base_url() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = EmbDefaults;
+    let (base, _shutdown, _dir, state) = boot().await;
+    let cl = client();
+    let (cookie, csrf) = login_admin(&cl, &base).await;
+
+    // A valid save first: this is the row every refusal below must
+    // leave untouched.
+    let good = admin_save_embeddings(
+        &cl,
+        &base,
+        &cookie,
+        &csrf,
+        "http://10.0.0.9:9999",
+        "nomic-embed-text",
+        None,
+    )
+    .await;
+    let loc = location_of(good).await;
+    assert!(loc.contains("ok="), "a valid save still works: {loc}");
+    let before = saved_config(&state).await;
+    assert_eq!(before.base_url, "http://10.0.0.9:9999");
+
+    // Empty and whitespace-only both count as empty (the handler trims
+    // before it decides).
+    for base_url in ["", "   "] {
+        let resp = admin_save_embeddings(
+            &cl,
+            &base,
+            &cookie,
+            &csrf,
+            base_url,
+            "nomic-embed-text",
+            None,
+        )
+        .await;
+        let loc = location_of(resp).await;
+        assert!(
+            loc.contains("error="),
+            "an empty base_url is refused: {loc}"
+        );
+        assert!(
+            loc.contains("base_url must not be empty"),
+            "the flash names the field: {loc}"
+        );
+        assert!(!loc.contains("ok="), "a refusal never flashes ok: {loc}");
+    }
+
+    // Same rule for the model.
+    let resp = admin_save_embeddings(
+        &cl,
+        &base,
+        &cookie,
+        &csrf,
+        "http://10.0.0.9:9999",
+        "  ",
+        None,
+    )
+    .await;
+    let loc = location_of(resp).await;
+    assert!(loc.contains("error="), "an empty model is refused: {loc}");
+    assert!(
+        loc.contains("model must not be empty"),
+        "the flash names the field: {loc}"
+    );
+
+    // The stored row never moved through any of the refusals.
+    let after = saved_config(&state).await;
+    assert_eq!(after.base_url, before.base_url);
+    assert_eq!(after.model, before.model);
+}

@@ -1332,7 +1332,11 @@ async fn execute_tool_tracked(
             // string omits (Ruling 4: `body` never wipes a concept), and
             // `body` outranks the legacy `replace_body`/`replace_section`
             // spellings when several arrive in one call. When `body` is
-            // absent the tool behaves exactly as before.
+            // absent the tool behaves exactly as before. The two spellings
+            // are deliberately NOT symmetric on empty: `body: ""` changes
+            // nothing (Ruling 4 again), while `replace_body: ""` — the
+            // older spelling, kept as-is for callers written before the
+            // ruling — does wipe the body.
             if let Some(body) = args
                 .get("body")
                 .and_then(|v| v.as_str())

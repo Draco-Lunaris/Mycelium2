@@ -36,7 +36,22 @@ variables for runtime settings:
   30 s (`GET {url}/models`, 5 s timeout) to keep the health indicator,
   `/health`, and `/metrics` current — no new config fields for it; a
   deleted config row means `Disabled` (nothing to probe, grey dot), not
-  an outage.
+  an outage. `/admin/llm` has a **Test connection** button that makes one
+  minimal completion with the submitted form values (a blank API key
+  means the stored one) and persists nothing; its flash is deliberately
+  bounded — a failure names the class (`HTTP 401`, "the backend did not
+  answer", "the backend returned no content") and never carries the
+  upstream body, because flash text rides a URL; the whole error goes to
+  the server log.
+- **Embeddings backend** — base URL + model (+ optional API key) for the
+  vector half of retrieval, sealed at rest like the LLM row. Absent means
+  vector retrieval is off, not broken. Fields, ranges and the
+  live-apply rule: [Embeddings backend](#embeddings-backend-admin--embeddings).
+- **Memory lifecycle** — retrieval fusion weights, the retrieval cap,
+  revision retention, the dream signal thresholds, and the dream
+  schedule (`dream_enabled` / `dream_interval_s`), all in one sealed
+  `lifecycle` row edited on `/admin/dream`. Table:
+  [Memory lifecycle and dreaming](#memory-lifecycle-and-dreaming-admin--dream).
 - **Upload limits** — maximum book upload size (MiB, 1–255; default
   32, the original Mycelium's default). Takes effect immediately.
 - **Security settings** — tunable within guardrails (out-of-range
@@ -96,6 +111,99 @@ stateless chat and dream endpoints answer `429` with `Retry-After: 5`.
 Exact bodies are in [API](api.md). Gate state is visible on `/health`,
 `/metrics` and the admin System page (see
 [Deployment](deployment.md)).
+
+## Embeddings backend (Admin → Embeddings)
+
+The vector half of retrieval: an OpenAI-compatible `/embeddings`
+endpoint whose model turns concept text into the vectors the hybrid
+composer fuses with the lexical hits (see
+[API → search](api.md)). Not an environment
+variable: the whole row seals under the service key as the `embeddings`
+config row and is edited on `/admin/embeddings`.
+
+**No row means vector retrieval is simply off** — the health dot reads
+`Disabled`, the composer answers lexically, the vector worker idles, and
+nothing anywhere errors. Saving a row turns it on and backfills the
+corpus without a restart.
+
+| Field | Default | Range | Meaning |
+|---|---|---|---|
+| `base_url` | — (required) | non-empty after trim | Endpoint base URL, e.g. `http://localhost:11434/v1`. An empty or whitespace-only value is refused with a flash and nothing is written: such a row would fail every embed at request time and read to the operator as an outage |
+| `model` | — (required) | non-empty after trim | Model name sent in each request. Refused when empty for the same reason |
+| `api_key` | none | — | Optional bearer token (`Authorization: Bearer …`), sealed at rest, never rendered back; a blank save keeps the stored key |
+| `timeout_secs` | 30 | 5–300 | Per-request timeout |
+| `batch` | 32 | 8–128 | Texts per `/embeddings` POST (the indexer's batch size) |
+
+- **Dims are learned, not typed.** A successful probe stamps the model's
+  dimensionality; a response wider than 4096 dims is rejected by name as
+  a config mistake. Changing `model` marks every row written under the
+  old model (or a different width) stale on the next worker tick, so the
+  corpus re-embeds itself.
+- **Clamped, never rejected** (same rule as every other row): out of
+  range clamps on save *and* on load. **Blank keeps the stored value**
+  for the two number fields.
+- **Live without a restart.** The 30 s probe, the search composer and
+  the vector worker all read the stored row per use; `/admin/embeddings`
+  has a **Test connection** button that probes once with the submitted
+  form (or the stored row once one exists — save first, then test) and
+  flashes the verdict. A failure flash carries the HTTP status or "the
+  backend did not answer" and never the upstream body; the full error
+  goes to the server log.
+- **Never on the LLM gate.** Embedding traffic is not an LLM run: it
+  neither occupies nor waits behind the chat/query slots.
+
+## Memory lifecycle and dreaming (Admin → Dream)
+
+One sealed `lifecycle` row holds every retrieval- and maintenance-side
+tunable; `/admin/dream` edits all of it and also shows the last
+scheduled run and the corpus-backfill state. A save clamps on the way
+in, so the row at rest is always in range.
+
+| Field | Default | Range | Meaning | Live how |
+|---|---|---|---|---|
+| `revision_retention` | 200 | 25–2000 | Revision rows kept per concept; older ones prune on the next write | static, re-stamped on save |
+| `query_top_k` | 8 | 1–64 | Hits a zero-LLM `memory_query` returns when the caller sends no `limit` | static |
+| `rrf_k` | 60 | 1–1024 | Fusion rank-softening constant: `weight / (k + rank)` | static |
+| `rrf_weight_lex` | 1.0 | 0.0–10.0 | The lexical pool's fusion weight | static |
+| `rrf_weight_vec` | 1.0 | 0.0–10.0 | The vector pool's fusion weight | static |
+| `dedup_cosine` | 0.92 | 0.5–1.0 | Cosine at which the dream nominates a duplicate pair | static |
+| `stale_days` | 90 | 7–3650 | An active concept unchanged longer than this is a staleness candidate | static |
+| `recent_window` | 14 | 1–365 | A newer concept inside this window counts as "recently confirmed" against a stale candidate | static |
+| `consolidation_patches` | 8 | 2–100 | Consecutive `update` revisions that mark a concept as disorganized (fires only when the count strictly exceeds it) | static |
+| `dream_interval_s` | 86400 | 3600–2592000 | The dream scheduler's wake cadence | read per tick |
+| `dream_enabled` | true | — | Whether the scheduler runs at all | read per tick |
+
+Behavior, mirroring the LLM row:
+
+- **Blank or non-numeric keeps the stored value** (an old cached form
+  still saves the fields it carries); out of range clamps.
+- **Nine static-bearing fields re-stamp on save** — the search composer,
+  the retrieval caps, the retention pruning and the dream signals read
+  process-global values, so "saved" means live, not "after a restart".
+  The two dream-pair fields carry no static: the scheduler re-reads the
+  sealed row each wake, which is why changing the cadence takes effect
+  on the next tick.
+- **`dream_enabled` is a checkbox with a marker**: the form always
+  posts a hidden `dream_enabled_present` field, so a real submission
+  with the box unticked means "off" while a POST that carries neither
+  field (an old form, a synthetic request) leaves the stored flag
+  untouched.
+- **Boot order matters and is enforced**: retention syncs from the row
+  before the packaged-skill seed and every boot sweep, because those
+  write revisions that the retention rule then governs.
+
+**Consolidation threshold vs revision retention.** The consolidation
+signal counts consecutive `update` revisions in a concept's retained
+history, and the two fields' ranges can contradict each other:
+`consolidation_patches` goes as high as 100 while
+`revision_retention` bottoms out at 25, and a concept whose threshold
+sits above its retained history can never reach the count — the signal
+silently never fires for it. The defaults are far from that corner
+(8 patches against 200 retained revisions), and the counting itself is
+correct in every combination: it reads what the log actually holds. An
+operator who raises the threshold toward its ceiling should raise
+retention with it; Mycelium2 does not refuse the pair, because both
+values are individually legitimate.
 
 ## Data directory layout
 
