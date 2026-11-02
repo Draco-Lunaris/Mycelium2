@@ -268,6 +268,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
+    // The dream scheduler (memory-lifecycle spec §3.4): one dream pass
+    // per wake, round-robin over the maintenance scopes (users then the
+    // skills shelf), try-class gate admission — a busy gate defers a
+    // wake, never waits. Spawned with the other long-lived workers,
+    // after the gate sync and the boot sweeps: its immediate first tick
+    // reads the stored cadence and applies it live if it differs.
+    state.dream_scheduler.clone().spawn(shutdown.clone());
+
     mycelium_web::serve(
         state,
         &data_dir,

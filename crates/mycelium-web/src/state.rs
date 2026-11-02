@@ -168,6 +168,11 @@ pub struct AppState {
     /// the stale-corpus rebuilds. Spawned at boot AFTER the embeddings
     /// posture sync.
     pub vector_worker: Arc<mycelium_librarian::vector_worker::VectorWorker>,
+    /// The dream scheduler (memory-lifecycle spec §3.4): one dream pass
+    /// per wake, round-robin over the maintenance scopes (users then
+    /// the skills shelf), try-class gate admission. Spawned at boot
+    /// after the gate sync and the boot sweeps.
+    pub dream_scheduler: Arc<crate::dream_scheduler::DreamScheduler>,
     /// Assets directory (CSS/JS served from disk).
     pub assets_dir: std::path::PathBuf,
     /// The server's data directory — the root that holds `config/tls/`
@@ -244,6 +249,15 @@ impl AppState {
             Arc::clone(&store),
             Arc::clone(&config),
             Arc::clone(&service_key),
+            Arc::clone(&recovery),
+        ));
+        // The dream scheduler (memory-lifecycle spec §3.4) shares the
+        // same recovery seam: one scope per wake, round-robin over the
+        // maintenance scopes, try-class gate admission.
+        let dream_scheduler = Arc::new(crate::dream_scheduler::DreamScheduler::new(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            Arc::clone(&service_key),
             recovery,
         ));
         // TOTP secrets encrypt at rest under the service key: attach it to
@@ -277,6 +291,7 @@ impl AppState {
             librarian,
             queue_worker,
             vector_worker,
+            dream_scheduler,
             assets_dir,
             data_dir,
             webauthn,

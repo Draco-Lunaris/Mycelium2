@@ -433,6 +433,26 @@ async fn metrics(State(state): State<AppState>) -> Response {
         "# TYPE mycelium2_vector_processed_total counter\nmycelium2_vector_processed_total {}",
         mycelium_store::VECTOR_PROCESSED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
     );
+    // Dream scheduler surfaces (memory-lifecycle §3.4): every wake of
+    // the scheduler's tick loop; passes are attempted wakes (a run, a
+    // no-signal pass, or a resolve-failure); skips are the gated and
+    // disabled wakes plus ticks without a usable config.
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_ticks_total counter\nmycelium2_dream_ticks_total {}",
+        crate::dream_scheduler::DREAM_TICKS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_passes_total counter\nmycelium2_dream_passes_total {}",
+        crate::dream_scheduler::DREAM_PASSES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mycelium2_dream_passes_skipped_total counter\nmycelium2_dream_passes_skipped_total {}",
+        crate::dream_scheduler::DREAM_PASSES_SKIPPED_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
     // Chat turns owed an answer (weather-parked + unclaimed crash),
     // zeroed on read failure like the queue surfaces beside it.
     let chat_waiting = state.chat_sessions.waiting_turn_count().await.unwrap_or(0);
