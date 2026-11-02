@@ -34,7 +34,10 @@
 //!      dropped the moment the run ends; every completed attempt (ran,
 //!      no-signal, or failure) writes the plain-JSON `dream_last_run`
 //!      record (Ruling 7: summary bounded at the byte-safe cap) and
-//!      advances the cursor.
+//!      advances the cursor. A PANICKING pass is caught (the queue
+//!      worker's 2026-10-31 panic net) and takes the same attempted-
+//!      failure shape — recorded `ran: false`, cursor advances, loop
+//!      continues on the next tick.
 //!
 //! The backfill worker (Task 4) shares the per-scope pass code through
 //! [`DreamScheduler::resolve_scope`] / [`DreamScheduler::finish_pass`]
@@ -46,6 +49,7 @@
 //! resolve-failure — is a pass; every wake that ended without one
 //! (gate busy, disabled, unreadable/unusable config) is a skip.
 
+use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,7 +57,8 @@ use std::time::Duration;
 
 use mycelium_auth::rbac::Role;
 use mycelium_crypto::keys::ServiceKey;
-use mycelium_librarian::agent::AgentScopes;
+use mycelium_librarian::agent::{AgentError, AgentScopes};
+use mycelium_librarian::dream::DreamReport;
 use mycelium_librarian::llm::{LlmClient, LlmConfig};
 use mycelium_librarian::llm_gate::{GatePermit, LLM_GATE};
 use mycelium_librarian::llm_health::short_detail;
@@ -426,10 +431,13 @@ impl DreamScheduler {
 
     /// One already-admitted dream pass — the tick's per-scope body, and
     /// the backfill worker's (Task 4). `run_dream` runs under the
-    /// caller's permit; the permit is dropped the MOMENT the run ends
-    /// (nothing between the run and the release). `write_readout`: the
-    /// scheduler tick writes `dream_last_run` (Ruling 7); the backfill
-    /// passes record nothing (Ruling 8).
+    /// caller's permit and under [`catch_pass_panic`]'s net; the permit
+    /// is dropped the MOMENT the run ends (nothing between the run and
+    /// the release). `write_readout`: the scheduler tick writes
+    /// `dream_last_run` (Ruling 7); the backfill passes record nothing
+    /// (Ruling 8). Every failure shape — a real `Err` and a caught
+    /// panic alike — is the same ATTEMPTED outcome: recorded `ran:
+    /// false` with the bounded detail; the loop continues.
     pub(crate) async fn finish_pass(
         &self,
         client: &LlmClient,
@@ -437,13 +445,13 @@ impl DreamScheduler {
         permit: GatePermit<'_>,
         write_readout: bool,
     ) {
-        let report = mycelium_librarian::dream::run_dream(
+        let report = catch_pass_panic(mycelium_librarian::dream::run_dream(
             client,
             &scope.cs,
             &scope.cons_cs,
             &scope.scopes,
             Some(&scope.vectors),
-        )
+        ))
         .await;
         drop(permit);
         if !write_readout {
@@ -459,9 +467,9 @@ impl DreamScheduler {
                 self.record_last_run(&scope.scope_id, report.ran, summary)
                     .await;
             }
-            Err(e) => {
-                tracing::warn!(scope = %scope.scope_id, error = %e, "scheduled dream pass failed");
-                self.record_last_run(&scope.scope_id, false, Some(e.to_string()))
+            Err(detail) => {
+                tracing::warn!(scope = %scope.scope_id, error = %detail, "scheduled dream pass failed");
+                self.record_last_run(&scope.scope_id, false, Some(detail))
                     .await;
             }
         }
@@ -631,10 +639,103 @@ fn retune(interval: &mut tokio::time::Interval, period: Duration) {
     interval.reset();
 }
 
+/// Run one dream pass under the queue-worker's panic net (the
+/// 2026-10-31 precedent: a panicking `run_item` wedged the drain — an
+/// escaping panic must never take the long-lived worker task down): a
+/// panicking pass future is caught and flattened into the SAME
+/// `Result` shape the attempted-failure path consumes, where a panic
+/// is exactly as attempted as an `Err`. Never swallows real errors —
+/// an `Err` from the pass keeps flowing with its own string.
+/// `AssertUnwindSafe` is justified like the drain's: nothing shared is
+/// poisoned by an unwind here (no locks held across the await; sqlx
+/// state is unaffected).
+async fn catch_pass_panic(
+    pass: impl std::future::Future<Output = Result<DreamReport, AgentError>>,
+) -> Result<DreamReport, String> {
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(pass)).await {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => Err(panic_message(payload)),
+    }
+}
+
+/// A bounded panic detail from the unwind payload (the queue worker's
+/// `panic_message` twin): `&str`/`String` payloads read through,
+/// anything else gets the fixed fallback — the reporting path may not
+/// itself panic.
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
+}
+
 /// Advance the rotation cursor one entry, wrapping. `wrapping_add`
 /// keeps a centuries-long process honest; `len.max(1)` keeps the
 /// modulo on a never-empty rotation (the skills shelf is always
 /// pushed) even if a future refactor drops that guarantee.
 fn advance_cursor(cursor: &mut usize, len: usize) {
     *cursor = cursor.wrapping_add(1) % len.max(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catch_pass_panic;
+
+    /// The catch on the pass boundary (the queue worker's 2026-10-31
+    /// panic net, without its e2e fixture: the malformed-legacy-payload
+    /// panic the drain wedged on no longer exists post-BadToolArgs
+    /// guard): a panicking pass future converts to the SAME Err shape
+    /// the attempted-failure path consumes — the panic detail becomes
+    /// the failed attempt's summary and a real error keeps its own
+    /// string; neither kills the caller.
+    #[tokio::test]
+    async fn panicking_pass_is_caught_as_failed_attempt() {
+        // A panic mid-execution of the future (the agent bug shape):
+        // the detail flows through as the failed-attempt summary.
+        let outcome = catch_pass_panic(async {
+            let why = "boom: malformed tool args";
+            panic!("a {why} panic")
+        })
+        .await;
+        assert_eq!(
+            outcome.expect_err("a panic must convert to a failed attempt"),
+            "a boom: malformed tool args panic"
+        );
+
+        // A non-string payload never breaks the reporting path — the
+        // fixed fallback detail stands in. (panic_any diverges, so its
+        // tail-as-only-expression coerces to the pass type.)
+        let outcome = catch_pass_panic(async { std::panic::panic_any(42u8) }).await;
+        assert_eq!(
+            outcome.expect_err("the fallback must hold for foreign payloads"),
+            "non-string panic payload"
+        );
+
+        // Real errors are NOT swallowed: an Err from the pass keeps
+        // flowing (with its own string) — the catch is panics-only.
+        let outcome =
+            catch_pass_panic(async { Err(mycelium_librarian::agent::AgentError::StepCapExceeded) })
+                .await;
+        assert_eq!(
+            outcome.expect_err("a real error passes through the catch"),
+            "agent step cap exceeded"
+        );
+
+        // And a calm report passes through untouched.
+        let outcome = catch_pass_panic(async {
+            Ok(mycelium_librarian::dream::DreamReport {
+                ran: true,
+                reason: None,
+                summary: Some("done".into()),
+                files_changed: None,
+            })
+        })
+        .await;
+        assert!(
+            outcome.expect("a pass result passes through the catch").ran,
+            "a pass result passes through the catch untouched"
+        );
+    }
 }
