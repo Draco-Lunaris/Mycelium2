@@ -272,7 +272,8 @@ pub struct ChatRunContext {
     pub llm: LlmConfig,
     /// Bookshelf-visibility slug set for the agent's library scope
     /// (None = unrestricted, i.e. admin) — computed before the spawn
-    /// (`visible_library_slugs` is async and borrows `AppState`).
+    /// (`visible_library_slugs` is async and borrows the metadata
+    /// `Store`, taking the admin flag directly).
     pub scopes_visible: Option<HashSet<String>>,
 }
 

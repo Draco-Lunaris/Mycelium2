@@ -60,7 +60,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mycelium_auth::rbac::{Role, SessionUser};
+use mycelium_auth::rbac::Role;
 use mycelium_librarian::llm::LlmConfig;
 use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH};
 use mycelium_store::chat::{ChatError, ChatTurnRow, ChatTurnStatus};
@@ -193,13 +193,8 @@ impl ChatResumeWorker {
                     continue;
                 }
             };
-            let session_user = SessionUser {
-                user_id,
-                username: rec.username.clone(),
-                role: rec.role,
-            };
             let scopes_visible =
-                visible_library_slugs(&self.state.store, session_user.role == Role::Admin).await;
+                visible_library_slugs(&self.state.store, rec.role == Role::Admin).await;
             let llm = crate::state::decrypt_config::<LlmConfig>(
                 &self.state.config,
                 &self.state.service_key,
