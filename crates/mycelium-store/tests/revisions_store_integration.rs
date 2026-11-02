@@ -11,11 +11,13 @@ use mycelium_crypto::keys::{ServiceKey, generate_master_key};
 use mycelium_crypto::store_keys::IndexKeys;
 use mycelium_crypto::{aead_open, aead_seal};
 use mycelium_store::revisions::{
-    DEFAULT_DEDUP_COSINE, DEFAULT_QUERY_TOP_K, DEFAULT_REVISION_RETENTION, DEFAULT_RRF_K,
-    DEFAULT_RRF_WEIGHT, LifecycleConfig, RevisionStore, RevisionsError, dedup_cosine, op_summary,
-    query_top_k, revision_retention, rrf_params, set_dedup_cosine, set_query_top_k,
-    set_revision_retention, set_rrf_k, set_rrf_weight_lex, set_rrf_weight_vec,
-    sync_lifecycle_from_store,
+    DEFAULT_CONSOLIDATION_PATCHES, DEFAULT_DEDUP_COSINE, DEFAULT_DREAM_INTERVAL_S,
+    DEFAULT_QUERY_TOP_K, DEFAULT_RECENT_WINDOW, DEFAULT_REVISION_RETENTION, DEFAULT_RRF_K,
+    DEFAULT_RRF_WEIGHT, DEFAULT_STALE_DAYS, LifecycleConfig, RevisionStore, RevisionsError,
+    consolidation_patches, dedup_cosine, op_summary, query_top_k, recent_window,
+    revision_retention, rrf_params, set_consolidation_patches, set_dedup_cosine, set_query_top_k,
+    set_recent_window, set_revision_retention, set_rrf_k, set_rrf_weight_lex, set_rrf_weight_vec,
+    set_stale_days, stale_days, sync_lifecycle_from_store,
 };
 use mycelium_store::{ConceptStore, ConfigStore, Store, config};
 use uuid::Uuid;
@@ -55,6 +57,19 @@ impl Drop for FusionDefaults {
         set_rrf_weight_lex(DEFAULT_RRF_WEIGHT);
         set_rrf_weight_vec(DEFAULT_RRF_WEIGHT);
         set_dedup_cosine(DEFAULT_DEDUP_COSINE);
+    }
+}
+
+/// Restores the three memory-lifecycle step-5 dream-signal statics on
+/// drop — [`FusionDefaults`]' shape, declared AFTER the lock so the
+/// restore happens while the lock is held.
+struct SignalDefaults;
+
+impl Drop for SignalDefaults {
+    fn drop(&mut self) {
+        set_stale_days(DEFAULT_STALE_DAYS);
+        set_recent_window(DEFAULT_RECENT_WINDOW);
+        set_consolidation_patches(DEFAULT_CONSOLIDATION_PATCHES);
     }
 }
 
@@ -842,4 +857,304 @@ async fn service_scopes_isolate_revisions() {
     // Each instance's browser index sees only its own scope.
     assert_eq!(skills.list_paths().await.unwrap().len(), 1);
     assert_eq!(library.list_paths().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lifecycle_config_new_fields_survive_old_rows() {
+    let _retention = retention_lock().await;
+    let _signal = SignalDefaults;
+    // Deliberately NOT the defaults: a sync over the old row would
+    // otherwise look like a no-op (the top-k test's reasoning, mirrored).
+    set_stale_days(7);
+    set_recent_window(1);
+    set_consolidation_patches(2);
+    let (_dir, store) = store().await;
+    let config = ConfigStore::new(store.pool().clone());
+    let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
+
+    // The constants the defaults ride on (the top-k pin's shape).
+    assert_eq!(DEFAULT_STALE_DAYS, 90);
+    assert_eq!(DEFAULT_RECENT_WINDOW, 14);
+    assert_eq!(DEFAULT_CONSOLIDATION_PATCHES, 8);
+    assert_eq!(DEFAULT_DREAM_INTERVAL_S, 86_400);
+
+    // Absent row → the defaults, and the sync stamps all three signal
+    // statics (an absent row RESETS the globals — it never keeps, the
+    // llm-row pattern).
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(stale_days(), 90, "absent row resets stale_days");
+    assert_eq!(recent_window(), 14, "absent row resets recent_window");
+    assert_eq!(
+        consolidation_patches(),
+        8,
+        "absent row resets consolidation_patches"
+    );
+
+    // An older build's row — the step 2/4 shape, all six fields. serde's
+    // `#[serde(default = ...)]` keeps it valid: the five step-5 fields
+    // parse as their defaults, both through a direct read and through
+    // the sync.
+    config
+        .set(
+            "lifecycle",
+            &config::seal_config(
+                &service_key,
+                "lifecycle",
+                &serde_json::json!({
+                    "revision_retention": 200,
+                    "query_top_k": 8,
+                    "rrf_k": 60,
+                    "rrf_weight_lex": 1.0,
+                    "rrf_weight_vec": 1.0,
+                    "dedup_cosine": 0.92
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    let parsed = config::get_sealed::<LifecycleConfig>(&config, &service_key, "lifecycle")
+        .await
+        .unwrap();
+    assert_eq!(parsed.stale_days, 90, "old row default stale_days");
+    assert_eq!(parsed.recent_window, 14, "old row default recent_window");
+    assert_eq!(
+        parsed.consolidation_patches, 8,
+        "old row default consolidation_patches"
+    );
+    assert_eq!(
+        parsed.dream_interval_s, 86_400,
+        "old row default dream_interval_s"
+    );
+    assert!(parsed.dream_enabled, "old row default dream_enabled: true");
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_days(),
+        90,
+        "the sync applies the defaulted stale_days"
+    );
+    assert_eq!(
+        recent_window(),
+        14,
+        "the sync applies the defaulted recent_window"
+    );
+    assert_eq!(
+        consolidation_patches(),
+        8,
+        "the sync applies the defaulted consolidation_patches"
+    );
+}
+
+#[tokio::test]
+async fn stale_recent_consolidation_statics_reclamp_and_nan_guard() {
+    let _retention = retention_lock().await;
+    let _signal = SignalDefaults;
+    // u32 fields carry ONLY the range clamp, on set AND get — the f32
+    // NaN guard has no u32 analogue (a u32 can never be NaN), so there
+    // is no NaN pin for these. (The get-side re-clamp of a value that
+    // entered the atomic without a setter is pinned in-module, the
+    // fusion statics' raw-bits shape.)
+    set_stale_days(0);
+    assert_eq!(stale_days(), 7, "stale_days floor (range 7..=3650)");
+    set_stale_days(4000);
+    assert_eq!(stale_days(), 3650, "stale_days ceiling");
+    set_stale_days(90);
+    assert_eq!(stale_days(), 90, "in-range stale_days passes through");
+
+    set_recent_window(0);
+    assert_eq!(recent_window(), 1, "recent_window floor (range 1..=365)");
+    set_recent_window(400);
+    assert_eq!(recent_window(), 365, "recent_window ceiling");
+    set_recent_window(14);
+    assert_eq!(recent_window(), 14, "in-range recent_window passes through");
+
+    set_consolidation_patches(0);
+    assert_eq!(consolidation_patches(), 2, "patches floor (range 2..=100)");
+    set_consolidation_patches(150);
+    assert_eq!(consolidation_patches(), 100, "patches ceiling");
+    set_consolidation_patches(8);
+    assert_eq!(
+        consolidation_patches(),
+        8,
+        "in-range patches passes through"
+    );
+
+    // The load seam too: a hand-edited row's out-of-range values clamp
+    // on load (the setters ARE the load-side clamp via the sync).
+    let (_dir, store) = store().await;
+    let config = ConfigStore::new(store.pool().clone());
+    let service_key = ServiceKey::from_bytes(&[7u8; 32]).unwrap();
+    let sealed = config::seal_config(
+        &service_key,
+        "lifecycle",
+        &serde_json::json!({
+            "revision_retention": 200,
+            "query_top_k": 8,
+            "rrf_k": 60,
+            "rrf_weight_lex": 1.0,
+            "rrf_weight_vec": 1.0,
+            "dedup_cosine": 0.92,
+            "stale_days": 3,
+            "recent_window": 999,
+            "consolidation_patches": 1000
+        }),
+    );
+    config.set("lifecycle", &sealed).await.unwrap();
+    sync_lifecycle_from_store(&config, &service_key)
+        .await
+        .unwrap();
+    assert_eq!(stale_days(), 7, "stored 3 clamps to the floor on load");
+    assert_eq!(
+        recent_window(),
+        365,
+        "stored 999 clamps to the ceiling on load"
+    );
+    assert_eq!(
+        consolidation_patches(),
+        100,
+        "stored 1000 clamps to the ceiling on load"
+    );
+
+    // The struct clamp the admin save path applies carries the same
+    // ranges — and the dream interval's (the bool has no range: it
+    // copies through):
+    let wild = LifecycleConfig {
+        stale_days: 1,
+        recent_window: 999_999,
+        consolidation_patches: 0,
+        dream_interval_s: 10,
+        ..Default::default()
+    };
+    let clamped = wild.clamp();
+    assert_eq!(clamped.stale_days, 7, "struct clamp: stale floor");
+    assert_eq!(clamped.recent_window, 365, "struct clamp: window ceiling");
+    assert_eq!(
+        clamped.consolidation_patches, 2,
+        "struct clamp: patches floor"
+    );
+    assert_eq!(
+        clamped.dream_interval_s, 3_600,
+        "struct clamp: dream interval floor (1 h)"
+    );
+    assert!(clamped.dream_enabled, "the bool has no range — it copies");
+    let high = LifecycleConfig {
+        dream_interval_s: 10_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        high.clamp().dream_interval_s,
+        2_592_000,
+        "struct clamp: dream interval ceiling (30 days)"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_update_count_counts_trailing_updates_only() {
+    let _retention = retention_lock().await;
+    set_revision_retention(DEFAULT_REVISION_RETENTION);
+    let _signal = SignalDefaults;
+    set_consolidation_patches(DEFAULT_CONSOLIDATION_PATCHES);
+    let (_dir, store) = store().await;
+    let user = Uuid::new_v4();
+    let master = generate_master_key();
+    let cs = ConceptStore::for_user(&store, user, master.clone());
+    let rs = RevisionStore::for_user(store.pool(), user, &master);
+    let path = "/notes/chain.md";
+    let token = rs.path_token_of(path);
+
+    // create → update×3 → restore → update×2: the `restore` row breaks
+    // the chain, so the count is the two updates AFTER it (trailing
+    // consecutive update revisions only — the scan never looks past a
+    // non-update op).
+    cs.put(&concept(path, "Chain", "v1")).await.unwrap();
+    for i in 2..=4 {
+        cs.put(&concept(path, "Chain", &format!("v{i}")))
+            .await
+            .unwrap();
+    }
+    cs.restore(path, 1).await.unwrap();
+    cs.put(&concept(path, "Chain", "v5")).await.unwrap();
+    cs.put(&concept(path, "Chain", "v6")).await.unwrap();
+    assert_eq!(
+        rs.consecutive_update_count(&token).await.unwrap(),
+        2,
+        "the restore row breaks the chain — only the two trailing updates count"
+    );
+
+    // A `consolidate` row resets the count the same way — the reset
+    // falls out of the tail break (no counter state exists anywhere):
+    // after the dreamed rewrite, the tail is updates-after-consolidate
+    // and the count reads only those.
+    let cons = ConceptStore::for_user(&store, user, master.clone()).with_revision_op("consolidate");
+    cons.put(&concept(path, "Chain", "consolidated body"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rs.consecutive_update_count(&token).await.unwrap(),
+        0,
+        "the consolidate row resets the count to 0"
+    );
+    cs.put(&concept(path, "Chain", "v7")).await.unwrap();
+    cs.put(&concept(path, "Chain", "v8")).await.unwrap();
+    assert_eq!(
+        rs.consecutive_update_count(&token).await.unwrap(),
+        2,
+        "updates after the consolidate count from zero again"
+    );
+
+    // Boundary (Review Focus 5): a fresh chain — one create, then
+    // consolidation_patches()+1 updates — counts exactly patches+1, the
+    // value the signal layer's strict `>` comparison fires on
+    // (count == consolidation_patches() → no signal; patches+1 →
+    // signal). The scan window is patches+1 rows, so the count cannot
+    // exceed it.
+    let patches = consolidation_patches();
+    assert_eq!(patches, 8);
+    let boundary = "/notes/boundary.md";
+    cs.put(&concept(boundary, "Boundary", "v1")).await.unwrap();
+    for i in 0..(patches as usize + 1) {
+        cs.put(&concept(boundary, "Boundary", &format!("v{}", i + 2)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rs.consecutive_update_count(&rs.path_token_of(boundary))
+            .await
+            .unwrap(),
+        patches + 1,
+        "patches+1 trailing updates read exactly patches+1"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_update_count_empty_chain_is_zero() {
+    let _retention = retention_lock().await;
+    set_revision_retention(DEFAULT_REVISION_RETENTION);
+    let _signal = SignalDefaults;
+    let (_dir, store) = store().await;
+    let user = Uuid::new_v4();
+    let master = generate_master_key();
+    let rs = RevisionStore::for_user(store.pool(), user, &master);
+
+    // No rows at all (never-written path): the signal layer's baseline.
+    let phantom = rs.path_token_of("/notes/never-written.md");
+    assert_eq!(rs.consecutive_update_count(&phantom).await.unwrap(), 0);
+
+    // A lone non-update row (create only) also reads zero — the tail
+    // break lands on the first scanned row.
+    let path = "/notes/only-create.md";
+    let cs = ConceptStore::for_user(&store, user, master.clone());
+    cs.put(&concept(path, "Only", "created once"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rs.consecutive_update_count(&rs.path_token_of(path))
+            .await
+            .unwrap(),
+        0,
+        "a lone create breaks on the first scanned row"
+    );
 }

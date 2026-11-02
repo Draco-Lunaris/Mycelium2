@@ -225,6 +225,117 @@ pub fn dedup_cosine() -> f32 {
     clamp_dedup_cosine(f32::from_bits(DEDUP_COSINE.load(Ordering::Relaxed)))
 }
 
+/// Default stale threshold in days for the dream signal layer: an
+/// active concept whose last confirmation is older than this reads
+/// "stale" (spec §3.4: default 90), admin-tunable.
+pub const DEFAULT_STALE_DAYS: u32 = 90;
+
+/// Accepted range for `stale_days` (7 keeps day-to-day noise from
+/// reading stale, 3650 caps the horizon at a decade), clamped on EVERY
+/// set, get, save and load.
+pub const STALE_DAYS_RANGE: (u32, u32) = (7, 3650);
+
+/// Default recency window in days for the dream signal layer: an other
+/// concept's confirmation inside this window counts as recent when
+/// pairing stale candidates (spec §3.4: default 14), admin-tunable.
+pub const DEFAULT_RECENT_WINDOW: u32 = 14;
+
+/// Accepted range for `recent_window` (1 keeps a same-day confirmation
+/// from pairing, 365 caps the reach at a year), clamped on EVERY set,
+/// get, save and load.
+pub const RECENT_WINDOW_RANGE: (u32, u32) = (1, 365);
+
+/// Default consecutive-`update` threshold for the dream consolidation
+/// signal (spec §3.4: default 8), admin-tunable.
+pub const DEFAULT_CONSOLIDATION_PATCHES: u32 = 8;
+
+/// Accepted range for `consolidation_patches` (2 keeps a handful of
+/// edits from reading disorganized, 100 caps the signal on one concept
+/// at a hundred patches), clamped on EVERY set, get, save and load.
+pub const CONSOLIDATION_PATCHES_RANGE: (u32, u32) = (2, 100);
+
+/// Default dream scheduler interval in seconds (spec §3.4: 86400 =
+/// 24 h; range 1 h–30 d).
+pub const DEFAULT_DREAM_INTERVAL_S: u32 = 86_400;
+
+/// Accepted range for `dream_interval_s` (an hour floors out scheduler
+/// thrash, 30 days caps the silence), enforced by [`LifecycleConfig::
+/// clamp`] on the save side.
+pub const DREAM_INTERVAL_S_RANGE: (u32, u32) = (3_600, 2_592_000);
+
+/// Process-global stale threshold, the [`REVISION_RETENTION`] pattern:
+/// initialized to the default and clamped on every set and get. Set at
+/// boot by [`sync_lifecycle_from_store`] and live by step 5's admin
+/// section; read by the librarian's dream signal layer.
+static STALE_DAYS: AtomicU32 = AtomicU32::new(DEFAULT_STALE_DAYS);
+
+/// Process-global recency window ([`STALE_DAYS`] pattern).
+static RECENT_WINDOW: AtomicU32 = AtomicU32::new(DEFAULT_RECENT_WINDOW);
+
+/// Process-global consolidation threshold ([`STALE_DAYS`] pattern);
+/// also the scan window of [`RevisionStore::consecutive_update_count`].
+static CONSOLIDATION_PATCHES: AtomicU32 = AtomicU32::new(DEFAULT_CONSOLIDATION_PATCHES);
+
+fn clamp_stale_days(v: u32) -> u32 {
+    v.clamp(STALE_DAYS_RANGE.0, STALE_DAYS_RANGE.1)
+}
+
+fn clamp_recent_window(v: u32) -> u32 {
+    v.clamp(RECENT_WINDOW_RANGE.0, RECENT_WINDOW_RANGE.1)
+}
+
+fn clamp_consolidation_patches(v: u32) -> u32 {
+    v.clamp(CONSOLIDATION_PATCHES_RANGE.0, CONSOLIDATION_PATCHES_RANGE.1)
+}
+
+fn clamp_dream_interval_s(v: u32) -> u32 {
+    v.clamp(DREAM_INTERVAL_S_RANGE.0, DREAM_INTERVAL_S_RANGE.1)
+}
+
+/// Set the process-global stale threshold. Clamp 7–3650 on EVERY set —
+/// an out-of-range caller (a hand-edited row, an older build, step 5's
+/// form) can neither read every young concept as stale nor hide
+/// staleness behind a decade.
+pub fn set_stale_days(days: u32) {
+    STALE_DAYS.store(clamp_stale_days(days), Ordering::Relaxed);
+}
+
+/// The process-global stale threshold (clamped — get applies the range,
+/// so a value that entered through any path reads as documented).
+#[must_use]
+pub fn stale_days() -> u32 {
+    clamp_stale_days(STALE_DAYS.load(Ordering::Relaxed))
+}
+
+/// Set the process-global recency window. Clamp 1–365 on EVERY set —
+/// the same out-of-range callers as [`set_stale_days`] can neither pair
+/// on a same-day confirmation nor reach back more than a year.
+pub fn set_recent_window(days: u32) {
+    RECENT_WINDOW.store(clamp_recent_window(days), Ordering::Relaxed);
+}
+
+/// The process-global recency window (clamped — get applies the range,
+/// so a value that entered through any path reads as documented).
+#[must_use]
+pub fn recent_window() -> u32 {
+    clamp_recent_window(RECENT_WINDOW.load(Ordering::Relaxed))
+}
+
+/// Set the process-global consolidation threshold. Clamp 2–100 on
+/// EVERY set — the same out-of-range callers can neither fire the
+/// consolidation signal on a concept's first edits nor never fire it.
+pub fn set_consolidation_patches(patches: u32) {
+    CONSOLIDATION_PATCHES.store(clamp_consolidation_patches(patches), Ordering::Relaxed);
+}
+
+/// The process-global consolidation threshold (clamped — get applies
+/// the range, so a value that entered through any path reads as
+/// documented).
+#[must_use]
+pub fn consolidation_patches() -> u32 {
+    clamp_consolidation_patches(CONSOLIDATION_PATCHES.load(Ordering::Relaxed))
+}
+
 /// Deterministic per-op summaries (byte-safe bounded, the queue
 /// receipts' `short_detail` discipline): create→"concept created",
 /// update→"concept updated", delete→"concept deleted", restore→
@@ -255,7 +366,8 @@ pub fn op_summary(op: &str, n: Option<u64>) -> Result<String, RevisionsError> {
 /// (or hand-edited) build can never widen the log or change the query
 /// defaults. Step 2 carries ONE field; later steps extend the struct —
 /// `serde(default)` keeps old rows valid through that growth (step 3's
-/// `query_top_k` rides exactly that promise).
+/// `query_top_k` rode exactly that promise; step 5's five dream/signal
+/// fields ride it again).
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct LifecycleConfig {
     #[serde(default = "default_retention")]
@@ -280,6 +392,33 @@ pub struct LifecycleConfig {
     /// clamped on save and load, NaN resets the default.
     #[serde(default = "default_dedup_cosine")]
     pub dedup_cosine: f32,
+    /// The dream staleness pairing's threshold in days: an active
+    /// concept unchanged longer than this is a stale candidate (spec
+    /// §3.4: 90); 7–3650, clamped on save and load.
+    #[serde(default = "default_stale_days")]
+    pub stale_days: u32,
+    /// The dream staleness pairing's recency window in days: an other
+    /// concept's confirmation inside this window counts as recent
+    /// against a stale candidate (spec §3.4: 14); 1–365, clamped on
+    /// save and load.
+    #[serde(default = "default_recent_window")]
+    pub recent_window: u32,
+    /// The dream consolidation signal's consecutive-`update` threshold
+    /// (spec §3.4: 8); 2–100, clamped on save and load.
+    #[serde(default = "default_consolidation_patches")]
+    pub consolidation_patches: u32,
+    /// The dream scheduler's tick interval in seconds (spec §3.4:
+    /// 86400 = one day); 3600–2592000, held by [`LifecycleConfig::
+    /// clamp`]. No process-global static — the scheduler reads the
+    /// sealed row per tick, so a save applies live without a restart.
+    #[serde(default = "default_dream_interval_s")]
+    pub dream_interval_s: u32,
+    /// Whether the dream scheduler runs at all (default `true`). No
+    /// process-global static and no range to clamp — the scheduler
+    /// reads the sealed row per tick, so a save applies live without a
+    /// restart.
+    #[serde(default = "default_dream_enabled")]
+    pub dream_enabled: bool,
 }
 
 fn default_retention() -> u32 {
@@ -302,6 +441,26 @@ fn default_dedup_cosine() -> f32 {
     DEFAULT_DEDUP_COSINE
 }
 
+fn default_stale_days() -> u32 {
+    DEFAULT_STALE_DAYS
+}
+
+fn default_recent_window() -> u32 {
+    DEFAULT_RECENT_WINDOW
+}
+
+fn default_consolidation_patches() -> u32 {
+    DEFAULT_CONSOLIDATION_PATCHES
+}
+
+fn default_dream_interval_s() -> u32 {
+    DEFAULT_DREAM_INTERVAL_S
+}
+
+fn default_dream_enabled() -> bool {
+    true
+}
+
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
@@ -311,6 +470,11 @@ impl Default for LifecycleConfig {
             rrf_weight_lex: DEFAULT_RRF_WEIGHT,
             rrf_weight_vec: DEFAULT_RRF_WEIGHT,
             dedup_cosine: DEFAULT_DEDUP_COSINE,
+            stale_days: DEFAULT_STALE_DAYS,
+            recent_window: DEFAULT_RECENT_WINDOW,
+            consolidation_patches: DEFAULT_CONSOLIDATION_PATCHES,
+            dream_interval_s: DEFAULT_DREAM_INTERVAL_S,
+            dream_enabled: true,
         }
     }
 }
@@ -319,9 +483,11 @@ impl LifecycleConfig {
     /// A copy with every field forced into its accepted range — the
     /// SAVE-side clamp (step 5's admin surface applies it before sealing
     /// the row); the load side clamps through [`set_revision_retention`],
-    /// [`set_query_top_k`] and the fusion setters. The NaN guard folds a
+    /// [`set_query_top_k`], the fusion setters and the three dream-signal
+    /// setters. The NaN guard folds a
     /// NaN weight/threshold to its field's default (`f32::clamp` would
-    /// propagate it).
+    /// propagate it) — the u32 fields carry only their ranges (no NaN
+    /// analogue), and the `dream_enabled` bool has no range at all.
     #[must_use]
     pub fn clamp(&self) -> LifecycleConfig {
         LifecycleConfig {
@@ -331,20 +497,29 @@ impl LifecycleConfig {
             rrf_weight_lex: clamp_fusion_weight(self.rrf_weight_lex),
             rrf_weight_vec: clamp_fusion_weight(self.rrf_weight_vec),
             dedup_cosine: clamp_dedup_cosine(self.dedup_cosine),
+            stale_days: clamp_stale_days(self.stale_days),
+            recent_window: clamp_recent_window(self.recent_window),
+            consolidation_patches: clamp_consolidation_patches(self.consolidation_patches),
+            dream_interval_s: clamp_dream_interval_s(self.dream_interval_s),
+            dream_enabled: self.dream_enabled,
         }
     }
 }
 
-/// Read the sealed `lifecycle` row and push it onto the process-global
-/// retention and query top-k. Boot-order contract: `main` syncs before
+/// Read the sealed `lifecycle` row and stamp every process-global static
+/// it drives: the retention/query/fusion/dedup tunables and the three
+/// dream-signal tunables (stale days, recency window, consolidation
+/// threshold), in that fixed order — the boot/live-apply contract the
+/// admin save re-runs. Boot-order contract: `main` syncs before
 /// `seed_packaged_skills` and before every boot sweep — the seed and the
 /// sweeps write concepts, so retention must be live before them (the
 /// same reason `sync_llm_gate_from_store` precedes the workers).
 ///
 /// Missing or undecryptable row simply means the defaults (`get_sealed`
 /// is intentionally lenient — the llm-row pattern); a value outside its
-/// range clamps through [`set_revision_retention`] or
-/// [`set_query_top_k`] on the way in.
+/// range clamps through the setters on the way in. `dream_enabled`/
+/// `dream_interval_s` have no statics — the scheduler reads the sealed
+/// row per tick, so this sync deliberately does not touch them.
 pub async fn sync_lifecycle_from_store(
     config: &ConfigStore,
     service_key: &ServiceKey,
@@ -358,6 +533,9 @@ pub async fn sync_lifecycle_from_store(
     set_rrf_weight_lex(cfg.rrf_weight_lex);
     set_rrf_weight_vec(cfg.rrf_weight_vec);
     set_dedup_cosine(cfg.dedup_cosine);
+    set_stale_days(cfg.stale_days);
+    set_recent_window(cfg.recent_window);
+    set_consolidation_patches(cfg.consolidation_patches);
     Ok(())
 }
 
@@ -751,6 +929,90 @@ impl<'a> RevisionStore<'a> {
         }
         tx.commit().await?;
         Ok(pruned)
+    }
+
+    /// The trailing-`update` count the dream consolidation signal reads
+    /// (spec §3.2a): scan the path's newest `consolidation_patches() + 1`
+    /// op rows (newest first) and count the leading `update`s until the
+    /// first other op — create/delete/restore/merge/consolidate/
+    /// migration all break the chain, so a `consolidate` row resets the
+    /// count to 0 with no counter state anywhere. The count tops out at
+    /// `consolidation_patches() + 1`, which is all the signal
+    /// comparison needs: it fires only when the count STRICTLY exceeds
+    /// the threshold, so the window always shows one row beyond it. An
+    /// empty chain reads 0. Named by the HMAC path token ([
+    /// `Self::path_token_of`]) — the caller holds tokens, not plaintext
+    /// paths.
+    pub async fn consecutive_update_count(&self, path_token: &str) -> Result<u32, RevisionsError> {
+        let limit = i64::from(consolidation_patches()) + 1;
+        let ops: Vec<(String,)> = sqlx::query_as(
+            "SELECT op FROM concept_revisions
+             WHERE scope_id = ? AND path_token = ?
+             ORDER BY revision_no DESC
+             LIMIT ?",
+        )
+        .bind(&self.scope_id)
+        .bind(path_token)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        let mut count = 0u32;
+        for (op,) in ops {
+            if op != "update" {
+                break;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod dream_signal_statics_tests {
+    use std::sync::atomic::Ordering;
+
+    /// The read seam is the last line of defense (`fusion_statics_tests`
+    /// shape): a u32 that reached an atomic WITHOUT a setter (a future
+    /// raw seam, a refactor bug) must still read clamped — there is no
+    /// NaN analogue for the u32 fields, only the range. The statics are
+    /// private, so only an in-module test can force out-of-range values
+    /// INTO them; the forced values are restored via the regular setters
+    /// so sibling tests in this binary read the defaults.
+    #[test]
+    fn stale_recent_consolidation_getters_reclamp_the_stale_bits() {
+        super::STALE_DAYS.store(0, Ordering::Relaxed);
+        super::RECENT_WINDOW.store(400, Ordering::Relaxed);
+        super::CONSOLIDATION_PATCHES.store(150, Ordering::Relaxed);
+
+        assert_eq!(
+            super::stale_days(),
+            super::STALE_DAYS_RANGE.0,
+            "stale → 7 floor at the read seam"
+        );
+        assert_eq!(
+            super::recent_window(),
+            super::RECENT_WINDOW_RANGE.1,
+            "window → 365 ceiling at the read seam"
+        );
+        assert_eq!(
+            super::consolidation_patches(),
+            super::CONSOLIDATION_PATCHES_RANGE.1,
+            "patches → 100 ceiling at the read seam"
+        );
+
+        // Restore the defaults via the setters so the binary's other
+        // tests see the shipped values.
+        super::set_stale_days(super::DEFAULT_STALE_DAYS);
+        super::set_recent_window(super::DEFAULT_RECENT_WINDOW);
+        super::set_consolidation_patches(super::DEFAULT_CONSOLIDATION_PATCHES);
+        assert_eq!(
+            (
+                super::stale_days(),
+                super::recent_window(),
+                super::consolidation_patches()
+            ),
+            (90, 14, 8)
+        );
     }
 }
 
