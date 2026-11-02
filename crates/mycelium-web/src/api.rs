@@ -41,12 +41,17 @@ pub(crate) fn parse_mode_param(
 /// Construct the librarian agent's cross-scope capabilities from a store
 /// and service key (global skills + library + full-text book search).
 /// `visible_slugs` filters library access by bookshelf visibility
-/// (None = unrestricted, i.e. admin).
+/// (None = unrestricted, i.e. admin). `scope_id` is the agent-trace id
+/// for the scope: `user:<uuid>` for per-user surfaces (chat runner,
+/// dream/api_dream, stateless chat), `global:skills` for the scheduler's
+/// system-side skills scope (memory-lifecycle §3.4) — shared so the
+/// dream scheduler's per-attempt construction stays the same shape the
+/// REST endpoints build.
 pub(crate) fn build_agent_scopes<'a>(
     store: &'a mycelium_store::Store,
-    service_key: &'a mycelium_crypto::keys::ServiceKey,
+    service_key: &mycelium_crypto::keys::ServiceKey,
     visible_slugs: Option<std::collections::HashSet<String>>,
-    user_id: uuid::Uuid,
+    scope_id: &str,
 ) -> mycelium_librarian::agent::AgentScopes<'a> {
     let store_arc = store.clone();
     let sk = service_key.clone();
@@ -86,33 +91,31 @@ pub(crate) fn build_agent_scopes<'a>(
         visible_slugs,
         trace: Some(mycelium_librarian::agent::TraceSink {
             pool: store.pool().clone(),
-            scope_id: format!("user:{user_id}"),
+            scope_id: scope_id.to_string(),
         }),
     }
 }
 
-/// The set of book slugs the user may see in the library: books on
-/// global-read shelves. Admins get None (unrestricted). `pub(crate)`:
-/// the chat submit endpoints resolve it once at submit time for the
-/// detached runner's context.
+/// The set of book slugs a scope's user may see in the library: books on
+/// global-read shelves. Admins (admin=true) get None (unrestricted).
+/// `pub(crate)` + store/role-shaped (not AppState/SessionUser): the chat
+/// submit endpoints resolve it once at submit time for the detached
+/// runner's context, and the dream scheduler calls it per attempt below
+/// the session layer (memory-lifecycle §3.4) — one walk, three users.
 pub(crate) async fn visible_library_slugs(
-    state: &AppState,
-    user: &SessionUser,
+    store: &mycelium_store::Store,
+    admin: bool,
 ) -> Option<std::collections::HashSet<String>> {
-    if user.role == Role::Admin {
+    if admin {
         return None;
     }
-    let shelves = state
-        .store
-        .list_bookshelves_detailed()
-        .await
-        .unwrap_or_default();
+    let shelves = store.list_bookshelves_detailed().await.unwrap_or_default();
     let mut out = std::collections::HashSet::new();
     for (id, _name, global_read) in shelves {
         if !global_read {
             continue;
         }
-        for (slug, _title) in state.store.books_on_shelf(id).await.unwrap_or_default() {
+        for (slug, _title) in store.books_on_shelf(id).await.unwrap_or_default() {
             out.insert(slug);
         }
     }
@@ -336,7 +339,7 @@ async fn search_all_scopes(
         // Bookshelf visibility, precomputed as a slug set (the same
         // tables book_by_slug consulted per hit before) — None for
         // admins (the option IS the allowlist-or-unrestricted shape).
-        visible_slugs: visible_library_slugs(state, user).await,
+        visible_slugs: visible_library_slugs(&state.store, user.role == Role::Admin).await,
         trace: None,
     };
     mycelium_librarian::agent::cross_scope_hits(
@@ -5130,8 +5133,8 @@ pub async fn api_dream(State(state): State<AppState>, user: SessionUser) -> Resp
     let scopes = build_agent_scopes(
         &state.store,
         &state.service_key,
-        visible_library_slugs(&state, &user).await,
-        user.user_id,
+        visible_library_slugs(&state.store, user.role == Role::Admin).await,
+        &format!("user:{}", user.user_id),
     );
     // Dream is wait class with the CHAT bound (spec §5): admin-triggered
     // and rare, so it may wait for a slot — but it never jumps the
@@ -5210,8 +5213,8 @@ pub async fn api_chat(
     let scopes = build_agent_scopes(
         &state.store,
         &state.service_key,
-        visible_library_slugs(&state, &user).await,
-        user.user_id,
+        visible_library_slugs(&state.store, user.role == Role::Admin).await,
+        &format!("user:{}", user.user_id),
     );
     // Wait class, bounded by `query_wait_secs` (spec §3.3): this
     // endpoint holds an HTTP request open, so its bound is the short

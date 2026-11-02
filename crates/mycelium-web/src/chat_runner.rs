@@ -497,7 +497,7 @@ async fn run_chat_turn(
         &ctx.store,
         &ctx.service_key,
         ctx.scopes_visible.clone(),
-        user_id,
+        &format!("user:{user_id}"),
     );
 
     // The agent emits progress on an unbounded channel (sends never

@@ -24,7 +24,7 @@ use axum::response::IntoResponse;
 use mycelium_core::concept::{Concept, Frontmatter};
 use mycelium_crypto::keys::{MasterKey, ServiceKey, generate_master_key};
 use mycelium_librarian::llm_gate::{DEFAULT_CAPACITY, LLM_GATE};
-use mycelium_librarian::llm_health::LLM_HEALTH;
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH, RED_FAILURE_THRESHOLD};
 use mycelium_librarian::queue_worker::MasterKeyRecovery;
 use mycelium_store::revisions::{DREAM_INTERVAL_S_RANGE, LIFECYCLE_CONFIG_KEY, LifecycleConfig};
 use mycelium_store::{ConceptStore, ConfigStore, Store};
@@ -406,9 +406,17 @@ async fn disabled_mid_run_finishes_the_pass_then_skips() {
     assert_eq!(mid.skipped - before.skipped, 0);
     assert_eq!(cursor, 1, "the ran pass advanced the cursor");
 
-    // Tick 2 — disabled: no admission, no pass, no advance.
-    write_lifecycle(&env, TEST_INTERVAL, false).await;
+    // Tick 2 — disabled (stored with a DIFFERENT interval so the
+    // retune-precedes-enabled-check order is observable): no admission,
+    // no pass, no advance.
+    write_lifecycle(&env, 7_200, false).await;
     env.scheduler.tick(&mut cursor, &mut interval).await;
+    assert_eq!(
+        interval.period(),
+        Duration::from_secs(7_200),
+        "a present row re-tunes the interval even when disabled — \
+         the retune precedes the enabled check"
+    );
     assert_eq!(
         requests.lock().await.len(),
         1,
@@ -440,6 +448,65 @@ async fn disabled_mid_run_finishes_the_pass_then_skips() {
     assert_eq!(rec["scope"], "global:skills");
     assert_eq!(rec["ran"], true);
     assert_eq!(rec["summary"], "pass two summary text");
+}
+
+/// A RED backend defers the wake before admission (drain parity): no
+/// admission, no LLM call, cursor stays, one skipped wake, nothing
+/// recorded — and once the backend goes Green again, the SAME scope
+/// runs (the cursor never moved).
+#[tokio::test]
+async fn red_backend_skips_the_tick() {
+    let _lock = TEST_LOCK.lock().await;
+    let _health = HealthDefaults;
+    let before = metrics();
+    let (llm_url, requests) = capturing_mock_llm(vec![text_response("recovered summary")]).await;
+    let env = env().await;
+    let user = fixed_user(0x0d01);
+    seed_user(env.store.as_ref(), user, "dream-red", "user").await;
+    orphan_in_user(&env, user).await;
+    write_llm(&env.config, &env.service_key, &llm_url).await;
+    write_lifecycle(&env, TEST_INTERVAL, true).await;
+
+    // Drive the process-global health machine to Red: three consecutive
+    // failures (RED_FAILURE_THRESHOLD). The fresh static is configured
+    // (its Default), so the notes count.
+    for _ in 0..RED_FAILURE_THRESHOLD {
+        LLM_HEALTH.note_failure();
+    }
+    assert_eq!(LLM_HEALTH.state(), BackendState::Red);
+
+    let mut cursor = 0usize;
+    let mut interval = test_interval(Duration::from_millis(50));
+    env.scheduler.tick(&mut cursor, &mut interval).await;
+
+    assert_eq!(
+        requests.lock().await.len(),
+        0,
+        "the Red tick made no LLM call — nothing admitted"
+    );
+    assert_eq!(cursor, 0, "the Red tick advances nothing");
+    let now = metrics();
+    assert_eq!(now.ticks - before.ticks, 1);
+    assert_eq!(now.passes - before.passes, 0, "no pass attempted");
+    assert_eq!(now.skipped - before.skipped, 1, "the Red wake is a skip");
+    assert!(
+        env.config
+            .get::<serde_json::Value>(DREAM_LAST_RUN_KEY)
+            .await
+            .unwrap()
+            .is_none(),
+        "deferring is not an attempt — nothing recorded"
+    );
+
+    // Recovery — reset the machine (Green) and the SAME first scope
+    // runs, proving the cursor never moved under Red.
+    LLM_HEALTH.reset_for_test();
+    env.scheduler.tick(&mut cursor, &mut interval).await;
+    assert_eq!(requests.lock().await.len(), 1, "the recovered tick runs");
+    let rec = last_run(&env.config).await;
+    assert_eq!(rec["scope"], format!("user:{user}"));
+    assert_eq!(rec["ran"], true);
+    assert_eq!(cursor, 1);
 }
 
 /// A busy gate defers the tick: the try class never waits — no slot is

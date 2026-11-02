@@ -28,7 +28,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 
-use mycelium_auth::rbac::SessionUser;
+use mycelium_auth::rbac::{Role, SessionUser};
 use mycelium_crypto::keys::MasterKey;
 use mycelium_librarian::llm_gate::LLM_GATE;
 use mycelium_store::chat::{ChatError, ChatRole};
@@ -295,7 +295,7 @@ async fn submit_turn(
         chat: (*state.chat_sessions).clone(),
         runs: Arc::clone(&state.chat_runs),
         llm,
-        scopes_visible: visible_library_slugs(state, user).await,
+        scopes_visible: visible_library_slugs(&state.store, user.role == Role::Admin).await,
     };
     // The replay cursor is this turn's user row: only THIS turn's
     // agent rows replay — a later submit in a session must not re-emit

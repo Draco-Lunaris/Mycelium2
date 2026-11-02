@@ -25,7 +25,10 @@
 //!      defers the wake.
 //!   6. admit through [`LLM_GATE.try_enter`] — try class, NEVER waits
 //!      (the stream's global constraint): a busy gate defers the wake
-//!      with the cursor untouched.
+//!      with the cursor untouched. A RED backend (the drain's Red-halt,
+//!      2026-10-31: a doomed run would hold a max_parallel slot up to
+//!      the LLM timeout) defers too; Disabled is step 4's no-op, NOT
+//!      weather, and Yellow still runs.
 //!   7. resolve the scope (stores, agent scopes, vectors — the
 //!      `api_dream` construction, built fresh per attempt). An
 //!      unrecoverable user master key is still an ATTEMPTED pass:
@@ -47,10 +50,10 @@
 //! /metrics exposes three counters (health.rs writes the lines): every
 //! wake is a tick; every wake that ran a pass — ran, no-signal, or
 //! resolve-failure — is a pass; every wake that ended without one
-//! (gate busy, disabled, unreadable/unusable config) is a skip.
+//! (gate busy, backend Red, disabled, unreadable/unusable config) is a
+//! skip.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -61,7 +64,7 @@ use mycelium_librarian::agent::{AgentError, AgentScopes};
 use mycelium_librarian::dream::DreamReport;
 use mycelium_librarian::llm::{LlmClient, LlmConfig};
 use mycelium_librarian::llm_gate::{GatePermit, LLM_GATE};
-use mycelium_librarian::llm_health::short_detail;
+use mycelium_librarian::llm_health::{BackendState, LLM_HEALTH, short_detail};
 use mycelium_librarian::queue_worker::MasterKeyRecovery;
 use mycelium_store::config::get_sealed;
 use mycelium_store::revisions::{DEFAULT_DREAM_INTERVAL_S, LIFECYCLE_CONFIG_KEY, LifecycleConfig};
@@ -206,8 +209,23 @@ impl DreamScheduler {
 
         // 6. One scope per wake, at the cursor; try class — a busy gate
         //    defers the wake with the cursor untouched (never waits).
+        //    Backend weather first (the drain's Red-halt, 2026-10-31): a
+        //    Red backend is a doomed run that would hold a max_parallel
+        //    slot for up to the LLM timeout, recorded as a failure
+        //    anyway — the wake defers instead. Disabled is deliberately
+        //    NOT gated here (no llm row is step 4's no-op, not weather)
+        //    and Yellow still runs (1-2 failures do not make every pass
+        //    doomed).
         let target = &rotation[*cursor % rotation.len()];
         let scope_id = target.scope_id();
+        if LLM_HEALTH.state() == BackendState::Red {
+            tracing::warn!(
+                scope = %scope_id,
+                "dream scheduler: backend Red — the wake defers"
+            );
+            DREAM_PASSES_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(permit) = LLM_GATE.try_enter() else {
             DREAM_PASSES_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return;
@@ -384,9 +402,13 @@ impl DreamScheduler {
                 let cons_cs = ConceptStore::for_user(self.store.as_ref(), *id, master)
                     .with_provenance("dream")
                     .with_revision_op("consolidate");
-                let visible = visible_library_slugs_for(self.store.as_ref(), *admin).await;
-                let scopes =
-                    build_dream_scopes(self.store.as_ref(), &self.service_key, &scope_id, visible);
+                let visible = crate::api::visible_library_slugs(self.store.as_ref(), *admin).await;
+                let scopes = crate::api::build_agent_scopes(
+                    self.store.as_ref(),
+                    &self.service_key,
+                    visible,
+                    &scope_id,
+                );
                 Some(DreamScope {
                     scope_id,
                     cs,
@@ -416,8 +438,12 @@ impl DreamScheduler {
                     VectorStore::for_service(self.store.pool(), &self.service_key, "skills");
                 // The service scope reads only service-side concepts —
                 // no per-user library visibility applies.
-                let scopes =
-                    build_dream_scopes(self.store.as_ref(), &self.service_key, &scope_id, None);
+                let scopes = crate::api::build_agent_scopes(
+                    self.store.as_ref(),
+                    &self.service_key,
+                    None,
+                    &scope_id,
+                );
                 Some(DreamScope {
                     scope_id,
                     cs,
@@ -556,76 +582,6 @@ struct DreamLastRunRecord {
     /// detail, when anything readable came out.
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
-}
-
-/// The agent-scope construction (api.rs `build_agent_scopes`'s dream
-/// shape): both service shelves readable, stack texts through the
-/// service key, the trace under the scope's id, per-role library
-/// visibility, and NO embeddings — deterministic dream maintenance
-/// must not take embeddings latency on its critical path (the try-class
-/// invariant).
-fn build_dream_scopes<'a>(
-    store: &'a Store,
-    service_key: &ServiceKey,
-    trace_scope_id: &str,
-    visible_slugs: Option<HashSet<String>>,
-) -> AgentScopes<'a> {
-    let store_arc = store.clone();
-    let sk = service_key.clone();
-    let read_stack_text: Option<Box<mycelium_librarian::agent::StackTextReader>> =
-        Some(Box::new(move |slug| {
-            let s = store_arc.clone();
-            let k = sk.clone();
-            let slug = slug.to_string();
-            Box::pin(async move {
-                mycelium_librarian::read_stack_text(&s, &k, &slug)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        }));
-    AgentScopes {
-        skills: Some(ConceptStore::for_service(
-            store,
-            service_key.clone(),
-            &store.skills_dir(),
-            "skills",
-        )),
-        library: Some(ConceptStore::for_service(
-            store,
-            service_key.clone(),
-            &store.library_dir(),
-            "library",
-        )),
-        // See the fn doc.
-        embeddings: None,
-        read_stack_text,
-        visible_slugs,
-        trace: Some(mycelium_librarian::agent::TraceSink {
-            pool: store.pool().clone(),
-            scope_id: trace_scope_id.to_string(),
-        }),
-    }
-}
-
-/// The library slugs the scope's user may read (books on global-read
-/// shelves), None when unrestricted — the api.rs `visible_library_slugs`
-/// walk with the role resolved from the users table instead of a
-/// SessionUser (the scheduler sits below the session layer).
-async fn visible_library_slugs_for(store: &Store, admin: bool) -> Option<HashSet<String>> {
-    if admin {
-        return None;
-    }
-    let shelves = store.list_bookshelves_detailed().await.unwrap_or_default();
-    let mut out = HashSet::new();
-    for (id, _name, global_read) in shelves {
-        if !global_read {
-            continue;
-        }
-        for (slug, _title) in store.books_on_shelf(id).await.unwrap_or_default() {
-            out.insert(slug);
-        }
-    }
-    Some(out)
 }
 
 /// Re-arm the wake interval at `period` (the live re-tune): a rebuilt
