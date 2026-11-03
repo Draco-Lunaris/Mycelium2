@@ -1,7 +1,9 @@
 //! VectorWorker integration tests (memory-lifecycle spec §3.3): the
 //! bounded write-hook queue drains through the admin-configured
 //! embeddings mock into `search_vectors`; a dead backend pauses the
-//! tick (Red) and a recovered one resumes; the boot backlog re-enqueues
+//! tick (Red) and a recovered one resumes — and a park-and-resume
+//! worker re-queues what a mid-drain Red interrupted, so no boot
+//! backlog dies to backend weather; the boot backlog re-enqueues
 //! pre-worker writes and a model swap re-embeds the corpus; deleted
 //! concepts are never resurrected. Direct-struct tests
 //! (queue_worker_integration.rs shape): a real temp-dir store, a stub
@@ -288,9 +290,10 @@ fn spawn_worker(
 }
 
 /// The machine's Red reached via the passive hooks implies
-/// `EMBED_ATTEMPTS` dead batch attempts already consumed their queue
-/// items — a test's Red-first poll can never fire on a pre-worker idle
-/// state (the reset machine is fresh Green).
+/// `EMBED_ATTEMPTS` dead batch attempts already ran inside a drain — a
+/// test's Red-first poll can never fire on a pre-worker idle state (the
+/// reset machine is fresh Green), and recovery assertions ordered after
+/// it cannot race a tick that has not yet red.
 async fn wait_red() {
     wait_until(
         "three dead batch attempts drive the machine Red",
@@ -383,11 +386,12 @@ async fn worker_drains_the_queue_into_vector_rows() {
 /// A dead backend: tick 1's boot backlog re-enqueues the drained era's
 /// two concepts (the test started with an emptied queue, so tick 1's
 /// drain was a no-op), tick 2 drains them through three failing batch
-/// attempts and the batch's items are DROPPED (the machine's Red
-/// threshold). Then a simulated probe recovery (fresh Green machine)
-/// and a healthy mock + one new write: the new item drains into exactly
-/// one fresh row; no row of the dropped era ever rebuilds (spec §3.3
-/// Review Focus 2, both halves).
+/// attempts (the machine's Red threshold) — and the items PARK: they
+/// re-enter the queue (park-and-resume; a mid-drain Red must not zero a
+/// boot's backlog). Then a simulated probe recovery (fresh Green
+/// machine), a healthy mock and a new write: a later tick drains the
+/// parked pair and the new write into three fresh rows — no restart, no
+/// second boot (spec §3.3: the red pause pauses, it does not drop).
 #[tokio::test]
 async fn worker_pauses_on_red_and_drains_after_recovery() {
     let _lock = TEST_LOCK.lock().await;
@@ -411,49 +415,201 @@ async fn worker_pauses_on_red_and_drains_after_recovery() {
     let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
 
     wait_red().await;
-    assert_eq!(
-        vector_queue_depth(),
-        0,
-        "the dead batch's items came out of the queue"
-    );
+    wait_until(
+        "the dead drain's items parked back into the queue",
+        || async { vector_queue_depth() == 2 },
+    )
+    .await;
     let rows = vs.load_rows().await.unwrap();
     assert!(
         rows.is_empty(),
-        "no rows were written from the dropped era: {rows:?}"
+        "no rows were written from the red era: {rows:?}"
     );
 
-    // Simulated recovery (the probe's ok feed) + a healthy era.
+    // Simulated recovery (the probe's ok feed) + a healthy era and a new
+    // write: the next green tick's drain rides the parked pair and the
+    // new item (three vec entries absorb whichever batch shapes the
+    // drain's timing produces).
+    shared.lock().await.script.push(vec_resp(DIMS));
+    shared.lock().await.script.push(vec_resp(DIMS));
     shared.lock().await.script.push(vec_resp(DIMS));
     EMBEDDING_HEALTH.reset_for_test();
     cs.put(&concept("/c.md", "C", "text c")).await.unwrap();
 
-    let want_row = [vs.path_token_of("/c.md")];
+    let want = [
+        vs.path_token_of("/a.md"),
+        vs.path_token_of("/b.md"),
+        vs.path_token_of("/c.md"),
+    ];
     wait_until(
-        "the recovered era drains the new write into one row",
+        "the recovered era drained the parked pair and the new write",
         || async {
             vs.load_rows()
                 .await
                 .map(|rows| {
-                    rows.len() == 1
-                        && want_row.contains(&rows[0].path_token)
-                        && !rows[0].stale
-                        && rows[0].model == MODEL
+                    rows.len() == 3
+                        && rows.iter().all(|r| !r.stale && r.model == MODEL)
+                        && rows.iter().all(|r| want.contains(&r.path_token))
                 })
                 .unwrap_or(false)
         },
     )
     .await;
-    let dropped = vec![vs.path_token_of("/a.md"), vs.path_token_of("/b.md")];
-    let tokens: Vec<String> = vs
-        .load_rows()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| r.path_token)
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the park drained empty after recovery"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
+/// The boot backlog concludes DESPITE a backend-cold window (the
+/// production 2026-11-03 incident twice zeroed a whole backlog against a
+/// boot-time cold backend: the backlog fired, the drain ran into the
+/// dead backend and DROPPED everything, and the backlog resumed only at
+/// the next boot). Here tick 1's backlog enqueues 40 concepts, tick 2's
+/// drain burns the first batch's attempts against the dead mock and the
+/// machine goes Red — the whole 40 PARK (they re-enter the queue) — and
+/// the recovery's first green tick drains every one of them into rows.
+/// No restart, no second boot, no lost era.
+#[tokio::test]
+async fn boot_backlog_survives_a_mid_drain_red() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    let (url, shared) = mock_embeddings(vec![status_resp(503, "down"); 3]).await;
+    let env = env().await;
+    write_emb_row(&env.config, &env.service_key, &url, MODEL).await;
+    let (cs, vs) = env.user_stores();
+
+    let concepts: Vec<Concept> = (0..40)
+        .map(|i| concept(&format!("/r-{i:02}.md"), &format!("R{i}"), "body"))
         .collect();
-    assert!(
-        tokens.iter().all(|t| !dropped.contains(t)),
-        "the dropped era never got rows: dropped={dropped:?} rows={tokens:?}"
+    cs.put_batch(&concepts).await.unwrap();
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the pre-worker era's queue is empty at spawn"
+    );
+
+    let processed_before = VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed);
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+
+    // The Red gate makes the order deterministic: the machine can only
+    // reach Red through the drain's dead batch attempts, so recovery is
+    // forced to run AFTER the red drain (a depth-only wait could race a
+    // backlog enqueue against the drain that consumed it).
+    wait_red().await;
+    // Tick 1 backlogs (its drain is a no-op), tick 2's drain reds on the
+    // first batch: the whole backlog parks back into the queue.
+    wait_until(
+        "the mid-drain red parked the whole boot backlog",
+        || async { vector_queue_depth() == 40 },
+    )
+    .await;
+    let rows = vs.load_rows().await.unwrap();
+    assert!(rows.is_empty(), "the red era wrote no rows: {rows:?}");
+
+    // Simulated recovery: the parked backlog completes in this process.
+    shared.lock().await.script.push(vec_resp(DIMS));
+    shared.lock().await.script.push(vec_resp(DIMS));
+    shared.lock().await.script.push(vec_resp(DIMS));
+    EMBEDDING_HEALTH.reset_for_test();
+    wait_until("the recovered ticks completed the boot backlog", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 40 && rows.iter().all(|r| !r.stale && r.model == MODEL))
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the park drained empty after the backlog completed"
+    );
+    assert_eq!(
+        VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed) - processed_before,
+        40,
+        "every backloged concept upserted exactly once"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
+/// The boot backlog flag defers through Red ticks: the tick's Red pause
+/// returns BEFORE the flag is consumed, so a backend that is already Red
+/// at the first present-config tick no longer costs the boot's backlog
+/// (the flag used to be consumed even by Red ticks — a red at boot meant
+/// the pre-existing corpus never backfilled without a restart). The
+/// recovery's first green tick fires the flag, enqueues the backlog and
+/// the next tick embeds it.
+#[tokio::test]
+async fn boot_backlog_defers_through_red_ticks_and_fires_on_recovery() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    let (url, shared) = mock_embeddings(vec![vec_resp(DIMS); 3]).await;
+    let env = env().await;
+    write_emb_row(&env.config, &env.service_key, &url, MODEL).await;
+    let (cs, vs) = env.user_stores();
+
+    let concepts: Vec<Concept> = (0..40)
+        .map(|i| concept(&format!("/d-{i:02}.md"), &format!("D{i}"), "body"))
+        .collect();
+    cs.put_batch(&concepts).await.unwrap();
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the pre-worker era's queue is empty at spawn"
+    );
+
+    // Force the machine Red BEFORE the worker spawns (the configured
+    // machine counts consecutive failures; three go Red; a note under
+    // Disabled is ignored, so the configured lift comes first).
+    EMBEDDING_HEALTH.note_configured();
+    for _ in 0..3 {
+        EMBEDDING_HEALTH.note_failure();
+    }
+    assert_eq!(EMBEDDING_HEALTH.state(), BackendState::Red);
+
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+
+    // Several red ticks: the flag stays held, nothing enqueues, the
+    // mock never sees a request.
+    tokio::time::sleep(Duration::from_millis(TICK_MS * 4)).await;
+    assert_eq!(
+        EMBEDDING_HEALTH.state(),
+        BackendState::Red,
+        "red ticks make no embed attempts, the machine stays Red"
+    );
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "red ticks enqueue no backlog (the flag is still held)"
+    );
+
+    // Simulated recovery: the first green tick fires the flag; the next
+    // tick drains the backlog into rows. No restart.
+    shared.lock().await.script.push(vec_resp(DIMS));
+    shared.lock().await.script.push(vec_resp(DIMS));
+    shared.lock().await.script.push(vec_resp(DIMS));
+    EMBEDDING_HEALTH.reset_for_test();
+    wait_until("the recovery's backlog fired and completed", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 40 && rows.iter().all(|r| !r.stale && r.model == MODEL))
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the backlog drained empty after firing"
     );
 
     shutdown.cancel();

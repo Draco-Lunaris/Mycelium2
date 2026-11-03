@@ -21,23 +21,28 @@
 //!    collect it for embedding; the path is gone ⇒ the belt
 //!    (`remove_row_by_token`).
 //! 5. Embedding runs in `cfg.batch`-sized batches with up to three
-//!    attempts per batch; a batch that still fails drops its items with
-//!    a bounded warn — nothing errors upward, and every successful
-//!    concept upserts its row and advances `VECTOR_PROCESSED_TOTAL`.
-//!    The scope's decoded cache invalidates once, after the drain's
-//!    upserts land.
+//!    attempts per batch; a batch that still fails — and the remainder
+//!    behind a Red verdict — PARKS: its paths re-enter the queue after
+//!    the drain (the dedupe keeps them single; the queue's capacity
+//!    rule governs overflow), so the next non-Red tick resumes the
+//!    leftovers instead of a boot backlog dying to backend weather.
+//!    Nothing errors upward, and every successful concept upserts its
+//!    row and advances `VECTOR_PROCESSED_TOTAL`. The scope's decoded
+//!    cache invalidates once, after the drain's upserts land.
 //! 6. Stale rebuild: every scope with stale rows (deterministic order)
 //!    re-embeds up to [`STALE_ROWS_PER_TICK`] rows per tick from the
 //!    registry's own backlog enumeration, then invalidates again. A
 //!    larger backlog simply resumes next tick.
-//! 7. Boot backlog (first PRESENT-config tick, per process): every
-//!    scope's `backlog_paths` re-enters the queue (writes that happened
-//!    before a worker ever saw them), bounded by the queue itself — at
-//!    capacity a NEW item is dropped and the remainder resumes next
-//!    boot. The flag defers while the embeddings row is absent or
-//!    unreadable (the fresh-deployment posture: the operator saves the
-//!    config post-boot, and the pre-existing corpus backfills at the
-//!    first tick that actually reads a row — no restart).
+//! 7. Boot backlog (first PRESENT-config, non-Red tick, per process):
+//!    every scope's `backlog_paths` re-enters the queue (writes that
+//!    happened before a worker ever saw them), bounded by the queue
+//!    itself — at capacity a NEW item is dropped and the remainder
+//!    resumes next boot (a mid-drain Red re-parks instead of dropping —
+//!    phase 5). The flag defers while the embeddings row is absent or
+//!    unreadable, or the backend is Red (the fresh-deployment posture:
+//!    the operator saves the config post-boot, and the pre-existing
+//!    corpus backfills at the first tick that actually reads a row and
+//!    can work — no restart).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -47,7 +52,7 @@ use std::time::Duration;
 use mycelium_crypto::keys::ServiceKey;
 use mycelium_store::vectors::{
     VECTOR_PROCESSED_TOTAL, VECTOR_QUEUE_CAPACITY, VectorStore, drain_queue, enqueue_write,
-    invalidate_scope,
+    invalidate_scope, vector_queue_depth,
 };
 use mycelium_store::{ConceptEntry, ConceptStore, ConceptStoreError, ConfigStore, Store};
 use tokio::task::JoinHandle;
@@ -69,9 +74,9 @@ pub const VECTOR_TICK_SECS: u64 = 5;
 /// hogs nor wedges the worker).
 pub const STALE_ROWS_PER_TICK: usize = 256;
 
-/// Embeddings attempts on one batch before the batch drops with its
-/// bounded warn (the items were drained — the drop never echoes back
-/// into the queue, so nothing wedges).
+/// Embeddings attempts on one batch before the batch parks its items
+/// with its bounded warn (the paths re-enter the queue for a later
+/// tick; the dedupe keeps them single — nothing wedges).
 const EMBED_ATTEMPTS: usize = 3;
 
 // ---- worker ----
@@ -145,21 +150,16 @@ impl VectorWorker {
     }
 
     /// One tick: the seven phases in turn (module doc). `boot_backlog_flag`
-    /// is the run loop's first-tick flag; the tick consumes it (a take)
-    /// only when the config read reports a PRESENT row — an absent /
-    /// failed / undecryptable row leaves it, so the backlog still fires
-    /// at the first present-config tick (≤ one interval after the
-    /// operator's save).
+    /// is the run loop's first-workable-tick flag; the tick consumes it
+    /// (a take) only when the config read reports a PRESENT row AND the
+    /// backend is not Red — an absent / failed / undecryptable row or a
+    /// Red verdict leaves it, so the backlog still fires at the first
+    /// present-config tick that can actually work (≤ one interval after
+    /// the operator's save or the backend's recovery — no restart).
     async fn tick(&self, boot_backlog_flag: &mut bool) {
         let Some(cfg) = self.read_config().await else {
             return;
         };
-
-        // The config row is present: the backlog flag is consumed from
-        // here on, even when the Red pause below skips this tick's
-        // enqueue (an era-3 backlog must not queue while the model is
-        // down; the next boot re-backlogs whatever was lost).
-        let boot_backlog = std::mem::take(boot_backlog_flag);
 
         // Prologue: the whole-corpus stale mark rides the learned dims.
         let learned = EMBEDDING_DIMS.load(Ordering::Relaxed);
@@ -179,10 +179,15 @@ impl VectorWorker {
         }
 
         // A Red backend parks the queue: nothing was embedded, nothing
-        // is re-tickable until a probe recovers the machine.
+        // is re-tickable until a probe recovers the machine. The boot
+        // backlog flag defers along with everything else — a Red tick
+        // has no enqueue to skip (its drain was skipped; nothing was
+        // dropped that a backlog re-enqueue would need to repair), and
+        // the backlog fires on the first tick that can actually work.
         if embedding_state() == BackendState::Red {
             return;
         }
+        let boot_backlog = std::mem::take(boot_backlog_flag);
 
         let client = EmbeddingsClient::new(&cfg);
         self.drain(&client, &cfg).await;
@@ -303,9 +308,28 @@ impl VectorWorker {
             }
         }
 
-        let wrote = self
+        let (wrote, parked_paths) = self
             .embed_and_upsert(client, cfg, vs, scope_id, pairs)
             .await;
+        if !parked_paths.is_empty() {
+            // Park-and-resume: a mid-drain Red (or a batch that burned
+            // its attempts) re-enters its items into the queue — the
+            // next non-Red tick resumes them, so neither the boot
+            // backlog nor a put-hook era dies to backend weather. The
+            // dedupe keeps them single; at capacity the queue refuses
+            // the new item (whatever was refused re-enters via the boot
+            // backlog).
+            for path in &parked_paths {
+                enqueue_write(vs.scope_id(), &vs.path_token_of(path));
+            }
+            if vector_queue_depth() >= VECTOR_QUEUE_CAPACITY {
+                tracing::warn!(
+                    scope = %scope_id,
+                    parked = parked_paths.len(),
+                    "re-park reached the queue's capacity — refused items resume via the boot backlog"
+                );
+            }
+        }
         if wrote {
             // The controller's contract: the scope's decoded cache
             // invalidates ONCE per tick-side write phase (the drain's
@@ -329,11 +353,16 @@ impl VectorWorker {
 
     /// Embed `pairs` in `cfg.batch`-sized batches and upsert one row per
     /// concept. Per batch: up to [`EMBED_ATTEMPTS`] backend attempts
-    /// (the passive hooks ride every attempt), then the batch's items
-    /// are dropped with a bounded warn. A Red verdict re-checked before
-    /// each attempt abandons the REST of this scope's work in one warn
-    /// (a dead backend must pause the tick, not hammer it). Returns
-    /// whether any upsert landed (the caller invalidates once).
+    /// (the passive hooks ride every attempt). A batch that still fails,
+    /// and the remainder behind a Red verdict re-checked before each
+    /// batch, PARKS: the paths return to the caller for re-enqueue (the
+    /// drain's parked items resume on a later, non-Red tick; the
+    /// rebuild's enumeration re-discovers stale rows on its own — see
+    /// its call site for why it may not re-park). A dead backend must
+    /// pause the drain, not hammer it: no further batch is attempted
+    /// once the machine is Red. Returns whether any upsert landed (the
+    /// caller invalidates once) and the paths that never embedded, in
+    /// drain order.
     async fn embed_and_upsert(
         &self,
         client: &EmbeddingsClient,
@@ -341,22 +370,24 @@ impl VectorWorker {
         vs: &VectorStore<'_>,
         scope_id: &str,
         pairs: Vec<(String, String)>,
-    ) -> bool {
+    ) -> (bool, Vec<String>) {
         if pairs.is_empty() {
-            return false;
+            return (false, Vec::new());
         }
         let batch = usize::try_from(cfg.batch).unwrap_or(pairs.len());
         let batch = batch.max(1);
         let total = pairs.len();
         let mut wrote = false;
+        let mut parked: Vec<String> = Vec::new();
         let mut idx = 0usize;
         while idx < total {
             if embedding_state() == BackendState::Red {
                 tracing::warn!(
                     scope = %scope_id,
                     remaining = total - idx,
-                    "embedding paused — backend red: this drain's remaining items dropped"
+                    "embedding paused — backend red: this drain's remaining items re-parked for a later tick"
                 );
+                parked.extend(pairs[idx..].iter().map(|(path, _)| path.clone()));
                 break;
             }
             let chunk = &pairs[idx..(idx + batch).min(total)];
@@ -384,8 +415,9 @@ impl VectorWorker {
                     scope = %scope_id,
                     count = texts.len(),
                     reason = err,
-                    "embedding batch dropped after retries"
+                    "embedding batch failed after retries — its items re-parked for a later tick"
                 );
+                parked.extend(chunk.iter().map(|(path, _)| path.clone()));
                 continue;
             };
 
@@ -407,7 +439,7 @@ impl VectorWorker {
                 }
             }
         }
-        wrote
+        (wrote, parked)
     }
 
     /// Step 6: every scope with stale rows (deterministic order), each
@@ -464,7 +496,11 @@ impl VectorWorker {
                     }
                 }
             }
-            let wrote = self
+            // The rebuild does NOT re-park leftovers: its own enumeration
+            // re-discovers every still-stale row next tick — re-queuing
+            // them would double-process a path the enumeration is about
+            // to re-embed.
+            let (wrote, _parked) = self
                 .embed_and_upsert(client, cfg, vs, &scope_id, pairs)
                 .await;
             // The controller's AGAIN rule: after the stale-rebuild's
