@@ -5,9 +5,11 @@
 //! worker re-queues what a mid-drain Red interrupted, so no boot
 //! backlog dies to backend weather; the boot backlog re-enqueues
 //! pre-worker writes and a model swap re-embeds the corpus; deleted
-//! concepts are never resurrected. Direct-struct tests
-//! (queue_worker_integration.rs shape): a real temp-dir store, a stub
-//! master-key recovery, a scripted mock embeddings endpoint.
+//! concepts are never resurrected; registry-dead `search_docs` rows
+//! (the historical ghost residue) are swept — lexical index row plus
+//! any vector row — instead of re-enqueueing every boot. Direct-struct
+//! tests (queue_worker_integration.rs shape): a real temp-dir store, a
+//! stub master-key recovery, a scripted mock embeddings endpoint.
 //!
 //! Process-global state serializes on TEST_LOCK — the vector write
 //! queue, the decoded scope cache, and the embeddings health machine.
@@ -849,6 +851,242 @@ async fn a_drained_item_for_a_deleted_concept_deletes_by_token() {
         vector_queue_depth(),
         0,
         "the belt consumed the deleted half's item too"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
+// ---------- dead-concept sweeps (the ghost-residue remediation) ----------
+
+/// The boot backlog sweeps registry-dead `search_docs` rows instead of
+/// re-enqueueing them forever: a concept whose FTS row outlived its
+/// registry row (historical delete-path residue) is enumerated by EVERY
+/// boot's `backlog_paths` and belted out silently — today. With the
+/// sweep, that path is REMOVED at the backlog (lexical index row plus
+/// any vector row) and never enqueued; the two live concepts still
+/// embed, and exactly two embeds happen — the ghost never does.
+#[tokio::test]
+async fn backlog_sweeps_registry_dead_index_rows() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    // One vec script entry serves the live pair's batch — a third embed
+    // (the ghost ever embedding) would exhaust the script into 500s.
+    let (url, _shared) = mock_embeddings(vec![vec_resp(DIMS)]).await;
+    let env = env().await;
+    write_emb_row(&env.config, &env.service_key, &url, MODEL).await;
+    let (cs, vs) = env.user_stores();
+    let scope = format!("user:{}", env.user);
+
+    cs.put_batch(&[
+        concept("/a.md", "A", "text a"),
+        concept("/b.md", "B", "text b"),
+    ])
+    .await
+    .unwrap();
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(vector_queue_depth(), 0, "queue empty at spawn");
+
+    // The ghost: a search_docs row whose concept the registry never
+    // held. A zero payload is enough — the enumeration reads only the
+    // path (the row is dead by construction; its AEAD payload is not
+    // decryptable and never read).
+    sqlx::query(
+        "INSERT INTO search_docs (scope, concept_path, payload, length) VALUES (?, '/ghost.md', x'00', 4)",
+    )
+    .bind(&scope)
+    .execute(env.store.pool())
+    .await
+    .unwrap();
+
+    let processed_before = VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed);
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+
+    wait_until("the ghost's search_docs row was swept", || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_docs WHERE scope = ? AND concept_path = '/ghost.md'",
+        )
+        .bind(&scope)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(1)
+            == 0
+    })
+    .await;
+    wait_until("the live concepts embedded fresh", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 2 && rows.iter().all(|r| !r.stale && r.model == MODEL))
+            .unwrap_or(false)
+    })
+    .await;
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "the ghost was never enqueued — the cycle is broken"
+    );
+    assert_eq!(
+        VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed) - processed_before,
+        2,
+        "exactly the two live concepts embedded"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_tokens WHERE scope = ? AND concept_path = '/ghost.md'",
+        )
+        .bind(&scope)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(1),
+        0,
+        "the ghost's postings are gone too — nothing searchable remains"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
+/// The stale-rebuild site completes the same sweep: a concept whose
+/// vector row went stale AND whose file is gone — while the FTS row
+/// outlived the delete (the historical residue: today's delete path
+/// removes registry → index → file → vector row in order) — is swept,
+/// the lexical index row AND the stale vector row, rather than belted
+/// token-only; the stale path then cannot re-enumerate next boot.
+#[tokio::test]
+async fn stale_rebuild_sweeps_registry_dead_stale_rows() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    EMBEDDING_HEALTH.reset_for_test();
+    // Two vecs: /c's initial backlog-then-drain embed, then the live
+    // pair's; a third (the ghost re-embedding) would exhaust the script.
+    let (url, _shared) = mock_embeddings(vec![vec_resp(DIMS), vec_resp(DIMS)]).await;
+    let env = env().await;
+    write_emb_row(&env.config, &env.service_key, &url, MODEL).await;
+    let (cs, vs) = env.user_stores();
+    let scope = format!("user:{}", env.user);
+    let token = vs.path_token_of("/c.md");
+
+    cs.put(&concept("/c.md", "C", "text c")).await.unwrap();
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+    wait_until("c's row landed fresh", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 1 && !rows[0].stale && rows[0].model == MODEL)
+            .unwrap_or(false)
+    })
+    .await;
+    // Tick 1's boot backlog enqueued c (no row yet) and is consumed;
+    // the corpus is current.
+    let processed_before = VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed);
+
+    // The surgery: a FULL delete (file + registry + rows) — the
+    // concept is truly gone — followed by the residue re-inserted by
+    // hand: the FTS doc row, one posting row, and a stale vector row
+    // (the shape the historical bug left; the garbage vec participates
+    // in backlog_paths by metadata only and is never decoded — the
+    // sweep deletes it before any load_rows read).
+    cs.delete("/c.md").await.unwrap();
+    sqlx::query(
+        "INSERT INTO search_docs (scope, concept_path, payload, length) VALUES (?, '/c.md', x'00', 4)",
+    )
+    .bind(&scope)
+    .execute(env.store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO search_tokens (scope, token, concept_path, tf) VALUES (?, 'dead-token', '/c.md', 1)",
+    )
+    .bind(&scope)
+    .execute(env.store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO search_vectors (scope_id, path_token, model, dims, stale, vec, updated_at) \
+         VALUES (?, ?, ?, ?, 1, x'00', ?)",
+    )
+    .bind(&scope)
+    .bind(&token)
+    .bind(MODEL)
+    .bind(DIMS as i64)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(env.store.pool())
+    .await
+    .unwrap();
+    assert!(
+        cs.get("/c.md").await.is_err(),
+        "surgery: the file is gone (cs.get must now miss)"
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_docs WHERE scope = ? AND concept_path = '/c.md'",
+        )
+        .bind(&scope)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(0)
+            == 1,
+        "surgery: the FTS row outlives the concept (the ghost shape)"
+    );
+
+    // Two live concepts ride the NEXT tick's drain; the stale rebuild
+    // meets the ghost in the same tick and must sweep it.
+    cs.put_batch(&[
+        concept("/a.md", "A", "text a"),
+        concept("/b.md", "B", "text b"),
+    ])
+    .await
+    .unwrap();
+
+    wait_until("the ghost was swept out of every row", || async {
+        let docs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_docs WHERE scope = ? AND concept_path = '/c.md'",
+        )
+        .bind(&scope)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(1);
+        let vecs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_vectors WHERE scope_id = ? AND path_token = ?",
+        )
+        .bind(&scope)
+        .bind(&token)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(1);
+        docs == 0 && vecs == 0
+    })
+    .await;
+    wait_until("the live concepts embedded fresh", || async {
+        vs.load_rows()
+            .await
+            .map(|rows| rows.len() == 2 && rows.iter().all(|r| !r.stale && r.model == MODEL))
+            .unwrap_or(false)
+    })
+    .await;
+    let _cleared = drain_queue(VECTOR_QUEUE_CAPACITY);
+    assert_eq!(
+        vector_queue_depth(),
+        0,
+        "nothing of the ghost remains queued"
+    );
+    assert_eq!(
+        VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed) - processed_before,
+        2,
+        "the stale ghost never re-embedded"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_tokens WHERE scope = ? AND concept_path = '/c.md'",
+        )
+        .bind(&scope)
+        .fetch_one(env.store.pool())
+        .await
+        .unwrap_or(1),
+        0,
+        "the ghost's posting row is gone too"
     );
 
     shutdown.cancel();

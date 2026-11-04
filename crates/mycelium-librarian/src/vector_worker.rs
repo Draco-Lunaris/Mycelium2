@@ -43,6 +43,16 @@
 //!    the operator saves the config post-boot, and the pre-existing
 //!    corpus backfills at the first tick that actually reads a row and
 //!    can work — no restart).
+//!
+//! Path-keyed sites that meet a dead concept — the file is gone while
+//! a row outlives it — do the FULL sweep (lexical index row + vector
+//! row, [`Self::sweep_dead_concept`]): the boot backlog and the stale
+//! rebuild both resolve paths first, so a historical ghost residue
+//! (`search_docs` rows the registry never knew, or a torn delete left
+//! behind) is removed instead of re-enumerating and belting out
+//! silently, boot after boot. The drain's queue items carry only the
+//! one-way HMAC token — the token-keyed belt there stays as-is (see
+//! phase 4), never able to address a lexical index row.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -339,7 +349,10 @@ impl VectorWorker {
     }
 
     /// The belt: mark the row of a token whose concept is gone for
-    /// removal (Ok on a miss — the row may already be gone).
+    /// removal (Ok on a miss — the row may already be gone). Token-keyed
+    /// by necessity — a queue item carries the one-way HMAC token, which
+    /// can never address a lexical index row; the PATH-keyed sites use
+    /// [`Self::sweep_dead_concept`], which removes the index row too.
     async fn belt(&self, vs: &VectorStore<'_>, token: &str) {
         if let Err(e) = vs.remove_row_by_token(token).await {
             tracing::warn!(
@@ -349,6 +362,27 @@ impl VectorWorker {
                 "vector belt: row removal failed"
             );
         }
+    }
+
+    /// Full dead-concept sweep at a PATH-keyed site: the concept's file
+    /// is gone, so (1) its vector row must not outlive it and (2) its
+    /// lexical index row must not survive as a searchable ghost — the
+    /// historical residue class (`search_docs` rows the registry never
+    /// knew, or a torn delete left behind) that re-enumerated by every
+    /// boot backlog and belted out silently, forever. The belt alone
+    /// cannot do (2): a token is one-way. Removal of a missing row is a
+    /// no-op on both stores.
+    async fn sweep_dead_concept(&self, cs: &ConceptStore<'_>, vs: &VectorStore<'_>, path: &str) {
+        if let Err(e) = cs.sweep_index_row(path).await {
+            tracing::warn!(scope = %vs.scope_id(), path = %path, error = %e,
+                "dead concept sweep: lexical index row removal failed");
+        }
+        if let Err(e) = vs.remove_row(path).await {
+            tracing::warn!(scope = %vs.scope_id(), path = %path, error = %e,
+                "dead concept sweep: vector row removal failed");
+        }
+        tracing::info!(scope = %vs.scope_id(), path = %path,
+            "dead concept sweep: registry-dead rows removed (lexical index + vector)");
     }
 
     /// Embed `pairs` in `cfg.batch`-sized batches and upsert one row per
@@ -483,12 +517,12 @@ impl VectorWorker {
                     }
                     Err(e) => {
                         // A registry path whose concept is gone — the
-                        // same belt as the drain: the row must not sit
-                        // stale forever (it would re-enumerate every
-                        // tick).
+                        // full sweep, not the token-only belt: the row
+                        // must not sit stale forever AND its lexical
+                        // index row must not linger as a searchable
+                        // ghost.
                         if matches!(e, ConceptStoreError::NotFound(_)) {
-                            let token = vs.path_token_of(&path);
-                            self.belt(vs, &token).await;
+                            self.sweep_dead_concept(&cs, vs, &path).await;
                         } else {
                             tracing::warn!(scope = %scope_id, path = %path, error = %e,
                                 "stale rebuild: concept unloadable — path skipped");
@@ -517,43 +551,39 @@ impl VectorWorker {
     /// queue's own rule); whatever was dropped resumes on the next
     /// boot.
     async fn enqueue_boot_backlog(&self, model: &str, learned: u32) {
-        // The two service scopes (sweep-targets order: skills, library).
-        for ns in ["skills", "library"] {
-            let vs = VectorStore::for_service(self.store.pool(), &self.service_key, ns);
-            self.enqueue_scope_backlog(&vs, model, learned).await;
-        }
-        // Users, below the auth layer: the sweep-targets enumeration.
-        let users: Vec<(String,)> = match sqlx::query_as("SELECT id FROM users ORDER BY id")
+        // Every scope through the shared per-scope resolver (the
+        // rebuild's shape) — the backlog needs the ConceptStore now, not
+        // just the VectorStore: a path the registry can no longer read
+        // is swept, not enqueued. Order: the two service scopes (sweep-
+        // targets order: skills, library), then the users.
+        let mut scope_ids = vec!["global:skills".to_string(), "global:library".to_string()];
+        match sqlx::query_as::<_, (String,)>("SELECT id FROM users ORDER BY id")
             .fetch_all(self.store.pool())
             .await
         {
-            Ok(users) => users,
+            Ok(users) => scope_ids.extend(users.into_iter().map(|(id,)| format!("user:{id}"))),
             Err(e) => {
                 tracing::warn!(error = %e, "boot backlog: user enumeration failed");
-                vec![]
             }
         };
-        for (id,) in users {
-            let Ok(user_id) = Uuid::parse_str(&id) else {
-                tracing::warn!(user = %id, "boot backlog: user row id unreadable — scope skipped");
+        for scope_id in scope_ids {
+            let Some(cs) = self.resolve_scope(&scope_id).await else {
+                tracing::warn!(scope = %scope_id, "boot backlog: scope unresolvable — skipped");
                 continue;
             };
-            let master = match (self.recovery)(user_id).await {
-                Ok(master) => master,
-                Err(e) => {
-                    tracing::warn!(user_id = %user_id, error = %e,
-                        "boot backlog: master key unrecoverable — user scope skipped (backlog resumes at the next boot; queue writes retry next tick)");
-                    continue;
-                }
-            };
-            let vs = VectorStore::for_user(self.store.pool(), user_id, &master);
-            self.enqueue_scope_backlog(&vs, model, learned).await;
+            self.enqueue_scope_backlog(&cs, model, learned).await;
         }
     }
 
     /// One scope's backlog enumeration → queue writes (deduped by the
-    /// queue; capacity drops new items).
-    async fn enqueue_scope_backlog(&self, vs: &VectorStore<'_>, model: &str, learned: u32) {
+    /// queue; capacity drops new items). A path whose concept is gone
+    /// (the historical ghost residue: an FTS row outliving its
+    /// registry/file, re-enumerated by every boot forever) is SWEPT —
+    /// lexical index row plus any vector row — instead of enqueued. A
+    /// concept that errors otherwise is skipped with a warn (same as
+    /// the drain/rebuild's unloadable handling).
+    async fn enqueue_scope_backlog(&self, cs: &ConceptStore<'_>, model: &str, learned: u32) {
+        let vs = cs.vectors();
         let paths = match vs.backlog_paths(model, learned).await {
             Ok(paths) => paths,
             Err(e) => {
@@ -564,9 +594,20 @@ impl VectorWorker {
         };
         let mut enqueued = 0usize;
         for path in paths {
-            let token = vs.path_token_of(&path);
-            enqueue_write(vs.scope_id(), &token);
-            enqueued += 1;
+            match cs.get(&path).await {
+                Ok(_) => {
+                    let token = vs.path_token_of(&path);
+                    enqueue_write(vs.scope_id(), &token);
+                    enqueued += 1;
+                }
+                Err(ConceptStoreError::NotFound(_)) => {
+                    self.sweep_dead_concept(cs, vs, &path).await;
+                }
+                Err(e) => {
+                    tracing::warn!(scope = vs.scope_id(), path = %path, error = %e,
+                        "boot backlog: concept unloadable — path skipped");
+                }
+            }
         }
         if enqueued > 0 {
             tracing::info!(
