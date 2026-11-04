@@ -151,6 +151,15 @@ corpus without a restart.
   goes to the server log.
 - **Never on the LLM gate.** Embedding traffic is not an LLM run: it
   neither occupies nor waits behind the chat/query slots.
+- **Tuning for the deployed model (bge-m3).** The production row serves
+  `bge-m3` (Ollama) at `batch: 8`, `timeout_secs: 300` — a large model
+  behind a latency-jittered host: 32-deep default batches overrun the
+  request window and a cold backend's first embeds strain the 30 s
+  default timeout. Failed embeddings are weather, not a restart: a
+  batch retries three times, re-parks its items into the queue, and a
+  later tick resumes them (the boot backlog defers through backend-Red
+  ticks the same way) — a slow-starting backend needs no restart and
+  nothing is lost.
 
 ## Memory lifecycle and dreaming (Admin → Dream)
 
