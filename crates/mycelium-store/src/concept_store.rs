@@ -664,6 +664,22 @@ impl<'a> ConceptStore<'a> {
         Ok(())
     }
 
+    /// Remove the lexical index row (doc + postings) of a path whose
+    /// concept is GONE — the dead-concept sweep's store side (the vector
+    /// worker's backlog and stale-rebuild call this for paths `cs.get`
+    /// can no longer read). Deliberately NOT the delete path: no file,
+    /// registry, revision, regen, or vector step exists — the registry
+    /// already lacks the concept and the sweeping worker belts the
+    /// vector row itself. Safety against a concurrent put rides the put
+    /// ordering (file → registry → index): an index row never precedes
+    /// its registry row, so a missing read here can only be a never- or
+    /// no-longer-written concept — a live put's index row is unreachable.
+    /// Removing a missing row is a no-op.
+    pub async fn sweep_index_row(&self, path: &str) -> Result<(), ConceptStoreError> {
+        self.index.remove(path).await?;
+        Ok(())
+    }
+
     /// List a scope's concepts (registry order: path asc).
     pub async fn list(&self) -> Result<Vec<ConceptEntry>, ConceptStoreError> {
         let rows: Vec<(String, String, String, String)> = sqlx::query_as(
