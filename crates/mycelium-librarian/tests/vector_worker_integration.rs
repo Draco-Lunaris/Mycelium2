@@ -7,7 +7,9 @@
 //! pre-worker writes and a model swap re-embeds the corpus; deleted
 //! concepts are never resurrected; registry-dead `search_docs` rows
 //! (the historical ghost residue) are swept — lexical index row plus
-//! any vector row — instead of re-enqueueing every boot. Direct-struct
+//! any vector row — instead of re-enqueueing every boot; and a drained
+//! token resolving to no concept belts out with a DEBUG line carrying
+//! the token. Direct-struct
 //! tests (queue_worker_integration.rs shape): a real temp-dir store, a
 //! stub master-key recovery, a scripted mock embeddings endpoint.
 //!
@@ -31,7 +33,8 @@ use mycelium_librarian::llm_health::{
 use mycelium_librarian::queue_worker::MasterKeyRecovery;
 use mycelium_librarian::vector_worker::VectorWorker;
 use mycelium_store::vectors::{
-    VECTOR_PROCESSED_TOTAL, VECTOR_QUEUE_CAPACITY, VectorStore, drain_queue, vector_queue_depth,
+    VECTOR_PROCESSED_TOTAL, VECTOR_QUEUE_CAPACITY, VectorStore, drain_queue, enqueue_write,
+    vector_queue_depth,
 };
 use mycelium_store::{ConceptStore, ConfigStore, Store};
 use uuid::Uuid;
@@ -1087,6 +1090,104 @@ async fn stale_rebuild_sweeps_registry_dead_stale_rows() {
         .unwrap_or(1),
         0,
         "the ghost's posting row is gone too"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}
+
+// ---------- the belt's debug-log observability ----------
+
+/// A fmt-log-capture writer: every formatted line is appended to a
+/// shared buffer. The worker task runs on the test's current-thread
+/// runtime, so a per-thread default subscriber captures its events.
+struct CaptureWriter(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(buf).to_string());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&self) -> Self::Writer {
+        CaptureWriter(Arc::clone(&self.0))
+    }
+}
+
+/// A drained queue token no registry concept resolves to goes to the
+/// belt — historically a silent continue (the 2026-11-03 stream's
+/// "deserves at least a debug log" gap). The belt's success path must
+/// emit a DEBUG line carrying the dead token, so any belt out is
+/// diagnosable from the logs.
+#[tokio::test]
+async fn belt_of_a_registry_dead_token_logs_at_debug() {
+    let _lock = TEST_LOCK.lock().await;
+    let _emb = EmbDefaults;
+    drain_queue(VECTOR_QUEUE_CAPACITY);
+
+    let mock = mock_embeddings(vec![vec_resp(DIMS)]).await;
+    let env = env().await;
+    write_emb_row(&env.config, &env.service_key, &mock.0, MODEL).await;
+
+    let (cs, vs) = env.user_stores();
+    cs.put(&concept("/a.md", "Live", "live body"))
+        .await
+        .unwrap();
+    let scope = vs.scope_id().to_string();
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(CaptureWriter(Arc::clone(&captured)))
+            .finish(),
+    );
+
+    let (shutdown, handle) = spawn_worker(&env, Duration::from_millis(TICK_MS));
+    let processed_before = VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed);
+    wait_until("the live concept embedded", || async {
+        VECTOR_PROCESSED_TOTAL.load(Ordering::Relaxed) - processed_before == 1
+    })
+    .await;
+
+    // A token whose concept never existed: the registry maps nothing,
+    // no vector row exists, the belt removes nothing — but its run
+    // must be visible.
+    let dead_token = vs.path_token_of("/never-lived.md");
+    enqueue_write(&scope, &dead_token);
+    let captured_for_wait = Arc::clone(&captured);
+    let dead_for_wait = dead_token.clone();
+    wait_until("the belt's debug line captured", || async {
+        captured_for_wait
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("vector belt:") && l.contains(&dead_for_wait))
+    })
+    .await;
+
+    let belt_lines: Vec<String> = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("vector belt:"))
+        .cloned()
+        .collect();
+    assert!(
+        belt_lines
+            .iter()
+            .all(|l| l.contains(&dead_token) && l.contains(&scope)),
+        "each belt line must carry the dead token and scope; captured: {:?}",
+        captured.lock().unwrap(),
     );
 
     shutdown.cancel();

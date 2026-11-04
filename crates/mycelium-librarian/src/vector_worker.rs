@@ -354,6 +354,11 @@ impl VectorWorker {
     /// can never address a lexical index row; the PATH-keyed sites use
     /// [`Self::sweep_dead_concept`], which removes the index row too.
     async fn belt(&self, vs: &VectorStore<'_>, token: &str) {
+        tracing::debug!(
+            scope = vs.scope_id(),
+            token = %token,
+            "vector belt: queue token resolves to no registry concept — vector row removed"
+        );
         if let Err(e) = vs.remove_row_by_token(token).await {
             tracing::warn!(
                 scope = vs.scope_id(),
